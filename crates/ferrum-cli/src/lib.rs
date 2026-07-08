@@ -362,8 +362,15 @@ fn print_backend_config(case_dir: &Path) -> Result<(), String> {
     };
 
     println!(
-        "backend config: default={} gpuBackend={} gpuDevice={} precision={}",
-        config.default, config.gpu.backend, config.gpu.device, config.gpu.precision
+        "backend config: default={} cpuThreads={} cpuPinning={} cpuNuma={} gpuBackend={} gpuDevices={} multiGpu={} precision={}",
+        config.default,
+        config.cpu.threads,
+        config.cpu.thread_pinning,
+        config.cpu.numa,
+        config.gpu.backend,
+        format_devices(&config.gpu.devices),
+        config.gpu.multi_gpu,
+        config.gpu.precision
     );
     for section in &config.sections {
         if section.entries.is_empty() {
@@ -380,6 +387,13 @@ fn print_backend_config(case_dir: &Path) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn format_devices(devices: &[String]) -> String {
+    if devices.len() == 1 {
+        return devices[0].clone();
+    }
+    format!("({})", devices.join(" "))
 }
 
 fn print_initial_fields(case_dir: &Path) -> Result<(), String> {

@@ -415,16 +415,36 @@ ferrumBackends
 {
     default cpu;
 
+    cpu
+    {
+        threads auto;
+        threadPinning off;
+        numa auto;
+    }
+
     flow
     {
+        nonlinearSolve gpu;
         residual gpu;
+        jacobian gpu;
         linearSolve gpu;
         pressureCorrection gpu;
     }
 
     chemistry
     {
+        nonlinearSolve gpu;
+        residual gpu;
+        jacobian gpu;
         odeSolve cpu;
+    }
+
+    gpu
+    {
+        backend auto;
+        devices (auto);
+        multiGpu auto;
+        precision f64;
     }
 }
 ```
@@ -433,17 +453,41 @@ The important rule is practical resource use: small or non-time-critical cases
 must be allowed to stay on CPU, while expensive residuals, linear solves, or
 other suitable kernels can run on GPU.
 
+Nonlinear solvers are treated as first-class GPU candidates. A Newton-style
+solve can select backend execution for `residual`, `jacobian`,
+`linearSolve`, and the enclosing `nonlinearSolve` loop. Chemistry can also
+select `odeSolve` separately because batched per-cell ODE solves may have
+different performance tradeoffs than flow linear algebra.
+
+CPU resource policy:
+
+- `threads auto;` lets FerrumCFD choose a sensible worker count.
+- `threads N;` pins the solver policy to `N` CPU worker threads.
+- `threadPinning auto|on|off;` is reserved for explicit CPU affinity control.
+- `numa auto|on|off;` leaves room for multi-socket CPU machines without forcing
+  a NUMA policy before the runtime exists.
+
+GPU resource policy:
+
+- `devices (auto);` lets FerrumCFD pick the GPU.
+- `devices (0);` selects one GPU.
+- `devices (0 1);` permits multi-GPU execution when a backend and solver
+  support it.
+- `multiGpu auto|on|off;` controls whether multi-GPU execution may be used.
+
 `checkFerrumMesh` reads `system/ferrumBackends` when the file exists:
 
 ```text
-backend config: default=cpu gpuBackend=auto gpuDevice=auto precision=f64
+backend config: default=cpu cpuThreads=auto cpuPinning=off cpuNuma=auto gpuBackend=auto gpuDevices=auto multiGpu=auto precision=f64
   mesh: import=cpu, checks=cpu
-  flow: residual=auto, linearSolve=auto
+  flow: nonlinearSolve=auto, residual=auto, jacobian=auto, linearSolve=auto, pressureCorrection=auto
+  chemistry: residual=auto, jacobian=auto, nonlinearSolve=auto, odeSolve=auto
 ```
 
 Allowed execution choices are `cpu`, `gpu`, and `auto`. The `gpu.backend`
 setting currently accepts `auto`, `wgpu`, `cuda`, and `hip`; `gpu.precision`
-accepts `auto`, `f32`, and `f64`.
+accepts `auto`, `f32`, and `f64`. CPU `threads` accepts `auto` or a positive
+integer.
 
 ## Current Limitations
 

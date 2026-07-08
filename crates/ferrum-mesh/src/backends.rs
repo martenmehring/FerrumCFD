@@ -9,6 +9,7 @@ pub struct BackendConfig {
     pub path: PathBuf,
     pub default: BackendChoice,
     pub sections: Vec<BackendSection>,
+    pub cpu: CpuConfig,
     pub gpu: GpuConfig,
 }
 
@@ -32,17 +33,36 @@ pub struct BackendSelection {
 }
 
 #[derive(Debug)]
+pub struct CpuConfig {
+    pub threads: String,
+    pub thread_pinning: String,
+    pub numa: String,
+}
+
+#[derive(Debug)]
 pub struct GpuConfig {
     pub backend: String,
-    pub device: String,
+    pub devices: Vec<String>,
+    pub multi_gpu: String,
     pub precision: String,
+}
+
+impl Default for CpuConfig {
+    fn default() -> Self {
+        Self {
+            threads: "auto".to_string(),
+            thread_pinning: "off".to_string(),
+            numa: "auto".to_string(),
+        }
+    }
 }
 
 impl Default for GpuConfig {
     fn default() -> Self {
         Self {
             backend: "auto".to_string(),
-            device: "auto".to_string(),
+            devices: vec!["auto".to_string()],
+            multi_gpu: "auto".to_string(),
             precision: "f64".to_string(),
         }
     }
@@ -124,6 +144,10 @@ fn parse_backend_entry(cursor: &mut TokenCursor, builder: &mut BackendConfigBuil
             cursor.expect("{")?;
             builder.gpu = parse_gpu_block(cursor)?;
         }
+        "cpu" => {
+            cursor.expect("{")?;
+            builder.cpu = parse_cpu_block(cursor)?;
+        }
         _ => {
             cursor.expect("{")?;
             builder.sections.push(parse_backend_section(cursor, key)?);
@@ -146,23 +170,67 @@ fn parse_backend_section(cursor: &mut TokenCursor, name: String) -> Result<Backe
     Ok(BackendSection { name, entries })
 }
 
+fn parse_cpu_block(cursor: &mut TokenCursor) -> Result<CpuConfig> {
+    let mut cpu = CpuConfig::default();
+
+    while !cursor.peek_is("}")? {
+        let key = cursor.next_required()?;
+        let values = cursor.read_value_until_semicolon()?;
+        match key.as_str() {
+            "threads" => {
+                let value = single_value(&values, "CPU threads", cursor.path())?;
+                validate_auto_or_positive_integer(&value, "CPU threads", cursor.path())?;
+                cpu.threads = value;
+            }
+            "threadPinning" => {
+                let value = single_value(&values, "CPU threadPinning", cursor.path())?;
+                validate_auto_on_off(&value, "CPU threadPinning", cursor.path())?;
+                cpu.thread_pinning = value;
+            }
+            "numa" => {
+                let value = single_value(&values, "CPU numa", cursor.path())?;
+                validate_auto_on_off(&value, "CPU numa", cursor.path())?;
+                cpu.numa = value;
+            }
+            _ => {}
+        }
+    }
+    cursor.expect("}")?;
+
+    Ok(cpu)
+}
+
 fn parse_gpu_block(cursor: &mut TokenCursor) -> Result<GpuConfig> {
     let mut gpu = GpuConfig::default();
 
     while !cursor.peek_is("}")? {
         let key = cursor.next_required()?;
-        let value = cursor.next_required()?;
-        cursor.expect_optional(";")?;
+        let values = cursor.read_value_until_semicolon()?;
         match key.as_str() {
             "backend" => {
+                let value = single_value(&values, "GPU backend", cursor.path())?;
                 validate_gpu_backend(&value, cursor.path())?;
                 gpu.backend = value;
             }
             "device" => {
+                let value = single_value(&values, "GPU device", cursor.path())?;
                 validate_word_or_number(&value, "GPU device", cursor.path())?;
-                gpu.device = value;
+                gpu.devices = vec![value];
+            }
+            "devices" => {
+                let devices = value_list(&values, "GPU devices", cursor.path())?;
+                for device in &devices {
+                    validate_word_or_number(device, "GPU device", cursor.path())?;
+                }
+                gpu.devices = devices;
+            }
+            "multiGpu" => {
+                let value = single_value(&values, "GPU multiGpu", cursor.path())?;
+                validate_auto_on_off(&value, "GPU multiGpu", cursor.path())?;
+                gpu.multi_gpu = value;
             }
             "precision" => {
+                let value = single_value(&values, "GPU precision", cursor.path())?;
                 validate_precision(&value, cursor.path())?;
                 gpu.precision = value;
             }
@@ -181,6 +249,82 @@ fn parse_backend_choice(value: &str, path: &Path) -> Result<BackendChoice> {
         "auto" => Ok(BackendChoice::Auto),
         _ => Err(MeshError::InvalidInput(format!(
             "invalid backend choice '{}' in {}; expected cpu, gpu, or auto",
+            value,
+            path.display()
+        ))),
+    }
+}
+
+fn single_value(values: &[String], label: &str, path: &Path) -> Result<String> {
+    if values.len() == 1 {
+        return Ok(values[0].clone());
+    }
+
+    Err(MeshError::InvalidInput(format!(
+        "{label} in {} must be a single value",
+        path.display()
+    )))
+}
+
+fn value_list(values: &[String], label: &str, path: &Path) -> Result<Vec<String>> {
+    if values.is_empty() {
+        return Err(MeshError::InvalidInput(format!(
+            "{label} in {} must not be empty",
+            path.display()
+        )));
+    }
+
+    if values.first().map(String::as_str) == Some("(")
+        && values.last().map(String::as_str) == Some(")")
+    {
+        let values = values[1..values.len() - 1].to_vec();
+        if values.is_empty() {
+            return Err(MeshError::InvalidInput(format!(
+                "{label} in {} must not be empty",
+                path.display()
+            )));
+        }
+        return Ok(values);
+    }
+
+    if values.len() == 1 {
+        return Ok(vec![values[0].clone()]);
+    }
+
+    Err(MeshError::InvalidInput(format!(
+        "{label} in {} must be a single value or parenthesized list",
+        path.display()
+    )))
+}
+
+fn validate_auto_or_positive_integer(value: &str, label: &str, path: &Path) -> Result<()> {
+    if value == "auto" {
+        return Ok(());
+    }
+
+    let parsed = value.parse::<usize>().map_err(|_| {
+        MeshError::InvalidInput(format!(
+            "invalid {label} '{}' in {}; expected auto or a positive integer",
+            value,
+            path.display()
+        ))
+    })?;
+    if parsed > 0 {
+        return Ok(());
+    }
+
+    Err(MeshError::InvalidInput(format!(
+        "invalid {label} '{}' in {}; expected auto or a positive integer",
+        value,
+        path.display()
+    )))
+}
+
+fn validate_auto_on_off(value: &str, label: &str, path: &Path) -> Result<()> {
+    match value {
+        "auto" | "on" | "off" => Ok(()),
+        _ => Err(MeshError::InvalidInput(format!(
+            "invalid {label} '{}' in {}; expected auto, on, or off",
             value,
             path.display()
         ))),
@@ -228,6 +372,7 @@ struct BackendConfigBuilder {
     path: PathBuf,
     default: Option<BackendChoice>,
     sections: Vec<BackendSection>,
+    cpu: CpuConfig,
     gpu: GpuConfig,
 }
 
@@ -237,6 +382,7 @@ impl BackendConfigBuilder {
             path: path.to_path_buf(),
             default: None,
             sections: Vec::new(),
+            cpu: CpuConfig::default(),
             gpu: GpuConfig::default(),
         }
     }
@@ -246,6 +392,7 @@ impl BackendConfigBuilder {
             path: self.path,
             default: self.default.unwrap_or(BackendChoice::Cpu),
             sections: self.sections,
+            cpu: self.cpu,
             gpu: self.gpu,
         })
     }
@@ -275,16 +422,26 @@ mod tests {
             checks cpu;
         }
 
+        cpu
+        {
+            threads auto;
+            threadPinning off;
+            numa auto;
+        }
+
         flow
         {
+            nonlinearSolve gpu;
             residual auto;
+            jacobian auto;
             linearSolve gpu;
         }
 
         gpu
         {
             backend wgpu;
-            device auto;
+            devices (0 1);
+            multiGpu auto;
             precision f64;
         }
         "#;
@@ -292,8 +449,12 @@ mod tests {
         let config = parse_backend_config_str(content, Path::new("ferrumBackends")).unwrap();
         assert_eq!(config.default, BackendChoice::Cpu);
         assert_eq!(config.sections.len(), 2);
-        assert_eq!(config.sections[1].entries[1].choice, BackendChoice::Gpu);
+        assert_eq!(config.cpu.threads, "auto");
+        assert_eq!(config.sections[1].entries[0].step, "nonlinearSolve");
+        assert_eq!(config.sections[1].entries[0].choice, BackendChoice::Gpu);
         assert_eq!(config.gpu.backend, "wgpu");
+        assert_eq!(config.gpu.devices, vec!["0".to_string(), "1".to_string()]);
+        assert_eq!(config.gpu.multi_gpu, "auto");
         assert_eq!(config.gpu.precision, "f64");
     }
 
@@ -327,5 +488,18 @@ mod tests {
 
         let error = parse_backend_config_str(content, Path::new("ferrumBackends")).unwrap_err();
         assert!(error.to_string().contains("expected cpu, gpu, or auto"));
+    }
+
+    #[test]
+    fn rejects_zero_cpu_threads() {
+        let content = r#"
+        cpu
+        {
+            threads 0;
+        }
+        "#;
+
+        let error = parse_backend_config_str(content, Path::new("ferrumBackends")).unwrap_err();
+        assert!(error.to_string().contains("positive integer"));
     }
 }

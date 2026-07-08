@@ -120,20 +120,33 @@ ferrumBackends
 
     flow
     {
+        nonlinearSolve gpu;
         residual gpu;
+        jacobian gpu;
         linearSolve gpu;
         pressureCorrection gpu;
     }
 
     chemistry
     {
+        nonlinearSolve gpu;
+        residual gpu;
+        jacobian gpu;
         odeSolve cpu;
+    }
+
+    cpu
+    {
+        threads auto;
+        threadPinning off;
+        numa auto;
     }
 
     gpu
     {
         backend auto;     // auto, wgpu, cuda, hip
-        device auto;
+        devices (auto);   // auto, one device id, or multiple ids
+        multiGpu auto;    // auto, on, off
         precision f64;
     }
 }
@@ -141,6 +154,13 @@ ferrumBackends
 
 This dictionary is parsed and validated as case metadata, but not yet consumed
 by executable solvers.
+
+Nonlinear solver stages must stay backend-selectable from the beginning. A
+Newton-style solver should not be CPU-bound by design: residual evaluation,
+Jacobian assembly, linear correction solves, convergence checks, and batched
+chemistry ODE solves must all be able to target CPU, GPU, or an auto policy.
+This is one of the architectural differences FerrumCFD should preserve over a
+CPU-first OpenFOAM-style implementation.
 
 ## Solver Architecture Direction
 

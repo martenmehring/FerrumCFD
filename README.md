@@ -62,6 +62,8 @@ The importer currently targets the membrane reactor test mesh shape:
   `symmetryPlane`, or custom patch types
 - OpenFOAM-like initial fields below `0/` are parsed for `dimensions`,
   `internalField`, and `boundaryField` summaries
+- backend policy can select CPU/GPU/auto per solver stage, including nonlinear
+  solver steps, with CPU thread and GPU device metadata
 
 `splitFerrumMeshRegions` can write one region mesh per imported cell zone under
 `constant/<region>/polyMesh`.
