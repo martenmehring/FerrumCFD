@@ -168,6 +168,10 @@ function Write-MarkdownReport($Path, $Result) {
         $method = $comparison.openFoamPressureLossMethod
         $lines.Add("")
         $lines.Add("OpenFOAM pressure loss sampling: ``$method`` with $($comparison.openFoamInletSamples) inlet and $($comparison.openFoamOutletSamples) outlet samples.")
+        if ($null -ne $comparison.openFoamEffectiveLengthFraction) {
+            $fraction = Format-NullableNumber $comparison.openFoamEffectiveLengthFraction "G8"
+            $lines.Add("The sampled pressure difference was extrapolated to the full pipe length with effective length fraction ``$fraction``.")
+        }
     }
     $lines.Add("")
     $lines.Add("## Timing")
@@ -295,6 +299,8 @@ $result = [ordered]@{
         openFoamPressureLossMethod = if ($null -ne $openFoamPressureLoss) { $openFoamPressureLoss.method } else { $null }
         openFoamInletSamples = if ($null -ne $openFoamPressureLoss) { $openFoamPressureLoss.inletSamples } else { $null }
         openFoamOutletSamples = if ($null -ne $openFoamPressureLoss) { $openFoamPressureLoss.outletSamples } else { $null }
+        openFoamSampledDeltaPPa = if ($null -ne $openFoamPressureLoss) { $openFoamPressureLoss.sampledDeltaPPa } else { $null }
+        openFoamEffectiveLengthFraction = if ($null -ne $openFoamPressureLoss) { $openFoamPressureLoss.effectiveLengthFraction } else { $null }
         ferrumDeltaPPa = $null
         ferrumRelativeErrorToOpenFoam = $null
         ferrumSolverComparison = "pending executable FerrumCFD flow solver"

@@ -482,6 +482,8 @@ The intended validation order is:
 The generated OpenFOAM cases and reports stay below `target/benchmarks/`.
 They are not part of the normal FerrumCFD workflow. Increase `-OpenFoamSteps`
 when fine OpenFOAM cases still have moving SIMPLE residuals.
+The current local Gmsh pipe mesh-study record is summarized in
+`docs/benchmarks/gmsh-pipe-mesh-study.md`.
 
 ## Solver Preflight
 

@@ -6,6 +6,7 @@ without forcing users to change their usual workflow.
 
 Start with the [User Guide](docs/user-guide.md). Longer-term design notes are
 tracked in [docs/architecture.md](docs/architecture.md).
+Current benchmark notes are kept under [docs/benchmarks](docs/benchmarks).
 
 ## First Commands
 

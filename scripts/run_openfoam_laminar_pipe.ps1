@@ -253,7 +253,14 @@ function Get-Average([double[]]$Values) {
     return $sum / [double]$Values.Count
 }
 
-function Measure-PatchOwnerPressureLoss($Values, [string]$CaseRoot) {
+function Get-CellCenterLengthFraction($Benchmark) {
+    if ($null -eq $Benchmark.axialCells -or [int]$Benchmark.axialCells -le 1) {
+        return $null
+    }
+    return ([double]([int]$Benchmark.axialCells - 1)) / [double]$Benchmark.axialCells
+}
+
+function Measure-PatchOwnerPressureLoss($Values, [string]$CaseRoot, $Benchmark) {
     $patches = Read-BoundaryPatchRanges (Join-Path $CaseRoot "constant\polyMesh\boundary")
     if (!$patches.ContainsKey("inlet") -or !$patches.ContainsKey("outlet")) {
         return $null
@@ -293,6 +300,7 @@ function Measure-PatchOwnerPressureLoss($Values, [string]$CaseRoot) {
         inletAverage = $inletAverage
         outletAverage = $outletAverage
         delta = $inletAverage - $outletAverage
+        effectiveLengthFraction = Get-CellCenterLengthFraction $Benchmark
     }
 }
 
@@ -320,11 +328,12 @@ function Measure-AxialPressureLoss($Values, $Benchmark, [string]$CaseRoot) {
                 inletAverage = $inletAverage
                 outletAverage = $outletAverage
                 delta = $inletAverage - $outletAverage
+                effectiveLengthFraction = Get-CellCenterLengthFraction $Benchmark
             }
         }
     }
 
-    $patchLoss = Measure-PatchOwnerPressureLoss $Values $CaseRoot
+    $patchLoss = Measure-PatchOwnerPressureLoss $Values $CaseRoot $Benchmark
     if ($null -ne $patchLoss) {
         return $patchLoss
     }
@@ -336,6 +345,7 @@ function Measure-AxialPressureLoss($Values, $Benchmark, [string]$CaseRoot) {
         inletAverage = [double]$Values[0]
         outletAverage = [double]$Values[$Values.Count - 1]
         delta = [double]$Values[0] - [double]$Values[$Values.Count - 1]
+        effectiveLengthFraction = $null
     }
 }
 
@@ -574,7 +584,15 @@ if ($null -ne $latestTime) {
     $pValues = Read-InternalScalarField (Join-Path $latestTime.FullName "p")
     $loss = Measure-AxialPressureLoss $pValues $benchmark $WorkDir
     if ($null -ne $loss) {
-        $deltaPa = $loss.delta * $rho
+        $sampledDeltaKinematic = $loss.delta
+        $sampledDeltaPa = $sampledDeltaKinematic * $rho
+        $effectiveLengthFraction = $loss.effectiveLengthFraction
+        $deltaPa = $sampledDeltaPa
+        $deltaKinematic = $sampledDeltaKinematic
+        if ($null -ne $effectiveLengthFraction -and [double]$effectiveLengthFraction -gt 0.0) {
+            $deltaPa = $sampledDeltaPa / [double]$effectiveLengthFraction
+            $deltaKinematic = $sampledDeltaKinematic / [double]$effectiveLengthFraction
+        }
         $openFoamDelta = [ordered]@{
             latestTime = $latestTime.Name
             samples = $pValues.Count
@@ -583,7 +601,10 @@ if ($null -ne $latestTime) {
             outletSamples = $loss.outletSamples
             inletAverageKinematic = $loss.inletAverage
             outletAverageKinematic = $loss.outletAverage
-            deltaPKinematic = $loss.delta
+            sampledDeltaPKinematic = $sampledDeltaKinematic
+            sampledDeltaPPa = $sampledDeltaPa
+            effectiveLengthFraction = $effectiveLengthFraction
+            deltaPKinematic = $deltaKinematic
             deltaPPa = $deltaPa
             relativeErrorToAnalytic = if ($analyticDeltaPPa -ne 0.0) { ($deltaPa - $analyticDeltaPPa) / $analyticDeltaPPa } else { $null }
         }
