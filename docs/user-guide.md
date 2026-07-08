@@ -201,6 +201,20 @@ The importer maps:
 Internal multi-region interfaces are therefore preserved as `faceZones` even
 when they are not external boundary patches.
 
+The repository also contains a small SI pipe `.geo` with two near-wall prism
+layers:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_gmsh_pipe_import.ps1
+```
+
+The script uses `examples/gmsh_pipe/pipe_prism2.geo`, writes the generated
+`.msh` below `target/gmsh/`, imports it to `target/cases/gmsh_pipe`, and runs
+`checkFerrumMesh`. It finds `gmsh.exe` from `PATH` or the local Downloads Gmsh
+installation; pass `-GmshExe <path-to-gmsh.exe>` when needed. This Gmsh pipe is
+a benchmark fixture for comparing FerrumCFD and OpenFOAM on the same mesh. It
+does not make OpenFOAM part of the normal FerrumCFD workflow.
+
 ## Interface Registry
 
 FerrumCFD derives a general interface registry from the imported mesh. It is not
