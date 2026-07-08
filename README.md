@@ -62,6 +62,7 @@ The importer currently targets the membrane reactor test mesh shape:
   `symmetryPlane`, or custom patch types
 - OpenFOAM-like initial fields below `0/` are parsed for `dimensions`,
   `internalField`, and `boundaryField` summaries
+- mesh geometry summaries compute face areas, boundary area, and cell volumes
 - backend policy can select CPU/GPU/auto per solver stage, including nonlinear
   solver steps, with CPU thread and GPU device metadata
 

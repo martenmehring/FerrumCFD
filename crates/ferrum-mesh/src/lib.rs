@@ -3,8 +3,10 @@ pub mod check;
 pub mod dictionary;
 pub mod fields;
 pub mod foam;
+pub mod geometry;
 pub mod gmsh;
 pub mod interfaces;
+pub mod poly_mesh;
 pub mod regions;
 
 use std::collections::HashMap;

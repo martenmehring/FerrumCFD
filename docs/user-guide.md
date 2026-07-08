@@ -240,11 +240,19 @@ The current checker reports:
 - boundary patches and patch types
 - face zones
 - cell zones
+- geometry summary: face areas, boundary area, and cell volumes
 - generated region meshes below `constant/<region>/polyMesh`
 - topology warnings from import
 
 This is not yet a full OpenFOAM-grade `checkMesh`, but it is the command that
 will grow into that role.
+
+Example geometry output:
+
+```text
+geometry: cells=523600 faces=1580785 totalVolume=4.921636e4 minCellVolume=1.413155e-2 maxCellVolume=8.414263e-1 nonPositiveCellVolumes=0
+geometry faces: minArea=3.532886e-3 maxArea=2.714353e0 totalBoundaryArea=1.437881e4
+```
 
 ## Split Multi-Region Meshes
 
@@ -436,7 +444,7 @@ ferrumBackends
         nonlinearSolve gpu;
         residual gpu;
         jacobian gpu;
-        odeSolve cpu;
+        odeSolve gpu;
     }
 
     gpu
@@ -455,9 +463,10 @@ other suitable kernels can run on GPU.
 
 Nonlinear solvers are treated as first-class GPU candidates. A Newton-style
 solve can select backend execution for `residual`, `jacobian`,
-`linearSolve`, and the enclosing `nonlinearSolve` loop. Chemistry can also
-select `odeSolve` separately because batched per-cell ODE solves may have
-different performance tradeoffs than flow linear algebra.
+`linearSolve`, and the enclosing `nonlinearSolve` loop. Chemistry ODEs can
+also run on GPU as batched per-cell ODE solves. `odeSolve cpu` is still a
+valid choice when the GPU is busy, unavailable, memory-limited, or when a
+particular stiff chemistry setup performs better on CPU.
 
 CPU resource policy:
 
@@ -496,6 +505,8 @@ integer.
 - Region splitting currently reads Ferrum-generated ASCII `polyMesh` files.
 - `checkFerrumMesh` is currently a structural summary plus basic topology
   warning report, with field, interface, and backend configuration validation.
+- Geometry computation currently reports summary values; full OpenFOAM-grade
+  geometry quality checks are not implemented yet.
 - Initial field parsing currently summarizes fields and boundary entries; it
   does not yet validate dimensions against solver equations or patch types.
 - Solver support is not implemented yet.

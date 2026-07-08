@@ -132,7 +132,7 @@ ferrumBackends
         nonlinearSolve gpu;
         residual gpu;
         jacobian gpu;
-        odeSolve cpu;
+        odeSolve gpu;
     }
 
     cpu
@@ -161,6 +161,21 @@ Jacobian assembly, linear correction solves, convergence checks, and batched
 chemistry ODE solves must all be able to target CPU, GPU, or an auto policy.
 This is one of the architectural differences FerrumCFD should preserve over a
 CPU-first OpenFOAM-style implementation.
+
+CPU remains a deliberate execution target, not a fallback of last resort. Users
+must be able to keep a solve on CPU when the GPU is needed elsewhere, when a
+small case would not amortize device transfers, or when a specific model has
+better CPU behavior.
+
+## Mesh Geometry Direction
+
+The first geometry pass derives face centres, oriented face area vectors,
+approximate cell centres, cell volumes, and boundary area from
+`constant/polyMesh`. These values are now summarized by `checkFerrumMesh`.
+
+This is still a geometry foundation, not a full quality checker. Future checks
+should add non-orthogonality, skewness, aspect ratio, wedge validity, `empty`
+validity, and interface-normal consistency.
 
 ## Solver Architecture Direction
 

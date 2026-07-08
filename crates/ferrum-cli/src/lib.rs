@@ -8,6 +8,7 @@ use ferrum_mesh::backends::read_backend_config;
 use ferrum_mesh::check::read_case_summary;
 use ferrum_mesh::fields::{FieldFile, read_initial_fields};
 use ferrum_mesh::foam::{FoamWriteOptions, write_openfoam_case_with_options};
+use ferrum_mesh::geometry::{GeometrySummary, summarize_case_geometry};
 use ferrum_mesh::gmsh::read_msh22_ascii;
 use ferrum_mesh::interfaces::{read_interface_config, validate_interface_config};
 use ferrum_mesh::regions::{
@@ -196,6 +197,7 @@ fn check_mesh(args: Vec<String>) -> Result<(), String> {
     print_interface_config(&case_dir, &interfaces)?;
     print_backend_config(&case_dir)?;
     print_initial_fields(&case_dir)?;
+    print_geometry_summary(&case_dir)?;
 
     let unmatched = summary.unmatched_boundary_faces.unwrap_or(0);
     let duplicate = summary.duplicate_boundary_faces.unwrap_or(0);
@@ -452,6 +454,34 @@ fn print_initial_field(field: &FieldFile) {
             );
         }
     }
+}
+
+fn print_geometry_summary(case_dir: &Path) -> Result<(), String> {
+    let geometry = summarize_case_geometry(case_dir).map_err(|error| error.to_string())?;
+    print_geometry(&geometry);
+    Ok(())
+}
+
+fn print_geometry(geometry: &GeometrySummary) {
+    println!(
+        "geometry: cells={} faces={} totalVolume={} minCellVolume={} maxCellVolume={} nonPositiveCellVolumes={}",
+        geometry.cells,
+        geometry.faces,
+        format_scientific(geometry.total_cell_volume),
+        format_scientific(geometry.min_cell_volume),
+        format_scientific(geometry.max_cell_volume),
+        geometry.non_positive_cell_volumes
+    );
+    println!(
+        "geometry faces: minArea={} maxArea={} totalBoundaryArea={}",
+        format_scientific(geometry.min_face_area),
+        format_scientific(geometry.max_face_area),
+        format_scientific(geometry.total_boundary_area)
+    );
+}
+
+fn format_scientific(value: f64) -> String {
+    format!("{value:.6e}")
 }
 
 fn print_region_patch(patch: &ferrum_mesh::regions::RegionPatchSummary) {
