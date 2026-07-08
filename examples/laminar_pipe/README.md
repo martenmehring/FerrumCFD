@@ -78,14 +78,11 @@ ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --maxSimpleIterati
 ```
 
 The full CFD time loop is not implemented yet. This case already executes the
-source-driven CPU Poiseuille benchmark and the first guarded laminar SIMPLE
-path, and remains the contract for the later flow and heat-transfer solvers.
-Multi-step SIMPLE reports are intentionally conservative: continuity, pressure
-loss, and U/p field changes must all stabilize before Ferrum marks the run as
-converged. If inlet/outlet pressure-field averages are available, the pressure
-field deltaP must also match the benchmark tolerance, and the coupled update
-limiter must no longer be clipping the step. The current multi-step run solves
-an absolute pressure equation from `phiHbyA`, carries the corrected `phi` into
-the next SIMPLE iteration, and bounds the committed U/p field update to 2% to
-keep intermediate fields finite and physically inspectable while the
-pressure-velocity coupling is still under development.
+source-driven CPU Poiseuille benchmark and the first laminar SIMPLE path, and
+remains the contract for the later flow and heat-transfer solvers. Multi-step
+SIMPLE reports require continuity, pressure loss, and U/p field changes to
+stabilize before Ferrum marks the run as converged. The stored pressure-field
+deltaP is reported next to the mean-flow pressure loss, but it is not used to
+cap or roll back a finite SIMPLE step. The current multi-step run solves an
+absolute pressure equation from `phiHbyA`, carries the corrected `phi` into the
+next SIMPLE iteration, and leaves finite U/p/phi updates uncapped.

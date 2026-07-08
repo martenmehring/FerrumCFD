@@ -625,9 +625,9 @@ relative error, flow rate, reconstructed pressure drop, solver iterations,
 residual, and wall-clock seconds. It does not write velocity or pressure fields
 back to the case.
 
-`--solveLaminarSimple` is the first guarded laminar incompressible
-pressure-velocity path. It reads the OpenFOAM-like case dictionaries and fields
-that a `simpleFoam` user expects:
+`--solveLaminarSimple` is the first laminar incompressible pressure-velocity
+path. It reads the OpenFOAM-like case dictionaries and fields that a
+`simpleFoam` user expects:
 
 - `0/U`
 - `0/p`
@@ -637,11 +637,11 @@ that a `simpleFoam` user expects:
 - `constant/polyMesh`
 
 It builds the first finite-volume flow operators on the runtime mesh:
-`phi = U_f . S_f`, `grad(p)`, `div(phi,U)`, and `laplacian(nu,U)`. The guarded
-momentum predictor currently assembles `rho * div(phi,U)` as an implicit
-upwind contribution and applies OpenFOAM-style equation relaxation to the
-velocity equation. This avoids the central-convection oscillations seen in
-early multi-step SIMPLE experiments. For the pipe benchmark the supported
+`phi = U_f . S_f`, `grad(p)`, `div(phi,U)`, and `laplacian(nu,U)`. The momentum
+predictor currently assembles `rho * div(phi,U)` as an implicit upwind
+contribution and applies OpenFOAM-style equation relaxation to the velocity
+equation. This avoids the central-convection oscillations seen in early
+multi-step SIMPLE experiments. For the pipe benchmark the supported
 boundary-condition contract is:
 
 - `U`: inlet `fixedValue` including nonuniform/parabolic values, wall `noSlip`,
@@ -672,21 +672,19 @@ and optional `maxIter` values from `system/fvSolution`. The current CPU
 preconditioner maps OpenFOAM `DIC`/`FDIC` to Ferrum's diagonal PCG
 preconditioner; a full incomplete-Cholesky factorization is still future
 solver work. The generic `--solveTolerance` and `--maxIterations` flags remain
-broad overrides for both equations.
+broad overrides for both equations. If present, OpenFOAM-style
+`SIMPLE.residualControl` entries for `U` and `p` are read as additional
+convergence criteria.
 
-The current default for this path remains one damped CPU SIMPLE step. When
-`--maxSimpleIterations` is greater than one, Ferrum defaults to at least two
-SIMPLE iterations before convergence can be accepted. Multi-step convergence
-requires all active checks to pass: continuity L2 below `--simpleTolerance`,
+When `--maxSimpleIterations` is greater than one, Ferrum defaults to at least
+two SIMPLE iterations before convergence can be accepted. Multi-step
+convergence currently requires continuity L2 below `--simpleTolerance`,
 Hagen-Poiseuille pressure-drop error below `--pressureDropTolerance`, and
-relative `U`/`p` field changes below `--fieldChangeTolerance`. If inlet and
-outlet pressure-field averages are available, the pressure-field pressure drop
-must also satisfy `--pressureDropTolerance`. Ferrum also requires the coupled
-update limiter to be inactive before reporting `converged=yes`, so an
-artificially clipped update cannot pass as a physical steady state. These
-controls can also be set as Ferrum-specific entries under `SIMPLE` in
-`system/fvSolution`: `minSimpleIterations`, `pressureDropTolerance`,
-`fieldChangeTolerance`, and `maxFieldChangePerStep`.
+relative `U`/`p` field changes below `--fieldChangeTolerance`. The stored
+pressure-field pressure drop is still reported, but it no longer acts as a
+hidden guard or field-capping mechanism. These controls can also be set as
+Ferrum-specific entries under `SIMPLE` in `system/fvSolution`:
+`minSimpleIterations`, `pressureDropTolerance`, and `fieldChangeTolerance`.
 
 The report records residuals, SIMPLE iterations, wall-clock time,
 finite-volume operator summaries, boundary counts, Hagen-Poiseuille error,
@@ -694,13 +692,11 @@ continuity, and per-iteration field changes. The pressure bridge uses
 equation-relaxed momentum diagonals for cell-wise `rAU`, reconstructs
 `phiHbyA`, solves an absolute pressure equation, corrects `phi` from the
 pressure-equation flux, and carries that corrected surface flux into the next
-SIMPLE iteration. The committed `U`/`p` field update is bounded with
-`--maxFieldChangePerStep` (default `0.02`), but the corrected mass flux itself
-is not damped by that field limiter. Guards roll back to the previous finite
-state when continuity or the benchmark pressure-drop reference jumps
-aggressively. This prevents runaway reports, but fully OpenFOAM-grade
-momentum-pressure coupling and true incomplete-Cholesky pressure
-preconditioning are still solver-development work.
+SIMPLE iteration. The normal solver path does not cap finite `U`, `p`, or
+`phi` updates and does not roll back a finite SIMPLE step; non-finite values
+are treated as numerical failure. Fully OpenFOAM-grade momentum-pressure
+coupling, pressure reference handling, residual-control parsing, and true
+incomplete-Cholesky pressure preconditioning are still solver-development work.
 
 For the standard pipe benchmark, the automated comparison command is:
 

@@ -502,7 +502,7 @@ fn run_laminar_simple_solve(
     let wall_clock_seconds = started.elapsed().as_secs_f64();
 
     println!(
-        "laminarSimple solve: backend=cpu linearSolver={} momentumLinearSolver={} momentumPreconditioner={} pressureLinearSolver={} pressurePreconditioner={} cells={} faces={} simpleIterations={} minSimpleIterations={} converged={} initialContinuityL2={} finalContinuityL2={} simpleTolerance={} pressureDropTolerance={} fieldChangeTolerance={} maxFieldChangePerStep={} momentumResidualNorm={} pressureCorrectionResidualNorm={} momentumLinearIterations={} pressureLinearIterations={} wallClockSeconds={:.6}",
+        "laminarSimple solve: backend=cpu linearSolver={} momentumLinearSolver={} momentumPreconditioner={} pressureLinearSolver={} pressurePreconditioner={} cells={} faces={} simpleIterations={} minSimpleIterations={} converged={} initialContinuityL2={} finalContinuityL2={} simpleTolerance={} pressureDropTolerance={} fieldChangeTolerance={} momentumResidualNorm={} pressureCorrectionResidualNorm={} momentumLinearIterations={} pressureLinearIterations={} wallClockSeconds={:.6}",
         options.linear_solver,
         options.momentum_linear_solver,
         options.momentum_preconditioner,
@@ -518,7 +518,6 @@ fn run_laminar_simple_solve(
         format_scientific(options.simple_tolerance),
         format_scientific(options.pressure_drop_tolerance),
         format_scientific(options.field_change_tolerance),
-        format_scientific(options.max_field_change_per_step),
         format_scientific(report.final_momentum_residual_norm),
         format_scientific(report.final_pressure_correction_residual_norm),
         report.total_momentum_linear_iterations,
@@ -697,10 +696,8 @@ fn resolve_laminar_simple_options(
         .field_change_tolerance
         .or_else(|| fv_solution_number(plan, "SIMPLE", "fieldChangeTolerance"))
         .unwrap_or(0.01);
-    let max_field_change_per_step = solve
-        .max_field_change_per_step
-        .or_else(|| fv_solution_number(plan, "SIMPLE", "maxFieldChangePerStep"))
-        .unwrap_or(0.02);
+    let momentum_residual_control = fv_solution_number(plan, "SIMPLE.residualControl", "U");
+    let pressure_residual_control = fv_solution_number(plan, "SIMPLE.residualControl", "p");
 
     Ok(LaminarSimpleOptions {
         density,
@@ -726,7 +723,8 @@ fn resolve_laminar_simple_options(
         simple_tolerance: solve.simple_tolerance,
         pressure_drop_tolerance,
         field_change_tolerance,
-        max_field_change_per_step,
+        momentum_residual_control,
+        pressure_residual_control,
         velocity_relaxation: solve
             .velocity_relaxation
             .or_else(|| fv_solution_number(plan, "relaxationFactors.equations", "U"))
@@ -1079,7 +1077,7 @@ fn print_solver_case_plan(plan: &SolverCasePlan) {
         }
     }
     println!(
-        "solver execution: CPU scalar diffusion, Poiseuille, and guarded laminar SIMPLE kernels are available; GPU equation kernels are planned"
+        "solver execution: CPU scalar diffusion, Poiseuille, and laminar SIMPLE kernels are available; GPU equation kernels are planned"
     );
 }
 
@@ -1699,8 +1697,11 @@ fn write_json_laminar_simple_options(
     write_json_key(writer, 4, "fieldChangeTolerance")?;
     write_json_optional_number(writer, Some(options.field_change_tolerance))?;
     writeln!(writer, ",")?;
-    write_json_key(writer, 4, "maxFieldChangePerStep")?;
-    write_json_optional_number(writer, Some(options.max_field_change_per_step))?;
+    write_json_key(writer, 4, "momentumResidualControl")?;
+    write_json_optional_number(writer, options.momentum_residual_control)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "pressureResidualControl")?;
+    write_json_optional_number(writer, options.pressure_residual_control)?;
     writeln!(writer, ",")?;
     write_json_number_field(
         writer,
@@ -2057,8 +2058,13 @@ fn write_laminar_simple_report_markdown(
     )?;
     writeln!(
         writer,
-        "| Max field change per step | {} |",
-        format_percent(options.max_field_change_per_step)
+        "| U residualControl | {} |",
+        format_optional_scientific(options.momentum_residual_control)
+    )?;
+    writeln!(
+        writer,
+        "| p residualControl | {} |",
+        format_optional_scientific(options.pressure_residual_control)
     )?;
     writeln!(writer)?;
     writeln!(writer, "## Result")?;
@@ -2142,7 +2148,7 @@ fn write_laminar_simple_report_markdown(
             if item.pressure_correction_accepted {
                 "accepted"
             } else {
-                "guarded"
+                "skipped"
             },
             format_scientific(item.momentum_residual_norm),
             format_scientific(item.pressure_correction_residual_norm),
@@ -3314,7 +3320,6 @@ struct LaminarSimpleSolveArgs {
     simple_tolerance: f64,
     pressure_drop_tolerance: Option<f64>,
     field_change_tolerance: Option<f64>,
-    max_field_change_per_step: Option<f64>,
     velocity_relaxation: Option<f64>,
     pressure_relaxation: Option<f64>,
     report_json: Option<PathBuf>,
@@ -3383,7 +3388,6 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
     let mut simple_tolerance = 1.0e-8;
     let mut pressure_drop_tolerance = None;
     let mut field_change_tolerance = None;
-    let mut max_field_change_per_step = None;
     let mut velocity_relaxation = None;
     let mut pressure_relaxation = None;
     let mut solve_report_json = None;
@@ -3720,18 +3724,6 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
                 laminar_simple_option_seen = true;
                 index += 2;
             }
-            "-maxFieldChangePerStep"
-            | "--maxFieldChangePerStep"
-            | "-max-field-change-per-step"
-            | "--max-field-change-per-step" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    "--maxFieldChangePerStep requires a positive relative limit".to_string()
-                })?;
-                max_field_change_per_step =
-                    Some(parse_positive_f64_arg("--maxFieldChangePerStep", value)?);
-                laminar_simple_option_seen = true;
-                index += 2;
-            }
             "-velocityRelaxation"
             | "--velocityRelaxation"
             | "-velocity-relaxation"
@@ -3831,7 +3823,6 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
             simple_tolerance,
             pressure_drop_tolerance,
             field_change_tolerance,
-            max_field_change_per_step,
             velocity_relaxation,
             pressure_relaxation,
             report_json: solve_report_json,
@@ -4163,7 +4154,7 @@ fn print_solver_usage() {
     println!("  --maxRunnerSteps <n> limit runner dry-run preview steps (default: 3)");
     println!("  --solveScalarDiffusion <field> assemble and solve one CPU scalar diffusion system");
     println!("  --solvePoiseuille    solve a source-driven axial Stokes/Poiseuille benchmark");
-    println!("  --solveLaminarSimple solve the first guarded laminar incompressible SIMPLE path");
+    println!("  --solveLaminarSimple solve the first laminar incompressible SIMPLE path");
     println!(
         "  --diffusivity <v>    scalar diffusion coefficient for --solveScalarDiffusion (default: 1)"
     );
@@ -4217,9 +4208,6 @@ fn print_solver_usage() {
         "  --fieldChangeTolerance <v> relative U/p field-change tolerance for --solveLaminarSimple (default: 0.01)"
     );
     println!(
-        "  --maxFieldChangePerStep <v> bound one laminar SIMPLE U/p/phi update (default: 0.02)"
-    );
-    println!(
         "  --velocityRelaxation <v> override U relaxation for --solveLaminarSimple (default: fvSolution relaxationFactors.equations.U or 0.7)"
     );
     println!(
@@ -4231,7 +4219,7 @@ fn print_solver_usage() {
     println!("  --maxIterations <n>  linear solver iteration cap (default: 10000)");
     println!();
     println!(
-        "CPU scalar diffusion, Poiseuille, and a guarded first laminar SIMPLE path are available; GPU equation kernels are planned"
+        "CPU scalar diffusion, Poiseuille, and a first laminar SIMPLE path are available; GPU equation kernels are planned"
     );
 }
 
@@ -4400,8 +4388,6 @@ mod tests {
             "0.015".to_string(),
             "--fieldChangeTolerance".to_string(),
             "0.005".to_string(),
-            "--maxFieldChangePerStep".to_string(),
-            "0.2".to_string(),
             "--velocityRelaxation".to_string(),
             "0.6".to_string(),
             "--pressureRelaxation".to_string(),
@@ -4438,7 +4424,6 @@ mod tests {
         assert_eq!(solve.simple_tolerance, 1e-7);
         assert_eq!(solve.pressure_drop_tolerance, Some(0.015));
         assert_eq!(solve.field_change_tolerance, Some(0.005));
-        assert_eq!(solve.max_field_change_per_step, Some(0.2));
         assert_eq!(solve.velocity_relaxation, Some(0.6));
         assert_eq!(solve.pressure_relaxation, Some(0.2));
         assert_eq!(solve.report_json, Some(PathBuf::from("target/simple.json")));

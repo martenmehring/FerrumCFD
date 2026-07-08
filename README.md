@@ -102,13 +102,13 @@ The importer currently targets the membrane reactor test mesh shape:
   benchmark dictionaries when present, and reports mean velocity, flow rate,
   Hagen-Poiseuille reference values, relative error, residual, and wall-clock
   time without writing field files
-- `--solveLaminarSimple` is the first guarded laminar incompressible SIMPLE
+- `--solveLaminarSimple` is the first laminar incompressible SIMPLE
   path. It reads `U`, `p`, `transportProperties`, `fvSchemes`, and
   `fvSolution`, builds finite-volume `phi`, `grad(p)`, `div(phi,U)`, and
   `laplacian(nu,U)` operators on the runtime `constant/polyMesh` geometry,
   writes JSON/Markdown reports, supports separate momentum and pressure
-  correction linear-solver choices, and currently defaults to one damped
-  Jacobi CPU predictor/correction step for the pipe benchmark
+  correction linear-solver choices, and runs an uncapped OpenFOAM-shaped
+  `phiHbyA` pressure-velocity correction path for the pipe benchmark
 - mesh geometry summaries compute face areas, boundary area, and cell volumes
 - special patch validation counts `empty`, `wedge`, and `symmetryPlane`
   patches and reports basic patch-range warnings
@@ -135,7 +135,7 @@ The importer currently targets the membrane reactor test mesh shape:
   equations
 - `examples/laminar_pipe` provides a generated circular-pipe SI benchmark with
   a flow-normalized parabolic inlet, analytical Hagen-Poiseuille data,
-  executable Ferrum Poiseuille and guarded laminar SIMPLE solves, and OpenFOAM
+  executable Ferrum Poiseuille and laminar SIMPLE solves, and OpenFOAM
   comparison/convergence scripts that record wall-clock runtime
 - `examples/gmsh_pipe/pipe_prism2.geo` provides a parametric Gmsh pipe with two
   near-wall prism layers; `scripts/run_gmsh_pipe_mesh_study.ps1` creates

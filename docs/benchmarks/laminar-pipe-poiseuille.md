@@ -30,22 +30,21 @@ Ferrum currently solves the source-driven axial Stokes/Poiseuille benchmark on
 CPU and reconstructs pressure loss from mean velocity. This is not yet the full
 SIMPLE-like pressure-velocity solver.
 
-## Guarded Laminar SIMPLE Path
+## Laminar SIMPLE Path
 
 The first `--solveLaminarSimple` benchmark uses the same medium pipe case,
-OpenFOAM-like field files, and SI inputs. Current default settings are one
-damped Jacobi CPU SIMPLE step with `--solveTolerance 1e-6` and
-`--maxIterations 100`.
+OpenFOAM-like field files, and SI inputs.
 
-| Source | Mean velocity [m/s] | DeltaP from mean [Pa] | Error to analytic | Solve/wall time [s] |
-| --- | ---: | ---: | ---: | ---: |
-| FerrumCFD laminarSimple | 0.0191079 | 1.531687 | -4.461% | 0.468459 solve |
-| OpenFOAM simpleFoam | n/a | 1.6401231 | 2.303% | 12.7306 wall |
+| Source | Mean velocity [m/s] | DeltaP from mean [Pa] | Stored p-field deltaP [Pa] | Error to analytic | Solve/wall time [s] |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| FerrumCFD laminarSimple | 0.019989 | 1.602316 | 2.143114 | -0.055% | 15.097480 solve |
+| OpenFOAM simpleFoam | n/a | 1.6401231 | n/a | 2.303% | 12.7306 wall |
 
 This path is a real finite-volume pressure-velocity assembly bridge, but it is
-still guarded. Multi-step SIMPLE correction and CG/PCG momentum solves are the
-next numerical-stability targets before treating it as a `simpleFoam`
-equivalent.
+still a development solver rather than a `simpleFoam` equivalent. The normal
+path no longer caps finite `U`, `p`, or `phi` updates. The mean-flow pressure
+loss and continuity are now close to the reference, while the stored pressure
+field is still too high and is the next pressure-coupling target.
 
 ### SIMPLE Solver Experiments
 
@@ -70,20 +69,19 @@ ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --maxSimpleIterati
 | Jacobi | PCG + diagonal | fvSolution 1e-10/default 10000 | fvSolution 0.7/0.3 + upwind convection + bounded 2% U/p/phi update | 9 | 1.605975 | 0.173% | 6.062e-11 | 56.472017 | upwind momentum convection keeps local U positive and moves U changes from about 9.6% to about 1.9%; convergence stays `no` because the update limiter is still active |
 | Jacobi | PCG + diagonal | fvSolution 1e-10/default 10000 | fvSolution 0.7/0.3 + implicit upwind momentum + equation relaxation + pressure-field check | 80 | 1.607913 | 0.294% | 9.504e-9 | 92.977633 | U changes fall to about 1% and the momentum limiter becomes inactive, but convergence stays `no` because pressure-field deltaP is still 2.259878 Pa and pressure updates remain clipped |
 | Jacobi | PCG + diagonal | fvSolution 1e-10/default 10000 | fvSolution 0.7/0.3 + absolute `p` solve from `phiHbyA` + full corrected `phi` + bounded U/p update | 80 | 1.604076 | 0.055% | 8.515e-11 | 98.653404 | OpenFOAM-like absolute pressure step greatly improves continuity and mean pressure loss; convergence stays `no` because pressure-field deltaP is still 2.092740 Pa |
+| Jacobi | PCG + diagonal | fvSolution 1e-10/default 10000 | fvSolution 0.7/0.3 + absolute `p` solve from `phiHbyA` + uncapped finite U/p/phi updates | 15 | 1.602316 | -0.055% | 8.473e-11 | 15.097480 | normal path no longer clips or rolls back finite SIMPLE updates; stored pressure-field deltaP remains high at 2.143114 Pa |
 
-The continuity-growth guard prevents the old runaway behavior where long
-multi-step trials produced infinite or astronomically large values. The
-multi-step guard now also refuses convergence when the Hagen-Poiseuille
-pressure-drop reference, the relative U/p field changes, or the coupled update
-limiter are not stable. It also refuses final convergence when the pressure
-field itself gives a bad inlet-outlet pressure drop. The absolute `p`/`phiHbyA`
-run now keeps the local axial velocity positive, drives continuity to
-`8.515e-11`, and gets the mean pressure loss to `0.055%` error. It still
-remains a guarded solver-development result rather than a `simpleFoam`
-equivalent because the stored pressure field is still too high. The next
-numerical target is tighter pressure-field coupling, then a proper
-non-symmetric momentum solver and true incomplete-Cholesky-style pressure
-preconditioning.
+The former continuity-growth and coupled field-update guards are no longer part
+of the normal solver path. Ferrum now lets finite SIMPLE updates proceed and
+uses convergence checks rather than hidden field clipping. Non-finite fields
+still terminate the solve as numerical failure. The absolute `p`/`phiHbyA` run
+keeps the local axial velocity positive, drives continuity to `8.473e-11`, and
+gets the mean pressure loss to `-0.055%` error. It still remains a
+solver-development result rather than a `simpleFoam` equivalent because the
+stored pressure field is too high. The next numerical target is tighter
+pressure-field coupling and OpenFOAM-style residual-control parsing, then a
+proper non-symmetric momentum solver and true incomplete-Cholesky-style
+pressure preconditioning.
 
 ## Mesh Study
 
