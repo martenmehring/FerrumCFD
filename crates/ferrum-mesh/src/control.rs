@@ -17,6 +17,11 @@ pub struct ControlDict {
     pub write_interval: Option<f64>,
 }
 
+#[derive(Debug)]
+pub struct ControlValidation {
+    pub warnings: Vec<String>,
+}
+
 pub fn read_control_dict(case_dir: &Path) -> Result<ControlDict> {
     let path = case_dir.join("system").join("controlDict");
     let content = fs::read_to_string(&path).map_err(|error| {
@@ -28,6 +33,76 @@ pub fn read_control_dict(case_dir: &Path) -> Result<ControlDict> {
     let mut control = parse_control_dict_str(&content, &path)?;
     control.path = path;
     Ok(control)
+}
+
+pub fn validate_control_dict(control: &ControlDict) -> ControlValidation {
+    let mut warnings = Vec::new();
+
+    if !matches!(
+        control.start_from.as_str(),
+        "startTime" | "firstTime" | "latestTime"
+    ) {
+        warnings.push(format!(
+            "startFrom '{}' is not recognized",
+            control.start_from
+        ));
+    }
+    if control.start_from == "startTime" && control.start_time.is_none() {
+        warnings.push("startFrom startTime requires startTime".to_string());
+    }
+    if let Some(start_time) = control.start_time {
+        validate_finite_number("startTime", start_time, &mut warnings);
+    }
+
+    if !matches!(
+        control.stop_at.as_str(),
+        "endTime" | "writeNow" | "noWriteNow" | "nextWrite"
+    ) {
+        warnings.push(format!("stopAt '{}' is not recognized", control.stop_at));
+    }
+    if control.stop_at == "endTime" && control.end_time.is_none() {
+        warnings.push("stopAt endTime requires endTime".to_string());
+    }
+    if let Some(end_time) = control.end_time {
+        validate_finite_number("endTime", end_time, &mut warnings);
+    }
+    if let (Some(start_time), Some(end_time)) = (control.start_time, control.end_time)
+        && control.stop_at == "endTime"
+        && end_time < start_time
+    {
+        warnings.push(format!(
+            "endTime {end_time} is earlier than startTime {start_time}"
+        ));
+    }
+
+    match control.delta_t {
+        Some(delta_t) if delta_t.is_finite() && delta_t > 0.0 => {}
+        Some(delta_t) => warnings.push(format!(
+            "deltaT must be positive and finite, found {delta_t}"
+        )),
+        None => warnings.push("missing deltaT".to_string()),
+    }
+
+    if !matches!(
+        control.write_control.as_str(),
+        "timeStep" | "runTime" | "adjustableRunTime" | "cpuTime" | "clockTime" | "none"
+    ) {
+        warnings.push(format!(
+            "writeControl '{}' is not recognized",
+            control.write_control
+        ));
+    }
+    if control.write_control != "none" {
+        match control.write_interval {
+            Some(write_interval) if write_interval.is_finite() && write_interval > 0.0 => {}
+            Some(write_interval) => warnings.push(format!(
+                "writeInterval must be positive and finite, found {write_interval}"
+            )),
+            None => warnings.push("writeControl requires writeInterval".to_string()),
+        }
+    }
+
+    ControlValidation { warnings }
 }
 
 fn parse_control_dict_str(content: &str, path: &Path) -> Result<ControlDict> {
@@ -60,6 +135,12 @@ fn parse_control_dict_str(content: &str, path: &Path) -> Result<ControlDict> {
     }
 
     builder.finish()
+}
+
+fn validate_finite_number(label: &str, value: f64, warnings: &mut Vec<String>) {
+    if !value.is_finite() {
+        warnings.push(format!("{label} must be finite, found {value}"));
+    }
 }
 
 fn single_value(values: &[String], label: &str) -> Result<String> {
@@ -130,7 +211,7 @@ impl ControlDictBuilder {
 mod tests {
     use std::path::Path;
 
-    use super::parse_control_dict_str;
+    use super::{parse_control_dict_str, validate_control_dict};
 
     #[test]
     fn parses_basic_control_dict() {
@@ -168,5 +249,71 @@ mod tests {
         assert_eq!(control.start_from, "startTime");
         assert_eq!(control.stop_at, "endTime");
         assert_eq!(control.write_control, "timeStep");
+    }
+
+    #[test]
+    fn validates_basic_control_dict() {
+        let control = parse_control_dict_str(
+            r#"
+            application ferrumSolver;
+            startFrom startTime;
+            startTime 0;
+            stopAt endTime;
+            endTime 1;
+            deltaT 0.1;
+            writeControl timeStep;
+            writeInterval 1;
+            "#,
+            Path::new("controlDict"),
+        )
+        .unwrap();
+
+        let validation = validate_control_dict(&control);
+
+        assert!(validation.warnings.is_empty());
+    }
+
+    #[test]
+    fn warns_for_invalid_time_controls() {
+        let control = parse_control_dict_str(
+            r#"
+            startFrom invalidStart;
+            startTime 2;
+            stopAt endTime;
+            endTime 1;
+            deltaT 0;
+            writeControl strange;
+            writeInterval -1;
+            "#,
+            Path::new("controlDict"),
+        )
+        .unwrap();
+
+        let validation = validate_control_dict(&control);
+
+        assert!(
+            validation
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("startFrom"))
+        );
+        assert!(
+            validation
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("endTime 1 is earlier"))
+        );
+        assert!(
+            validation
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("deltaT"))
+        );
+        assert!(
+            validation
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("writeControl"))
+        );
     }
 }

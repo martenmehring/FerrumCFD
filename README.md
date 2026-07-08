@@ -73,6 +73,8 @@ The importer currently targets the membrane reactor test mesh shape:
   structurally for the solver preflight
 - constant property dictionaries such as `transportProperties` and
   region-local property files are parsed structurally for the solver preflight
+- `system/controlDict` is checked for basic run-control consistency such as
+  positive `deltaT`, valid time controls, and write intervals
 - backend policy can select CPU/GPU/auto per solver stage, including nonlinear
   solver steps, with multi-CPU, core-count, thread, and GPU device metadata
 - `ferrumSolver` currently performs a solver preflight and prints a

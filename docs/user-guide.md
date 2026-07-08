@@ -429,6 +429,11 @@ The preflight warns about basic numerical setup gaps, such as missing standard
 `fvSchemes` sections, missing `default` scheme entries, or initial fields that
 do not have a matching `fvSolution.solvers` entry.
 
+It also checks basic `controlDict` consistency: recognized `startFrom`,
+`stopAt`, and `writeControl` modes, positive finite `deltaT`, valid
+`writeInterval`, and an `endTime` that is not earlier than `startTime` for
+`stopAt endTime`.
+
 It also reads material and transport property dictionaries below `constant/`
 and `constant/<region>/`. At this stage FerrumCFD checks the structure and
 dimension-vector shape, but solver modules will later decide which properties
@@ -585,6 +590,8 @@ accept `auto` or a positive integer.
 - Region splitting currently reads Ferrum-generated ASCII `polyMesh` files.
 - `checkFerrumMesh` is currently a structural summary plus basic topology
   warning report, with field, interface, and backend configuration validation.
+- `controlDict` validation is structural run-control validation; adaptive time
+  stepping and solver-specific time-loop behavior are not implemented yet.
 - Geometry computation currently reports summary values; full OpenFOAM-grade
   geometry quality checks are not implemented yet.
 - Initial field parsing currently summarizes fields and boundary entries; it

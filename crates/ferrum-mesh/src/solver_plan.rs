@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crate::Result;
 use crate::backends::{BackendChoice, read_backend_config, validate_backend_resources};
-use crate::control::{ControlDict, read_control_dict};
+use crate::control::{ControlDict, read_control_dict, validate_control_dict};
 use crate::fields::{read_initial_fields, validate_initial_field_boundaries};
 use crate::interfaces::{read_interface_config, validate_interface_config};
 use crate::numerics::{
@@ -179,9 +179,17 @@ impl std::fmt::Display for SolverDimensionality {
 
 pub fn build_solver_case_plan(case_dir: &Path) -> Result<SolverCasePlan> {
     let control = read_control_dict(case_dir)?;
+    let mut warnings = Vec::new();
+    let control_validation = validate_control_dict(&control);
+    warnings.extend(
+        control_validation
+            .warnings
+            .iter()
+            .map(|warning| format!("controlDict: {warning}")),
+    );
+
     let mesh = PolyMesh::read(&case_dir.join("constant").join("polyMesh"))?;
     let patch_validation = validate_poly_mesh_patches(case_dir, &mesh);
-    let mut warnings = Vec::new();
     warnings.extend(
         patch_validation
             .warnings

@@ -223,6 +223,11 @@ standard `fvSchemes` sections, missing `default` entries, missing
 Equation-specific validation, such as whether a convection scheme is valid for
 a particular transport equation, stays with the future solver modules.
 
+`controlDict` validation is also structural. The preflight should catch
+invalid run-control modes, missing or non-positive `deltaT`, invalid
+`writeInterval`, and inconsistent `startTime`/`endTime` before a backend
+runtime tries to enter a time loop.
+
 Property dictionary parsing follows the same rule. The preflight can report
 entries such as `transportProperties.nu=[0 2 -1 0 0 0 0] 1e-05` and warn about
 malformed dimension vectors, but physics modules decide later whether a
