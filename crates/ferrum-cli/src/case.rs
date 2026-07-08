@@ -179,6 +179,18 @@ fn write_fv_solution(writer: &mut BufWriter<File>) -> Result<(), std::io::Error>
     write_foam_header(writer, "dictionary", "fvSolution", "system")?;
     writeln!(writer, "solvers {{ }}")?;
     writeln!(writer, "SIMPLE {{ nNonOrthogonalCorrectors 0; }}")?;
+    writeln!(writer)?;
+    writeln!(writer, "relaxationFactors")?;
+    writeln!(writer, "{{")?;
+    writeln!(writer, "    fields")?;
+    writeln!(writer, "    {{")?;
+    writeln!(writer, "        p 0.3;")?;
+    writeln!(writer, "    }}")?;
+    writeln!(writer, "    equations")?;
+    writeln!(writer, "    {{")?;
+    writeln!(writer, "        U 0.7;")?;
+    writeln!(writer, "    }}")?;
+    writeln!(writer, "}}")?;
     Ok(())
 }
 

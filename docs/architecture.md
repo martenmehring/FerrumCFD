@@ -365,9 +365,12 @@ Jacobi CPU SIMPLE step is the stable default for the pipe benchmark, while
 multi-step pressure correction remains an active solver-development target.
 Momentum and pressure-correction linear solvers can be selected separately, so
 experiments can run CG for momentum and Jacobi for pressure correction without
-changing the case files. The operator and report boundaries are kept
-backend-neutral so the same assembly path can later dispatch linear and
-nonlinear solves to CPU, GPU, or mixed CPU/GPU resources.
+changing the case files. OpenFOAM-style `relaxationFactors` in
+`system/fvSolution` are the default source for pressure and velocity
+under-relaxation, with CLI flags available as explicit experiment overrides.
+The operator and report boundaries are kept backend-neutral so the same
+assembly path can later dispatch linear and nonlinear solves to CPU, GPU, or
+mixed CPU/GPU resources.
 
 Important design constraint:
 

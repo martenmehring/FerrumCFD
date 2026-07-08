@@ -658,6 +658,11 @@ path can also split the linear solver choice by equation:
 ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --momentumLinearSolver cg --pressureLinearSolver jacobi --velocityRelaxation 0.1 --pressureRelaxation 0.02 --maxSimpleIterations 20
 ```
 
+By default, `--solveLaminarSimple` reads OpenFOAM-style relaxation factors from
+`system/fvSolution`: `relaxationFactors.equations.U` for velocity and
+`relaxationFactors.fields.p` for pressure. The CLI flags above are explicit
+overrides for experiments.
+
 The current default for this path is one damped Jacobi CPU SIMPLE step. The
 report records residuals, SIMPLE iterations, wall-clock time, finite-volume
 operator summaries, boundary counts, Hagen-Poiseuille error, and continuity.

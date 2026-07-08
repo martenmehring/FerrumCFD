@@ -632,8 +632,14 @@ fn resolve_laminar_simple_options(
         max_linear_iterations: solve.max_linear_iterations,
         max_simple_iterations: solve.max_simple_iterations,
         simple_tolerance: solve.simple_tolerance,
-        velocity_relaxation: solve.velocity_relaxation,
-        pressure_relaxation: solve.pressure_relaxation,
+        velocity_relaxation: solve
+            .velocity_relaxation
+            .or_else(|| fv_solution_number(plan, "relaxationFactors.equations", "U"))
+            .unwrap_or(0.7),
+        pressure_relaxation: solve
+            .pressure_relaxation
+            .or_else(|| fv_solution_number(plan, "relaxationFactors.fields", "p"))
+            .unwrap_or(0.3),
     })
 }
 
@@ -651,6 +657,22 @@ fn property_number(
                 && entry.section.as_deref() == section
                 && entry.key == key
         })
+        .and_then(|entry| last_number(&entry.value))
+}
+
+fn fv_solution_number(plan: &SolverCasePlan, section: &str, key: &str) -> Option<f64> {
+    numerics_dictionary_number(&plan.numerics.fv_solution, section, key)
+}
+
+fn numerics_dictionary_number(
+    dictionary: &SolverNumericsDictionaryPlan,
+    section: &str,
+    key: &str,
+) -> Option<f64> {
+    dictionary
+        .entries
+        .iter()
+        .find(|entry| entry.section == section && entry.key == key)
         .and_then(|entry| last_number(&entry.value))
 }
 
@@ -2984,8 +3006,8 @@ struct LaminarSimpleSolveArgs {
     max_linear_iterations: usize,
     max_simple_iterations: usize,
     simple_tolerance: f64,
-    velocity_relaxation: f64,
-    pressure_relaxation: f64,
+    velocity_relaxation: Option<f64>,
+    pressure_relaxation: Option<f64>,
     report_json: Option<PathBuf>,
     report_markdown: Option<PathBuf>,
 }
@@ -3041,8 +3063,8 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
     let mut scalar_diffusion_max_iterations = 10_000;
     let mut max_simple_iterations = 1;
     let mut simple_tolerance = 1.0e-8;
-    let mut velocity_relaxation = 0.7;
-    let mut pressure_relaxation = 0.3;
+    let mut velocity_relaxation = None;
+    let mut pressure_relaxation = None;
     let mut solve_report_json = None;
     let mut solve_report_markdown = None;
     let mut index = 0;
@@ -3274,7 +3296,7 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
                 let value = args.get(index + 1).ok_or_else(|| {
                     "--velocityRelaxation requires a number in (0, 1]".to_string()
                 })?;
-                velocity_relaxation = parse_relaxation_arg("--velocityRelaxation", value)?;
+                velocity_relaxation = Some(parse_relaxation_arg("--velocityRelaxation", value)?);
                 laminar_simple_option_seen = true;
                 index += 2;
             }
@@ -3285,7 +3307,7 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
                 let value = args.get(index + 1).ok_or_else(|| {
                     "--pressureRelaxation requires a number in (0, 1]".to_string()
                 })?;
-                pressure_relaxation = parse_relaxation_arg("--pressureRelaxation", value)?;
+                pressure_relaxation = Some(parse_relaxation_arg("--pressureRelaxation", value)?);
                 laminar_simple_option_seen = true;
                 index += 2;
             }
@@ -3717,10 +3739,10 @@ fn print_solver_usage() {
         "  --simpleTolerance <v> SIMPLE continuity tolerance for --solveLaminarSimple (default: 1e-8)"
     );
     println!(
-        "  --velocityRelaxation <v> velocity relaxation for --solveLaminarSimple (default: 0.7)"
+        "  --velocityRelaxation <v> override U relaxation for --solveLaminarSimple (default: fvSolution relaxationFactors.equations.U or 0.7)"
     );
     println!(
-        "  --pressureRelaxation <v> pressure relaxation for --solveLaminarSimple (default: 0.3)"
+        "  --pressureRelaxation <v> override p relaxation for --solveLaminarSimple (default: fvSolution relaxationFactors.fields.p or 0.3)"
     );
     println!("  --solveReportJson <file> write --solveLaminarSimple JSON report");
     println!("  --solveReportMarkdown <file> write --solveLaminarSimple Markdown report");
@@ -3756,7 +3778,8 @@ fn normalize_case_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        ScalarDiffusionLinearSolver, parse_solver_args, write_json_solver_state, write_json_string,
+        ScalarDiffusionLinearSolver, SolverNumericsDictionaryPlan, numerics_dictionary_number,
+        parse_solver_args, write_json_solver_state, write_json_string,
     };
     use ferrum_mesh::flow::LaminarSimpleLinearSolver;
     use ferrum_mesh::solver_state::{
@@ -3913,8 +3936,8 @@ mod tests {
         assert_eq!(solve.pressure_linear_solver, None);
         assert_eq!(solve.max_simple_iterations, 7);
         assert_eq!(solve.simple_tolerance, 1e-7);
-        assert_eq!(solve.velocity_relaxation, 0.6);
-        assert_eq!(solve.pressure_relaxation, 0.2);
+        assert_eq!(solve.velocity_relaxation, Some(0.6));
+        assert_eq!(solve.pressure_relaxation, Some(0.2));
         assert_eq!(solve.report_json, Some(PathBuf::from("target/simple.json")));
         assert_eq!(
             solve.report_markdown,
@@ -3947,6 +3970,52 @@ mod tests {
         assert_eq!(
             solve.pressure_linear_solver,
             Some(LaminarSimpleLinearSolver::Jacobi)
+        );
+    }
+
+    #[test]
+    fn parses_laminar_simple_relaxation_as_case_defaults_when_not_overridden() {
+        let args = vec!["--solveLaminarSimple".to_string()];
+
+        let parsed = parse_solver_args(&args).expect("solver args should parse");
+        let solve = parsed
+            .laminar_simple_solve
+            .expect("laminar SIMPLE solve args");
+
+        assert_eq!(solve.velocity_relaxation, None);
+        assert_eq!(solve.pressure_relaxation, None);
+    }
+
+    #[test]
+    fn reads_numerics_dictionary_numbers() {
+        let dictionary = SolverNumericsDictionaryPlan {
+            present: true,
+            sections: Vec::new(),
+            entries: vec![
+                ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
+                    section: "relaxationFactors.fields".to_string(),
+                    key: "p".to_string(),
+                    value: "0.3".to_string(),
+                },
+                ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
+                    section: "relaxationFactors.equations".to_string(),
+                    key: "U".to_string(),
+                    value: "0.7".to_string(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            numerics_dictionary_number(&dictionary, "relaxationFactors.equations", "U"),
+            Some(0.7)
+        );
+        assert_eq!(
+            numerics_dictionary_number(&dictionary, "relaxationFactors.fields", "p"),
+            Some(0.3)
+        );
+        assert_eq!(
+            numerics_dictionary_number(&dictionary, "relaxationFactors.fields", "U"),
+            None
         );
     }
 
