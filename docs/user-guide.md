@@ -83,6 +83,33 @@ The importer maps:
 Internal multi-region interfaces are therefore preserved as `faceZones` even
 when they are not external boundary patches.
 
+## Interface Registry
+
+FerrumCFD derives a general interface registry from the imported mesh. It is not
+specific to a membrane reactor. The registry uses:
+
+- `cellZones` to determine which region each cell belongs to
+- `faceZones` to identify named interface surfaces
+- `owner` and `neighbour` to determine the two adjacent regions
+- `flipMap` to retain the source faceZone orientation
+
+For example, a generic multi-region mesh can produce output like:
+
+```text
+interfaces:
+  interface_name: region_a <-> region_b faces=100
+```
+
+For the membrane reactor test case this detects:
+
+```text
+mantle_inner_membrane_complete: inner_zone <-> membrane
+mantle_membrane_outer_complete: membrane <-> outer_zone
+```
+
+Future models can use this registry for pressure-jump, heat-transfer,
+species-transfer, membrane, conjugate, or other coupled-interface laws.
+
 ## Check A Mesh
 
 Run:

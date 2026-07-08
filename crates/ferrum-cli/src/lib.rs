@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use ferrum_mesh::check::read_case_summary;
 use ferrum_mesh::foam::{FoamWriteOptions, write_openfoam_case_with_options};
 use ferrum_mesh::gmsh::read_msh22_ascii;
-use ferrum_mesh::regions::{read_region_mesh_summaries, split_regions_by_cell_zones};
+use ferrum_mesh::regions::{
+    InterfaceRegistrySummary, InterfaceSummary, build_interface_registry,
+    read_region_mesh_summaries, split_regions_by_cell_zones,
+};
 
 pub fn run_ferrum() -> i32 {
     let args = env::args().skip(1).collect::<Vec<_>>();
@@ -146,6 +149,9 @@ fn check_mesh(args: Vec<String>) -> Result<(), String> {
         println!("  {zone}");
     }
 
+    let interfaces = build_interface_registry(&case_dir).map_err(|error| error.to_string())?;
+    print_interface_registry(&interfaces);
+
     let unmatched = summary.unmatched_boundary_faces.unwrap_or(0);
     let duplicate = summary.duplicate_boundary_faces.unwrap_or(0);
     let non_manifold = summary.non_manifold_faces.unwrap_or(0);
@@ -210,6 +216,8 @@ fn split_mesh_regions(args: Vec<String>) -> Result<(), String> {
     for zone in &summary.cell_zones {
         println!("  {zone}");
     }
+    let interfaces = build_interface_registry(&case_dir).map_err(|error| error.to_string())?;
+    print_interface_registry(&interfaces);
 
     let split = split_regions_by_cell_zones(&case_dir).map_err(|error| error.to_string())?;
     println!("wrote region meshes:");
@@ -229,6 +237,44 @@ fn split_mesh_regions(args: Vec<String>) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn print_interface_registry(registry: &InterfaceRegistrySummary) {
+    if !registry.interfaces.is_empty() {
+        println!("interfaces:");
+        for interface in &registry.interfaces {
+            print_interface(interface);
+        }
+    }
+    if registry.same_region_face_zone_faces > 0 || registry.unknown_region_face_zone_faces > 0 {
+        println!(
+            "interface registry notes: sameRegionFaceZoneFaces={}, unknownRegionFaceZoneFaces={}",
+            registry.same_region_face_zone_faces, registry.unknown_region_face_zone_faces
+        );
+    }
+}
+
+fn print_interface(interface: &InterfaceSummary) {
+    println!(
+        "  {}: {} <-> {} faces={} mesh({}->{}={}, {}->{}={}) zone({}->{}={}, {}->{}={}) flipped={}",
+        interface.name,
+        interface.region_a,
+        interface.region_b,
+        interface.faces,
+        interface.region_a,
+        interface.region_b,
+        interface.mesh_a_to_b_faces,
+        interface.region_b,
+        interface.region_a,
+        interface.mesh_b_to_a_faces,
+        interface.region_a,
+        interface.region_b,
+        interface.zone_a_to_b_faces,
+        interface.region_b,
+        interface.region_a,
+        interface.zone_b_to_a_faces,
+        interface.flipped_faces
+    );
 }
 
 fn print_region_patch(patch: &ferrum_mesh::regions::RegionPatchSummary) {

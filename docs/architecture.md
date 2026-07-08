@@ -173,6 +173,20 @@ membrane model can define positive species flux from `inner_zone` into
 `membrane`, while the discretisation backend maps that sign convention onto the
 actual face owner/neighbour orientation.
 
+The same registry must work for non-membrane cases too. Examples include:
+
+- pressure-jump interfaces
+- porous jumps
+- baffles
+- conjugate heat transfer
+- species transfer between regions
+- generic coupled regions
+
+The interface registry should therefore stay model-neutral. It should describe
+the geometry and orientation. Physics modules decide which law to apply, such
+as a pressure-difference law, temperature-difference law, concentration jump,
+or membrane permeance law.
+
 ## Reference Points
 
 - [OpenFOAM User Guide](https://www.openfoam.com/documentation/user-guide):

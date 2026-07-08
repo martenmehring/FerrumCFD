@@ -32,6 +32,36 @@ pub struct RegionPatchSummary {
     pub source_flipped_faces: usize,
 }
 
+#[derive(Debug)]
+pub struct InterfaceRegistrySummary {
+    pub case_dir: PathBuf,
+    pub interfaces: Vec<InterfaceSummary>,
+    pub boundary_face_zones: Vec<BoundaryFaceZoneSummary>,
+    pub same_region_face_zone_faces: usize,
+    pub unknown_region_face_zone_faces: usize,
+}
+
+#[derive(Debug)]
+pub struct InterfaceSummary {
+    pub name: String,
+    pub region_a: String,
+    pub region_b: String,
+    pub faces: usize,
+    pub mesh_a_to_b_faces: usize,
+    pub mesh_b_to_a_faces: usize,
+    pub zone_a_to_b_faces: usize,
+    pub zone_b_to_a_faces: usize,
+    pub flipped_faces: usize,
+}
+
+#[derive(Debug)]
+pub struct BoundaryFaceZoneSummary {
+    pub name: String,
+    pub region: String,
+    pub faces: usize,
+    pub flipped_faces: usize,
+}
+
 pub fn split_regions_by_cell_zones(case_dir: &Path) -> Result<RegionSplitSummary> {
     let poly_mesh_dir = case_dir.join("constant").join("polyMesh");
     let mesh = PolyMesh::read(&poly_mesh_dir)?;
@@ -93,6 +123,111 @@ pub fn split_regions_by_cell_zones(case_dir: &Path) -> Result<RegionSplitSummary
     })
 }
 
+pub fn build_interface_registry(case_dir: &Path) -> Result<InterfaceRegistrySummary> {
+    let poly_mesh_dir = case_dir.join("constant").join("polyMesh");
+    let mesh = PolyMesh::read(&poly_mesh_dir)?;
+    let cell_to_zone = build_cell_to_zone(&mesh.cell_zones, mesh.cell_count())?;
+
+    let mut interfaces = HashMap::<InterfaceKey, InterfaceAccumulator>::new();
+    let mut boundary_zones = HashMap::<BoundaryFaceZoneKey, BoundaryFaceZoneAccumulator>::new();
+    let mut same_region_face_zone_faces = 0;
+    let mut unknown_region_face_zone_faces = 0;
+
+    for face_zone in &mesh.face_zones {
+        for entry in &face_zone.faces {
+            let Some(&owner) = mesh.owner.get(entry.face) else {
+                unknown_region_face_zone_faces += 1;
+                continue;
+            };
+            let owner_zone = cell_to_zone.get(owner).and_then(|zone| *zone);
+            let Some(owner_zone) = owner_zone else {
+                unknown_region_face_zone_faces += 1;
+                continue;
+            };
+
+            let Some(&neighbour) = mesh.neighbour.get(entry.face) else {
+                let key = BoundaryFaceZoneKey {
+                    name: face_zone.name.clone(),
+                    region: mesh.cell_zones[owner_zone].name.clone(),
+                };
+                boundary_zones
+                    .entry(key)
+                    .or_insert_with(|| {
+                        BoundaryFaceZoneAccumulator::new(
+                            &face_zone.name,
+                            &mesh.cell_zones[owner_zone].name,
+                        )
+                    })
+                    .add(entry.flip);
+                continue;
+            };
+
+            let neighbour_zone = cell_to_zone.get(neighbour).and_then(|zone| *zone);
+            let Some(neighbour_zone) = neighbour_zone else {
+                unknown_region_face_zone_faces += 1;
+                continue;
+            };
+
+            if owner_zone == neighbour_zone {
+                same_region_face_zone_faces += 1;
+                continue;
+            }
+
+            let owner_region = &mesh.cell_zones[owner_zone].name;
+            let neighbour_region = &mesh.cell_zones[neighbour_zone].name;
+            let (region_a, region_b, mesh_is_a_to_b) = if owner_region <= neighbour_region {
+                (owner_region.clone(), neighbour_region.clone(), true)
+            } else {
+                (neighbour_region.clone(), owner_region.clone(), false)
+            };
+
+            let key = InterfaceKey {
+                name: face_zone.name.clone(),
+                region_a,
+                region_b,
+            };
+            let key_name = key.name.clone();
+            let key_region_a = key.region_a.clone();
+            let key_region_b = key.region_b.clone();
+            interfaces
+                .entry(key)
+                .or_insert_with(|| {
+                    InterfaceAccumulator::new(&key_name, &key_region_a, &key_region_b)
+                })
+                .add(mesh_is_a_to_b, entry.flip);
+        }
+    }
+
+    let mut interfaces = interfaces
+        .into_values()
+        .map(InterfaceAccumulator::into_summary)
+        .collect::<Vec<_>>();
+    interfaces.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then(left.region_a.cmp(&right.region_a))
+            .then(left.region_b.cmp(&right.region_b))
+    });
+
+    let mut boundary_face_zones = boundary_zones
+        .into_values()
+        .map(BoundaryFaceZoneAccumulator::into_summary)
+        .collect::<Vec<_>>();
+    boundary_face_zones.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then(left.region.cmp(&right.region))
+    });
+
+    Ok(InterfaceRegistrySummary {
+        case_dir: case_dir.to_path_buf(),
+        interfaces,
+        boundary_face_zones,
+        same_region_face_zone_faces,
+        unknown_region_face_zone_faces,
+    })
+}
+
 pub fn read_region_mesh_summaries(case_dir: &Path) -> Result<Vec<RegionSummary>> {
     let constant_dir = case_dir.join("constant");
     if !constant_dir.exists() {
@@ -145,6 +280,115 @@ fn summarize_poly_mesh(name: String, path: PathBuf, mesh: &PolyMesh) -> RegionSu
                 source_flipped_faces: 0,
             })
             .collect(),
+    }
+}
+
+#[derive(Hash, PartialEq, Eq)]
+struct InterfaceKey {
+    name: String,
+    region_a: String,
+    region_b: String,
+}
+
+struct InterfaceAccumulator {
+    name: String,
+    region_a: String,
+    region_b: String,
+    faces: usize,
+    mesh_a_to_b_faces: usize,
+    mesh_b_to_a_faces: usize,
+    zone_a_to_b_faces: usize,
+    zone_b_to_a_faces: usize,
+    flipped_faces: usize,
+}
+
+impl InterfaceAccumulator {
+    fn new(name: &str, region_a: &str, region_b: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            region_a: region_a.to_string(),
+            region_b: region_b.to_string(),
+            faces: 0,
+            mesh_a_to_b_faces: 0,
+            mesh_b_to_a_faces: 0,
+            zone_a_to_b_faces: 0,
+            zone_b_to_a_faces: 0,
+            flipped_faces: 0,
+        }
+    }
+
+    fn add(&mut self, mesh_is_a_to_b: bool, flip: bool) {
+        self.faces += 1;
+        if mesh_is_a_to_b {
+            self.mesh_a_to_b_faces += 1;
+        } else {
+            self.mesh_b_to_a_faces += 1;
+        }
+
+        let zone_is_a_to_b = mesh_is_a_to_b != flip;
+        if zone_is_a_to_b {
+            self.zone_a_to_b_faces += 1;
+        } else {
+            self.zone_b_to_a_faces += 1;
+        }
+
+        if flip {
+            self.flipped_faces += 1;
+        }
+    }
+
+    fn into_summary(self) -> InterfaceSummary {
+        InterfaceSummary {
+            name: self.name,
+            region_a: self.region_a,
+            region_b: self.region_b,
+            faces: self.faces,
+            mesh_a_to_b_faces: self.mesh_a_to_b_faces,
+            mesh_b_to_a_faces: self.mesh_b_to_a_faces,
+            zone_a_to_b_faces: self.zone_a_to_b_faces,
+            zone_b_to_a_faces: self.zone_b_to_a_faces,
+            flipped_faces: self.flipped_faces,
+        }
+    }
+}
+
+#[derive(Hash, PartialEq, Eq)]
+struct BoundaryFaceZoneKey {
+    name: String,
+    region: String,
+}
+
+struct BoundaryFaceZoneAccumulator {
+    name: String,
+    region: String,
+    faces: usize,
+    flipped_faces: usize,
+}
+
+impl BoundaryFaceZoneAccumulator {
+    fn new(name: &str, region: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            region: region.to_string(),
+            faces: 0,
+            flipped_faces: 0,
+        }
+    }
+
+    fn add(&mut self, flip: bool) {
+        self.faces += 1;
+        if flip {
+            self.flipped_faces += 1;
+        }
+    }
+
+    fn into_summary(self) -> BoundaryFaceZoneSummary {
+        BoundaryFaceZoneSummary {
+            name: self.name,
+            region: self.region,
+            faces: self.faces,
+            flipped_faces: self.flipped_faces,
+        }
     }
 }
 
