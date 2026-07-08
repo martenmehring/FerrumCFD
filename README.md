@@ -91,8 +91,8 @@ The importer currently targets the membrane reactor test mesh shape:
   ranges, cell centres, face centres, owner-oriented face-area vectors, cell
   volumes, and materialized CPU f64 field buffers for later CPU/GPU kernels
 - CPU linear algebra now has a small executable CSR foundation with matrix-vector
-  products, residuals, Jacobi, and conjugate-gradient solves for the first
-  Poisson/diffusion equation assembly step
+  products, residuals, Jacobi, conjugate-gradient, preconditioned-CG, and
+  BiCGStab solves for the first Poisson/diffusion and flow assembly steps
 - scalar diffusion/Poisson assembly can build and solve an opt-in CPU CSR system
   from runtime mesh geometry with internal-face diffusion, `fixedValue`,
   `zeroGradient`, and volume source terms; it reports iterations, residual,
@@ -107,8 +107,10 @@ The importer currently targets the membrane reactor test mesh shape:
   `fvSolution`, builds finite-volume `phi`, `grad(p)`, `div(phi,U)`, and
   `laplacian(nu,U)` operators on the runtime `constant/polyMesh` geometry,
   writes JSON/Markdown reports, supports separate momentum and pressure
-  correction linear-solver choices, and runs an uncapped OpenFOAM-shaped
-  `phiHbyA` pressure-velocity correction path for the pipe benchmark
+  correction linear-solver choices, maps OpenFOAM `smoothSolver` on `U` to a
+  non-symmetric CPU `bicgstab` path, supports `pRefCell`/`pRefValue` and
+  `nNonOrthogonalCorrectors`, and runs an uncapped OpenFOAM-shaped `phiHbyA`
+  pressure-velocity correction path for the pipe benchmark
 - mesh geometry summaries compute face areas, boundary area, and cell volumes
 - special patch validation counts `empty`, `wedge`, and `symmetryPlane`
   patches and reports basic patch-range warnings

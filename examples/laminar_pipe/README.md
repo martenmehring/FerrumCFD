@@ -74,7 +74,8 @@ checkFerrumMesh -case examples\laminar_pipe
 ferrumSolver -case examples\laminar_pipe --runnerDryRun --maxRunnerSteps 2 --planJson target\laminar_pipe_plan.json
 ferrumSolver -case examples\laminar_pipe --solvePoiseuille --linearSolver cg
 ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --solveTolerance 1e-6 --maxIterations 100 --solveReportJson target\benchmarks\laminar_pipe_laminar_simple.json --solveReportMarkdown target\benchmarks\laminar_pipe_laminar_simple.md
-ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --maxSimpleIterations 20 --solveReportJson target\benchmarks\laminar_pipe_laminar_simple_coupled_pcg_dic.json --solveReportMarkdown target\benchmarks\laminar_pipe_laminar_simple_coupled_pcg_dic.md
+ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --momentumLinearSolver bicgstab --pressureLinearSolver pcg --pressurePreconditioner DIC --maxSimpleIterations 20 --solveReportJson target\benchmarks\laminar_pipe_laminar_simple_bicgstab_pcg.json --solveReportMarkdown target\benchmarks\laminar_pipe_laminar_simple_bicgstab_pcg.md
+ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --minSimpleIterations 30 --maxSimpleIterations 30 --solveReportJson target\benchmarks\laminar_pipe_laminar_simple_30iter.json
 ```
 
 The full CFD time loop is not implemented yet. This case already executes the
@@ -85,4 +86,6 @@ stabilize before Ferrum marks the run as converged. The stored pressure-field
 deltaP is reported next to the mean-flow pressure loss, but it is not used to
 cap or roll back a finite SIMPLE step. The current multi-step run solves an
 absolute pressure equation from `phiHbyA`, carries the corrected `phi` into the
-next SIMPLE iteration, and leaves finite U/p/phi updates uncapped.
+next SIMPLE iteration, supports `pRefCell`/`pRefValue` and
+`nNonOrthogonalCorrectors`, maps OpenFOAM `smoothSolver` on U to Ferrum's
+`bicgstab` momentum path, and leaves finite U/p/phi updates uncapped.

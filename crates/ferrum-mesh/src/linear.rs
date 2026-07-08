@@ -15,6 +15,7 @@ pub struct LinearSolverCapabilities {
     pub cpu_jacobi: bool,
     pub cpu_conjugate_gradient: bool,
     pub cpu_preconditioned_conjugate_gradient: bool,
+    pub cpu_bicgstab: bool,
     pub cpu_diagonal_preconditioner: bool,
     pub gpu_linear_solvers: bool,
 }
@@ -40,6 +41,13 @@ pub enum CgPreconditioner {
 
 #[derive(Clone, Copy, Debug)]
 pub struct PreconditionedConjugateGradientOptions {
+    pub max_iterations: usize,
+    pub tolerance: f64,
+    pub preconditioner: CgPreconditioner,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BiCgStabOptions {
     pub max_iterations: usize,
     pub tolerance: f64,
     pub preconditioner: CgPreconditioner,
@@ -204,12 +212,23 @@ impl Default for PreconditionedConjugateGradientOptions {
     }
 }
 
+impl Default for BiCgStabOptions {
+    fn default() -> Self {
+        Self {
+            max_iterations: 1_000,
+            tolerance: 1.0e-10,
+            preconditioner: CgPreconditioner::Diagonal,
+        }
+    }
+}
+
 pub fn linear_solver_capabilities() -> LinearSolverCapabilities {
     LinearSolverCapabilities {
         cpu_csr: true,
         cpu_jacobi: true,
         cpu_conjugate_gradient: true,
         cpu_preconditioned_conjugate_gradient: true,
+        cpu_bicgstab: true,
         cpu_diagonal_preconditioner: true,
         gpu_linear_solvers: false,
     }
@@ -491,6 +510,145 @@ pub fn preconditioned_conjugate_gradient_solve(
     })
 }
 
+pub fn bicgstab_solve(
+    matrix: &CsrMatrix,
+    rhs: &[f64],
+    initial: Option<&[f64]>,
+    options: BiCgStabOptions,
+) -> Result<IterativeSolveReport> {
+    validate_iterative_solve_input(matrix, rhs, initial, options.tolerance)?;
+
+    let preconditioner = BuiltPreconditioner::build(matrix, options.preconditioner)?;
+    let mut x = initial
+        .map(|values| values.to_vec())
+        .unwrap_or_else(|| vec![0.0; rhs.len()]);
+    let mut r = residual(matrix, &x, rhs)?;
+    let r_hat = r.clone();
+    let mut residual_norm = l2_norm(&r);
+    if residual_norm <= options.tolerance {
+        return Ok(IterativeSolveReport {
+            solution: x,
+            iterations: 0,
+            residual_norm,
+            converged: true,
+        });
+    }
+
+    let mut rho_old = 1.0;
+    let mut alpha = 1.0;
+    let mut omega = 1.0;
+    let mut v = vec![0.0; rhs.len()];
+    let mut p = vec![0.0; rhs.len()];
+
+    for iteration in 1..=options.max_iterations {
+        let rho = dot(&r_hat, &r);
+        if !rho.is_finite() {
+            return Err(invalid_input(
+                "BiCGStab residual product is not finite".to_string(),
+            ));
+        }
+        if rho.abs() <= f64::EPSILON {
+            return Ok(IterativeSolveReport {
+                solution: x,
+                iterations: iteration.saturating_sub(1),
+                residual_norm,
+                converged: false,
+            });
+        }
+
+        let beta = (rho / rho_old) * (alpha / omega);
+        for row in 0..p.len() {
+            p[row] = r[row] + beta * (p[row] - omega * v[row]);
+        }
+
+        let p_hat = preconditioner.apply(&p);
+        v = matrix.matvec(&p_hat)?;
+        let alpha_denominator = dot(&r_hat, &v);
+        if !alpha_denominator.is_finite() {
+            return Err(invalid_input(
+                "BiCGStab alpha denominator is not finite".to_string(),
+            ));
+        }
+        if alpha_denominator.abs() <= f64::EPSILON {
+            return Ok(IterativeSolveReport {
+                solution: x,
+                iterations: iteration.saturating_sub(1),
+                residual_norm,
+                converged: false,
+            });
+        }
+        alpha = rho / alpha_denominator;
+
+        let mut s = vec![0.0; r.len()];
+        for row in 0..s.len() {
+            s[row] = r[row] - alpha * v[row];
+        }
+        let s_norm = l2_norm(&s);
+        if s_norm <= options.tolerance {
+            for row in 0..x.len() {
+                x[row] += alpha * p_hat[row];
+            }
+            return Ok(IterativeSolveReport {
+                solution: x,
+                iterations: iteration,
+                residual_norm: s_norm,
+                converged: true,
+            });
+        }
+
+        let s_hat = preconditioner.apply(&s);
+        let t = matrix.matvec(&s_hat)?;
+        let omega_denominator = dot(&t, &t);
+        if !omega_denominator.is_finite() {
+            return Err(invalid_input(
+                "BiCGStab omega denominator is not finite".to_string(),
+            ));
+        }
+        if omega_denominator.abs() <= f64::EPSILON {
+            return Ok(IterativeSolveReport {
+                solution: x,
+                iterations: iteration.saturating_sub(1),
+                residual_norm,
+                converged: false,
+            });
+        }
+        omega = dot(&t, &s) / omega_denominator;
+        if !omega.is_finite() {
+            return Err(invalid_input("BiCGStab omega is not finite".to_string()));
+        }
+        if omega.abs() <= f64::EPSILON {
+            return Ok(IterativeSolveReport {
+                solution: x,
+                iterations: iteration.saturating_sub(1),
+                residual_norm,
+                converged: false,
+            });
+        }
+
+        for row in 0..x.len() {
+            x[row] += alpha * p_hat[row] + omega * s_hat[row];
+            r[row] = s[row] - omega * t[row];
+        }
+        residual_norm = l2_norm(&r);
+        if residual_norm <= options.tolerance {
+            return Ok(IterativeSolveReport {
+                solution: x,
+                iterations: iteration,
+                residual_norm,
+                converged: true,
+            });
+        }
+        rho_old = rho;
+    }
+
+    Ok(IterativeSolveReport {
+        solution: x,
+        iterations: options.max_iterations,
+        residual_norm,
+        converged: false,
+    })
+}
+
 enum BuiltPreconditioner {
     None,
     Diagonal(Vec<f64>),
@@ -630,9 +788,9 @@ fn invalid_input(message: String) -> MeshError {
 #[cfg(test)]
 mod tests {
     use super::{
-        CgPreconditioner, ConjugateGradientOptions, CsrMatrix, JacobiOptions,
-        PreconditionedConjugateGradientOptions, conjugate_gradient_solve, jacobi_solve,
-        preconditioned_conjugate_gradient_solve, residual,
+        BiCgStabOptions, CgPreconditioner, ConjugateGradientOptions, CsrMatrix, JacobiOptions,
+        PreconditionedConjugateGradientOptions, bicgstab_solve, conjugate_gradient_solve,
+        jacobi_solve, preconditioned_conjugate_gradient_solve, residual,
     };
 
     #[test]
@@ -719,6 +877,29 @@ mod tests {
         assert!(report.converged);
         assert_eq!(report.iterations, 1);
         assert_close(&report.solution, &[2.0, 3.0], 1.0e-14);
+        assert!(report.residual_norm <= 1.0e-12);
+    }
+
+    #[test]
+    fn bicgstab_solves_nonsymmetric_system() {
+        let matrix =
+            CsrMatrix::from_rows(vec![vec![(0, 4.0), (1, 1.0)], vec![(0, 2.0), (1, 3.0)]], 2)
+                .expect("matrix");
+        let report = bicgstab_solve(
+            &matrix,
+            &[1.0, 1.0],
+            None,
+            BiCgStabOptions {
+                max_iterations: 8,
+                tolerance: 1.0e-12,
+                preconditioner: CgPreconditioner::Diagonal,
+            },
+        )
+        .expect("bicgstab solve");
+
+        assert!(report.converged);
+        assert!(report.iterations <= 2);
+        assert_close(&report.solution, &[0.2, 0.2], 1.0e-12);
         assert!(report.residual_norm <= 1.0e-12);
     }
 

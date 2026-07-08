@@ -195,7 +195,8 @@ fn build_solver_runtime_plan(plan: &SolverCasePlan) -> SolverRuntimePlan {
         numa: plan.backends.cpu.numa.clone(),
         linear_solvers_available: linear_solvers.cpu_csr
             && linear_solvers.cpu_jacobi
-            && linear_solvers.cpu_conjugate_gradient,
+            && linear_solvers.cpu_conjugate_gradient
+            && linear_solvers.cpu_bicgstab,
         kernels_available: false,
     };
     let gpu = SolverGpuRuntimeHandle {

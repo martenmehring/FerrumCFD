@@ -2,15 +2,16 @@ use std::collections::BTreeMap;
 
 use crate::fields::{FieldFile, FieldValueSummary, InitialFieldSet};
 use crate::linear::{
-    CgPreconditioner, ConjugateGradientOptions, CsrMatrix, JacobiOptions,
-    PreconditionedConjugateGradientOptions, conjugate_gradient_solve, jacobi_solve, l2_norm,
-    preconditioned_conjugate_gradient_solve,
+    BiCgStabOptions, CgPreconditioner, ConjugateGradientOptions, CsrMatrix, JacobiOptions,
+    PreconditionedConjugateGradientOptions, bicgstab_solve, conjugate_gradient_solve, jacobi_solve,
+    l2_norm, preconditioned_conjugate_gradient_solve,
 };
 use crate::runtime::{SolverRuntimeData, SolverRuntimeMeshData};
 use crate::{MeshError, Point3, Result};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LaminarSimpleLinearSolver {
+    BiCgStab,
     Cg,
     Jacobi,
     Pcg,
@@ -49,6 +50,9 @@ pub struct LaminarSimpleOptions {
     pub field_change_tolerance: f64,
     pub momentum_residual_control: Option<f64>,
     pub pressure_residual_control: Option<f64>,
+    pub pressure_reference_cell: Option<usize>,
+    pub pressure_reference_value: f64,
+    pub non_orthogonal_correctors: usize,
     pub velocity_relaxation: f64,
     pub pressure_relaxation: f64,
 }
@@ -147,6 +151,7 @@ enum VectorFaceTreatment {
 #[derive(Clone, Copy, Debug)]
 enum ScalarFaceTreatment {
     FixedValue(f64),
+    FixedGradient(f64),
     ZeroGradient,
     Constraint,
 }
@@ -154,6 +159,7 @@ enum ScalarFaceTreatment {
 impl std::fmt::Display for LaminarSimpleLinearSolver {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::BiCgStab => formatter.write_str("bicgstab"),
             Self::Cg => formatter.write_str("cg"),
             Self::Jacobi => formatter.write_str("jacobi"),
             Self::Pcg => formatter.write_str("pcg"),
@@ -361,67 +367,97 @@ pub fn solve_laminar_simple(
             }
             continue;
         }
-        let pressure_source = pressure_correction_source(&runtime.mesh, &net_flux_star)?;
-        let pressure_system = assemble_variable_scalar_component_system(
+        let constrained_pressure_boundary = constrained_pressure_treatments(
             &runtime.mesh,
-            &r_au,
-            &pressure_source,
             &pressure_boundary,
+            &velocity_boundary,
+            &predicted_velocity,
+            &phi_hby_a,
+            &r_au,
         )?;
-        let pressure_report = match solve_scalar_system(
-            &pressure_system.matrix,
-            &pressure_system.rhs,
-            Some(&pressure),
-            options.pressure_linear_solver,
-            options.pressure_preconditioner,
-            options.pressure_linear_tolerance,
-            options.pressure_max_linear_iterations,
-        ) {
-            Ok(report) => report,
-            Err(error) if is_pressure_correction_breakdown(&error) => {
-                velocity = predicted_velocity;
-                final_pressure_correction_residual_norm = l2_norm(&pressure_system.rhs);
-                final_phi = phi_hby_a;
-                final_continuity = continuity_star;
-                final_grad_p = scalar_gradient(&runtime.mesh, &pressure, &pressure_boundary)?;
-                final_convection = vector_convection_divergence(
-                    &runtime.mesh,
-                    &velocity,
-                    &velocity_boundary,
-                    &final_phi,
-                )?;
-                history.push(LaminarSimpleIterationSummary {
-                    iteration,
-                    continuity_before,
-                    continuity_after: final_continuity,
-                    pressure_correction_accepted: false,
-                    momentum_linear_iterations: momentum.iterations,
-                    pressure_linear_iterations: 0,
-                    momentum_residual_norm: momentum.residual_norm,
-                    pressure_correction_residual_norm: final_pressure_correction_residual_norm,
-                    relative_pressure_drop_error: relative_pressure_drop_error_from_velocity(
+        let pressure_source = pressure_correction_source(&runtime.mesh, &net_flux_star)?;
+        let mut pressure_report = None;
+        let mut pressure_linear_iterations_this_simple = 0;
+        let pressure_solve_count = options.non_orthogonal_correctors + 1;
+        for _ in 0..pressure_solve_count {
+            let mut pressure_system = assemble_variable_scalar_component_system(
+                &runtime.mesh,
+                &r_au,
+                &pressure_source,
+                &constrained_pressure_boundary,
+            )?;
+            apply_pressure_reference(
+                &mut pressure_system,
+                &runtime.mesh,
+                &constrained_pressure_boundary,
+                options,
+            )?;
+            let pressure_system_rhs_norm = l2_norm(&pressure_system.rhs);
+            let initial_pressure = pressure_report
+                .as_ref()
+                .map(|report: &ScalarSolveReport| report.solution.as_slice())
+                .unwrap_or(&pressure);
+            let report = match solve_scalar_system(
+                &pressure_system.matrix,
+                &pressure_system.rhs,
+                Some(initial_pressure),
+                options.pressure_linear_solver,
+                options.pressure_preconditioner,
+                options.pressure_linear_tolerance,
+                options.pressure_max_linear_iterations,
+            ) {
+                Ok(report) => report,
+                Err(error) if is_pressure_correction_breakdown(&error) => {
+                    velocity = predicted_velocity.clone();
+                    final_pressure_correction_residual_norm = pressure_system_rhs_norm;
+                    final_phi = phi_hby_a.clone();
+                    final_continuity = continuity_star;
+                    final_grad_p =
+                        scalar_gradient(&runtime.mesh, &pressure, &constrained_pressure_boundary)?;
+                    final_convection = vector_convection_divergence(
                         &runtime.mesh,
                         &velocity,
-                        options,
-                    )?,
-                    relative_velocity_change_l2: relative_vector_field_change_l2(
-                        &previous_velocity,
-                        &velocity,
-                    ),
-                    relative_pressure_change_l2: 0.0,
-                    momentum_update_scale,
-                    pressure_correction_update_scale: 0.0,
-                });
-                break;
-            }
-            Err(error) => {
-                return Err(invalid_input(format!(
-                    "laminar SIMPLE pressure correction solve failed: {error}"
-                )));
-            }
+                        &velocity_boundary,
+                        &final_phi,
+                    )?;
+                    history.push(LaminarSimpleIterationSummary {
+                        iteration,
+                        continuity_before,
+                        continuity_after: final_continuity,
+                        pressure_correction_accepted: false,
+                        momentum_linear_iterations: momentum.iterations,
+                        pressure_linear_iterations: 0,
+                        momentum_residual_norm: momentum.residual_norm,
+                        pressure_correction_residual_norm: final_pressure_correction_residual_norm,
+                        relative_pressure_drop_error: relative_pressure_drop_error_from_velocity(
+                            &runtime.mesh,
+                            &velocity,
+                            options,
+                        )?,
+                        relative_velocity_change_l2: relative_vector_field_change_l2(
+                            &previous_velocity,
+                            &velocity,
+                        ),
+                        relative_pressure_change_l2: 0.0,
+                        momentum_update_scale,
+                        pressure_correction_update_scale: 0.0,
+                    });
+                    break;
+                }
+                Err(error) => {
+                    return Err(invalid_input(format!(
+                        "laminar SIMPLE pressure correction solve failed: {error}"
+                    )));
+                }
+            };
+            total_pressure_linear_iterations += report.iterations;
+            pressure_linear_iterations_this_simple += report.iterations;
+            final_pressure_correction_residual_norm = report.residual_norm;
+            pressure_report = Some(report);
+        }
+        let Some(pressure_report) = pressure_report else {
+            break;
         };
-        total_pressure_linear_iterations += pressure_report.iterations;
-        final_pressure_correction_residual_norm = pressure_report.residual_norm;
 
         let pressure_delta = pressure_report
             .solution
@@ -450,7 +486,7 @@ pub fn solve_laminar_simple(
             &runtime.mesh,
             &pressure_report.solution,
             &r_au,
-            &pressure_boundary,
+            &constrained_pressure_boundary,
         )?;
         let corrected_phi = add_face_fluxes(&phi_hby_a, &pressure_flux)?;
         let corrected_continuity =
@@ -477,7 +513,7 @@ pub fn solve_laminar_simple(
                 continuity_after: final_continuity,
                 pressure_correction_accepted: false,
                 momentum_linear_iterations: momentum.iterations,
-                pressure_linear_iterations: pressure_report.iterations,
+                pressure_linear_iterations: pressure_linear_iterations_this_simple,
                 momentum_residual_norm: momentum.residual_norm,
                 pressure_correction_residual_norm: pressure_report.residual_norm,
                 relative_pressure_drop_error: relative_pressure_drop_error_from_velocity(
@@ -502,7 +538,7 @@ pub fn solve_laminar_simple(
         surface_flux = final_phi.clone();
         final_continuity = corrected_continuity;
 
-        final_grad_p = scalar_gradient(&runtime.mesh, &pressure, &pressure_boundary)?;
+        final_grad_p = scalar_gradient(&runtime.mesh, &pressure, &constrained_pressure_boundary)?;
         final_convection =
             vector_convection_divergence(&runtime.mesh, &velocity, &velocity_boundary, &final_phi)?;
 
@@ -522,7 +558,7 @@ pub fn solve_laminar_simple(
             continuity_after: final_continuity,
             pressure_correction_accepted: true,
             momentum_linear_iterations: momentum.iterations,
-            pressure_linear_iterations: pressure_report.iterations,
+            pressure_linear_iterations: pressure_linear_iterations_this_simple,
             momentum_residual_norm: momentum.residual_norm,
             pressure_correction_residual_norm: pressure_report.residual_norm,
             relative_pressure_drop_error,
@@ -669,6 +705,16 @@ fn solve_scalar_system(
     max_iterations: usize,
 ) -> Result<ScalarSolveReport> {
     let report = match solver {
+        LaminarSimpleLinearSolver::BiCgStab => bicgstab_solve(
+            matrix,
+            rhs,
+            initial,
+            BiCgStabOptions {
+                max_iterations,
+                tolerance,
+                preconditioner: map_cg_preconditioner(preconditioner),
+            },
+        )?,
         LaminarSimpleLinearSolver::Cg => conjugate_gradient_solve(
             matrix,
             rhs,
@@ -752,6 +798,58 @@ fn relax_scalar_component_equation(
     system.matrix = CsrMatrix::from_rows(rows, system.matrix.cols())?;
 
     Ok(diagonal)
+}
+
+fn apply_pressure_reference(
+    system: &mut ScalarComponentSystem,
+    mesh: &SolverRuntimeMeshData,
+    pressure_boundary: &[ScalarFaceTreatment],
+    options: &LaminarSimpleOptions,
+) -> Result<()> {
+    let pressure_needs_reference = !pressure_boundary
+        .iter()
+        .any(|treatment| matches!(treatment, ScalarFaceTreatment::FixedValue(_)));
+    if !pressure_needs_reference && options.pressure_reference_cell.is_none() {
+        return Ok(());
+    }
+
+    let reference_cell = options.pressure_reference_cell.unwrap_or(0);
+    if reference_cell >= mesh.cells {
+        return Err(invalid_input(format!(
+            "laminar SIMPLE pRefCell {reference_cell} exceeds mesh cell count {}",
+            mesh.cells
+        )));
+    }
+    let reference_value = options.pressure_reference_value;
+    let mut rows = csr_rows(&system.matrix);
+    for (row_index, row) in rows.iter_mut().enumerate() {
+        if row_index == reference_cell {
+            row.clear();
+            row.push((reference_cell, 1.0));
+            system.rhs[row_index] = reference_value;
+            continue;
+        }
+        if let Some(position) = row.iter().position(|(column, _)| *column == reference_cell) {
+            let (_, coefficient) = row.remove(position);
+            system.rhs[row_index] -= coefficient * reference_value;
+        }
+    }
+    system.matrix = CsrMatrix::from_rows(rows, system.matrix.cols())?;
+    Ok(())
+}
+
+fn csr_rows(matrix: &CsrMatrix) -> Vec<Vec<(usize, f64)>> {
+    let mut rows = Vec::with_capacity(matrix.rows());
+    for row in 0..matrix.rows() {
+        let start = matrix.row_offsets()[row];
+        let end = matrix.row_offsets()[row + 1];
+        rows.push(
+            (start..end)
+                .map(|entry| (matrix.col_indices()[entry], matrix.values()[entry]))
+                .collect(),
+        );
+    }
+    rows
 }
 
 fn map_cg_preconditioner(preconditioner: LaminarSimplePreconditioner) -> CgPreconditioner {
@@ -947,7 +1045,9 @@ fn assemble_momentum_component_system(
                 rhs[owner] += coefficient * value;
                 add_boundary_upwind_convection(&mut rows, &mut rhs, owner, value, mass_flux);
             }
-            ScalarFaceTreatment::ZeroGradient | ScalarFaceTreatment::Constraint => {
+            ScalarFaceTreatment::FixedGradient(_)
+            | ScalarFaceTreatment::ZeroGradient
+            | ScalarFaceTreatment::Constraint => {
                 add_entry(&mut rows[owner], owner, mass_flux);
             }
         }
@@ -1055,6 +1155,16 @@ fn assemble_variable_scalar_component_system(
                 add_entry(&mut rows[owner], owner, coefficient);
                 rhs[owner] += coefficient * value;
             }
+            ScalarFaceTreatment::FixedGradient(gradient) => {
+                let flux = fixed_gradient_pressure_flux(
+                    mesh,
+                    cell_diffusivity,
+                    owner,
+                    face_index,
+                    gradient,
+                )?;
+                rhs[owner] -= flux;
+            }
             ScalarFaceTreatment::ZeroGradient | ScalarFaceTreatment::Constraint => {}
         }
     }
@@ -1138,6 +1248,10 @@ fn pressure_correction_flux(
                 let coefficient =
                     variable_face_diffusion_coefficient(mesh, r_au, owner, None, face_index)?;
                 flux[face_index] = coefficient * (pressure_correction[owner] - value);
+            }
+            ScalarFaceTreatment::FixedGradient(gradient) => {
+                flux[face_index] =
+                    fixed_gradient_pressure_flux(mesh, r_au, owner, face_index, gradient)?;
             }
             ScalarFaceTreatment::ZeroGradient | ScalarFaceTreatment::Constraint => {}
         }
@@ -1519,7 +1633,9 @@ fn summarize_boundaries(
         }
         match treatment {
             ScalarFaceTreatment::FixedValue(_) => summary.pressure_fixed_value_faces += 1,
-            ScalarFaceTreatment::ZeroGradient => summary.pressure_zero_gradient_faces += 1,
+            ScalarFaceTreatment::FixedGradient(_) | ScalarFaceTreatment::ZeroGradient => {
+                summary.pressure_zero_gradient_faces += 1;
+            }
             ScalarFaceTreatment::Constraint => summary.pressure_constraint_faces += 1,
         }
     }
@@ -1576,6 +1692,9 @@ fn scalar_face_treatments(
         } else {
             match field_patch.patch_type.as_deref() {
                 Some("fixedValue") => fixed_scalar_patch_values(field, field_patch, patch.faces)?,
+                Some("fixedFluxPressure") => {
+                    vec![ScalarFaceTreatment::FixedGradient(0.0); patch.faces]
+                }
                 Some("zeroGradient") => vec![ScalarFaceTreatment::ZeroGradient; patch.faces],
                 Some("empty" | "wedge" | "symmetryPlane") => {
                     vec![ScalarFaceTreatment::Constraint; patch.faces]
@@ -1606,10 +1725,62 @@ fn pressure_correction_treatments(pressure: &[ScalarFaceTreatment]) -> Vec<Scala
         .iter()
         .map(|treatment| match treatment {
             ScalarFaceTreatment::FixedValue(_) => ScalarFaceTreatment::FixedValue(0.0),
+            ScalarFaceTreatment::FixedGradient(_) => ScalarFaceTreatment::FixedGradient(0.0),
             ScalarFaceTreatment::ZeroGradient => ScalarFaceTreatment::ZeroGradient,
             ScalarFaceTreatment::Constraint => ScalarFaceTreatment::Constraint,
         })
         .collect()
+}
+
+fn constrained_pressure_treatments(
+    mesh: &SolverRuntimeMeshData,
+    pressure_boundary: &[ScalarFaceTreatment],
+    velocity_boundary: &[VectorFaceTreatment],
+    velocity: &[Point3],
+    phi_hby_a: &[f64],
+    r_au: &[f64],
+) -> Result<Vec<ScalarFaceTreatment>> {
+    if pressure_boundary.len() != mesh.faces || velocity_boundary.len() != mesh.faces {
+        return Err(invalid_input(format!(
+            "pressure constraint boundary sizes must match mesh faces ({})",
+            mesh.faces
+        )));
+    }
+    if velocity.len() != mesh.cells || phi_hby_a.len() != mesh.faces || r_au.len() != mesh.cells {
+        return Err(invalid_input(
+            "pressure constraint field sizes do not match runtime mesh".to_string(),
+        ));
+    }
+
+    let mut constrained = pressure_boundary.to_vec();
+    for face_index in 0..mesh.faces {
+        if mesh.neighbour[face_index].is_some() {
+            continue;
+        }
+        let ScalarFaceTreatment::FixedGradient(_) = pressure_boundary[face_index] else {
+            continue;
+        };
+        let owner = mesh.owner[face_index];
+        let area = magnitude(mesh.face_area_vectors[face_index]);
+        let face_r_au = r_au[owner];
+        if !area.is_finite() || area <= f64::EPSILON {
+            return Err(invalid_input(format!(
+                "fixedFluxPressure face {face_index} has non-positive area magnitude {area}"
+            )));
+        }
+        if !face_r_au.is_finite() || face_r_au <= f64::EPSILON {
+            return Err(invalid_input(format!(
+                "fixedFluxPressure face {face_index} has invalid rAU {face_r_au}"
+            )));
+        }
+        let u_flux = dot(
+            face_vector_value(mesh, velocity, velocity_boundary, face_index),
+            mesh.face_area_vectors[face_index],
+        );
+        let gradient = (phi_hby_a[face_index] - u_flux) / (area * face_r_au);
+        constrained[face_index] = ScalarFaceTreatment::FixedGradient(gradient);
+    }
+    Ok(constrained)
 }
 
 fn fixed_vector_patch_values(
@@ -1875,6 +2046,9 @@ fn face_scalar_value(
     }
     match boundary[face_index] {
         ScalarFaceTreatment::FixedValue(value) => value,
+        ScalarFaceTreatment::FixedGradient(gradient) => {
+            values[owner] + gradient * boundary_normal_distance(mesh, owner, face_index)
+        }
         ScalarFaceTreatment::ZeroGradient | ScalarFaceTreatment::Constraint => values[owner],
     }
 }
@@ -1975,6 +2149,12 @@ fn validate_laminar_simple_options(options: &LaminarSimpleOptions) -> Result<()>
             options.min_simple_iterations, options.max_simple_iterations
         )));
     }
+    if !options.pressure_reference_value.is_finite() {
+        return Err(invalid_input(format!(
+            "laminar SIMPLE pressure reference value must be finite, got {}",
+            options.pressure_reference_value
+        )));
+    }
     if !options.linear_tolerance.is_finite() || options.linear_tolerance < 0.0 {
         return Err(invalid_input(format!(
             "laminar SIMPLE linear tolerance must be non-negative and finite, got {}",
@@ -2035,10 +2215,13 @@ fn validate_solver_preconditioner(
     preconditioner: LaminarSimplePreconditioner,
 ) -> Result<()> {
     if preconditioner != LaminarSimplePreconditioner::None
-        && solver != LaminarSimpleLinearSolver::Pcg
+        && !matches!(
+            solver,
+            LaminarSimpleLinearSolver::Pcg | LaminarSimpleLinearSolver::BiCgStab
+        )
     {
         return Err(invalid_input(format!(
-            "laminar SIMPLE {name} preconditioner {preconditioner} requires pcg solver, got {solver}"
+            "laminar SIMPLE {name} preconditioner {preconditioner} requires pcg or bicgstab solver, got {solver}"
         )));
     }
     Ok(())
@@ -2155,6 +2338,41 @@ fn variable_face_diffusion_coefficient(
     )
 }
 
+fn fixed_gradient_pressure_flux(
+    mesh: &SolverRuntimeMeshData,
+    cell_diffusivity: &[f64],
+    owner: usize,
+    face_index: usize,
+    gradient: f64,
+) -> Result<f64> {
+    if !gradient.is_finite() {
+        return Err(invalid_input(format!(
+            "fixed-gradient pressure face {face_index} has non-finite gradient {gradient}"
+        )));
+    }
+    let area = magnitude(mesh.face_area_vectors[face_index]);
+    if !area.is_finite() || area <= f64::EPSILON {
+        return Err(invalid_input(format!(
+            "fixed-gradient pressure face {face_index} has non-positive area magnitude {area}"
+        )));
+    }
+    Ok(-cell_diffusivity[owner] * area * gradient)
+}
+
+fn boundary_normal_distance(mesh: &SolverRuntimeMeshData, owner: usize, face_index: usize) -> f64 {
+    let area = mesh.face_area_vectors[face_index];
+    let area_magnitude = magnitude(area);
+    if area_magnitude <= f64::EPSILON {
+        return distance(mesh.cell_centres[owner], mesh.face_centres[face_index]);
+    }
+    let centre_to_face = Point3 {
+        x: mesh.face_centres[face_index].x - mesh.cell_centres[owner].x,
+        y: mesh.face_centres[face_index].y - mesh.cell_centres[owner].y,
+        z: mesh.face_centres[face_index].z - mesh.cell_centres[owner].z,
+    };
+    (dot(centre_to_face, area) / area_magnitude).abs()
+}
+
 fn validate_positive_cell_values(name: &str, values: &[f64]) -> Result<()> {
     for (index, value) in values.iter().copied().enumerate() {
         if !value.is_finite() || value <= f64::EPSILON {
@@ -2249,11 +2467,11 @@ mod tests {
 
     use super::{
         LaminarSimpleLinearSolver, LaminarSimpleOptions, LaminarSimplePreconditioner,
-        ScalarFaceTreatment, assemble_momentum_component_system,
-        assemble_variable_scalar_component_system, compute_face_flux, net_cell_flux,
-        pressure_correction_flux, reciprocal_momentum_diagonal, relax_scalar_component_equation,
-        scalar_component_boundary, solve_laminar_simple, upwind_face_vector_value,
-        vector_face_treatments,
+        ScalarFaceTreatment, apply_pressure_reference, assemble_momentum_component_system,
+        assemble_variable_scalar_component_system, compute_face_flux,
+        constrained_pressure_treatments, net_cell_flux, pressure_correction_flux,
+        reciprocal_momentum_diagonal, relax_scalar_component_equation, scalar_component_boundary,
+        solve_laminar_simple, upwind_face_vector_value, vector_face_treatments,
     };
     use crate::Point3;
 
@@ -2418,10 +2636,74 @@ mod tests {
     }
 
     #[test]
+    fn pressure_reference_anchors_closed_pressure_system() {
+        let runtime = two_cell_runtime();
+        let boundary = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
+        let r_au = vec![1.0, 1.0];
+        let source = vec![0.0, 0.0];
+        let mut system =
+            assemble_variable_scalar_component_system(&runtime.mesh, &r_au, &source, &boundary)
+                .expect("closed pressure system");
+        let mut options = minimal_laminar_options();
+        options.pressure_reference_cell = Some(1);
+        options.pressure_reference_value = 7.0;
+
+        apply_pressure_reference(&mut system, &runtime.mesh, &boundary, &options)
+            .expect("pressure reference");
+        let solution = system.matrix.matvec(&[7.0, 7.0]).expect("matvec");
+
+        assert_close(solution[0], system.rhs[0]);
+        assert_close(solution[1], system.rhs[1]);
+    }
+
+    #[test]
+    fn fixed_flux_pressure_gradient_makes_pressure_flux_match_boundary_u() {
+        let runtime = two_cell_runtime();
+        let fields = two_cell_fields();
+        let u_field = fields
+            .fields
+            .iter()
+            .find(|field| field.name == "U")
+            .expect("U field");
+        let velocity_boundary = vector_face_treatments(&runtime.mesh, u_field).expect("U boundary");
+        let velocity = vec![point(0.0, 0.0, 0.0), point(0.0, 0.0, 0.0)];
+        let mut pressure_boundary = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
+        pressure_boundary[1] = ScalarFaceTreatment::FixedGradient(0.0);
+        let phi_hby_a = vec![0.0, -0.25, 0.0];
+        let r_au = vec![2.0, 2.0];
+
+        let constrained = constrained_pressure_treatments(
+            &runtime.mesh,
+            &pressure_boundary,
+            &velocity_boundary,
+            &velocity,
+            &phi_hby_a,
+            &r_au,
+        )
+        .expect("constrained pressure");
+        let pressure_flux =
+            pressure_correction_flux(&runtime.mesh, &[0.0, 0.0], &r_au, &constrained)
+                .expect("pressure flux");
+
+        assert_close(phi_hby_a[1] + pressure_flux[1], -1.0);
+    }
+
+    #[test]
     fn runs_minimal_simple_loop_on_two_cells() {
         let runtime = two_cell_runtime();
         let fields = two_cell_fields();
-        let options = LaminarSimpleOptions {
+        let options = minimal_laminar_options();
+
+        let report = solve_laminar_simple(&runtime, &fields, &options).expect("simple report");
+
+        assert_eq!(report.cells, 2);
+        assert!(report.simple_iterations > 0);
+        assert!(report.solution.mean_velocity.is_finite());
+        assert!(report.final_continuity.l2_norm.is_finite());
+    }
+
+    fn minimal_laminar_options() -> LaminarSimpleOptions {
+        LaminarSimpleOptions {
             density: 1.0,
             dynamic_viscosity: 1.0,
             pressure_drop: 1.0,
@@ -2447,16 +2729,12 @@ mod tests {
             field_change_tolerance: 1.0,
             momentum_residual_control: None,
             pressure_residual_control: None,
+            pressure_reference_cell: None,
+            pressure_reference_value: 0.0,
+            non_orthogonal_correctors: 0,
             velocity_relaxation: 0.7,
             pressure_relaxation: 0.3,
-        };
-
-        let report = solve_laminar_simple(&runtime, &fields, &options).expect("simple report");
-
-        assert_eq!(report.cells, 2);
-        assert!(report.simple_iterations > 0);
-        assert!(report.solution.mean_velocity.is_finite());
-        assert!(report.final_continuity.l2_norm.is_finite());
+        }
     }
 
     fn two_cell_runtime() -> SolverRuntimeData {

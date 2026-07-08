@@ -332,11 +332,12 @@ solver steps. Backend implementations should decide where and how those
 operations run.
 
 The first executable solver foundation is CPU linear algebra: CSR matrices,
-matrix-vector products, residuals, Jacobi, and conjugate gradient. This is the
-minimal substrate used by the first scalar Poisson/diffusion assembly from
-runtime mesh geometry. It should remain a small backend-neutral contract so
-later GPU implementations can provide the same operations without changing the
-equation assembly layer.
+matrix-vector products, residuals, Jacobi, conjugate gradient,
+preconditioned-CG, and BiCGStab. This is the minimal substrate used by the
+first scalar Poisson/diffusion and laminar flow assemblies from runtime mesh
+geometry. It should remain a small backend-neutral contract so later GPU
+implementations can provide the same operations without changing the equation
+assembly layer.
 
 The first equation assembly layer is scalar diffusion/Poisson on CPU. It
 converts runtime mesh geometry into a CSR system with internal face coupling,
@@ -367,20 +368,23 @@ iterations without artificial field clipping, and reports continuity,
 Hagen-Poiseuille pressure-drop error, stored pressure-field pressure drop, and
 relative `U`/`p` field changes.
 Momentum and pressure-correction linear solvers can be selected separately, so
-experiments can run CG/PCG for one equation and Jacobi for another without
-changing the case files. OpenFOAM-style `fvSolution` entries are the default
-source for pressure and velocity under-relaxation and for per-equation linear
+experiments can run the non-symmetric `bicgstab` momentum path with a PCG
+pressure solve without changing the case files. OpenFOAM-style `fvSolution`
+entries are the default source for pressure and velocity under-relaxation and
+for per-equation linear
 tolerances: `relaxationFactors.equations.U`,
 `relaxationFactors.fields.p`, `solvers.U.tolerance`, `solvers.p.tolerance`,
-`solvers.p.solver PCG`, `solvers.p.preconditioner DIC`, and optional `maxIter`
-values. OpenFOAM-style `SIMPLE.residualControl` entries for `U` and `p` are
-read as optional additional convergence criteria. Ferrum-specific SIMPLE
-entries can additionally set
-`minSimpleIterations`, `pressureDropTolerance`, and `fieldChangeTolerance`.
-`PCG` dispatches to Ferrum's CPU preconditioned-CG path. OpenFOAM `DIC`/`FDIC`
-currently maps to a diagonal PCG preconditioner, while true incomplete-Cholesky
-is tracked as a later numerical upgrade. CLI flags remain explicit experiment
-overrides.
+`solvers.p.solver PCG`, `solvers.p.preconditioner DIC`,
+`SIMPLE.nNonOrthogonalCorrectors`, `SIMPLE.pRefCell`, `SIMPLE.pRefValue`, and
+optional `maxIter` values. OpenFOAM-style `SIMPLE.residualControl` entries for
+`U` and `p` are read as optional additional convergence criteria.
+Ferrum-specific SIMPLE entries can additionally set `minSimpleIterations`,
+`pressureDropTolerance`, and `fieldChangeTolerance`. `PCG` dispatches to
+Ferrum's CPU preconditioned-CG path, and OpenFOAM `smoothSolver` on `U` maps to
+Ferrum's CPU `bicgstab` path because the current upwind momentum matrix is
+non-symmetric. OpenFOAM `DIC`/`FDIC`/`DILU` currently map to a diagonal
+preconditioner, while true incomplete factorizations are tracked as later
+numerical upgrades. CLI flags remain explicit experiment overrides.
 The pressure bridge now follows the OpenFOAM shape more closely: it applies
 equation relaxation to the momentum equation, builds cell-wise `rAU` from the
 original momentum diagonal, reconstructs `phiHbyA` by removing the old pressure
@@ -388,11 +392,13 @@ flux from the momentum predictor flux, solves an absolute variable-coefficient
 pressure equation, corrects `phi` with the pressure-equation flux, and carries
 that corrected surface flux into the next SIMPLE iteration. The normal solver
 path no longer bounds or rolls back finite `U`, `p`, or `phi` updates; only
-non-finite fields are treated as numerical failure. The
-momentum convection term uses an implicit upwind contribution in this SIMPLE
-path, which moves the pipe benchmark away from the earlier central-convection
-oscillations while the full non-symmetric momentum linear-solver stack is still
-being developed. The
+non-finite fields are treated as numerical failure. The pressure equation also
+supports OpenFOAM-like pressure reference anchoring and runs
+`nNonOrthogonalCorrectors + 1` pressure solves, updating `phi` from the final
+pressure solve. The momentum convection term uses an implicit upwind
+contribution in this SIMPLE path, which moves the pipe benchmark away from the
+earlier central-convection oscillations while the full consistent-SIMPLE and
+non-orthogonal correction terms are still being developed. The
 operator and report boundaries are kept backend-neutral so the same assembly
 path can later dispatch linear and nonlinear solves to CPU, GPU, or mixed
 CPU/GPU resources.

@@ -37,7 +37,7 @@ OpenFOAM-like field files, and SI inputs.
 
 | Source | Mean velocity [m/s] | DeltaP from mean [Pa] | Stored p-field deltaP [Pa] | Error to analytic | Solve/wall time [s] |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| FerrumCFD laminarSimple | 0.019989 | 1.602316 | 2.143114 | -0.055% | 15.097480 solve |
+| FerrumCFD laminarSimple | 0.019989 | 1.602328 | 2.143763 | -0.054% | 22.441697 solve |
 | OpenFOAM simpleFoam | n/a | 1.6401231 | n/a | 2.303% | 12.7306 wall |
 
 This path is a real finite-volume pressure-velocity assembly bridge, but it is
@@ -51,9 +51,8 @@ field is still too high and is the next pressure-coupling target.
 Local experiment on the same medium pipe case:
 
 ```powershell
-ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --linearSolver jacobi --solveTolerance 1e-6 --maxIterations 100 --maxSimpleIterations 20 --velocityRelaxation 0.1 --pressureRelaxation 0.02
-ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --linearSolver cg --solveTolerance 1e-6 --maxIterations 20000 --maxSimpleIterations 20 --velocityRelaxation 0.1 --pressureRelaxation 0.02
-ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --linearSolver jacobi --momentumLinearSolver cg --pressureLinearSolver jacobi --solveTolerance 1e-6 --maxIterations 100 --maxSimpleIterations 20 --velocityRelaxation 0.1 --pressureRelaxation 0.02
+ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --momentumLinearSolver bicgstab --pressureLinearSolver pcg --pressurePreconditioner DIC --maxSimpleIterations 20
+ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --momentumLinearSolver bicgstab --pressureLinearSolver pcg --minSimpleIterations 30 --maxSimpleIterations 30
 ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --solveTolerance 1e-6 --maxIterations 100 --maxSimpleIterations 20
 ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --maxSimpleIterations 20
 ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --maxSimpleIterations 80
@@ -70,6 +69,8 @@ ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --maxSimpleIterati
 | Jacobi | PCG + diagonal | fvSolution 1e-10/default 10000 | fvSolution 0.7/0.3 + implicit upwind momentum + equation relaxation + pressure-field check | 80 | 1.607913 | 0.294% | 9.504e-9 | 92.977633 | U changes fall to about 1% and the momentum limiter becomes inactive, but convergence stays `no` because pressure-field deltaP is still 2.259878 Pa and pressure updates remain clipped |
 | Jacobi | PCG + diagonal | fvSolution 1e-10/default 10000 | fvSolution 0.7/0.3 + absolute `p` solve from `phiHbyA` + full corrected `phi` + bounded U/p update | 80 | 1.604076 | 0.055% | 8.515e-11 | 98.653404 | OpenFOAM-like absolute pressure step greatly improves continuity and mean pressure loss; convergence stays `no` because pressure-field deltaP is still 2.092740 Pa |
 | Jacobi | PCG + diagonal | fvSolution 1e-10/default 10000 | fvSolution 0.7/0.3 + absolute `p` solve from `phiHbyA` + uncapped finite U/p/phi updates | 15 | 1.602316 | -0.055% | 8.473e-11 | 15.097480 | normal path no longer clips or rolls back finite SIMPLE updates; stored pressure-field deltaP remains high at 2.143114 Pa |
+| BiCGStab + diagonal | PCG + diagonal | fvSolution 1e-10/default 10000 | fvSolution 0.7/0.3 + pRef/non-orthogonal pressure loop support | 15 | 1.602328 | -0.054% | 9.808e-11 | 22.441697 | OpenFOAM `smoothSolver` on U now maps to Ferrum `bicgstab`; p-field deltaP remains high at 2.143763 Pa |
+| BiCGStab + diagonal | PCG + diagonal | fvSolution 1e-10/default 10000 | forced 30 SIMPLE iterations | 30 | 1.603415 | 0.013% | 6.881e-11 | 60.421159 | p-field deltaP improves to 1.910522 Pa, so the stored pressure field is still converging more slowly than the mean-flow metric |
 
 The former continuity-growth and coupled field-update guards are no longer part
 of the normal solver path. Ferrum now lets finite SIMPLE updates proceed and
@@ -79,9 +80,8 @@ keeps the local axial velocity positive, drives continuity to `8.473e-11`, and
 gets the mean pressure loss to `-0.055%` error. It still remains a
 solver-development result rather than a `simpleFoam` equivalent because the
 stored pressure field is too high. The next numerical target is tighter
-pressure-field coupling and OpenFOAM-style residual-control parsing, then a
-proper non-symmetric momentum solver and true incomplete-Cholesky-style
-pressure preconditioning.
+pressure-field coupling, consistent-SIMPLE terms, and residual-control-driven
+stopping, then true incomplete preconditioning for pressure and momentum.
 
 ## Mesh Study
 
