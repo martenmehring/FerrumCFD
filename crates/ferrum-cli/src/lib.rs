@@ -27,6 +27,7 @@ use ferrum_mesh::runner::{
     SolverRunnerDryRun, SolverRunnerDryRunEvent, SolverRunnerDryRunOptions,
     build_solver_runner_dry_run,
 };
+use ferrum_mesh::runtime::SolverRuntimeData;
 use ferrum_mesh::solver_plan::{
     SolverBackendPlan, SolverCasePlan, SolverFieldPlan, SolverInterfacePlan, SolverMeshPlan,
     SolverNumericsDictionaryPlan, SolverNumericsPlan, SolverPropertiesPlan, SolverRunPlan,
@@ -398,6 +399,7 @@ fn print_solver_case_plan(plan: &SolverCasePlan) {
         }
     }
     print_solver_state_plan(&plan.state);
+    print_solver_runtime_data(&plan.runtime_data);
     print_solver_properties(&plan.properties);
     print_solver_numerics_dictionary("fvSchemes", &plan.numerics.fv_schemes);
     print_solver_numerics_dictionary("fvSolution", &plan.numerics.fv_solution);
@@ -516,6 +518,86 @@ fn print_solver_state_plan(plan: &SolverStatePlan) {
     }
     for warning in &plan.warnings {
         println!("solver state warning: {warning}");
+    }
+}
+
+fn print_solver_runtime_data(runtime: &SolverRuntimeData) {
+    let field_scalars = runtime
+        .fields
+        .iter()
+        .map(|field| field.scalar_slots)
+        .sum::<usize>();
+    let field_bytes = runtime
+        .fields
+        .iter()
+        .map(|field| field.bytes_f64)
+        .sum::<usize>();
+    println!(
+        "runtime data: meshGeometry=yes fields={} fieldScalars={} fieldBytesF64={} warnings={}",
+        runtime.fields.len(),
+        field_scalars,
+        field_bytes,
+        runtime.warnings.len()
+    );
+    println!(
+        "runtime mesh: points={} cells={} faces={} internal={} boundary={} ownerLabels={} neighbourLabels={} patches={}",
+        runtime.mesh.points,
+        runtime.mesh.cells,
+        runtime.mesh.faces,
+        runtime.mesh.internal_faces,
+        runtime.mesh.boundary_faces,
+        runtime.mesh.owner.len(),
+        runtime
+            .mesh
+            .neighbour
+            .iter()
+            .filter(|cell| cell.is_some())
+            .count(),
+        runtime.mesh.patches.len()
+    );
+    println!(
+        "runtime geometry arrays: cellCentres={} faceCentres={} faceAreaVectors={} cellVolumes={} totalVolume={} minCellVolume={} maxCellVolume={} minFaceArea={} maxFaceArea={} nonPositiveCellVolumes={}",
+        runtime.mesh.cell_centres.len(),
+        runtime.mesh.face_centres.len(),
+        runtime.mesh.face_area_vectors.len(),
+        runtime.mesh.cell_volumes.len(),
+        format_scientific(runtime.mesh.total_cell_volume),
+        format_scientific(runtime.mesh.min_cell_volume),
+        format_scientific(runtime.mesh.max_cell_volume),
+        format_scientific(runtime.mesh.min_face_area),
+        format_scientific(runtime.mesh.max_face_area),
+        runtime.mesh.non_positive_cell_volumes
+    );
+    println!("runtime patches:");
+    for patch in &runtime.mesh.patches {
+        println!(
+            "  {}: type={} faces={} startFace={}",
+            patch.name, patch.patch_type, patch.faces, patch.start_face
+        );
+    }
+    if runtime.fields.is_empty() {
+        println!("runtime field buffers: none");
+    } else {
+        println!("runtime field buffers:");
+        for field in &runtime.fields {
+            let name = if let Some(region) = &field.region {
+                format!("{region}/{}", field.name)
+            } else {
+                field.name.clone()
+            };
+            println!(
+                "  {}: kind={} components={} scalarSlots={} bytesF64={} values={}",
+                name,
+                field.kind,
+                field.components,
+                field.scalar_slots,
+                field.bytes_f64,
+                field.values.len()
+            );
+        }
+    }
+    for warning in &runtime.warnings {
+        println!("runtime data warning: {warning}");
     }
 }
 
@@ -735,6 +817,8 @@ fn write_solver_plan_json(plan: &SolverCasePlan, path: &Path) -> std::io::Result
     write_json_fields(&mut writer, &plan.fields)?;
     writeln!(writer, ",")?;
     write_json_solver_state(&mut writer, &plan.state)?;
+    writeln!(writer, ",")?;
+    write_json_runtime_data(&mut writer, &plan.runtime_data)?;
     writeln!(writer, ",")?;
     write_json_properties(&mut writer, &plan.properties)?;
     writeln!(writer, ",")?;
@@ -980,6 +1064,132 @@ fn write_json_solver_state(writer: &mut impl Write, plan: &SolverStatePlan) -> s
     writeln!(writer, "],")?;
     write_json_key(writer, 4, "warnings")?;
     write_json_string_array(writer, &plan.warnings)?;
+    writeln!(writer)?;
+    write_indent(writer, 2)?;
+    write!(writer, "}}")
+}
+
+fn write_json_runtime_data(
+    writer: &mut impl Write,
+    runtime: &SolverRuntimeData,
+) -> std::io::Result<()> {
+    write_json_key(writer, 2, "runtimeData")?;
+    writeln!(writer, "{{")?;
+    write_json_key(writer, 4, "mesh")?;
+    writeln!(writer, "{{")?;
+    write_json_number_field(writer, 6, "points", runtime.mesh.points)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(writer, 6, "cells", runtime.mesh.cells)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(writer, 6, "faces", runtime.mesh.faces)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(writer, 6, "internalFaces", runtime.mesh.internal_faces)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(writer, 6, "boundaryFaces", runtime.mesh.boundary_faces)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(writer, 6, "ownerLabels", runtime.mesh.owner.len())?;
+    writeln!(writer, ",")?;
+    write_json_number_field(
+        writer,
+        6,
+        "neighbourLabels",
+        runtime
+            .mesh
+            .neighbour
+            .iter()
+            .filter(|cell| cell.is_some())
+            .count(),
+    )?;
+    writeln!(writer, ",")?;
+    write_json_number_field(writer, 6, "cellCentres", runtime.mesh.cell_centres.len())?;
+    writeln!(writer, ",")?;
+    write_json_number_field(writer, 6, "faceCentres", runtime.mesh.face_centres.len())?;
+    writeln!(writer, ",")?;
+    write_json_number_field(
+        writer,
+        6,
+        "faceAreaVectors",
+        runtime.mesh.face_area_vectors.len(),
+    )?;
+    writeln!(writer, ",")?;
+    write_json_number_field(writer, 6, "cellVolumes", runtime.mesh.cell_volumes.len())?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 6, "totalCellVolume")?;
+    write_json_optional_number(writer, Some(runtime.mesh.total_cell_volume))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 6, "minCellVolume")?;
+    write_json_optional_number(writer, Some(runtime.mesh.min_cell_volume))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 6, "maxCellVolume")?;
+    write_json_optional_number(writer, Some(runtime.mesh.max_cell_volume))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 6, "minFaceArea")?;
+    write_json_optional_number(writer, Some(runtime.mesh.min_face_area))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 6, "maxFaceArea")?;
+    write_json_optional_number(writer, Some(runtime.mesh.max_face_area))?;
+    writeln!(writer, ",")?;
+    write_json_number_field(
+        writer,
+        6,
+        "nonPositiveCellVolumes",
+        runtime.mesh.non_positive_cell_volumes,
+    )?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 6, "patches")?;
+    writeln!(writer, "[")?;
+    for (index, patch) in runtime.mesh.patches.iter().enumerate() {
+        write_indent(writer, 8)?;
+        writeln!(writer, "{{")?;
+        write_json_string_field(writer, 10, "name", &patch.name)?;
+        writeln!(writer, ",")?;
+        write_json_string_field(writer, 10, "type", &patch.patch_type)?;
+        writeln!(writer, ",")?;
+        write_json_number_field(writer, 10, "startFace", patch.start_face)?;
+        writeln!(writer, ",")?;
+        write_json_number_field(writer, 10, "faces", patch.faces)?;
+        writeln!(writer)?;
+        write_indent(writer, 8)?;
+        if index + 1 == runtime.mesh.patches.len() {
+            writeln!(writer, "}}")?;
+        } else {
+            writeln!(writer, "}},")?;
+        }
+    }
+    write_indent(writer, 6)?;
+    writeln!(writer, "]")?;
+    write_indent(writer, 4)?;
+    writeln!(writer, "}},")?;
+    write_json_key(writer, 4, "fields")?;
+    writeln!(writer, "[")?;
+    for (index, field) in runtime.fields.iter().enumerate() {
+        write_indent(writer, 6)?;
+        writeln!(writer, "{{")?;
+        write_json_key(writer, 8, "region")?;
+        write_json_optional_string(writer, field.region.as_deref())?;
+        writeln!(writer, ",")?;
+        write_json_string_field(writer, 8, "name", &field.name)?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 8, "kind")?;
+        write_json_string(writer, &field.kind.to_string())?;
+        writeln!(writer, ",")?;
+        write_json_number_field(writer, 8, "components", field.components)?;
+        writeln!(writer, ",")?;
+        write_json_number_field(writer, 8, "scalarSlots", field.scalar_slots)?;
+        writeln!(writer, ",")?;
+        write_json_number_field(writer, 8, "bytesF64", field.bytes_f64)?;
+        writeln!(writer)?;
+        write_indent(writer, 6)?;
+        if index + 1 == runtime.fields.len() {
+            writeln!(writer, "}}")?;
+        } else {
+            writeln!(writer, "}},")?;
+        }
+    }
+    write_indent(writer, 4)?;
+    writeln!(writer, "],")?;
+    write_json_key(writer, 4, "warnings")?;
+    write_json_string_array(writer, &runtime.warnings)?;
     writeln!(writer)?;
     write_indent(writer, 2)?;
     write!(writer, "}}")

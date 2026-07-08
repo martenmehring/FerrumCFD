@@ -17,36 +17,32 @@ pub struct GeometrySummary {
     pub non_positive_cell_volumes: usize,
 }
 
+#[derive(Clone, Debug)]
+pub struct PolyMeshGeometry {
+    pub face_centres: Vec<Point3>,
+    pub face_area_vectors: Vec<Point3>,
+    pub cell_centres: Vec<Point3>,
+    pub cell_volumes: Vec<f64>,
+    pub non_positive_cell_volumes: usize,
+}
+
 pub fn summarize_case_geometry(case_dir: &Path) -> Result<GeometrySummary> {
     let mesh = PolyMesh::read(&case_dir.join("constant").join("polyMesh"))?;
     summarize_poly_mesh_geometry(case_dir, &mesh)
 }
 
 pub fn summarize_poly_mesh_geometry(case_dir: &Path, mesh: &PolyMesh) -> Result<GeometrySummary> {
-    let face_geometry = compute_face_geometry(mesh)?;
-    let cell_centres = compute_cell_centres(mesh, &face_geometry);
-    let oriented_area_vectors = orient_face_area_vectors(mesh, &face_geometry, &cell_centres);
-
-    let mut cell_volumes = vec![0.0; mesh.cell_count()];
+    let geometry = compute_poly_mesh_geometry(mesh)?;
     let mut min_face_area = f64::INFINITY;
     let mut max_face_area = 0.0_f64;
     let mut total_boundary_area = 0.0_f64;
 
-    for (face_index, face) in face_geometry.iter().enumerate() {
-        let area = oriented_area_vectors[face_index].mag();
+    for (face_index, area_vector) in geometry.face_area_vectors.iter().enumerate() {
+        let area = Vec3::from(*area_vector).mag();
         min_face_area = min_face_area.min(area);
         max_face_area = max_face_area.max(area);
 
-        let owner = mesh.owner[face_index];
-        let owner_centre = cell_centres[owner];
-        cell_volumes[owner] +=
-            oriented_area_vectors[face_index].dot(face.centre - owner_centre) / 3.0;
-
-        if let Some(&neighbour) = mesh.neighbour.get(face_index) {
-            let neighbour_centre = cell_centres[neighbour];
-            cell_volumes[neighbour] +=
-                (-oriented_area_vectors[face_index]).dot(face.centre - neighbour_centre) / 3.0;
-        } else {
+        if mesh.neighbour.get(face_index).is_none() {
             total_boundary_area += area;
         }
     }
@@ -54,13 +50,9 @@ pub fn summarize_poly_mesh_geometry(case_dir: &Path, mesh: &PolyMesh) -> Result<
     let mut min_cell_volume = f64::INFINITY;
     let mut max_cell_volume = 0.0_f64;
     let mut total_cell_volume = 0.0_f64;
-    let mut non_positive_cell_volumes = 0;
+    let non_positive_cell_volumes = geometry.non_positive_cell_volumes;
 
-    for volume in cell_volumes {
-        if volume <= 0.0 {
-            non_positive_cell_volumes += 1;
-        }
-        let volume = volume.abs();
+    for volume in geometry.cell_volumes {
         min_cell_volume = min_cell_volume.min(volume);
         max_cell_volume = max_cell_volume.max(volume);
         total_cell_volume += volume;
@@ -83,6 +75,42 @@ pub fn summarize_poly_mesh_geometry(case_dir: &Path, mesh: &PolyMesh) -> Result<
         min_cell_volume,
         max_cell_volume,
         total_cell_volume,
+        non_positive_cell_volumes,
+    })
+}
+
+pub fn compute_poly_mesh_geometry(mesh: &PolyMesh) -> Result<PolyMeshGeometry> {
+    let face_geometry = compute_face_geometry(mesh)?;
+    let cell_centres = compute_cell_centres(mesh, &face_geometry);
+    let oriented_area_vectors = orient_face_area_vectors(mesh, &face_geometry, &cell_centres);
+
+    let mut cell_volumes = vec![0.0; mesh.cell_count()];
+    for (face_index, face) in face_geometry.iter().enumerate() {
+        let owner = mesh.owner[face_index];
+        let owner_centre = cell_centres[owner];
+        cell_volumes[owner] +=
+            oriented_area_vectors[face_index].dot(face.centre - owner_centre) / 3.0;
+
+        if let Some(&neighbour) = mesh.neighbour.get(face_index) {
+            let neighbour_centre = cell_centres[neighbour];
+            cell_volumes[neighbour] +=
+                (-oriented_area_vectors[face_index]).dot(face.centre - neighbour_centre) / 3.0;
+        }
+    }
+
+    let non_positive_cell_volumes = cell_volumes.iter().filter(|volume| **volume <= 0.0).count();
+
+    Ok(PolyMeshGeometry {
+        face_centres: face_geometry
+            .iter()
+            .map(|face| Point3::from(face.centre))
+            .collect(),
+        face_area_vectors: oriented_area_vectors
+            .into_iter()
+            .map(Point3::from)
+            .collect(),
+        cell_centres: cell_centres.into_iter().map(Point3::from).collect(),
+        cell_volumes: cell_volumes.into_iter().map(f64::abs).collect(),
         non_positive_cell_volumes,
     })
 }
@@ -223,6 +251,16 @@ impl Vec3 {
 
 impl From<Point3> for Vec3 {
     fn from(value: Point3) -> Self {
+        Self {
+            x: value.x,
+            y: value.y,
+            z: value.z,
+        }
+    }
+}
+
+impl From<Vec3> for Point3 {
+    fn from(value: Vec3) -> Self {
         Self {
             x: value.x,
             y: value.y,

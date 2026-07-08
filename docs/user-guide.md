@@ -549,6 +549,14 @@ count matches the mesh. Other nonuniform value types remain summary-only until
 their type-specific loader exists. This still does not solve equations or
 change field values.
 
+The preflight also prepares solver runtime data. It builds compact
+owner/neighbour connectivity, patch face ranges, cell centres, face centres,
+owner-oriented face-area vectors, positive cell volumes, and materialized CPU
+f64 buffers for fields that passed the solver-state checks. `--planJson` writes
+a `runtimeData` summary with array sizes and buffer sizes, but it intentionally
+does not dump the full geometry or field arrays into JSON. These runtime arrays
+are the handoff point for the future CPU/GPU equation kernels.
+
 It also checks basic `controlDict` consistency: recognized `startFrom`,
 `stopAt`, and `writeControl` modes, positive finite `deltaT`, valid
 `writeInterval`, and an `endTime` that is not earlier than `startTime` for

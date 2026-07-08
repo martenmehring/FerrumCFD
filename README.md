@@ -76,6 +76,9 @@ The importer currently targets the membrane reactor test mesh shape:
   field-storage capability; valid `uniform`, `List<scalar>`, and
   `List<vector>` initial fields can be materialized as CPU f64 buffers without
   solving equations
+- solver runtime preparation builds owner/neighbour connectivity, patch face
+  ranges, cell centres, face centres, owner-oriented face-area vectors, cell
+  volumes, and materialized CPU f64 field buffers for later CPU/GPU kernels
 - mesh geometry summaries compute face areas, boundary area, and cell volumes
 - special patch validation counts `empty`, `wedge`, and `symmetryPlane`
   patches and reports basic patch-range warnings

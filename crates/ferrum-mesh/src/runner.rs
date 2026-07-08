@@ -305,6 +305,7 @@ mod tests {
 
     use crate::backends::BackendChoice;
     use crate::control::ControlDict;
+    use crate::runtime::{SolverRuntimeData, SolverRuntimeMeshData};
     use crate::solver_plan::{
         SolverBackendPlan, SolverCasePlan, SolverCpuResourcePlan, SolverDimensionality,
         SolverFieldPlan, SolverGpuResourcePlan, SolverInterfacePlan, SolverMeshPlan,
@@ -416,6 +417,30 @@ mod tests {
             },
             fields: SolverFieldPlan { fields: Vec::new() },
             state: SolverStatePlan {
+                fields: Vec::new(),
+                warnings: Vec::new(),
+            },
+            runtime_data: SolverRuntimeData {
+                mesh: SolverRuntimeMeshData {
+                    points: 0,
+                    cells: 0,
+                    faces: 0,
+                    internal_faces: 0,
+                    boundary_faces: 0,
+                    owner: Vec::new(),
+                    neighbour: Vec::new(),
+                    patches: Vec::new(),
+                    face_centres: Vec::new(),
+                    face_area_vectors: Vec::new(),
+                    cell_centres: Vec::new(),
+                    cell_volumes: Vec::new(),
+                    min_face_area: 0.0,
+                    max_face_area: 0.0,
+                    min_cell_volume: 0.0,
+                    max_cell_volume: 0.0,
+                    total_cell_volume: 0.0,
+                    non_positive_cell_volumes: 0,
+                },
                 fields: Vec::new(),
                 warnings: Vec::new(),
             },

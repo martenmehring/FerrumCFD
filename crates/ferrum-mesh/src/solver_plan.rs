@@ -18,6 +18,7 @@ use crate::properties::{
     validate_properties,
 };
 use crate::regions::{build_interface_registry, read_region_mesh_summaries};
+use crate::runtime::{SolverRuntimeData, build_solver_runtime_data};
 use crate::solver_state::{SolverStatePlan, build_solver_state_plan};
 
 #[derive(Debug)]
@@ -27,6 +28,7 @@ pub struct SolverCasePlan {
     pub mesh: SolverMeshPlan,
     pub fields: SolverFieldPlan,
     pub state: SolverStatePlan,
+    pub runtime_data: SolverRuntimeData,
     pub properties: SolverPropertiesPlan,
     pub numerics: SolverNumericsPlan,
     pub interfaces: SolverInterfacePlan,
@@ -292,6 +294,13 @@ pub fn build_solver_case_plan(case_dir: &Path) -> Result<SolverCasePlan> {
             .iter()
             .map(|warning| format!("solver state: {warning}")),
     );
+    let runtime_data = build_solver_runtime_data(case_dir, &mesh, &state)?;
+    warnings.extend(
+        runtime_data
+            .warnings
+            .iter()
+            .map(|warning| format!("runtime data: {warning}")),
+    );
 
     let field_names = unique_field_names(&fields);
     let properties = build_properties_plan(case_dir, &mut warnings)?;
@@ -361,6 +370,7 @@ pub fn build_solver_case_plan(case_dir: &Path) -> Result<SolverCasePlan> {
                 .collect(),
         },
         state,
+        runtime_data,
         properties,
         numerics,
         interfaces,
