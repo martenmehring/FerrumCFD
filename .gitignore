@@ -1,0 +1,13 @@
+/target/
+
+# Local mesh input and generated OpenFOAM-like case output can be very large
+# and may contain private geometry.
+*.msh
+*.vtk
+*.vtu
+*.stl
+*.step
+*.stp
+/examples/*/constant/
+/examples/*/system/
+
