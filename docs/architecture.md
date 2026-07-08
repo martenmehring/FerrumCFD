@@ -368,9 +368,13 @@ experiments can run CG for momentum and Jacobi for pressure correction without
 changing the case files. OpenFOAM-style `relaxationFactors` in
 `system/fvSolution` are the default source for pressure and velocity
 under-relaxation, with CLI flags available as explicit experiment overrides.
-The operator and report boundaries are kept backend-neutral so the same
-assembly path can later dispatch linear and nonlinear solves to CPU, GPU, or
-mixed CPU/GPU resources.
+The pressure-correction bridge now follows the OpenFOAM shape more closely:
+it builds cell-wise `rAU = V/A(U)`, assembles a variable-coefficient pressure
+correction equation, and corrects `phi` with the pressure-equation flux instead
+of recomputing the surface flux only from corrected cell velocity. The operator
+and report boundaries are kept backend-neutral so the same assembly path can
+later dispatch linear and nonlinear solves to CPU, GPU, or mixed CPU/GPU
+resources.
 
 Important design constraint:
 

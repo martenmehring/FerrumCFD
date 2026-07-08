@@ -275,13 +275,11 @@ pub fn solve_laminar_simple(
             break;
         }
         let pressure_source = pressure_correction_source(&runtime.mesh, &net_flux_star)?;
-        let pressure_correction_diffusivity =
-            mean_pressure_correction_diffusivity(&runtime.mesh, &momentum.diagonal);
-        let pressure_system = assemble_scalar_component_system(
+        let r_au = reciprocal_momentum_diagonal(&runtime.mesh, &momentum.diagonal)?;
+        let pressure_system = assemble_variable_scalar_component_system(
             &runtime.mesh,
-            pressure_correction_diffusivity,
+            &r_au,
             &pressure_source,
-            None,
             &pressure_correction_boundary,
         )?;
         let pressure_report = match solve_scalar_system(
@@ -344,8 +342,13 @@ pub fn solve_laminar_simple(
             *value += options.pressure_relaxation * correction;
         }
 
-        let corrected_phi =
-            compute_face_flux(&runtime.mesh, &corrected_velocity, &velocity_boundary)?;
+        let pressure_flux = pressure_correction_flux(
+            &runtime.mesh,
+            &pressure_report.solution,
+            &r_au,
+            &pressure_correction_boundary,
+        )?;
+        let corrected_phi = add_face_fluxes(&phi_star, &pressure_flux)?;
         let corrected_continuity =
             summarize_continuity(&net_cell_flux(&runtime.mesh, &corrected_phi)?);
         let pressure_correction_accepted = corrected_continuity.l2_norm.is_finite()
@@ -669,6 +672,83 @@ fn assemble_scalar_component_system(
     Ok(ScalarComponentSystem { matrix, rhs })
 }
 
+fn assemble_variable_scalar_component_system(
+    mesh: &SolverRuntimeMeshData,
+    cell_diffusivity: &[f64],
+    volumetric_source: &[f64],
+    boundary: &[ScalarFaceTreatment],
+) -> Result<ScalarComponentSystem> {
+    if cell_diffusivity.len() != mesh.cells {
+        return Err(invalid_input(format!(
+            "variable scalar component diffusivity has {} values, expected {} mesh cells",
+            cell_diffusivity.len(),
+            mesh.cells
+        )));
+    }
+    validate_positive_cell_values("variable scalar component diffusivity", cell_diffusivity)?;
+    if volumetric_source.len() != mesh.cells {
+        return Err(invalid_input(format!(
+            "variable scalar component source has {} values, expected {} mesh cells",
+            volumetric_source.len(),
+            mesh.cells
+        )));
+    }
+    if boundary.len() != mesh.faces {
+        return Err(invalid_input(format!(
+            "variable scalar component boundary has {} values, expected {} mesh faces",
+            boundary.len(),
+            mesh.faces
+        )));
+    }
+
+    let mut rows = vec![BTreeMap::<usize, f64>::new(); mesh.cells];
+    let mut rhs = volumetric_source
+        .iter()
+        .zip(&mesh.cell_volumes)
+        .map(|(source, volume)| source * volume)
+        .collect::<Vec<_>>();
+    for (face_index, treatment) in boundary.iter().enumerate() {
+        let owner = mesh.owner[face_index];
+        if let Some(neighbour) = mesh.neighbour[face_index] {
+            let coefficient = variable_face_diffusion_coefficient(
+                mesh,
+                cell_diffusivity,
+                owner,
+                Some(neighbour),
+                face_index,
+            )?;
+            add_entry(&mut rows[owner], owner, coefficient);
+            add_entry(&mut rows[owner], neighbour, -coefficient);
+            add_entry(&mut rows[neighbour], neighbour, coefficient);
+            add_entry(&mut rows[neighbour], owner, -coefficient);
+            continue;
+        }
+
+        match *treatment {
+            ScalarFaceTreatment::FixedValue(value) => {
+                let coefficient = variable_face_diffusion_coefficient(
+                    mesh,
+                    cell_diffusivity,
+                    owner,
+                    None,
+                    face_index,
+                )?;
+                add_entry(&mut rows[owner], owner, coefficient);
+                rhs[owner] += coefficient * value;
+            }
+            ScalarFaceTreatment::ZeroGradient | ScalarFaceTreatment::Constraint => {}
+        }
+    }
+
+    let matrix_rows = rows
+        .into_iter()
+        .map(|row| row.into_iter().collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let matrix = CsrMatrix::from_rows(matrix_rows, mesh.cells)?;
+
+    Ok(ScalarComponentSystem { matrix, rhs })
+}
+
 fn compute_face_flux(
     mesh: &SolverRuntimeMeshData,
     velocity: &[Point3],
@@ -687,6 +767,78 @@ fn compute_face_flux(
         flux[face_index] = dot(face_velocity, mesh.face_area_vectors[face_index]);
     }
     Ok(flux)
+}
+
+fn pressure_correction_flux(
+    mesh: &SolverRuntimeMeshData,
+    pressure_correction: &[f64],
+    r_au: &[f64],
+    boundary: &[ScalarFaceTreatment],
+) -> Result<Vec<f64>> {
+    if pressure_correction.len() != mesh.cells {
+        return Err(invalid_input(format!(
+            "pressure correction flux expected {} cell values, got {}",
+            mesh.cells,
+            pressure_correction.len()
+        )));
+    }
+    if r_au.len() != mesh.cells {
+        return Err(invalid_input(format!(
+            "pressure correction rAU has {} values, expected {} mesh cells",
+            r_au.len(),
+            mesh.cells
+        )));
+    }
+    validate_positive_cell_values("pressure correction rAU", r_au)?;
+    if boundary.len() != mesh.faces {
+        return Err(invalid_input(format!(
+            "pressure correction boundary has {} values, expected {} mesh faces",
+            boundary.len(),
+            mesh.faces
+        )));
+    }
+
+    let mut flux = vec![0.0; mesh.faces];
+    for (face_index, treatment) in boundary.iter().enumerate() {
+        let owner = mesh.owner[face_index];
+        if let Some(neighbour) = mesh.neighbour[face_index] {
+            let coefficient = variable_face_diffusion_coefficient(
+                mesh,
+                r_au,
+                owner,
+                Some(neighbour),
+                face_index,
+            )?;
+            flux[face_index] =
+                coefficient * (pressure_correction[owner] - pressure_correction[neighbour]);
+            continue;
+        }
+
+        match *treatment {
+            ScalarFaceTreatment::FixedValue(value) => {
+                let coefficient =
+                    variable_face_diffusion_coefficient(mesh, r_au, owner, None, face_index)?;
+                flux[face_index] = coefficient * (pressure_correction[owner] - value);
+            }
+            ScalarFaceTreatment::ZeroGradient | ScalarFaceTreatment::Constraint => {}
+        }
+    }
+    Ok(flux)
+}
+
+fn add_face_fluxes(left: &[f64], right: &[f64]) -> Result<Vec<f64>> {
+    if left.len() != right.len() {
+        return Err(invalid_input(format!(
+            "face flux arrays have different lengths: {} and {}",
+            left.len(),
+            right.len()
+        )));
+    }
+    Ok(left
+        .iter()
+        .zip(right)
+        .map(|(left, right)| left + right)
+        .collect())
 }
 
 fn scalar_gradient(
@@ -784,16 +936,35 @@ fn pressure_correction_source(mesh: &SolverRuntimeMeshData, net_flux: &[f64]) ->
         .collect())
 }
 
-fn mean_pressure_correction_diffusivity(mesh: &SolverRuntimeMeshData, diagonal: &[f64]) -> f64 {
-    let mut sum = 0.0;
-    let mut count = 0;
-    for (volume, diagonal) in mesh.cell_volumes.iter().zip(diagonal) {
-        if diagonal.is_finite() && *diagonal > f64::EPSILON {
-            sum += volume / diagonal;
-            count += 1;
-        }
+fn reciprocal_momentum_diagonal(
+    mesh: &SolverRuntimeMeshData,
+    diagonal: &[f64],
+) -> Result<Vec<f64>> {
+    if diagonal.len() != mesh.cells {
+        return Err(invalid_input(format!(
+            "momentum diagonal has {} values, expected {} mesh cells",
+            diagonal.len(),
+            mesh.cells
+        )));
     }
-    if count == 0 { 1.0 } else { sum / count as f64 }
+    diagonal
+        .iter()
+        .zip(&mesh.cell_volumes)
+        .enumerate()
+        .map(|(cell, (diagonal, volume))| {
+            if !diagonal.is_finite() || *diagonal <= f64::EPSILON {
+                return Err(invalid_input(format!(
+                    "momentum diagonal for cell {cell} must be positive and finite, got {diagonal}"
+                )));
+            }
+            if !volume.is_finite() || *volume <= f64::EPSILON {
+                return Err(invalid_input(format!(
+                    "cell volume for cell {cell} must be positive and finite, got {volume}"
+                )));
+            }
+            Ok(volume / diagonal)
+        })
+        .collect()
 }
 
 fn correct_velocity(
@@ -1484,6 +1655,43 @@ fn face_diffusion_coefficient(
     Ok(diffusivity * area / distance)
 }
 
+fn variable_face_diffusion_coefficient(
+    mesh: &SolverRuntimeMeshData,
+    cell_diffusivity: &[f64],
+    owner: usize,
+    neighbour: Option<usize>,
+    face_index: usize,
+) -> Result<f64> {
+    let diffusivity = if let Some(neighbour) = neighbour {
+        0.5 * (cell_diffusivity[owner] + cell_diffusivity[neighbour])
+    } else {
+        cell_diffusivity[owner]
+    };
+    let to = if let Some(neighbour) = neighbour {
+        mesh.cell_centres[neighbour]
+    } else {
+        mesh.face_centres[face_index]
+    };
+    face_diffusion_coefficient(
+        diffusivity,
+        mesh.face_area_vectors[face_index],
+        mesh.cell_centres[owner],
+        to,
+        face_index,
+    )
+}
+
+fn validate_positive_cell_values(name: &str, values: &[f64]) -> Result<()> {
+    for (index, value) in values.iter().copied().enumerate() {
+        if !value.is_finite() || value <= f64::EPSILON {
+            return Err(invalid_input(format!(
+                "{name} value for cell {index} must be positive and finite, got {value}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn add_entry(row: &mut BTreeMap<usize, f64>, col: usize, value: f64) {
     *row.entry(col).or_insert(0.0) += value;
 }
@@ -1566,7 +1774,9 @@ mod tests {
     use crate::solver_state::SolverStateFieldKind;
 
     use super::{
-        LaminarSimpleLinearSolver, LaminarSimpleOptions, compute_face_flux, solve_laminar_simple,
+        LaminarSimpleLinearSolver, LaminarSimpleOptions, ScalarFaceTreatment,
+        assemble_variable_scalar_component_system, compute_face_flux, net_cell_flux,
+        pressure_correction_flux, reciprocal_momentum_diagonal, solve_laminar_simple,
         vector_face_treatments,
     };
     use crate::Point3;
@@ -1600,6 +1810,44 @@ mod tests {
         assert_close(flux[0], 2.0);
         assert_close(flux[1], -1.0);
         assert_close(flux[2], 3.0);
+    }
+
+    #[test]
+    fn builds_cell_reciprocal_momentum_diagonal() {
+        let runtime = two_cell_runtime();
+
+        let r_au =
+            reciprocal_momentum_diagonal(&runtime.mesh, &[2.0, 4.0]).expect("cell rAU values");
+
+        assert_eq!(r_au.len(), 2);
+        assert_close(r_au[0], 0.25);
+        assert_close(r_au[1], 0.125);
+    }
+
+    #[test]
+    fn pressure_correction_flux_matches_variable_laplacian_balance() {
+        let runtime = two_cell_runtime();
+        let boundary = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
+        let r_au = vec![1.0, 2.0];
+        let pressure_correction = vec![2.0, 0.0];
+        let source = vec![0.0, 0.0];
+        let system =
+            assemble_variable_scalar_component_system(&runtime.mesh, &r_au, &source, &boundary)
+                .expect("variable pressure system");
+
+        let matrix_balance = system
+            .matrix
+            .matvec(&pressure_correction)
+            .expect("matrix balance");
+        let face_flux =
+            pressure_correction_flux(&runtime.mesh, &pressure_correction, &r_au, &boundary)
+                .expect("pressure correction flux");
+        let flux_balance = net_cell_flux(&runtime.mesh, &face_flux).expect("flux balance");
+
+        assert_eq!(matrix_balance.len(), flux_balance.len());
+        for (matrix_value, flux_value) in matrix_balance.iter().zip(&flux_balance) {
+            assert_close(*matrix_value, *flux_value);
+        }
     }
 
     #[test]

@@ -666,6 +666,9 @@ overrides for experiments.
 The current default for this path is one damped Jacobi CPU SIMPLE step. The
 report records residuals, SIMPLE iterations, wall-clock time, finite-volume
 operator summaries, boundary counts, Hagen-Poiseuille error, and continuity.
+The pressure-correction bridge uses cell-wise `rAU = V/A(U)` and corrects
+`phi` from the pressure-equation flux, matching the broad OpenFOAM SIMPLE
+structure more closely than a plain recompute from corrected cell velocity.
 Multi-step SIMPLE runs now have a continuity-growth guard: when a step grows
 the continuity norm too aggressively, Ferrum rolls back to the previous finite
 state and stops the trial. This prevents runaway reports, but multiple
