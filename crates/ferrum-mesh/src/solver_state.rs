@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::mem::size_of;
 use std::path::{Path, PathBuf};
 
 use crate::fields::{FieldFile, FieldValueSummary, InitialFieldSet};
@@ -31,12 +32,16 @@ pub struct SolverStateInternalFieldPlan {
     pub value_count: Option<usize>,
     pub expected_count: Option<usize>,
     pub valid_count: Option<bool>,
+    pub uniform_components: Option<Vec<f64>>,
 }
 
 #[derive(Clone, Debug)]
 pub struct SolverStateStoragePlan {
     pub cpu_capable: bool,
     pub gpu_capable: bool,
+    pub components: Option<usize>,
+    pub scalar_slots: Option<usize>,
+    pub bytes_f64: Option<usize>,
     pub status: SolverStateStorageStatus,
 }
 
@@ -122,7 +127,7 @@ fn build_state_field(
 
     validate_dimensions(field, &label, warnings);
     let internal_field = build_internal_field_plan(field, kind, expected_count, &label, warnings);
-    let storage = build_storage_plan(kind, &label, warnings);
+    let storage = build_storage_plan(kind, expected_count, &label, warnings);
 
     SolverStateFieldPlan {
         region: field.region.clone(),
@@ -200,12 +205,31 @@ fn build_internal_field_plan(
     warnings: &mut Vec<String>,
 ) -> SolverStateInternalFieldPlan {
     match &field.internal_field {
-        Some(FieldValueSummary::Uniform(_)) => SolverStateInternalFieldPlan {
-            kind: SolverStateValueKind::Uniform,
-            value_count: expected_count,
-            expected_count,
-            valid_count: expected_count.map(|_| true),
-        },
+        Some(FieldValueSummary::Uniform(value)) => {
+            let uniform_components = parse_uniform_components(value);
+            match (&uniform_components, components_per_value(kind)) {
+                (Some(values), Some(expected_components))
+                    if values.len() != expected_components =>
+                {
+                    warnings.push(format!(
+                        "field '{label}' uniform internalField has {} components, expected {expected_components} for {kind}",
+                        values.len()
+                    ));
+                }
+                (None, Some(_)) => warnings.push(format!(
+                    "field '{label}' uniform internalField value could not be parsed as numeric components"
+                )),
+                _ => {}
+            }
+
+            SolverStateInternalFieldPlan {
+                kind: SolverStateValueKind::Uniform,
+                value_count: expected_count,
+                expected_count,
+                valid_count: expected_count.map(|_| true),
+                uniform_components,
+            }
+        }
         Some(FieldValueSummary::NonUniform { count, .. }) => {
             let valid_count = count.zip(expected_count).map(|(count, expected)| {
                 if count != expected {
@@ -228,6 +252,7 @@ fn build_internal_field_plan(
                 value_count: *count,
                 expected_count,
                 valid_count,
+                uniform_components: None,
             }
         }
         Some(FieldValueSummary::Other(_)) => SolverStateInternalFieldPlan {
@@ -235,6 +260,7 @@ fn build_internal_field_plan(
             value_count: None,
             expected_count,
             valid_count: None,
+            uniform_components: None,
         },
         None => {
             warnings.push(format!("field '{label}' has no internalField entry"));
@@ -243,6 +269,7 @@ fn build_internal_field_plan(
                 value_count: None,
                 expected_count,
                 valid_count: Some(false),
+                uniform_components: None,
             }
         }
     }
@@ -261,17 +288,34 @@ fn expected_internal_count(kind: SolverStateFieldKind, mesh: Option<&PolyMesh>) 
 
 fn build_storage_plan(
     kind: SolverStateFieldKind,
+    expected_count: Option<usize>,
     label: &str,
     warnings: &mut Vec<String>,
 ) -> SolverStateStoragePlan {
     match kind {
         SolverStateFieldKind::VolScalar
         | SolverStateFieldKind::VolVector
-        | SolverStateFieldKind::SurfaceScalar => SolverStateStoragePlan {
-            cpu_capable: true,
-            gpu_capable: true,
-            status: SolverStateStorageStatus::Loaded,
-        },
+        | SolverStateFieldKind::SurfaceScalar => {
+            let components = components_per_value(kind);
+            let scalar_slots = components
+                .zip(expected_count)
+                .and_then(|(components, count)| count.checked_mul(components));
+            let bytes_f64 = scalar_slots.and_then(|slots| slots.checked_mul(size_of::<f64>()));
+            if expected_count.is_some() && scalar_slots.is_none() {
+                warnings.push(format!(
+                    "field '{label}' storage size overflowed while estimating scalar slots"
+                ));
+            }
+
+            SolverStateStoragePlan {
+                cpu_capable: true,
+                gpu_capable: true,
+                components,
+                scalar_slots,
+                bytes_f64,
+                status: SolverStateStorageStatus::Loaded,
+            }
+        }
         SolverStateFieldKind::Other => {
             warnings.push(format!(
                 "field '{label}' has unsupported class for solver-state storage"
@@ -279,9 +323,33 @@ fn build_storage_plan(
             SolverStateStoragePlan {
                 cpu_capable: false,
                 gpu_capable: false,
+                components: None,
+                scalar_slots: None,
+                bytes_f64: None,
                 status: SolverStateStorageStatus::UnsupportedClass,
             }
         }
+    }
+}
+
+fn components_per_value(kind: SolverStateFieldKind) -> Option<usize> {
+    match kind {
+        SolverStateFieldKind::VolScalar | SolverStateFieldKind::SurfaceScalar => Some(1),
+        SolverStateFieldKind::VolVector => Some(3),
+        SolverStateFieldKind::Other => None,
+    }
+}
+
+fn parse_uniform_components(value: &str) -> Option<Vec<f64>> {
+    let cleaned = value.replace(['(', ')'], " ");
+    let mut values = Vec::new();
+    for token in cleaned.split_whitespace() {
+        values.push(token.parse::<f64>().ok()?);
+    }
+    if values.is_empty() {
+        None
+    } else {
+        Some(values)
     }
 }
 
@@ -338,10 +406,61 @@ mod tests {
         assert_eq!(state.internal_field.kind, SolverStateValueKind::Uniform);
         assert_eq!(state.internal_field.value_count, Some(4));
         assert_eq!(state.internal_field.valid_count, Some(true));
+        assert_eq!(state.internal_field.uniform_components, Some(vec![0.0]));
         assert!(state.storage.cpu_capable);
         assert!(state.storage.gpu_capable);
+        assert_eq!(state.storage.components, Some(1));
+        assert_eq!(state.storage.scalar_slots, Some(4));
+        assert_eq!(state.storage.bytes_f64, Some(32));
         assert_eq!(state.storage.status, SolverStateStorageStatus::Loaded);
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn estimates_vector_storage_slots_from_mesh_cells() {
+        let field = field(
+            "U",
+            "volVectorField",
+            Some(FieldValueSummary::Uniform("( 1 2 3 )".to_string())),
+        );
+        let mesh = mesh(4);
+        let mut warnings = Vec::new();
+
+        let state = build_state_field(&field, Some(&mesh), &mut warnings);
+
+        assert_eq!(state.kind, SolverStateFieldKind::VolVector);
+        assert_eq!(
+            state.internal_field.uniform_components,
+            Some(vec![1.0, 2.0, 3.0])
+        );
+        assert_eq!(state.storage.components, Some(3));
+        assert_eq!(state.storage.scalar_slots, Some(12));
+        assert_eq!(state.storage.bytes_f64, Some(96));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn warns_for_wrong_uniform_component_count() {
+        let field = field(
+            "U",
+            "volVectorField",
+            Some(FieldValueSummary::Uniform("( 1 2 )".to_string())),
+        );
+        let mesh = mesh(4);
+        let mut warnings = Vec::new();
+
+        let state = build_state_field(&field, Some(&mesh), &mut warnings);
+
+        assert_eq!(state.storage.components, Some(3));
+        assert_eq!(
+            state.internal_field.uniform_components,
+            Some(vec![1.0, 2.0])
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("expected 3"))
+        );
     }
 
     #[test]

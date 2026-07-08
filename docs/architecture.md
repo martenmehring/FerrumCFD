@@ -246,9 +246,10 @@ Solver state is the boundary between OpenFOAM-like field files and future
 equation kernels. The preflight should convert initial fields below `0/` into
 typed storage plans for `volScalarField`, `volVectorField`, and eventually
 surface fields used by fluxes. Volume fields must match mesh cell counts when
-nonuniform data is supplied; surface fields must match face counts. This state
-layer reports CPU/GPU storage capability but does not imply that solver kernels
-exist or have run.
+nonuniform data is supplied; surface fields must match face counts. The state
+layer should estimate component counts, f64 slot counts, and byte footprints so
+CPU/GPU buffers can later be allocated reproducibly. It reports CPU/GPU storage
+capability but does not imply that solver kernels exist or have run.
 
 `--runnerDryRun` is the first runner boundary. It expands the run plan into a
 capped sequence of time-step starts, stage dispatch decisions, and planned

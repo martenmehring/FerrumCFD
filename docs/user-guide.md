@@ -438,9 +438,11 @@ It also builds a solver-state preview from initial fields below `0/`.
 `volScalarField`, `volVectorField`, and `surfaceScalarField` are recognized as
 field-storage candidates. Volume fields are checked against mesh cell counts;
 surface fields are checked against mesh face counts. The report shows the
-field region, class, internal value count, expected count, boundary patch
-counts, and whether the field storage is CPU/GPU-capable. This still does not
-solve equations or change field values.
+field region, class, internal value count, expected count, components, f64 slot
+count, byte estimate, boundary patch counts, and whether the field storage is
+CPU/GPU-capable. Uniform scalar/vector values are parsed into numeric
+components when possible. This still does not solve equations or change field
+values.
 
 It also checks basic `controlDict` consistency: recognized `startFrom`,
 `stopAt`, and `writeControl` modes, positive finite `deltaT`, valid

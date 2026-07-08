@@ -69,7 +69,8 @@ The importer currently targets the membrane reactor test mesh shape:
   special patch types
 - solver-state preflight recognizes `volScalarField`, `volVectorField`, and
   `surfaceScalarField`, checks internal field counts against mesh cells/faces,
-  and reports CPU/GPU field-storage capability without solving equations
+  estimates components, f64 slots, byte counts, and reports CPU/GPU
+  field-storage capability without solving equations
 - mesh geometry summaries compute face areas, boundary area, and cell volumes
 - special patch validation counts `empty`, `wedge`, and `symmetryPlane`
   patches and reports basic patch-range warnings

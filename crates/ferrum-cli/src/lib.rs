@@ -460,11 +460,17 @@ fn print_solver_state_plan(plan: &SolverStatePlan) {
         .iter()
         .filter(|field| field.storage.gpu_capable)
         .count();
+    let bytes_f64 = plan
+        .fields
+        .iter()
+        .filter_map(|field| field.storage.bytes_f64)
+        .sum::<usize>();
     println!(
-        "solver state: fields={} cpuCapable={} gpuCapable={}",
+        "solver state: fields={} cpuCapable={} gpuCapable={} bytesF64={}",
         plan.fields.len(),
         cpu_capable,
-        gpu_capable
+        gpu_capable,
+        bytes_f64
     );
     for field in &plan.fields {
         let name = if let Some(region) = &field.region {
@@ -473,7 +479,7 @@ fn print_solver_state_plan(plan: &SolverStatePlan) {
             field.name.clone()
         };
         println!(
-            "  {}: class={} kind={} meshCells={} internal={} values={} expected={} valid={} boundaryPatches={}/{} cpu={} gpu={} storage={}",
+            "  {}: class={} kind={} meshCells={} internal={} values={} expected={} valid={} components={} scalarSlots={} bytesF64={} uniform={} boundaryPatches={}/{} cpu={} gpu={} storage={}",
             name,
             field.class_name.as_deref().unwrap_or("unknown"),
             field.kind,
@@ -482,6 +488,10 @@ fn print_solver_state_plan(plan: &SolverStatePlan) {
             format_optional_usize(field.internal_field.value_count),
             format_optional_usize(field.internal_field.expected_count),
             format_optional_bool(field.internal_field.valid_count),
+            format_optional_usize(field.storage.components),
+            format_optional_usize(field.storage.scalar_slots),
+            format_optional_usize(field.storage.bytes_f64),
+            format_optional_f64_list(field.internal_field.uniform_components.as_deref()),
             field.boundary_patches,
             format_optional_usize(field.mesh_boundary_patches),
             yes_no(field.storage.cpu_capable),
@@ -641,11 +651,17 @@ fn print_solver_runner_state(plan: &SolverStatePlan) {
         .iter()
         .filter(|field| field.storage.gpu_capable)
         .count();
+    let bytes_f64 = plan
+        .fields
+        .iter()
+        .filter_map(|field| field.storage.bytes_f64)
+        .sum::<usize>();
     println!(
-        "runner state: fields={} cpuCapable={} gpuCapable={}",
+        "runner state: fields={} cpuCapable={} gpuCapable={} bytesF64={}",
         plan.fields.len(),
         cpu_capable,
-        gpu_capable
+        gpu_capable,
+        bytes_f64
     );
     for field in &plan.fields {
         let name = if let Some(region) = &field.region {
@@ -654,12 +670,16 @@ fn print_solver_runner_state(plan: &SolverStatePlan) {
             field.name.clone()
         };
         println!(
-            "  field {}: kind={} internal={} values={} expected={} cpu={} gpu={} storage={}",
+            "  field {}: kind={} internal={} values={} expected={} components={} scalarSlots={} bytesF64={} uniform={} cpu={} gpu={} storage={}",
             name,
             field.kind,
             field.internal_field.kind,
             format_optional_usize(field.internal_field.value_count),
             format_optional_usize(field.internal_field.expected_count),
+            format_optional_usize(field.storage.components),
+            format_optional_usize(field.storage.scalar_slots),
+            format_optional_usize(field.storage.bytes_f64),
+            format_optional_f64_list(field.internal_field.uniform_components.as_deref()),
             yes_no(field.storage.cpu_capable),
             yes_no(field.storage.gpu_capable),
             field.storage.status
@@ -858,6 +878,9 @@ fn write_json_solver_state(writer: &mut impl Write, plan: &SolverStatePlan) -> s
         writeln!(writer, ",")?;
         write_json_key(writer, 10, "validCount")?;
         write_json_optional_bool(writer, field.internal_field.valid_count)?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 10, "uniformComponents")?;
+        write_json_optional_f64_array(writer, field.internal_field.uniform_components.as_deref())?;
         writeln!(writer)?;
         write_indent(writer, 8)?;
         writeln!(writer, "}},")?;
@@ -871,6 +894,15 @@ fn write_json_solver_state(writer: &mut impl Write, plan: &SolverStatePlan) -> s
         write_json_bool_field(writer, 10, "cpuCapable", field.storage.cpu_capable)?;
         writeln!(writer, ",")?;
         write_json_bool_field(writer, 10, "gpuCapable", field.storage.gpu_capable)?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 10, "components")?;
+        write_json_optional_usize(writer, field.storage.components)?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 10, "scalarSlots")?;
+        write_json_optional_usize(writer, field.storage.scalar_slots)?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 10, "bytesF64")?;
+        write_json_optional_usize(writer, field.storage.bytes_f64)?;
         writeln!(writer, ",")?;
         write_json_key(writer, 10, "status")?;
         write_json_string(writer, &field.storage.status.to_string())?;
@@ -1234,6 +1266,27 @@ fn write_json_optional_bool(writer: &mut impl Write, value: Option<bool>) -> std
     }
 }
 
+fn write_json_optional_f64_array(
+    writer: &mut impl Write,
+    values: Option<&[f64]>,
+) -> std::io::Result<()> {
+    let Some(values) = values else {
+        return write!(writer, "null");
+    };
+    write!(writer, "[")?;
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            write!(writer, ", ")?;
+        }
+        if value.is_finite() {
+            write!(writer, "{value}")?;
+        } else {
+            write_json_string(writer, &value.to_string())?;
+        }
+    }
+    write!(writer, "]")
+}
+
 fn write_json_optional_string(writer: &mut impl Write, value: Option<&str>) -> std::io::Result<()> {
     match value {
         Some(value) => write_json_string(writer, value),
@@ -1419,6 +1472,23 @@ fn format_optional_bool(value: Option<bool>) -> &'static str {
         Some(false) => "no",
         None => "missing",
     }
+}
+
+fn format_optional_f64_list(values: Option<&[f64]>) -> String {
+    let Some(values) = values else {
+        return "missing".to_string();
+    };
+    if values.is_empty() {
+        return "empty".to_string();
+    }
+    format!(
+        "({})",
+        values
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
 }
 
 fn yes_no(value: bool) -> &'static str {
