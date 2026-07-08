@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use ferrum_mesh::check::read_case_summary;
 use ferrum_mesh::foam::{FoamWriteOptions, write_openfoam_case_with_options};
 use ferrum_mesh::gmsh::read_msh22_ascii;
+use ferrum_mesh::regions::split_regions_by_cell_zones;
 
 pub fn run_ferrum() -> i32 {
     let args = env::args().skip(1).collect::<Vec<_>>();
@@ -189,7 +190,27 @@ fn split_mesh_regions(args: Vec<String>) -> Result<(), String> {
     for zone in &summary.cell_zones {
         println!("  {zone}");
     }
-    println!("full per-region polyMesh writing is the next importer milestone");
+
+    let split = split_regions_by_cell_zones(&case_dir).map_err(|error| error.to_string())?;
+    println!("wrote region meshes:");
+    for region in &split.regions {
+        println!(
+            "  {}: points={}, cells={}, faces={}, internal={}, boundary={}, path={}",
+            region.name,
+            region.points,
+            region.cells,
+            region.faces,
+            region.internal_faces,
+            region.boundary_faces,
+            region.path.display()
+        );
+        for patch in &region.patches {
+            println!(
+                "    patch {} type={} faces={} startFace={}",
+                patch.name, patch.patch_type, patch.faces, patch.start_face
+            );
+        }
+    }
     Ok(())
 }
 

@@ -4,7 +4,8 @@ FerrumCFD is an early Rust CFD platform prototype. The first milestone is
 `ferrum-mesh`: import existing Gmsh meshes into an OpenFOAM-like case layout
 without forcing users to change their usual workflow.
 
-Longer-term design notes are tracked in [docs/architecture.md](docs/architecture.md).
+Start with the [User Guide](docs/user-guide.md). Longer-term design notes are
+tracked in [docs/architecture.md](docs/architecture.md).
 
 ## First Commands
 
@@ -58,8 +59,8 @@ The importer currently targets the membrane reactor test mesh shape:
 - patch types can be written as OpenFOAM-compatible `patch`, `empty`, `wedge`,
   `symmetryPlane`, or custom patch types
 
-`splitFerrumMeshRegions` currently lists detected cell zones. Full region
-mesh splitting is the next milestone.
+`splitFerrumMeshRegions` can write one region mesh per imported cell zone under
+`constant/<region>/polyMesh`.
 
 ## Local Test Mesh
 

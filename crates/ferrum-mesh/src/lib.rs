@@ -1,6 +1,7 @@
 pub mod check;
 pub mod foam;
 pub mod gmsh;
+pub mod regions;
 
 use std::collections::HashMap;
 
