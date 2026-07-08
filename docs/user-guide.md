@@ -386,6 +386,28 @@ splitFerrumMeshRegions
 ferrumSolver
 ```
 
+## Units Policy
+
+FerrumCFD-facing case data is SI-first. Unqualified numeric values are treated
+as SI values by default:
+
+- length: `m`
+- pressure: `Pa`
+- temperature: `K`
+- velocity: `m/s`
+- density: `kg/m3`
+- dynamic viscosity: `Pa s`
+- kinematic viscosity: `m2/s`
+
+If a future parser accepts unit suffixes, non-SI values must be explicit, such
+as `1 km` or `25 degC`. A bare `1` for a length-like quantity means `1 m`, not
+`1 mm`, `1 cm`, or a solver-specific display unit.
+
+OpenFOAM comparison cases are allowed to use OpenFOAM's native conventions when
+needed. For example, incompressible OpenFOAM solvers commonly store `p` as
+kinematic pressure in `m2/s2`. FerrumCFD benchmark scripts must convert those
+results back to SI pressure in `Pa` before comparison.
+
 ## Solver Preflight
 
 `ferrumSolver` is the solver front door. At this stage it does not execute CFD

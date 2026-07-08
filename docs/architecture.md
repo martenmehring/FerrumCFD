@@ -199,6 +199,20 @@ misspelled stages or duplicate entries. Unknown sections remain allowed as
 forward-compatible custom policy, but the preflight should report that current
 built-in solvers do not consume them yet.
 
+## Units Contract
+
+FerrumCFD's user-facing model and solver data should be SI-first. Bare numeric
+values represent SI units for their dimension: metres, kilograms, seconds,
+kelvin, pascal, and derived SI units. Non-SI values should require explicit
+unit syntax once unit suffix parsing exists. This keeps solver kernels and
+benchmark comparisons dimensionally predictable and avoids hidden display-unit
+conventions.
+
+Compatibility layers may adapt external tools. OpenFOAM incompressible
+benchmarks, for example, can use kinematic pressure internally because that is
+what `simpleFoam` expects, but comparison scripts must convert back to SI
+pressure before writing FerrumCFD benchmark JSON.
+
 ## Solver Preflight Boundary
 
 `ferrumSolver` currently builds a solver-neutral case plan instead of executing

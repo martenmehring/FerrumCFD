@@ -54,6 +54,8 @@ gmshToFerrumFoam path\to\mesh.msh -case cases\mesh -patchType symmetry=symmetryP
 The importer currently targets the membrane reactor test mesh shape:
 
 - Gmsh 2.2 ASCII `.msh`
+- SI-first case values: unqualified lengths, pressures, temperatures, and
+  velocities are interpreted as m, Pa, K, and m/s in FerrumCFD-facing data
 - `quad4` physical surfaces as boundary patches
 - `hex8` physical volumes as cell zones
 - OpenFOAM-like `constant/polyMesh` output: `points`, `faces`, `owner`,
@@ -96,6 +98,9 @@ The importer currently targets the membrane reactor test mesh shape:
   steps and logs planned field state, CPU/GPU stage dispatch, runtime handles,
   and missing executable backend status without updating fields or solving
   equations
+- `examples/laminar_pipe` provides a small SI-first benchmark case with
+  analytical Hagen-Poiseuille data and OpenFOAM comparison scripts that record
+  wall-clock runtime
 
 `splitFerrumMeshRegions` can write one region mesh per imported cell zone under
 `constant/<region>/polyMesh`.

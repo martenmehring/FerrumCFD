@@ -32,6 +32,24 @@ flowReference
     minorLosses off;
 }
 
+openFoamReference
+{
+    application simpleFoam;
+    pressureConvention kinematic;
+    pressureConversion "p_Pa = rho * p_OpenFOAM";
+    expectedDeltaPKinematic [0 2 -2 0 0 0 0] 0.0016060909637347224;
+    generatedCase "target/openfoam/laminar_pipe";
+    resultJson "target/benchmarks/laminar_pipe_openfoam.json";
+}
+
+timingReference
+{
+    recordWallClock yes;
+    recordOpenFoamExecutionTime yes;
+    recordFerrumPreflightWallClock yes;
+    resultJson "target/benchmarks/laminar_pipe_compare.json";
+}
+
 heatReference
 {
     enabled yes;

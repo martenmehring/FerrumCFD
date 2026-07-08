@@ -8,7 +8,8 @@ Git because they can be large and may contain private geometry.
 Versioned examples:
 
 - `laminar_pipe`: tiny preflight benchmark for laminar water flow, constant wall
-  temperature, and Hagen-Poiseuille pressure-loss references.
+  temperature, Hagen-Poiseuille pressure-loss references, and OpenFOAM
+  comparison scripts that record runtime.
 
 Useful local test commands:
 
