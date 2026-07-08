@@ -194,6 +194,11 @@ The interface dictionary expresses intent, for example `orientation
 fluid_to_solid`, and FerrumCFD maps that intent onto owner/neighbour and
 faceZone orientation data.
 
+That orientation is only a sign convention. It must not clamp or force the
+later physical flux direction. If a pressure jump reverses, a pressure-driven
+interface model should produce a negative flux with respect to the configured
+positive direction.
+
 ## Reference Points
 
 - [OpenFOAM User Guide](https://www.openfoam.com/documentation/user-guide):

@@ -7,6 +7,7 @@ use case::{InitCaseOptions, init_case};
 use ferrum_mesh::check::read_case_summary;
 use ferrum_mesh::foam::{FoamWriteOptions, write_openfoam_case_with_options};
 use ferrum_mesh::gmsh::read_msh22_ascii;
+use ferrum_mesh::interfaces::{read_interface_config, validate_interface_config};
 use ferrum_mesh::regions::{
     InterfaceRegistrySummary, InterfaceSummary, build_interface_registry,
     read_region_mesh_summaries, split_regions_by_cell_zones,
@@ -190,6 +191,7 @@ fn check_mesh(args: Vec<String>) -> Result<(), String> {
 
     let interfaces = build_interface_registry(&case_dir).map_err(|error| error.to_string())?;
     print_interface_registry(&interfaces);
+    print_interface_config(&case_dir, &interfaces)?;
 
     let unmatched = summary.unmatched_boundary_faces.unwrap_or(0);
     let duplicate = summary.duplicate_boundary_faces.unwrap_or(0);
@@ -314,6 +316,39 @@ fn print_interface(interface: &InterfaceSummary) {
         interface.zone_b_to_a_faces,
         interface.flipped_faces
     );
+}
+
+fn print_interface_config(
+    case_dir: &Path,
+    registry: &InterfaceRegistrySummary,
+) -> Result<(), String> {
+    let Some(config) = read_interface_config(case_dir).map_err(|error| error.to_string())? else {
+        println!("interface config: none (no constant/interfaces)");
+        return Ok(());
+    };
+
+    let validation = validate_interface_config(&config, registry);
+    if validation.entries.is_empty() {
+        println!("interface config: no configured entries");
+    } else {
+        println!("interface config:");
+        for entry in &validation.entries {
+            println!(
+                "  {}: faceZone={} sign={}->{} model={} meshFaces={}",
+                entry.name,
+                entry.face_zone,
+                entry.positive_from,
+                entry.positive_to,
+                entry.model,
+                display_count(entry.mesh_faces)
+            );
+        }
+    }
+    for warning in &validation.warnings {
+        println!("interface config warning: {warning}");
+    }
+
+    Ok(())
 }
 
 fn print_region_patch(patch: &ferrum_mesh::regions::RegionPatchSummary) {

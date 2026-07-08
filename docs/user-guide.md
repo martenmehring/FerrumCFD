@@ -309,6 +309,19 @@ pressure jump, heat flux, species flux, or membrane permeation. FerrumCFD then
 maps that model direction onto mesh `owner`/`neighbour` and `flipMap`
 orientation metadata.
 
+This does not force the physical flow direction. If pressure, temperature, or
+concentration differences reverse during a solve, the model should return a
+negative value relative to this sign convention. The case dictionary only
+defines what "positive" means.
+
+`checkFerrumMesh` reads `constant/interfaces` when the file exists and checks
+configured entries against the imported faceZones and region pairs:
+
+```text
+interface config:
+  reactor_wall: faceZone=wall_interface sign=fluid->solid model=heatTransfer meshFaces=240
+```
+
 ## Backend Selection Direction
 
 Backend selection is a design target, not a finished feature yet. The long-term

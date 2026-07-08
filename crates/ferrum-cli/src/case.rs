@@ -214,6 +214,10 @@ fn write_interfaces(writer: &mut BufWriter<File>) -> Result<(), std::io::Error> 
     writeln!(writer, "    // {{")?;
     writeln!(writer, "    //     regions (region_a region_b);")?;
     writeln!(writer, "    //     faceZone interface_name;")?;
+    writeln!(
+        writer,
+        "    //     // Sign convention only: reversed physics gives a negative flux."
+    )?;
     writeln!(writer, "    //     orientation region_a_to_region_b;")?;
     writeln!(writer, "    //     model none;")?;
     writeln!(writer, "    // }}")?;
