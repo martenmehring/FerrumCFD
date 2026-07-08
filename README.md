@@ -106,8 +106,9 @@ The importer currently targets the membrane reactor test mesh shape:
   path. It reads `U`, `p`, `transportProperties`, `fvSchemes`, and
   `fvSolution`, builds finite-volume `phi`, `grad(p)`, `div(phi,U)`, and
   `laplacian(nu,U)` operators on the runtime `constant/polyMesh` geometry,
-  writes JSON/Markdown reports, and currently defaults to one damped Jacobi
-  CPU predictor/correction step for the pipe benchmark
+  writes JSON/Markdown reports, supports separate momentum and pressure
+  correction linear-solver choices, and currently defaults to one damped
+  Jacobi CPU predictor/correction step for the pipe benchmark
 - mesh geometry summaries compute face areas, boundary area, and cell volumes
 - special patch validation counts `empty`, `wedge`, and `symmetryPlane`
   patches and reports basic patch-range warnings

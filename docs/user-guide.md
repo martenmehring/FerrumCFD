@@ -651,11 +651,21 @@ Current practical command:
 ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --solveTolerance 1e-6 --maxIterations 100 --solveReportJson target\benchmarks\laminar_pipe_laminar_simple.json --solveReportMarkdown target\benchmarks\laminar_pipe_laminar_simple.md
 ```
 
+The generic `--linearSolver` value is still accepted, but the laminar SIMPLE
+path can also split the linear solver choice by equation:
+
+```powershell
+ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --momentumLinearSolver cg --pressureLinearSolver jacobi --velocityRelaxation 0.1 --pressureRelaxation 0.02 --maxSimpleIterations 20
+```
+
 The current default for this path is one damped Jacobi CPU SIMPLE step. The
 report records residuals, SIMPLE iterations, wall-clock time, finite-volume
 operator summaries, boundary counts, Hagen-Poiseuille error, and continuity.
-Multiple SIMPLE correction steps and the CG/PCG momentum path are intentionally
-still treated as solver-development work.
+Multi-step SIMPLE runs now have a continuity-growth guard: when a step grows
+the continuity norm too aggressively, Ferrum rolls back to the previous finite
+state and stops the trial. This prevents runaway reports, but multiple
+correction steps and robust PCG-grade pressure correction are still
+solver-development work.
 
 For the standard pipe benchmark, the automated comparison command is:
 

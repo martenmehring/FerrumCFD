@@ -15,9 +15,13 @@ param(
     [switch]$UseExistingOpenFoamJson,
     [ValidateSet("jacobi", "cg")]
     [string]$FerrumLinearSolver = "jacobi",
+    [string]$FerrumMomentumLinearSolver = "",
+    [string]$FerrumPressureLinearSolver = "",
     [double]$FerrumSolveTolerance = 1e-6,
     [int]$FerrumMaxIterations = 100,
-    [int]$FerrumMaxSimpleIterations = 1
+    [int]$FerrumMaxSimpleIterations = 1,
+    [double]$FerrumVelocityRelaxation = 0.7,
+    [double]$FerrumPressureRelaxation = 0.3
 )
 
 $ErrorActionPreference = "Stop"
@@ -59,6 +63,19 @@ if ($FerrumMaxIterations -le 0) {
 if ($FerrumMaxSimpleIterations -le 0) {
     throw "FerrumMaxSimpleIterations must be positive"
 }
+if ($FerrumVelocityRelaxation -le 0.0 -or $FerrumVelocityRelaxation -gt 1.0) {
+    throw "FerrumVelocityRelaxation must be in (0, 1]"
+}
+if ($FerrumPressureRelaxation -le 0.0 -or $FerrumPressureRelaxation -gt 1.0) {
+    throw "FerrumPressureRelaxation must be in (0, 1]"
+}
+$validFerrumLinearSolvers = @("jacobi", "cg")
+if (![string]::IsNullOrWhiteSpace($FerrumMomentumLinearSolver) -and $validFerrumLinearSolvers -notcontains $FerrumMomentumLinearSolver) {
+    throw "FerrumMomentumLinearSolver must be 'jacobi' or 'cg'"
+}
+if (![string]::IsNullOrWhiteSpace($FerrumPressureLinearSolver) -and $validFerrumLinearSolvers -notcontains $FerrumPressureLinearSolver) {
+    throw "FerrumPressureLinearSolver must be 'jacobi' or 'cg'"
+}
 
 function Format-F64([double]$Value) {
     return $Value.ToString("G17", [System.Globalization.CultureInfo]::InvariantCulture)
@@ -97,9 +114,13 @@ function Invoke-FerrumLaminarSimple(
     [string]$ReportMarkdown,
     [string]$LogPath,
     [string]$LinearSolver,
+    [string]$MomentumLinearSolver,
+    [string]$PressureLinearSolver,
     [double]$SolveTolerance,
     [int]$MaxIterations,
-    [int]$MaxSimpleIterations
+    [int]$MaxSimpleIterations,
+    [double]$VelocityRelaxation,
+    [double]$PressureRelaxation
 ) {
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ReportJson) | Out-Null
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $LogPath) | Out-Null
@@ -107,19 +128,23 @@ function Invoke-FerrumLaminarSimple(
     $exe = Join-Path $RepoRoot "target\debug\ferrumSolver.exe"
     if (Test-Path -LiteralPath $exe) {
         $command = $exe
-        $arguments = @(
+        $arguments = New-Object System.Collections.Generic.List[string]
+        @(
             "-case", $CaseRoot,
             "--solveLaminarSimple",
             "--linearSolver", $LinearSolver,
             "--solveTolerance", (Format-F64 $SolveTolerance),
             "--maxIterations", $MaxIterations.ToString([System.Globalization.CultureInfo]::InvariantCulture),
             "--maxSimpleIterations", $MaxSimpleIterations.ToString([System.Globalization.CultureInfo]::InvariantCulture),
+            "--velocityRelaxation", (Format-F64 $VelocityRelaxation),
+            "--pressureRelaxation", (Format-F64 $PressureRelaxation),
             "--solveReportJson", $ReportJson,
             "--solveReportMarkdown", $ReportMarkdown
-        )
+        ) | ForEach-Object { $arguments.Add($_) | Out-Null }
     } else {
         $command = "cargo"
-        $arguments = @(
+        $arguments = New-Object System.Collections.Generic.List[string]
+        @(
             "run", "-p", "ferrum-cli", "--bin", "ferrumSolver", "--",
             "-case", $CaseRoot,
             "--solveLaminarSimple",
@@ -127,16 +152,26 @@ function Invoke-FerrumLaminarSimple(
             "--solveTolerance", (Format-F64 $SolveTolerance),
             "--maxIterations", $MaxIterations.ToString([System.Globalization.CultureInfo]::InvariantCulture),
             "--maxSimpleIterations", $MaxSimpleIterations.ToString([System.Globalization.CultureInfo]::InvariantCulture),
+            "--velocityRelaxation", (Format-F64 $VelocityRelaxation),
+            "--pressureRelaxation", (Format-F64 $PressureRelaxation),
             "--solveReportJson", $ReportJson,
             "--solveReportMarkdown", $ReportMarkdown
-        )
+        ) | ForEach-Object { $arguments.Add($_) | Out-Null }
+    }
+    if (![string]::IsNullOrWhiteSpace($MomentumLinearSolver)) {
+        $arguments.Add("--momentumLinearSolver") | Out-Null
+        $arguments.Add($MomentumLinearSolver) | Out-Null
+    }
+    if (![string]::IsNullOrWhiteSpace($PressureLinearSolver)) {
+        $arguments.Add("--pressureLinearSolver") | Out-Null
+        $arguments.Add($PressureLinearSolver) | Out-Null
     }
 
     $script:ferrumExitCode = $null
     $elapsed = Measure-Command {
         Push-Location $RepoRoot
         try {
-            & $command @arguments *> $LogPath
+            & $command @($arguments.ToArray()) *> $LogPath
             $script:ferrumExitCode = $LASTEXITCODE
         } finally {
             Pop-Location
@@ -148,7 +183,7 @@ function Invoke-FerrumLaminarSimple(
     }
 
     return [ordered]@{
-        command = Format-CommandLine -Command $command -Arguments $arguments
+        command = Format-CommandLine -Command $command -Arguments $arguments.ToArray()
         log = $LogPath
         reportJson = $ReportJson
         reportMarkdown = $ReportMarkdown
@@ -190,9 +225,13 @@ $ferrumRun = Invoke-FerrumLaminarSimple `
     -ReportMarkdown $FerrumMarkdown `
     -LogPath $FerrumLog `
     -LinearSolver $FerrumLinearSolver `
+    -MomentumLinearSolver $FerrumMomentumLinearSolver `
+    -PressureLinearSolver $FerrumPressureLinearSolver `
     -SolveTolerance $FerrumSolveTolerance `
     -MaxIterations $FerrumMaxIterations `
-    -MaxSimpleIterations $FerrumMaxSimpleIterations
+    -MaxSimpleIterations $FerrumMaxSimpleIterations `
+    -VelocityRelaxation $FerrumVelocityRelaxation `
+    -PressureRelaxation $FerrumPressureRelaxation
 
 $ferrum = Get-Content -LiteralPath $FerrumJson -Raw | ConvertFrom-Json
 $openFoamPressureLoss = $null
@@ -250,6 +289,10 @@ $md.Add("| --- | --- | ---: |")
 $md.Add("| Ferrum laminarSimple | cells | $($ferrum.mesh.cells) |")
 $md.Add("| Ferrum laminarSimple | SIMPLE iterations | $($ferrum.solve.simpleIterations) |")
 $md.Add("| Ferrum laminarSimple | linear solver | $($ferrum.options.linearSolver) |")
+$md.Add("| Ferrum laminarSimple | momentum linear solver | $($ferrum.options.momentumLinearSolver) |")
+$md.Add("| Ferrum laminarSimple | pressure linear solver | $($ferrum.options.pressureLinearSolver) |")
+$md.Add("| Ferrum laminarSimple | velocity relaxation | $($ferrum.options.velocityRelaxation) |")
+$md.Add("| Ferrum laminarSimple | pressure relaxation | $($ferrum.options.pressureRelaxation) |")
 $md.Add("| Ferrum laminarSimple | solve wall clock [s] | $(Format-NullableNumber $ferrum.solve.wallClockSeconds 'F6') |")
 $md.Add("| Ferrum laminarSimple | mean velocity error | $(Format-NullablePercent $ferrum.solution.relativeMeanVelocityError) |")
 $md.Add("| Ferrum laminarSimple | pressure drop error | $(Format-NullablePercent $ferrum.solution.relativePressureDropError) |")

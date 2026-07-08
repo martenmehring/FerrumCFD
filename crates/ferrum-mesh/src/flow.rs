@@ -8,6 +8,8 @@ use crate::linear::{
 use crate::runtime::{SolverRuntimeData, SolverRuntimeMeshData};
 use crate::{MeshError, Point3, Result};
 
+const MAX_LAMINAR_SIMPLE_STEP_CONTINUITY_GROWTH: f64 = 2.0;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LaminarSimpleLinearSolver {
     Cg,
@@ -24,6 +26,8 @@ pub struct LaminarSimpleOptions {
     pub inlet_patch: String,
     pub outlet_patch: String,
     pub linear_solver: LaminarSimpleLinearSolver,
+    pub momentum_linear_solver: LaminarSimpleLinearSolver,
+    pub pressure_linear_solver: LaminarSimpleLinearSolver,
     pub linear_tolerance: f64,
     pub max_linear_iterations: usize,
     pub max_simple_iterations: usize,
@@ -167,6 +171,8 @@ pub fn solve_laminar_simple(
     let mut final_convection = vec![zero(); runtime.mesh.cells];
 
     for iteration in 1..=options.max_simple_iterations {
+        let previous_velocity = velocity.clone();
+        let previous_pressure = pressure.clone();
         let phi = compute_face_flux(&runtime.mesh, &velocity, &velocity_boundary)?;
         let continuity_before = summarize_continuity(&net_cell_flux(&runtime.mesh, &phi)?);
         let grad_p = scalar_gradient(&runtime.mesh, &pressure, &pressure_boundary)?;
@@ -282,7 +288,7 @@ pub fn solve_laminar_simple(
             &pressure_system.matrix,
             &pressure_system.rhs,
             None,
-            options.linear_solver,
+            options.pressure_linear_solver,
             options.linear_tolerance,
             options.max_linear_iterations,
         ) {
@@ -359,17 +365,36 @@ pub fn solve_laminar_simple(
         final_convection =
             vector_convection_divergence(&runtime.mesh, &velocity, &velocity_boundary, &final_phi)?;
 
+        let continuity_growth_exceeded = iteration > 1
+            && simple_step_continuity_growth_exceeded(final_continuity, continuity_before);
+        let reported_continuity_after = if continuity_growth_exceeded {
+            continuity_before
+        } else {
+            final_continuity
+        };
+        let reported_pressure_correction_accepted =
+            pressure_correction_accepted && !continuity_growth_exceeded;
+
         history.push(LaminarSimpleIterationSummary {
             iteration,
             continuity_before,
-            continuity_after: final_continuity,
-            pressure_correction_accepted,
+            continuity_after: reported_continuity_after,
+            pressure_correction_accepted: reported_pressure_correction_accepted,
             momentum_linear_iterations: momentum.iterations,
             pressure_linear_iterations: pressure_report.iterations,
             momentum_residual_norm: momentum.residual_norm,
             pressure_correction_residual_norm: pressure_report.residual_norm,
         });
 
+        if continuity_growth_exceeded {
+            velocity = previous_velocity;
+            pressure = previous_pressure;
+            final_phi = phi;
+            final_continuity = continuity_before;
+            final_grad_p = grad_p;
+            final_convection = convection;
+            break;
+        }
         if final_continuity.l2_norm <= options.simple_tolerance {
             converged = true;
             break;
@@ -459,7 +484,7 @@ fn solve_momentum_predictor(
             &system.matrix,
             &system.rhs,
             Some(&old_components[component]),
-            options.linear_solver,
+            options.momentum_linear_solver,
             options.linear_tolerance,
             options.max_linear_iterations,
         )
@@ -537,6 +562,16 @@ fn is_finite_continuity(summary: ContinuitySummary) -> bool {
         && summary.max_abs.is_finite()
         && summary.sum_abs.is_finite()
         && summary.global_sum.is_finite()
+}
+
+fn simple_step_continuity_growth_exceeded(
+    after: ContinuitySummary,
+    before: ContinuitySummary,
+) -> bool {
+    before.l2_norm.is_finite()
+        && before.l2_norm > f64::EPSILON
+        && after.l2_norm.is_finite()
+        && after.l2_norm > before.l2_norm * MAX_LAMINAR_SIMPLE_STEP_CONTINUITY_GROWTH
 }
 
 fn points_are_finite(values: &[Point3]) -> bool {
@@ -1580,6 +1615,8 @@ mod tests {
             inlet_patch: "inlet".to_string(),
             outlet_patch: "outlet".to_string(),
             linear_solver: LaminarSimpleLinearSolver::Cg,
+            momentum_linear_solver: LaminarSimpleLinearSolver::Cg,
+            pressure_linear_solver: LaminarSimpleLinearSolver::Cg,
             linear_tolerance: 1.0e-10,
             max_linear_iterations: 100,
             max_simple_iterations: 3,

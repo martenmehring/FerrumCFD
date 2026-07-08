@@ -307,11 +307,22 @@ pub fn conjugate_gradient_solve(
     for iteration in 1..=options.max_iterations {
         let ap = matrix.matvec(&p)?;
         let denominator = dot(&p, &ap);
-        if !denominator.is_finite() || denominator == 0.0 {
+        if !denominator.is_finite() {
             return Err(invalid_input(
-                "conjugate-gradient denominator is zero; matrix is likely singular or not SPD"
+                "conjugate-gradient denominator is not finite; matrix is likely not SPD"
                     .to_string(),
             ));
+        }
+        let denominator_scale = l2_norm(&p) * l2_norm(&ap);
+        if denominator_scale <= f64::EPSILON
+            || denominator.abs() <= f64::EPSILON * denominator_scale
+        {
+            return Ok(IterativeSolveReport {
+                solution: x,
+                iterations: iteration.saturating_sub(1),
+                residual_norm,
+                converged: false,
+            });
         }
 
         let alpha = residual_squared / denominator;
@@ -516,6 +527,26 @@ mod tests {
         assert!(report.iterations <= 2);
         assert_close(&report.solution, &[1.0, 1.0, 1.0], 1.0e-12);
         assert!(report.residual_norm <= 1.0e-12);
+    }
+
+    #[test]
+    fn conjugate_gradient_reports_breakdown_as_not_converged() {
+        let matrix = CsrMatrix::from_rows(vec![vec![(0, 0.0)]], 1).expect("matrix");
+        let report = conjugate_gradient_solve(
+            &matrix,
+            &[1.0],
+            None,
+            ConjugateGradientOptions {
+                max_iterations: 10,
+                tolerance: 1.0e-12,
+            },
+        )
+        .expect("breakdown should return a non-converged report");
+
+        assert!(!report.converged);
+        assert_eq!(report.iterations, 0);
+        assert_close(&report.solution, &[0.0], 1.0e-14);
+        assert_eq!(report.residual_norm, 1.0);
     }
 
     #[test]

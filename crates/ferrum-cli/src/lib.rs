@@ -502,8 +502,10 @@ fn run_laminar_simple_solve(
     let wall_clock_seconds = started.elapsed().as_secs_f64();
 
     println!(
-        "laminarSimple solve: backend=cpu linearSolver={} cells={} faces={} simpleIterations={} converged={} initialContinuityL2={} finalContinuityL2={} momentumResidualNorm={} pressureCorrectionResidualNorm={} momentumLinearIterations={} pressureLinearIterations={} wallClockSeconds={:.6}",
+        "laminarSimple solve: backend=cpu linearSolver={} momentumLinearSolver={} pressureLinearSolver={} cells={} faces={} simpleIterations={} converged={} initialContinuityL2={} finalContinuityL2={} momentumResidualNorm={} pressureCorrectionResidualNorm={} momentumLinearIterations={} pressureLinearIterations={} wallClockSeconds={:.6}",
         options.linear_solver,
+        options.momentum_linear_solver,
+        options.pressure_linear_solver,
         report.cells,
         report.faces,
         report.simple_iterations,
@@ -624,6 +626,8 @@ fn resolve_laminar_simple_options(
         inlet_patch: solve.inlet_patch.clone(),
         outlet_patch: solve.outlet_patch.clone(),
         linear_solver: solve.linear_solver,
+        momentum_linear_solver: solve.momentum_linear_solver.unwrap_or(solve.linear_solver),
+        pressure_linear_solver: solve.pressure_linear_solver.unwrap_or(solve.linear_solver),
         linear_tolerance: solve.linear_tolerance,
         max_linear_iterations: solve.max_linear_iterations,
         max_simple_iterations: solve.max_simple_iterations,
@@ -1432,6 +1436,20 @@ fn write_json_laminar_simple_options(
         &options.linear_solver.to_string(),
     )?;
     writeln!(writer, ",")?;
+    write_json_string_field(
+        writer,
+        4,
+        "momentumLinearSolver",
+        &options.momentum_linear_solver.to_string(),
+    )?;
+    writeln!(writer, ",")?;
+    write_json_string_field(
+        writer,
+        4,
+        "pressureLinearSolver",
+        &options.pressure_linear_solver.to_string(),
+    )?;
+    writeln!(writer, ",")?;
     write_json_key(writer, 4, "density")?;
     write_json_optional_number(writer, Some(options.density))?;
     writeln!(writer, ",")?;
@@ -1718,6 +1736,16 @@ fn write_laminar_simple_report_markdown(
         writer,
         "| Analytic deltaP [Pa] | {} |",
         format_scientific(options.pressure_drop)
+    )?;
+    writeln!(
+        writer,
+        "| Momentum linear solver | {} |",
+        options.momentum_linear_solver
+    )?;
+    writeln!(
+        writer,
+        "| Pressure linear solver | {} |",
+        options.pressure_linear_solver
     )?;
     writeln!(writer)?;
     writeln!(writer, "## Result")?;
@@ -2950,6 +2978,8 @@ struct LaminarSimpleSolveArgs {
     inlet_patch: String,
     outlet_patch: String,
     linear_solver: LaminarSimpleLinearSolver,
+    momentum_linear_solver: Option<LaminarSimpleLinearSolver>,
+    pressure_linear_solver: Option<LaminarSimpleLinearSolver>,
     linear_tolerance: f64,
     max_linear_iterations: usize,
     max_simple_iterations: usize,
@@ -3002,6 +3032,8 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
     let mut wall_patches = Vec::new();
     let mut linear_solve_option_seen = false;
     let mut linear_solver_name_seen = false;
+    let mut momentum_linear_solver = None;
+    let mut pressure_linear_solver = None;
     let mut scalar_diffusion_diffusivity = 1.0;
     let mut scalar_diffusion_source = 0.0;
     let mut scalar_diffusion_linear_solver = ScalarDiffusionLinearSolver::Cg;
@@ -3172,6 +3204,32 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
                 linear_solve_option_seen = true;
                 index += 2;
             }
+            "-momentumLinearSolver"
+            | "--momentumLinearSolver"
+            | "-momentum-linear-solver"
+            | "--momentum-linear-solver" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--momentumLinearSolver requires 'cg' or 'jacobi'".to_string()
+                })?;
+                momentum_linear_solver = Some(map_laminar_simple_linear_solver(
+                    parse_scalar_diffusion_linear_solver(value)?,
+                ));
+                laminar_simple_option_seen = true;
+                index += 2;
+            }
+            "-pressureLinearSolver"
+            | "--pressureLinearSolver"
+            | "-pressure-linear-solver"
+            | "--pressure-linear-solver" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--pressureLinearSolver requires 'cg' or 'jacobi'".to_string()
+                })?;
+                pressure_linear_solver = Some(map_laminar_simple_linear_solver(
+                    parse_scalar_diffusion_linear_solver(value)?,
+                ));
+                laminar_simple_option_seen = true;
+                index += 2;
+            }
             "-solveTolerance" | "--solveTolerance" | "-solve-tolerance" | "--solve-tolerance" => {
                 let value = args
                     .get(index + 1)
@@ -3298,6 +3356,8 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
             inlet_patch,
             outlet_patch,
             linear_solver: laminar_simple_linear_solver,
+            momentum_linear_solver,
+            pressure_linear_solver,
             linear_tolerance: scalar_diffusion_tolerance,
             max_linear_iterations: scalar_diffusion_max_iterations,
             max_simple_iterations,
@@ -3638,6 +3698,10 @@ fn print_solver_usage() {
     println!(
         "  --linearSolver <s>   cg or jacobi for executable solves (default: cg; laminar SIMPLE default: jacobi)"
     );
+    println!("  --momentumLinearSolver <s> override laminar SIMPLE momentum solver (cg or jacobi)");
+    println!(
+        "  --pressureLinearSolver <s> override laminar SIMPLE pressure-correction solver (cg or jacobi)"
+    );
     println!("  --pressureDrop <Pa>  pressure drop for --solvePoiseuille/--solveLaminarSimple");
     println!("  --rho <kg/m3>        density for --solveLaminarSimple");
     println!("  --mu <Pa.s>          dynamic viscosity for --solvePoiseuille/--solveLaminarSimple");
@@ -3845,6 +3909,8 @@ mod tests {
         assert_eq!(solve.length, Some(1.0));
         assert_eq!(solve.diameter, Some(0.02));
         assert_eq!(solve.linear_solver, LaminarSimpleLinearSolver::Jacobi);
+        assert_eq!(solve.momentum_linear_solver, None);
+        assert_eq!(solve.pressure_linear_solver, None);
         assert_eq!(solve.max_simple_iterations, 7);
         assert_eq!(solve.simple_tolerance, 1e-7);
         assert_eq!(solve.velocity_relaxation, 0.6);
@@ -3853,6 +3919,34 @@ mod tests {
         assert_eq!(
             solve.report_markdown,
             Some(PathBuf::from("target/simple.md"))
+        );
+    }
+
+    #[test]
+    fn parses_laminar_simple_split_linear_solvers() {
+        let args = vec![
+            "--solveLaminarSimple".to_string(),
+            "--linearSolver".to_string(),
+            "jacobi".to_string(),
+            "--momentumLinearSolver".to_string(),
+            "cg".to_string(),
+            "--pressureLinearSolver".to_string(),
+            "jacobi".to_string(),
+        ];
+
+        let parsed = parse_solver_args(&args).expect("solver args should parse");
+        let solve = parsed
+            .laminar_simple_solve
+            .expect("laminar SIMPLE solve args");
+
+        assert_eq!(solve.linear_solver, LaminarSimpleLinearSolver::Jacobi);
+        assert_eq!(
+            solve.momentum_linear_solver,
+            Some(LaminarSimpleLinearSolver::Cg)
+        );
+        assert_eq!(
+            solve.pressure_linear_solver,
+            Some(LaminarSimpleLinearSolver::Jacobi)
         );
     }
 

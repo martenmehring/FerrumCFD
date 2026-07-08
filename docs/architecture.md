@@ -362,8 +362,10 @@ SIMPLE, PISO, or full Navier-Stokes implementation.
 operators on the same runtime `polyMesh` geometry, and writes solver reports as
 JSON/Markdown. The current implementation is deliberately guarded: one damped
 Jacobi CPU SIMPLE step is the stable default for the pipe benchmark, while
-multi-step pressure correction and CG/PCG momentum solves remain active solver
-development targets. The operator and report boundaries are kept
+multi-step pressure correction remains an active solver-development target.
+Momentum and pressure-correction linear solvers can be selected separately, so
+experiments can run CG for momentum and Jacobi for pressure correction without
+changing the case files. The operator and report boundaries are kept
 backend-neutral so the same assembly path can later dispatch linear and
 nonlinear solves to CPU, GPU, or mixed CPU/GPU resources.
 
