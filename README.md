@@ -56,8 +56,8 @@ The importer currently targets the membrane reactor test mesh shape:
 - Gmsh 2.2 ASCII `.msh`
 - SI-first case values: unqualified lengths, pressures, temperatures, and
   velocities are interpreted as m, Pa, K, and m/s in FerrumCFD-facing data
-- `quad4` physical surfaces as boundary patches
-- `hex8` physical volumes as cell zones
+- `tri3` and `quad4` physical surfaces as boundary patches
+- `prism6` and `hex8` physical volumes as cell zones
 - OpenFOAM-like `constant/polyMesh` output: `points`, `faces`, `owner`,
   `neighbour`, `boundary`, `faceZones`, `cellZones`
 - external Gmsh physical surfaces become boundary patches

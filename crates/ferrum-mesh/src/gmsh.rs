@@ -180,6 +180,16 @@ fn read_elements<R: BufRead>(
         let physical_tag = if tag_count > 0 { fields[3] as i32 } else { 0 };
 
         match element_type {
+            2 => {
+                if fields.len() != node_start + 3 {
+                    return Err(reader.parse_error("tri3 element does not have 3 nodes"));
+                }
+                boundary_faces.push(BoundaryFace {
+                    source_id,
+                    physical_tag,
+                    nodes: read_element_nodes(&fields[node_start..], node_id_to_index, reader)?,
+                });
+            }
             3 => {
                 if fields.len() != node_start + 4 {
                     return Err(reader.parse_error("quad4 element does not have 4 nodes"));
@@ -187,24 +197,7 @@ fn read_elements<R: BufRead>(
                 boundary_faces.push(BoundaryFace {
                     source_id,
                     physical_tag,
-                    nodes: [
-                        node_index(fields[node_start], node_id_to_index, reader.line_number())?,
-                        node_index(
-                            fields[node_start + 1],
-                            node_id_to_index,
-                            reader.line_number(),
-                        )?,
-                        node_index(
-                            fields[node_start + 2],
-                            node_id_to_index,
-                            reader.line_number(),
-                        )?,
-                        node_index(
-                            fields[node_start + 3],
-                            node_id_to_index,
-                            reader.line_number(),
-                        )?,
-                    ],
+                    nodes: read_element_nodes(&fields[node_start..], node_id_to_index, reader)?,
                 });
             }
             5 => {
@@ -214,44 +207,17 @@ fn read_elements<R: BufRead>(
                 cells.push(Cell {
                     source_id,
                     physical_tag,
-                    nodes: [
-                        node_index(fields[node_start], node_id_to_index, reader.line_number())?,
-                        node_index(
-                            fields[node_start + 1],
-                            node_id_to_index,
-                            reader.line_number(),
-                        )?,
-                        node_index(
-                            fields[node_start + 2],
-                            node_id_to_index,
-                            reader.line_number(),
-                        )?,
-                        node_index(
-                            fields[node_start + 3],
-                            node_id_to_index,
-                            reader.line_number(),
-                        )?,
-                        node_index(
-                            fields[node_start + 4],
-                            node_id_to_index,
-                            reader.line_number(),
-                        )?,
-                        node_index(
-                            fields[node_start + 5],
-                            node_id_to_index,
-                            reader.line_number(),
-                        )?,
-                        node_index(
-                            fields[node_start + 6],
-                            node_id_to_index,
-                            reader.line_number(),
-                        )?,
-                        node_index(
-                            fields[node_start + 7],
-                            node_id_to_index,
-                            reader.line_number(),
-                        )?,
-                    ],
+                    nodes: read_element_nodes(&fields[node_start..], node_id_to_index, reader)?,
+                });
+            }
+            6 => {
+                if fields.len() != node_start + 6 {
+                    return Err(reader.parse_error("prism6 element does not have 6 nodes"));
+                }
+                cells.push(Cell {
+                    source_id,
+                    physical_tag,
+                    nodes: read_element_nodes(&fields[node_start..], node_id_to_index, reader)?,
                 });
             }
             other => {
@@ -266,6 +232,17 @@ fn read_elements<R: BufRead>(
         boundary_faces,
         unsupported,
     })
+}
+
+fn read_element_nodes<R: BufRead>(
+    node_ids: &[i64],
+    node_id_to_index: &[Option<usize>],
+    reader: &LineReader<R>,
+) -> Result<Vec<usize>> {
+    node_ids
+        .iter()
+        .map(|node_id| node_index(*node_id, node_id_to_index, reader.line_number()))
+        .collect()
 }
 
 fn node_index(node_id: i64, node_id_to_index: &[Option<usize>], line: usize) -> Result<usize> {
@@ -390,5 +367,112 @@ impl<R: BufRead> LineReader<R> {
             line: self.line_number,
             message: message.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::foam::write_openfoam_case;
+
+    use super::*;
+
+    #[test]
+    fn reads_prism6_and_tri3_boundary_faces() {
+        let mesh_path = unique_temp_path("prism6_tri3", "msh");
+        fs::write(&mesh_path, prism_msh()).expect("write test mesh");
+
+        let mesh = read_msh22_ascii(&mesh_path).expect("read prism mesh");
+
+        assert_eq!(mesh.points.len(), 6);
+        assert_eq!(mesh.cells.len(), 1);
+        assert_eq!(mesh.cells[0].nodes.len(), 6);
+        assert_eq!(mesh.boundary_faces.len(), 5);
+        assert_eq!(
+            mesh.boundary_faces
+                .iter()
+                .filter(|face| face.nodes.len() == 3)
+                .count(),
+            2
+        );
+        assert_eq!(
+            mesh.boundary_faces
+                .iter()
+                .filter(|face| face.nodes.len() == 4)
+                .count(),
+            3
+        );
+        assert!(mesh.unsupported_elements.is_empty());
+
+        let _ = fs::remove_file(mesh_path);
+    }
+
+    #[test]
+    fn writes_openfoam_faces_for_prism6_mesh() {
+        let mesh_path = unique_temp_path("prism6_poly_mesh", "msh");
+        let case_dir = unique_temp_path("prism6_case", "case");
+        fs::write(&mesh_path, prism_msh()).expect("write test mesh");
+        let mesh = read_msh22_ascii(&mesh_path).expect("read prism mesh");
+
+        let summary = write_openfoam_case(&mesh, &case_dir, &mesh_path).expect("write foam case");
+        assert_eq!(summary.cells, 1);
+        assert_eq!(summary.faces, 5);
+        assert_eq!(summary.boundary_faces, 5);
+
+        let faces = fs::read_to_string(case_dir.join("constant/polyMesh/faces"))
+            .expect("read written faces");
+        assert!(faces.contains("3("));
+        assert!(faces.contains("4("));
+
+        let _ = fs::remove_file(mesh_path);
+        let _ = fs::remove_dir_all(case_dir);
+    }
+
+    fn unique_temp_path(label: &str, extension: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "ferrum_mesh_{label}_{}_{}.{}",
+            std::process::id(),
+            nanos,
+            extension
+        ))
+    }
+
+    fn prism_msh() -> &'static str {
+        r#"$MeshFormat
+2.2 0 8
+$EndMeshFormat
+$PhysicalNames
+5
+2 1 "inlet"
+2 2 "outlet"
+2 3 "wall"
+3 10 "fluid"
+0 99 "ignored"
+$EndPhysicalNames
+$Nodes
+6
+1 0 0 0
+2 1 0 0
+3 0 1 0
+4 0 0 1
+5 1 0 1
+6 0 1 1
+$EndNodes
+$Elements
+6
+1 2 2 1 0 1 2 3
+2 2 2 2 0 4 5 6
+3 3 2 3 0 1 2 5 4
+4 3 2 3 0 2 3 6 5
+5 3 2 3 0 3 1 4 6
+6 6 2 10 0 1 2 3 4 5 6
+$EndElements
+"#
     }
 }

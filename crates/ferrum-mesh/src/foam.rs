@@ -138,7 +138,7 @@ fn build_topology(mesh: &Mesh) -> Topology {
     let mut duplicate_boundary_faces = 0;
 
     for face in &mesh.boundary_faces {
-        let key = FaceKey::from_nodes(face.nodes);
+        let key = FaceKey::from_nodes(&face.nodes);
         let patch_name = sanitize_name(&mesh.physical_name(face.physical_tag));
         if boundary_by_key
             .insert(
@@ -159,8 +159,8 @@ fn build_topology(mesh: &Mesh) -> Topology {
     let mut non_manifold_faces = 0;
 
     for (cell_index, cell) in mesh.cells.iter().enumerate() {
-        for nodes in hex_faces(cell.nodes) {
-            let key = FaceKey::from_nodes(nodes);
+        for nodes in cell_faces(&cell.nodes) {
+            let key = FaceKey::from_nodes(&nodes);
             if let Some(&face_index) = face_index_by_key.get(&key) {
                 let face = &mut faces[face_index];
                 if face.neighbour.is_some() {
@@ -169,7 +169,7 @@ fn build_topology(mesh: &Mesh) -> Topology {
                     face.neighbour = Some(cell_index);
                 }
             } else {
-                face_index_by_key.insert(key, faces.len());
+                face_index_by_key.insert(key.clone(), faces.len());
                 faces.push(FaceRecord {
                     nodes,
                     key,
@@ -181,7 +181,10 @@ fn build_topology(mesh: &Mesh) -> Topology {
         }
     }
 
-    let topology_face_keys = faces.iter().map(|face| face.key).collect::<HashSet<_>>();
+    let topology_face_keys = faces
+        .iter()
+        .map(|face| face.key.clone())
+        .collect::<HashSet<_>>();
     let mut unmatched_boundary_faces = 0;
     for key in boundary_by_key.keys() {
         if !topology_face_keys.contains(key) {
@@ -289,12 +292,15 @@ fn write_faces(path: &Path, faces: &[FaceRecord], ordered: &[usize]) -> Result<(
     writeln!(writer, "{}", ordered.len())?;
     writeln!(writer, "(")?;
     for &index in ordered {
-        let nodes = faces[index].nodes;
-        writeln!(
-            writer,
-            "4({} {} {} {})",
-            nodes[0], nodes[1], nodes[2], nodes[3]
-        )?;
+        let nodes = &faces[index].nodes;
+        write!(writer, "{}(", nodes.len())?;
+        for (node_index, node) in nodes.iter().enumerate() {
+            if node_index > 0 {
+                write!(writer, " ")?;
+            }
+            write!(writer, "{node}")?;
+        }
+        writeln!(writer, ")")?;
     }
     writeln!(writer, ")")?;
     Ok(())
@@ -348,12 +354,12 @@ fn write_face_zones(
 ) -> Result<Vec<FaceZoneSummary>> {
     let mut topology_index_by_key = HashMap::<FaceKey, usize>::new();
     for (index, face) in faces.iter().enumerate() {
-        topology_index_by_key.insert(face.key, index);
+        topology_index_by_key.insert(face.key.clone(), index);
     }
 
     let mut zones = BTreeMap::<i32, Vec<usize>>::new();
     for face in &mesh.boundary_faces {
-        let key = FaceKey::from_nodes(face.nodes);
+        let key = FaceKey::from_nodes(&face.nodes);
         if let Some(&topology_index) = topology_index_by_key.get(&key)
             && let Some(&ordered_index) =
                 ordered.ordered_label_by_topology_index.get(&topology_index)
@@ -573,14 +579,32 @@ fn foam_writer_at(
     Ok(writer)
 }
 
-fn hex_faces(nodes: [usize; 8]) -> [[usize; 4]; 6] {
-    [
-        [nodes[0], nodes[3], nodes[2], nodes[1]],
-        [nodes[4], nodes[5], nodes[6], nodes[7]],
-        [nodes[0], nodes[1], nodes[5], nodes[4]],
-        [nodes[1], nodes[2], nodes[6], nodes[5]],
-        [nodes[2], nodes[3], nodes[7], nodes[6]],
-        [nodes[3], nodes[0], nodes[4], nodes[7]],
+fn cell_faces(nodes: &[usize]) -> Vec<Vec<usize>> {
+    match nodes.len() {
+        6 => prism_faces(nodes),
+        8 => hex_faces(nodes),
+        _ => Vec::new(),
+    }
+}
+
+fn hex_faces(nodes: &[usize]) -> Vec<Vec<usize>> {
+    vec![
+        vec![nodes[0], nodes[3], nodes[2], nodes[1]],
+        vec![nodes[4], nodes[5], nodes[6], nodes[7]],
+        vec![nodes[0], nodes[1], nodes[5], nodes[4]],
+        vec![nodes[1], nodes[2], nodes[6], nodes[5]],
+        vec![nodes[2], nodes[3], nodes[7], nodes[6]],
+        vec![nodes[3], nodes[0], nodes[4], nodes[7]],
+    ]
+}
+
+fn prism_faces(nodes: &[usize]) -> Vec<Vec<usize>> {
+    vec![
+        vec![nodes[0], nodes[2], nodes[1]],
+        vec![nodes[3], nodes[4], nodes[5]],
+        vec![nodes[0], nodes[1], nodes[4], nodes[3]],
+        vec![nodes[1], nodes[2], nodes[5], nodes[4]],
+        vec![nodes[2], nodes[0], nodes[3], nodes[5]],
     ]
 }
 
@@ -603,12 +627,12 @@ fn sanitize_name(name: &str) -> String {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct FaceKey([usize; 4]);
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct FaceKey(Vec<usize>);
 
 impl FaceKey {
-    fn from_nodes(nodes: [usize; 4]) -> Self {
-        let mut sorted = nodes;
+    fn from_nodes(nodes: &[usize]) -> Self {
+        let mut sorted = nodes.to_vec();
         sorted.sort_unstable();
         Self(sorted)
     }
@@ -622,7 +646,7 @@ struct BoundaryPatchRef {
 
 #[derive(Clone, Debug)]
 struct FaceRecord {
-    nodes: [usize; 4],
+    nodes: Vec<usize>,
     key: FaceKey,
     owner: usize,
     neighbour: Option<usize>,

@@ -179,8 +179,8 @@ initial fields:
 
 ## Import A Gmsh Mesh
 
-The first supported mesh path is Gmsh 2.2 ASCII with `quad4` physical surfaces
-and `hex8` physical volumes:
+The first supported mesh path is Gmsh 2.2 ASCII with `tri3`/`quad4` physical
+surfaces and `prism6`/`hex8` physical volumes:
 
 ```powershell
 gmshToFerrumFoam path\to\mesh.msh -case cases\my_case
@@ -700,8 +700,8 @@ consumed by built-in solver code.
 
 ## Current Limitations
 
-- Gmsh import currently supports Gmsh 2.2 ASCII, `quad4` surfaces, and `hex8`
-  cells.
+- Gmsh import currently supports Gmsh 2.2 ASCII, `tri3`/`quad4` surfaces, and
+  `prism6`/`hex8` cells.
 - Region splitting currently reads Ferrum-generated ASCII `polyMesh` files.
 - `checkFerrumMesh` is currently a structural summary plus basic topology
   warning report, with field, interface, and backend configuration validation.

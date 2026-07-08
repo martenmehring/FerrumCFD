@@ -55,14 +55,14 @@ pub struct Point3 {
 pub struct Cell {
     pub source_id: usize,
     pub physical_tag: i32,
-    pub nodes: [usize; 8],
+    pub nodes: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]
 pub struct BoundaryFace {
     pub source_id: usize,
     pub physical_tag: i32,
-    pub nodes: [usize; 4],
+    pub nodes: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]

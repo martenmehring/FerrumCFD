@@ -142,7 +142,7 @@ fn gmsh_to_foam(args: Vec<String>) -> Result<(), String> {
     println!("Reading Gmsh mesh: {}", import.mesh_path.display());
     let mesh = read_msh22_ascii(&import.mesh_path).map_err(|error| error.to_string())?;
     println!(
-        "Loaded {} points, {} hex cells, {} boundary quads",
+        "Loaded {} points, {} supported volume cells, {} supported boundary faces",
         mesh.points.len(),
         mesh.cells.len(),
         mesh.boundary_faces.len()
