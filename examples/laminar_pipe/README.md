@@ -82,4 +82,6 @@ source-driven CPU Poiseuille benchmark and the first guarded laminar SIMPLE
 path, and remains the contract for the later flow and heat-transfer solvers.
 Multi-step SIMPLE reports are intentionally conservative: continuity, pressure
 loss, and U/p field changes must all stabilize before Ferrum marks the run as
-converged.
+converged. The default multi-step run also bounds each coupled U/p/phi update
+to keep the intermediate velocity field finite and physically inspectable while
+the pressure-velocity coupling is still under development.

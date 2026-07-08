@@ -66,18 +66,18 @@ ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --maxSimpleIterati
 | CG | Jacobi | CLI 1e-6/100 | CLI 0.1/0.02 | 4 | 1.684419 | 5.066% | 4.547e-7 | 0.719120 | confirms the current CG-momentum path is not yet the accuracy bottleneck alone |
 | Jacobi | Jacobi | CLI 1e-6/100 | fvSolution 0.7/0.3 | 2 | 1.531687 | -4.461% | 5.547e-7 | 1.208509 | broad CLI tolerance/iteration overrides still affect both equations |
 | Jacobi | Jacobi | fvSolution 1e-10/default 10000 | fvSolution 0.7/0.3 | 3 | 1.416486 | -11.646% | 1.797e-5 | 78.180144 | per-equation tolerances are read from `solvers.U/p`; Jacobi pressure correction reaches the guard |
-| Jacobi | PCG + diagonal | fvSolution 1e-10/default 10000 | fvSolution 0.7/0.3 | 3 | 1.596293 | -0.431% | 9.295e-11 | 23.478386 | corrected `phi` is carried between SIMPLE iterations; convergence stays `no` because U/p field changes are still too large and the reference-error guard rolls back iteration 3 |
+| Jacobi | PCG + diagonal | fvSolution 1e-10/default 10000 | fvSolution 0.7/0.3 + bounded 10% U/p/phi update | 7 | 1.608395 | 0.324% | 7.509e-11 | 44.184460 | velocity-relaxed `rAU`, corrected `phi` carry-over, and bounded coupled updates keep local U positive; convergence stays `no` because U/p changes are still above 1% |
 
 The continuity-growth guard prevents the old runaway behavior where long
 multi-step trials produced infinite or astronomically large values. The
 multi-step guard now also refuses convergence when the Hagen-Poiseuille
-pressure-drop reference or the relative U/p field changes are not stable. That
-keeps the PCG pressure-correction run honest: its mean pressure loss is close
-to analytic after two accepted steps, but the local velocity field is still
-oscillatory, so the run remains a guarded solver-development result rather than
-a `simpleFoam` equivalent. The next numerical target is a better
-pressure-correction operator, bounded momentum update, and true
-incomplete-Cholesky-style pressure preconditioning.
+pressure-drop reference or the relative U/p field changes are not stable. The
+bounded PCG pressure-correction run now keeps the local axial velocity positive
+and the mean pressure loss close to analytic, but it still remains a guarded
+solver-development result rather than a `simpleFoam` equivalent because the
+field changes have not settled to the 1% convergence target. The next numerical
+target is a less oscillatory momentum predictor, tighter pressure-field
+coupling, and true incomplete-Cholesky-style pressure preconditioning.
 
 ## Mesh Study
 

@@ -502,7 +502,7 @@ fn run_laminar_simple_solve(
     let wall_clock_seconds = started.elapsed().as_secs_f64();
 
     println!(
-        "laminarSimple solve: backend=cpu linearSolver={} momentumLinearSolver={} momentumPreconditioner={} pressureLinearSolver={} pressurePreconditioner={} cells={} faces={} simpleIterations={} minSimpleIterations={} converged={} initialContinuityL2={} finalContinuityL2={} simpleTolerance={} pressureDropTolerance={} fieldChangeTolerance={} momentumResidualNorm={} pressureCorrectionResidualNorm={} momentumLinearIterations={} pressureLinearIterations={} wallClockSeconds={:.6}",
+        "laminarSimple solve: backend=cpu linearSolver={} momentumLinearSolver={} momentumPreconditioner={} pressureLinearSolver={} pressurePreconditioner={} cells={} faces={} simpleIterations={} minSimpleIterations={} converged={} initialContinuityL2={} finalContinuityL2={} simpleTolerance={} pressureDropTolerance={} fieldChangeTolerance={} maxFieldChangePerStep={} momentumResidualNorm={} pressureCorrectionResidualNorm={} momentumLinearIterations={} pressureLinearIterations={} wallClockSeconds={:.6}",
         options.linear_solver,
         options.momentum_linear_solver,
         options.momentum_preconditioner,
@@ -518,6 +518,7 @@ fn run_laminar_simple_solve(
         format_scientific(options.simple_tolerance),
         format_scientific(options.pressure_drop_tolerance),
         format_scientific(options.field_change_tolerance),
+        format_scientific(options.max_field_change_per_step),
         format_scientific(report.final_momentum_residual_norm),
         format_scientific(report.final_pressure_correction_residual_norm),
         report.total_momentum_linear_iterations,
@@ -696,6 +697,10 @@ fn resolve_laminar_simple_options(
         .field_change_tolerance
         .or_else(|| fv_solution_number(plan, "SIMPLE", "fieldChangeTolerance"))
         .unwrap_or(0.01);
+    let max_field_change_per_step = solve
+        .max_field_change_per_step
+        .or_else(|| fv_solution_number(plan, "SIMPLE", "maxFieldChangePerStep"))
+        .unwrap_or(0.10);
 
     Ok(LaminarSimpleOptions {
         density,
@@ -721,6 +726,7 @@ fn resolve_laminar_simple_options(
         simple_tolerance: solve.simple_tolerance,
         pressure_drop_tolerance,
         field_change_tolerance,
+        max_field_change_per_step,
         velocity_relaxation: solve
             .velocity_relaxation
             .or_else(|| fv_solution_number(plan, "relaxationFactors.equations", "U"))
@@ -1693,6 +1699,9 @@ fn write_json_laminar_simple_options(
     write_json_key(writer, 4, "fieldChangeTolerance")?;
     write_json_optional_number(writer, Some(options.field_change_tolerance))?;
     writeln!(writer, ",")?;
+    write_json_key(writer, 4, "maxFieldChangePerStep")?;
+    write_json_optional_number(writer, Some(options.max_field_change_per_step))?;
+    writeln!(writer, ",")?;
     write_json_number_field(
         writer,
         4,
@@ -1924,6 +1933,12 @@ fn write_json_laminar_simple_history(
         writeln!(writer, ",")?;
         write_json_key(writer, 6, "relativePressureChangeL2")?;
         write_json_optional_number(writer, Some(item.relative_pressure_change_l2))?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 6, "momentumUpdateScale")?;
+        write_json_optional_number(writer, Some(item.momentum_update_scale))?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 6, "pressureCorrectionUpdateScale")?;
+        write_json_optional_number(writer, Some(item.pressure_correction_update_scale))?;
         writeln!(writer)?;
         write_indent(writer, 4)?;
         if index + 1 == history.len() {
@@ -2040,6 +2055,11 @@ fn write_laminar_simple_report_markdown(
         "| Field-change tolerance | {} |",
         format_percent(options.field_change_tolerance)
     )?;
+    writeln!(
+        writer,
+        "| Max field change per step | {} |",
+        format_percent(options.max_field_change_per_step)
+    )?;
     writeln!(writer)?;
     writeln!(writer, "## Result")?;
     writeln!(writer)?;
@@ -2106,13 +2126,16 @@ fn write_laminar_simple_report_markdown(
     writeln!(writer)?;
     writeln!(
         writer,
-        "| Iteration | Continuity before | Continuity after | Pressure correction | Momentum residual | Pressure residual | Pressure-drop error | U change | p change |"
+        "| Iteration | Continuity before | Continuity after | Pressure correction | Momentum residual | Pressure residual | Pressure-drop error | U change | p change | Momentum scale | Pressure scale |"
     )?;
-    writeln!(writer, "| ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |")?;
+    writeln!(
+        writer,
+        "| ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+    )?;
     for item in &report.history {
         writeln!(
             writer,
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             item.iteration,
             format_scientific(item.continuity_before.l2_norm),
             format_scientific(item.continuity_after.l2_norm),
@@ -2125,7 +2148,9 @@ fn write_laminar_simple_report_markdown(
             format_scientific(item.pressure_correction_residual_norm),
             format_percent(item.relative_pressure_drop_error),
             format_percent(item.relative_velocity_change_l2),
-            format_percent(item.relative_pressure_change_l2)
+            format_percent(item.relative_pressure_change_l2),
+            format_percent(item.momentum_update_scale),
+            format_percent(item.pressure_correction_update_scale)
         )?;
     }
 
@@ -3289,6 +3314,7 @@ struct LaminarSimpleSolveArgs {
     simple_tolerance: f64,
     pressure_drop_tolerance: Option<f64>,
     field_change_tolerance: Option<f64>,
+    max_field_change_per_step: Option<f64>,
     velocity_relaxation: Option<f64>,
     pressure_relaxation: Option<f64>,
     report_json: Option<PathBuf>,
@@ -3357,6 +3383,7 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
     let mut simple_tolerance = 1.0e-8;
     let mut pressure_drop_tolerance = None;
     let mut field_change_tolerance = None;
+    let mut max_field_change_per_step = None;
     let mut velocity_relaxation = None;
     let mut pressure_relaxation = None;
     let mut solve_report_json = None;
@@ -3693,6 +3720,18 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
                 laminar_simple_option_seen = true;
                 index += 2;
             }
+            "-maxFieldChangePerStep"
+            | "--maxFieldChangePerStep"
+            | "-max-field-change-per-step"
+            | "--max-field-change-per-step" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--maxFieldChangePerStep requires a positive relative limit".to_string()
+                })?;
+                max_field_change_per_step =
+                    Some(parse_positive_f64_arg("--maxFieldChangePerStep", value)?);
+                laminar_simple_option_seen = true;
+                index += 2;
+            }
             "-velocityRelaxation"
             | "--velocityRelaxation"
             | "-velocity-relaxation"
@@ -3792,6 +3831,7 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
             simple_tolerance,
             pressure_drop_tolerance,
             field_change_tolerance,
+            max_field_change_per_step,
             velocity_relaxation,
             pressure_relaxation,
             report_json: solve_report_json,
@@ -4177,6 +4217,9 @@ fn print_solver_usage() {
         "  --fieldChangeTolerance <v> relative U/p field-change tolerance for --solveLaminarSimple (default: 0.01)"
     );
     println!(
+        "  --maxFieldChangePerStep <v> bound one laminar SIMPLE U/p/phi update (default: 0.10)"
+    );
+    println!(
         "  --velocityRelaxation <v> override U relaxation for --solveLaminarSimple (default: fvSolution relaxationFactors.equations.U or 0.7)"
     );
     println!(
@@ -4357,6 +4400,8 @@ mod tests {
             "0.015".to_string(),
             "--fieldChangeTolerance".to_string(),
             "0.005".to_string(),
+            "--maxFieldChangePerStep".to_string(),
+            "0.2".to_string(),
             "--velocityRelaxation".to_string(),
             "0.6".to_string(),
             "--pressureRelaxation".to_string(),
@@ -4393,6 +4438,7 @@ mod tests {
         assert_eq!(solve.simple_tolerance, 1e-7);
         assert_eq!(solve.pressure_drop_tolerance, Some(0.015));
         assert_eq!(solve.field_change_tolerance, Some(0.005));
+        assert_eq!(solve.max_field_change_per_step, Some(0.2));
         assert_eq!(solve.velocity_relaxation, Some(0.6));
         assert_eq!(solve.pressure_relaxation, Some(0.2));
         assert_eq!(solve.report_json, Some(PathBuf::from("target/simple.json")));

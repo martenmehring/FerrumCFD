@@ -372,17 +372,19 @@ tolerances: `relaxationFactors.equations.U`, `relaxationFactors.fields.p`,
 `solvers.U.tolerance`, `solvers.p.tolerance`, `solvers.p.solver PCG`,
 `solvers.p.preconditioner DIC`, and optional `maxIter` values. Ferrum-specific
 SIMPLE entries can additionally set `minSimpleIterations`,
-`pressureDropTolerance`, and `fieldChangeTolerance`. `PCG` dispatches to
-Ferrum's CPU preconditioned-CG path. OpenFOAM `DIC`/`FDIC` currently maps to a
-diagonal PCG preconditioner, while true incomplete-Cholesky is tracked as a
-later numerical upgrade. CLI flags remain explicit experiment overrides.
+`pressureDropTolerance`, `fieldChangeTolerance`, and `maxFieldChangePerStep`.
+`PCG` dispatches to Ferrum's CPU preconditioned-CG path. OpenFOAM `DIC`/`FDIC`
+currently maps to a diagonal PCG preconditioner, while true incomplete-Cholesky
+is tracked as a later numerical upgrade. CLI flags remain explicit experiment
+overrides.
 The pressure-correction bridge now follows the OpenFOAM shape more closely:
-it builds cell-wise `rAU = V/A(U)`, assembles a variable-coefficient pressure
-correction equation, corrects `phi` with the pressure-equation flux, and
-carries the corrected surface flux into the next SIMPLE iteration. The operator
-and report boundaries are kept backend-neutral so the same assembly path can
-later dispatch linear and nonlinear solves to CPU, GPU, or mixed CPU/GPU
-resources.
+it builds velocity-relaxed cell-wise `rAU`, assembles a variable-coefficient
+pressure correction equation, corrects `phi` with the pressure-equation flux,
+carries the corrected surface flux into the next SIMPLE iteration, and bounds
+the coupled `U`/`p`/`phi` update before committing the SIMPLE step. The
+operator and report boundaries are kept backend-neutral so the same assembly
+path can later dispatch linear and nonlinear solves to CPU, GPU, or mixed
+CPU/GPU resources.
 
 Important design constraint:
 

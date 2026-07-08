@@ -677,17 +677,20 @@ requires all active checks to pass: continuity L2 below `--simpleTolerance`,
 Hagen-Poiseuille pressure-drop error below `--pressureDropTolerance`, and
 relative `U`/`p` field changes below `--fieldChangeTolerance`. These can also
 be set as Ferrum-specific entries under `SIMPLE` in `system/fvSolution`:
-`minSimpleIterations`, `pressureDropTolerance`, and `fieldChangeTolerance`.
+`minSimpleIterations`, `pressureDropTolerance`, `fieldChangeTolerance`, and
+`maxFieldChangePerStep`.
 
 The report records residuals, SIMPLE iterations, wall-clock time,
 finite-volume operator summaries, boundary counts, Hagen-Poiseuille error,
 continuity, and per-iteration field changes. The pressure-correction bridge
-uses cell-wise `rAU = V/A(U)`, corrects `phi` from the pressure-equation flux,
-and carries that corrected surface flux into the next SIMPLE iteration. Guards
-roll back to the previous finite state when continuity or the benchmark
-pressure-drop reference jumps aggressively. This prevents runaway reports, but
-fully OpenFOAM-grade momentum-pressure coupling and true incomplete-Cholesky
-pressure preconditioning are still solver-development work.
+uses velocity-relaxed cell-wise `rAU`, corrects `phi` from the
+pressure-equation flux, carries that corrected surface flux into the next
+SIMPLE iteration, and bounds each coupled `U`/`p`/`phi` update with
+`--maxFieldChangePerStep` (default `0.10`). Guards roll back to the previous
+finite state when continuity or the benchmark pressure-drop reference jumps
+aggressively. This prevents runaway reports, but fully OpenFOAM-grade
+momentum-pressure coupling and true incomplete-Cholesky pressure
+preconditioning are still solver-development work.
 
 For the standard pipe benchmark, the automated comparison command is:
 
