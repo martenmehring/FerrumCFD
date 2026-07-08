@@ -557,6 +557,13 @@ a `runtimeData` summary with array sizes and buffer sizes, but it intentionally
 does not dump the full geometry or field arrays into JSON. These runtime arrays
 are the handoff point for the future CPU/GPU equation kernels.
 
+FerrumCFD also contains the first executable CPU linear algebra foundation:
+CSR matrices, matrix-vector products, residual calculation, Jacobi, and
+conjugate gradient. The preflight reports these as CPU linear-solver
+capabilities. They are not yet connected to an assembled CFD equation; the next
+solver step is to assemble a Poisson/diffusion matrix from the runtime mesh and
+solve it through this interface.
+
 It also checks basic `controlDict` consistency: recognized `startFrom`,
 `stopAt`, and `writeControl` modes, positive finite `deltaT`, valid
 `writeInterval`, and an `endTime` that is not earlier than `startTime` for
@@ -576,11 +583,11 @@ With `--runnerDryRun`, FerrumCFD expands the current run plan into a capped
 runner preview. The preview logs time-step starts, planned stage dispatch such
 as `flow.residual` or `interfaces.flux`, backend choice, and planned write
 events. It also prints runtime handles derived from `system/ferrumBackends`,
-including CPU thread policy and GPU backend/device metadata. GPU stages are
-reported as planned dispatch only until executable GPU solver kernels exist.
-The same dry-run output also lists the solver-state fields that would be
-available to the future runner, including whether an initial field can already
-be materialized into a CPU buffer.
+including CPU thread policy, CPU linear-solver availability, and GPU
+backend/device metadata. GPU stages are reported as planned dispatch only until
+executable GPU solver kernels exist. The same dry-run output also lists the
+solver-state fields that would be available to the future runner, including
+whether an initial field can already be materialized into a CPU buffer.
 `--maxRunnerSteps <n>` limits the preview length. This does not update fields,
 advance physics, or solve equations.
 
@@ -766,10 +773,11 @@ consumed by built-in solver code.
   dimensions against solver equations.
 - `fvSchemes` and `fvSolution` are parsed and checked structurally for the
   solver preflight; their entries are not yet consumed by executable
-  discretisation or linear solver kernels.
+  discretisation or equation assembly.
 - Constant property dictionaries are parsed structurally; solver-specific
   required material models and coefficients are not enforced yet.
 - `ferrumSolver` is currently a preflight/run planner; `--runnerDryRun`
-  previews scheduling only, and CFD solver kernels are not implemented yet.
+  previews scheduling only. CPU CSR/Jacobi/CG kernels exist, but CFD equation
+  kernels are not implemented yet.
 - CPU/GPU backend selection is validated as configuration and not yet
   executable solver behavior.

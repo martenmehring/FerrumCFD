@@ -1,4 +1,5 @@
 use crate::backends::BackendChoice;
+use crate::linear::linear_solver_capabilities;
 use crate::solver_plan::{SolverCasePlan, SolverRunPlan, SolverRunStageSource};
 use crate::solver_state::SolverStatePlan;
 
@@ -57,6 +58,7 @@ pub struct SolverCpuRuntimeHandle {
     pub threads: String,
     pub thread_pinning: String,
     pub numa: String,
+    pub linear_solvers_available: bool,
     pub kernels_available: bool,
 }
 
@@ -68,6 +70,7 @@ pub struct SolverGpuRuntimeHandle {
     pub devices: Vec<String>,
     pub multi_gpu: String,
     pub precision: String,
+    pub linear_solvers_available: bool,
     pub kernels_available: bool,
 }
 
@@ -178,6 +181,7 @@ pub fn build_solver_runner_dry_run(
 }
 
 fn build_solver_runtime_plan(plan: &SolverCasePlan) -> SolverRuntimePlan {
+    let linear_solvers = linear_solver_capabilities();
     let cpu = SolverCpuRuntimeHandle {
         requested: plan.backends.uses_cpu,
         handle: format!(
@@ -189,6 +193,9 @@ fn build_solver_runtime_plan(plan: &SolverCasePlan) -> SolverRuntimePlan {
         threads: plan.backends.cpu.threads.clone(),
         thread_pinning: plan.backends.cpu.thread_pinning.clone(),
         numa: plan.backends.cpu.numa.clone(),
+        linear_solvers_available: linear_solvers.cpu_csr
+            && linear_solvers.cpu_jacobi
+            && linear_solvers.cpu_conjugate_gradient,
         kernels_available: false,
     };
     let gpu = SolverGpuRuntimeHandle {
@@ -202,6 +209,7 @@ fn build_solver_runtime_plan(plan: &SolverCasePlan) -> SolverRuntimePlan {
         devices: plan.backends.gpu.devices.clone(),
         multi_gpu: plan.backends.gpu.multi_gpu.clone(),
         precision: plan.backends.gpu.precision.clone(),
+        linear_solvers_available: linear_solvers.gpu_linear_solvers,
         kernels_available: false,
     };
 
@@ -328,7 +336,9 @@ mod tests {
         assert_eq!(dry_run.preview_steps, 3);
         assert_eq!(dry_run.stage_count, 2);
         assert_eq!(dry_run.preview_write_events, 1);
+        assert!(dry_run.runtime.cpu.linear_solvers_available);
         assert!(dry_run.runtime.gpu.requested);
+        assert!(!dry_run.runtime.gpu.linear_solvers_available);
         assert!(
             dry_run
                 .runtime

@@ -18,6 +18,7 @@ use ferrum_mesh::foam::{FoamWriteOptions, write_openfoam_case_with_options};
 use ferrum_mesh::geometry::{GeometrySummary, summarize_case_geometry};
 use ferrum_mesh::gmsh::read_msh22_ascii;
 use ferrum_mesh::interfaces::{read_interface_config, validate_interface_config};
+use ferrum_mesh::linear::linear_solver_capabilities;
 use ferrum_mesh::patches::{PatchValidationSummary, validate_case_patches};
 use ferrum_mesh::regions::{
     InterfaceRegistrySummary, InterfaceSummary, build_interface_registry,
@@ -400,6 +401,7 @@ fn print_solver_case_plan(plan: &SolverCasePlan) {
     }
     print_solver_state_plan(&plan.state);
     print_solver_runtime_data(&plan.runtime_data);
+    print_linear_solver_capabilities();
     print_solver_properties(&plan.properties);
     print_solver_numerics_dictionary("fvSchemes", &plan.numerics.fv_schemes);
     print_solver_numerics_dictionary("fvSolution", &plan.numerics.fv_solution);
@@ -421,7 +423,20 @@ fn print_solver_case_plan(plan: &SolverCasePlan) {
             println!("  {warning}");
         }
     }
-    println!("solver execution: no solver kernels are executed yet");
+    println!(
+        "solver execution: CPU linear algebra kernels are available; CFD equation kernels are not executed yet"
+    );
+}
+
+fn print_linear_solver_capabilities() {
+    let capabilities = linear_solver_capabilities();
+    println!(
+        "linear solvers: cpuCsr={} cpuJacobi={} cpuCg={} gpuLinearSolvers={}",
+        yes_no(capabilities.cpu_csr),
+        yes_no(capabilities.cpu_jacobi),
+        yes_no(capabilities.cpu_conjugate_gradient),
+        yes_no(capabilities.gpu_linear_solvers)
+    );
 }
 
 fn print_solver_properties(plan: &SolverPropertiesPlan) {
@@ -687,13 +702,15 @@ fn print_solver_runner_dry_run(dry_run: &SolverRunnerDryRun) {
     );
     print_solver_runner_state(&dry_run.state);
     println!(
-        "runner runtime: cpuRequested={} cpuHandle={} cpuKernels={} cpuThreads={} gpuRequested={} gpuHandle={} gpuKernels={} gpuBackend={} gpuDevices={} gpuPrecision={}",
+        "runner runtime: cpuRequested={} cpuHandle={} cpuLinearSolvers={} cpuKernels={} cpuThreads={} gpuRequested={} gpuHandle={} gpuLinearSolvers={} gpuKernels={} gpuBackend={} gpuDevices={} gpuPrecision={}",
         yes_no(dry_run.runtime.cpu.requested),
         dry_run.runtime.cpu.handle,
+        yes_no(dry_run.runtime.cpu.linear_solvers_available),
         yes_no(dry_run.runtime.cpu.kernels_available),
         dry_run.runtime.cpu.threads,
         yes_no(dry_run.runtime.gpu.requested),
         dry_run.runtime.gpu.handle,
+        yes_no(dry_run.runtime.gpu.linear_solvers_available),
         yes_no(dry_run.runtime.gpu.kernels_available),
         dry_run.runtime.gpu.backend,
         format_devices(&dry_run.runtime.gpu.devices),
@@ -2194,7 +2211,7 @@ fn print_solver_usage() {
     println!("  --runnerDryRun       preview the future solver runner without solving equations");
     println!("  --maxRunnerSteps <n> limit runner dry-run preview steps (default: 3)");
     println!();
-    println!("solver kernels are not executed yet");
+    println!("CPU CSR/Jacobi/CG kernels are available; CFD equation kernels are not executed yet");
 }
 
 fn print_gmsh_to_foam_usage() {

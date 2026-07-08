@@ -7,6 +7,7 @@ pub mod foam;
 pub mod geometry;
 pub mod gmsh;
 pub mod interfaces;
+pub mod linear;
 pub mod numerics;
 pub mod patches;
 pub mod poly_mesh;

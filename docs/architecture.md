@@ -273,10 +273,12 @@ loaders exist. None of this implies that solver kernels exist or have run.
 capped sequence of time-step starts, stage dispatch decisions, and planned
 write events. It also resolves lightweight CPU/GPU runtime handles from
 `ferrumBackends`, including CPU thread metadata and GPU backend/device
-metadata. GPU dispatch must be reported as unavailable until executable GPU
-solver kernels exist. It must remain explicit that this mode does not update
-fields, advance physics, assemble matrices, or solve equations. Its job is to
-harden the scheduling contract before CPU/GPU solver kernels exist.
+metadata. CPU linear algebra availability is reported separately from full CFD
+kernel availability. GPU dispatch must be reported as unavailable until
+executable GPU solver kernels exist. It must remain explicit that this mode
+does not update fields, advance physics, assemble matrices, or solve equations.
+Its job is to harden the scheduling contract before CPU/GPU solver kernels
+exist.
 
 `fvSchemes` and `fvSolution` parsing is currently structural. The preflight can
 report entries such as `ddtSchemes.default=Euler` or
@@ -328,6 +330,13 @@ Backend implementations: CPU, WGPU, CUDA, HIP
 Physics code should express operations in terms of fields, operators, and
 solver steps. Backend implementations should decide where and how those
 operations run.
+
+The first executable solver foundation is CPU linear algebra: CSR matrices,
+matrix-vector products, residuals, Jacobi, and conjugate gradient. This is the
+minimal substrate needed before assembling the first Poisson or diffusion
+equation from runtime mesh geometry. It should remain a small backend-neutral
+contract so later GPU implementations can provide the same operations without
+changing the equation assembly layer.
 
 Important design constraint:
 

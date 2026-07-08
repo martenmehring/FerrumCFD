@@ -79,6 +79,9 @@ The importer currently targets the membrane reactor test mesh shape:
 - solver runtime preparation builds owner/neighbour connectivity, patch face
   ranges, cell centres, face centres, owner-oriented face-area vectors, cell
   volumes, and materialized CPU f64 field buffers for later CPU/GPU kernels
+- CPU linear algebra now has a small executable CSR foundation with matrix-vector
+  products, residuals, Jacobi, and conjugate-gradient solves for the first
+  Poisson/diffusion equation assembly step
 - mesh geometry summaries compute face areas, boundary area, and cell volumes
 - special patch validation counts `empty`, `wedge`, and `symmetryPlane`
   patches and reports basic patch-range warnings
@@ -96,8 +99,8 @@ The importer currently targets the membrane reactor test mesh shape:
 - `ferrumSolver` currently performs a solver preflight and prints a
   solver-neutral case plan, including the estimated time/write schedule and
   resolved backend choice per built-in run stage; `--planJson <file>` also
-  writes the same plan as machine-readable JSON; executable solver kernels are
-  not implemented yet
+  writes the same plan as machine-readable JSON; CPU linear algebra kernels are
+  available, but executable CFD equation kernels are not implemented yet
 - `--runnerDryRun` previews the future solver runner for a capped number of
   steps and logs planned field state, CPU/GPU stage dispatch, runtime handles,
   and missing executable backend status without updating fields or solving
