@@ -244,6 +244,7 @@ The current checker reports:
 - special patch validation for `empty`, `wedge`, and `symmetryPlane`
 - generated region meshes below `constant/<region>/polyMesh`
 - topology warnings from import
+- field boundary entries against mesh patches
 
 This is not yet a full OpenFOAM-grade `checkMesh`, but it is the command that
 will grow into that role.
@@ -255,6 +256,12 @@ geometry: cells=523600 faces=1580785 totalVolume=4.921636e4 minCellVolume=1.4131
 geometry faces: minArea=3.532886e-3 maxArea=2.714353e0 totalBoundaryArea=1.437881e4
 patch validation: patches=7 empty=0 wedge=0 symmetryPlane=0 warnings=0
 ```
+
+When initial fields exist, their `boundaryField` entries are checked against
+the mesh patches. `checkFerrumMesh` warns about missing entries, extra entries,
+duplicates, and special mesh patches whose field boundary type should match the
+mesh patch type, for example `empty` on an `empty` patch or `wedge` on a
+`wedge` patch.
 
 ## Split Multi-Region Meshes
 
@@ -527,7 +534,8 @@ accept `auto` or a positive integer.
 - Geometry computation currently reports summary values; full OpenFOAM-grade
   geometry quality checks are not implemented yet.
 - Initial field parsing currently summarizes fields and boundary entries; it
-  does not yet validate dimensions against solver equations or patch types.
+  validates boundary patch names and special patch boundary types, but it does
+  not yet validate dimensions against solver equations.
 - Solver support is not implemented yet.
 - CPU/GPU backend selection is validated as configuration and not yet
   executable solver behavior.

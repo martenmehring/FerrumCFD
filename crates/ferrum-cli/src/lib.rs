@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 use case::{InitCaseOptions, init_case};
 use ferrum_mesh::backends::{read_backend_config, validate_backend_resources};
 use ferrum_mesh::check::read_case_summary;
-use ferrum_mesh::fields::{FieldFile, read_initial_fields};
+use ferrum_mesh::fields::{
+    FieldBoundaryValidationSummary, FieldFile, InitialFieldSet, read_initial_fields,
+    validate_initial_field_boundaries,
+};
 use ferrum_mesh::foam::{FoamWriteOptions, write_openfoam_case_with_options};
 use ferrum_mesh::geometry::{GeometrySummary, summarize_case_geometry};
 use ferrum_mesh::gmsh::read_msh22_ascii;
@@ -197,7 +200,9 @@ fn check_mesh(args: Vec<String>) -> Result<(), String> {
     print_interface_registry(&interfaces);
     print_interface_config(&case_dir, &interfaces)?;
     print_backend_config(&case_dir)?;
-    print_initial_fields(&case_dir)?;
+    let fields = read_initial_fields(&case_dir).map_err(|error| error.to_string())?;
+    print_initial_fields(&fields);
+    print_field_boundary_validation(&case_dir, &fields);
     print_geometry_summary(&case_dir)?;
     print_patch_validation(&case_dir)?;
 
@@ -410,19 +415,16 @@ fn format_devices(devices: &[String]) -> String {
     format!("({})", devices.join(" "))
 }
 
-fn print_initial_fields(case_dir: &Path) -> Result<(), String> {
-    let fields = read_initial_fields(case_dir).map_err(|error| error.to_string())?;
+fn print_initial_fields(fields: &InitialFieldSet) {
     if fields.fields.is_empty() {
         println!("initial fields: none");
-        return Ok(());
+        return;
     }
 
     println!("initial fields:");
     for field in &fields.fields {
         print_initial_field(field);
     }
-
-    Ok(())
 }
 
 fn print_initial_field(field: &FieldFile) {
@@ -465,6 +467,26 @@ fn print_initial_field(field: &FieldFile) {
                 patch.patch_type.as_deref().unwrap_or("unknown")
             );
         }
+    }
+}
+
+fn print_field_boundary_validation(case_dir: &Path, fields: &InitialFieldSet) {
+    let summary = validate_initial_field_boundaries(case_dir, fields);
+    print_field_boundary_validation_summary(&summary);
+}
+
+fn print_field_boundary_validation_summary(summary: &FieldBoundaryValidationSummary) {
+    if summary.fields == 0 {
+        return;
+    }
+
+    println!(
+        "field boundary validation: fields={} warnings={}",
+        summary.fields,
+        summary.warnings.len()
+    );
+    for warning in &summary.warnings {
+        println!("field boundary warning: {warning}");
     }
 }
 

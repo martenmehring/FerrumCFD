@@ -62,6 +62,8 @@ The importer currently targets the membrane reactor test mesh shape:
   `symmetryPlane`, or custom patch types
 - OpenFOAM-like initial fields below `0/` are parsed for `dimensions`,
   `internalField`, and `boundaryField` summaries
+- field `boundaryField` entries are checked against mesh patch names and
+  special patch types
 - mesh geometry summaries compute face areas, boundary area, and cell volumes
 - special patch validation counts `empty`, `wedge`, and `symmetryPlane`
   patches and reports basic patch-range warnings

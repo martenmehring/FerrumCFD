@@ -1,7 +1,9 @@
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::dictionary::{TokenCursor, tokenize};
+use crate::poly_mesh::PolyMesh;
 use crate::{MeshError, Result};
 
 #[derive(Debug)]
@@ -36,6 +38,12 @@ pub struct FieldBoundaryPatch {
     pub name: String,
     pub patch_type: Option<String>,
     pub value: Option<FieldValueSummary>,
+}
+
+#[derive(Debug)]
+pub struct FieldBoundaryValidationSummary {
+    pub fields: usize,
+    pub warnings: Vec<String>,
 }
 
 impl std::fmt::Display for FieldValueSummary {
@@ -91,6 +99,21 @@ pub fn read_initial_fields(case_dir: &Path) -> Result<InitialFieldSet> {
         case_dir: case_dir.to_path_buf(),
         fields,
     })
+}
+
+pub fn validate_initial_field_boundaries(
+    case_dir: &Path,
+    fields: &InitialFieldSet,
+) -> FieldBoundaryValidationSummary {
+    let mut validator = FieldBoundaryValidator::new(case_dir);
+    for field in &fields.fields {
+        validator.validate_field(field);
+    }
+
+    FieldBoundaryValidationSummary {
+        fields: fields.fields.len(),
+        warnings: validator.warnings,
+    }
 }
 
 fn read_field_files_in_dir(
@@ -270,11 +293,155 @@ fn join_tokens(tokens: &[String]) -> String {
     tokens.join(" ")
 }
 
+struct FieldBoundaryValidator<'a> {
+    case_dir: &'a Path,
+    mesh_cache: HashMap<Option<String>, Result<PolyMesh>>,
+    warnings: Vec<String>,
+}
+
+impl<'a> FieldBoundaryValidator<'a> {
+    fn new(case_dir: &'a Path) -> Self {
+        Self {
+            case_dir,
+            mesh_cache: HashMap::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn validate_field(&mut self, field: &FieldFile) {
+        let region = field.region.clone();
+        let mesh = self.mesh_for_region(region.clone());
+        let Some(mesh) = mesh else {
+            return;
+        };
+
+        let mut field_warnings = Vec::new();
+        validate_field_boundary_patches(field, mesh, &mut field_warnings);
+        self.warnings.extend(field_warnings);
+    }
+
+    fn mesh_for_region(&mut self, region: Option<String>) -> Option<&PolyMesh> {
+        if !self.mesh_cache.contains_key(&region) {
+            let mesh_path = if let Some(region) = &region {
+                self.case_dir.join("constant").join(region).join("polyMesh")
+            } else {
+                self.case_dir.join("constant").join("polyMesh")
+            };
+            let mesh = PolyMesh::read(&mesh_path);
+            self.mesh_cache.insert(region.clone(), mesh);
+        }
+
+        match self
+            .mesh_cache
+            .get(&region)
+            .expect("mesh cache entry exists")
+        {
+            Ok(mesh) => Some(mesh),
+            Err(error) => {
+                let label = region
+                    .as_deref()
+                    .map(|region| format!("region '{region}'"))
+                    .unwrap_or_else(|| "base mesh".to_string());
+                self.warnings
+                    .push(format!("could not validate fields for {label}: {error}"));
+                None
+            }
+        }
+    }
+}
+
+fn validate_field_boundary_patches(field: &FieldFile, mesh: &PolyMesh, warnings: &mut Vec<String>) {
+    let field_label = field_label(field);
+    let field_patch_names = field
+        .boundary_patches
+        .iter()
+        .map(|patch| patch.name.as_str())
+        .collect::<Vec<_>>();
+    let mut seen = HashSet::new();
+    for name in &field_patch_names {
+        if !seen.insert(*name) {
+            warnings.push(format!(
+                "field '{}' has duplicate boundaryField entry '{}'",
+                field_label, name
+            ));
+        }
+    }
+
+    let mesh_patch_names = mesh
+        .patches
+        .iter()
+        .map(|patch| patch.name.as_str())
+        .collect::<HashSet<_>>();
+    for patch in &mesh.patches {
+        let field_patch = field
+            .boundary_patches
+            .iter()
+            .find(|field_patch| field_patch.name == patch.name);
+        let Some(field_patch) = field_patch else {
+            warnings.push(format!(
+                "field '{}' is missing boundaryField entry for mesh patch '{}'",
+                field_label, patch.name
+            ));
+            continue;
+        };
+
+        validate_special_patch_field_type(field, field_patch, &patch.patch_type, warnings);
+    }
+
+    for field_patch in &field.boundary_patches {
+        if !mesh_patch_names.contains(field_patch.name.as_str()) {
+            warnings.push(format!(
+                "field '{}' has boundaryField entry '{}' that is not a mesh patch",
+                field_label, field_patch.name
+            ));
+        }
+    }
+}
+
+fn validate_special_patch_field_type(
+    field: &FieldFile,
+    field_patch: &FieldBoundaryPatch,
+    mesh_patch_type: &str,
+    warnings: &mut Vec<String>,
+) {
+    let expected = match mesh_patch_type {
+        "empty" => "empty",
+        "wedge" => "wedge",
+        "symmetryPlane" => "symmetryPlane",
+        _ => return,
+    };
+
+    if field_patch.patch_type.as_deref() != Some(expected) {
+        warnings.push(format!(
+            "field '{}' patch '{}' should use boundary type '{}' for mesh patch type '{}', found '{}'",
+            field_label(field),
+            field_patch.name,
+            expected,
+            mesh_patch_type,
+            field_patch.patch_type.as_deref().unwrap_or("missing")
+        ));
+    }
+}
+
+fn field_label(field: &FieldFile) -> String {
+    if let Some(region) = &field.region {
+        format!("{region}/{}", field.name)
+    } else {
+        field.name.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
-    use super::{FieldValueSummary, parse_field_file_str};
+    use crate::Point3;
+    use crate::poly_mesh::{BoundaryPatch, PolyMesh};
+
+    use super::{
+        FieldBoundaryPatch, FieldFile, FieldValueSummary, parse_field_file_str,
+        validate_field_boundary_patches,
+    };
 
     #[test]
     fn parses_scalar_field_with_boundary_field() {
@@ -372,6 +539,115 @@ mod tests {
                 assert_eq!(count, Some(3));
             }
             other => panic!("unexpected field value: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validates_special_field_patch_types() {
+        let field = test_field(vec![
+            FieldBoundaryPatch {
+                name: "inlet".to_string(),
+                patch_type: Some("fixedValue".to_string()),
+                value: None,
+            },
+            FieldBoundaryPatch {
+                name: "front".to_string(),
+                patch_type: Some("empty".to_string()),
+                value: None,
+            },
+        ]);
+        let mesh = test_mesh(vec![
+            BoundaryPatch {
+                name: "inlet".to_string(),
+                patch_type: "patch".to_string(),
+                faces: 1,
+                start_face: 0,
+            },
+            BoundaryPatch {
+                name: "front".to_string(),
+                patch_type: "empty".to_string(),
+                faces: 1,
+                start_face: 1,
+            },
+        ]);
+        let mut warnings = Vec::new();
+
+        validate_field_boundary_patches(&field, &mesh, &mut warnings);
+
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn warns_for_missing_extra_and_wrong_special_field_patches() {
+        let field = test_field(vec![
+            FieldBoundaryPatch {
+                name: "front".to_string(),
+                patch_type: Some("zeroGradient".to_string()),
+                value: None,
+            },
+            FieldBoundaryPatch {
+                name: "unused".to_string(),
+                patch_type: Some("patch".to_string()),
+                value: None,
+            },
+        ]);
+        let mesh = test_mesh(vec![
+            BoundaryPatch {
+                name: "inlet".to_string(),
+                patch_type: "patch".to_string(),
+                faces: 1,
+                start_face: 0,
+            },
+            BoundaryPatch {
+                name: "front".to_string(),
+                patch_type: "empty".to_string(),
+                faces: 1,
+                start_face: 1,
+            },
+        ]);
+        let mut warnings = Vec::new();
+
+        validate_field_boundary_patches(&field, &mesh, &mut warnings);
+
+        assert_eq!(warnings.len(), 3);
+    }
+
+    fn test_field(boundary_patches: Vec<FieldBoundaryPatch>) -> FieldFile {
+        FieldFile {
+            path: PathBuf::from("0/p"),
+            region: None,
+            name: "p".to_string(),
+            class_name: Some("volScalarField".to_string()),
+            dimensions: None,
+            internal_field: None,
+            boundary_patches,
+        }
+    }
+
+    fn test_mesh(patches: Vec<BoundaryPatch>) -> PolyMesh {
+        PolyMesh {
+            path: PathBuf::from("polyMesh"),
+            points: vec![
+                Point3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                Point3 {
+                    x: 1.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                Point3 {
+                    x: 0.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+            ],
+            faces: vec![vec![0, 1, 2], vec![0, 2, 1]],
+            owner: vec![0, 0],
+            neighbour: Vec::new(),
+            patches,
         }
     }
 }

@@ -60,6 +60,12 @@ Initial field parsing is intentionally structural at this stage. It reads
 setup in `checkFerrumMesh`. Solver modules will later interpret these fields in
 the context of equations, patch constraints, and dimensions.
 
+`checkFerrumMesh` now validates field boundary entries against mesh patches.
+This is deliberately solver-neutral: it checks names and special patch
+compatibility such as `empty` fields on `empty` mesh patches, but it does not
+yet decide whether a pressure or velocity boundary condition is physically
+appropriate for a solver.
+
 ## Reduced Dimensions And Axisymmetry
 
 The mesh importer can now write OpenFOAM-compatible patch types such as
