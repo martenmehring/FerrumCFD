@@ -24,9 +24,29 @@ pub struct FoamWriteSummary {
 #[derive(Clone, Debug)]
 pub struct PatchSummary {
     pub name: String,
+    pub patch_type: String,
     pub physical_tag: Option<i32>,
     pub faces: usize,
     pub start_face: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct FoamWriteOptions {
+    pub patch_types: HashMap<String, String>,
+}
+
+impl FoamWriteOptions {
+    pub fn set_patch_type(&mut self, patch_name: impl Into<String>, patch_type: impl Into<String>) {
+        self.patch_types
+            .insert(sanitize_name(&patch_name.into()), patch_type.into());
+    }
+
+    fn patch_type_for(&self, patch_name: &str) -> String {
+        self.patch_types
+            .get(patch_name)
+            .cloned()
+            .unwrap_or_else(|| "patch".to_string())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -48,12 +68,21 @@ pub fn write_openfoam_case(
     case_dir: &Path,
     source_path: &Path,
 ) -> Result<FoamWriteSummary> {
+    write_openfoam_case_with_options(mesh, case_dir, source_path, &FoamWriteOptions::default())
+}
+
+pub fn write_openfoam_case_with_options(
+    mesh: &Mesh,
+    case_dir: &Path,
+    source_path: &Path,
+    options: &FoamWriteOptions,
+) -> Result<FoamWriteSummary> {
     let poly_mesh_dir = case_dir.join("constant").join("polyMesh");
     fs::create_dir_all(&poly_mesh_dir)?;
     fs::create_dir_all(case_dir.join("system"))?;
 
     let topology = build_topology(mesh);
-    let ordered = order_faces(mesh, &topology.faces);
+    let ordered = order_faces(mesh, &topology.faces, options);
 
     write_points(&poly_mesh_dir.join("points"), mesh)?;
     write_faces(
@@ -178,7 +207,7 @@ fn build_topology(mesh: &Mesh) -> Topology {
     }
 }
 
-fn order_faces(mesh: &Mesh, faces: &[FaceRecord]) -> OrderedFaces {
+fn order_faces(mesh: &Mesh, faces: &[FaceRecord], options: &FoamWriteOptions) -> OrderedFaces {
     let mut internal_face_indices = Vec::new();
     let mut boundary_by_patch = BTreeMap::<String, Vec<usize>>::new();
     let mut patch_tags = HashMap::<String, Option<i32>>::new();
@@ -227,6 +256,7 @@ fn order_faces(mesh: &Mesh, faces: &[FaceRecord]) -> OrderedFaces {
         }
         patches.push(PatchSummary {
             name: name.clone(),
+            patch_type: options.patch_type_for(&name),
             physical_tag: patch_tags.get(&name).copied().flatten(),
             faces: face_count,
             start_face,
@@ -299,7 +329,7 @@ fn write_boundary(path: &Path, patches: &[PatchSummary]) -> Result<()> {
     for patch in patches {
         writeln!(writer, "    {}", patch.name)?;
         writeln!(writer, "    {{")?;
-        writeln!(writer, "        type patch;")?;
+        writeln!(writer, "        type {};", patch.patch_type)?;
         writeln!(writer, "        nFaces {};", patch.faces)?;
         writeln!(writer, "        startFace {};", patch.start_face)?;
         writeln!(writer, "    }}")?;
@@ -483,8 +513,8 @@ fn write_summary(
             .unwrap_or_else(|| "-".to_string());
         writeln!(
             writer,
-            "{} tag={} faces={} startFace={}",
-            patch.name, tag, patch.faces, patch.start_face
+            "{} type={} tag={} faces={} startFace={}",
+            patch.name, patch.patch_type, tag, patch.faces, patch.start_face
         )?;
     }
     writeln!(writer)?;

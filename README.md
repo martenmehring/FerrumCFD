@@ -19,6 +19,28 @@ cargo run -p ferrum-cli --bin checkFerrumMesh -- -case examples\membrane_reactor
 cargo run -p ferrum-cli --bin splitFerrumMeshRegions -- -case examples\membrane_reactor -cellZones
 ```
 
+## 2D And Axisymmetric Meshes
+
+FerrumCFD follows the OpenFOAM mesh workflow:
+
+- 2D planar cases are imported as one-cell-thick 3D meshes. The front/back
+  patches must use the OpenFOAM `empty` patch type.
+- Axisymmetric cases are imported as wedge meshes. The two angular patches
+  must use the OpenFOAM `wedge` patch type.
+
+Examples:
+
+```powershell
+gmshToFerrumFoam path\to\mesh2d.msh -case cases\plate2d -emptyPatch frontAndBack
+gmshToFerrumFoam path\to\axisymmetric.msh -case cases\reactor_axi -wedgePatch wedgeMin -wedgePatch wedgeMax
+```
+
+Generic OpenFOAM-compatible patch types can be written with:
+
+```powershell
+gmshToFerrumFoam path\to\mesh.msh -case cases\mesh -patchType symmetry=symmetryPlane
+```
+
 ## Current Mesh Scope
 
 The importer currently targets the membrane reactor test mesh shape:
@@ -31,6 +53,8 @@ The importer currently targets the membrane reactor test mesh shape:
 - external Gmsh physical surfaces become boundary patches
 - all Gmsh physical surfaces, including internal multi-region interfaces,
   are preserved as `faceZones`
+- patch types can be written as OpenFOAM-compatible `patch`, `empty`, `wedge`,
+  `symmetryPlane`, or custom patch types
 
 `splitFerrumMeshRegions` currently lists detected cell zones. Full region
 mesh splitting is the next milestone.
