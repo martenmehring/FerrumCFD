@@ -652,16 +652,20 @@ ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --solveTolerance 1
 ```
 
 The generic `--linearSolver` value is still accepted, but the laminar SIMPLE
-path can also split the linear solver choice by equation:
+path can also split the linear solver choice and linear controls by equation:
 
 ```powershell
 ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --momentumLinearSolver cg --pressureLinearSolver jacobi --velocityRelaxation 0.1 --pressureRelaxation 0.02 --maxSimpleIterations 20
+ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --momentumSolveTolerance 1e-7 --pressureSolveTolerance 1e-9 --momentumMaxIterations 300 --pressureMaxIterations 400
 ```
 
 By default, `--solveLaminarSimple` reads OpenFOAM-style relaxation factors from
 `system/fvSolution`: `relaxationFactors.equations.U` for velocity and
 `relaxationFactors.fields.p` for pressure. The CLI flags above are explicit
-overrides for experiments.
+overrides for experiments. It also reads `solvers.U.tolerance`,
+`solvers.p.tolerance`, and optional `maxIter` values from `system/fvSolution`.
+The generic `--solveTolerance` and `--maxIterations` flags remain broad
+overrides for both equations.
 
 The current default for this path is one damped Jacobi CPU SIMPLE step. The
 report records residuals, SIMPLE iterations, wall-clock time, finite-volume

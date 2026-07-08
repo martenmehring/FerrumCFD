@@ -365,9 +365,11 @@ Jacobi CPU SIMPLE step is the stable default for the pipe benchmark, while
 multi-step pressure correction remains an active solver-development target.
 Momentum and pressure-correction linear solvers can be selected separately, so
 experiments can run CG for momentum and Jacobi for pressure correction without
-changing the case files. OpenFOAM-style `relaxationFactors` in
-`system/fvSolution` are the default source for pressure and velocity
-under-relaxation, with CLI flags available as explicit experiment overrides.
+changing the case files. OpenFOAM-style `fvSolution` entries are the default
+source for pressure and velocity under-relaxation and for per-equation linear
+tolerances: `relaxationFactors.equations.U`, `relaxationFactors.fields.p`,
+`solvers.U.tolerance`, `solvers.p.tolerance`, and optional `maxIter` values.
+CLI flags remain explicit experiment overrides.
 The pressure-correction bridge now follows the OpenFOAM shape more closely:
 it builds cell-wise `rAU = V/A(U)`, assembles a variable-coefficient pressure
 correction equation, and corrects `phi` with the pressure-equation flux instead

@@ -56,22 +56,25 @@ ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --linearSolver jac
 ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --linearSolver cg --solveTolerance 1e-6 --maxIterations 20000 --maxSimpleIterations 20 --velocityRelaxation 0.1 --pressureRelaxation 0.02
 ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --linearSolver jacobi --momentumLinearSolver cg --pressureLinearSolver jacobi --solveTolerance 1e-6 --maxIterations 100 --maxSimpleIterations 20 --velocityRelaxation 0.1 --pressureRelaxation 0.02
 ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --solveTolerance 1e-6 --maxIterations 100 --maxSimpleIterations 20
+ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --maxSimpleIterations 20
 ```
 
-| Momentum solver | Pressure solver | Relaxation source | SIMPLE tries | DeltaP from mean [Pa] | Error to analytic | Final continuity L2 | Solve time [s] | Notes |
-| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Jacobi | Jacobi | CLI 0.1/0.02 | 13 | 1.584929 | -1.140% | 3.551e-6 | 5.323929 | best pressure-loss error, but local axial velocity oscillates |
-| CG | CG | CLI 0.1/0.02 | 4 | 1.684419 | 5.066% | 4.547e-7 | 0.554151 | fast, pressure correction effectively stalls |
-| CG | Jacobi | CLI 0.1/0.02 | 4 | 1.684419 | 5.066% | 4.547e-7 | 0.719120 | confirms the current CG-momentum path is not yet the accuracy bottleneck alone |
-| Jacobi | Jacobi | fvSolution 0.7/0.3 | 2 | 1.531687 | -4.461% | 5.547e-7 | 1.099823 | OpenFOAM-style defaults are read from `relaxationFactors`; pressure correction uses cell-wise `rAU` and direct `phi` correction; second step is guarded |
+| Momentum solver | Pressure solver | Linear controls | Relaxation source | SIMPLE tries | DeltaP from mean [Pa] | Error to analytic | Final continuity L2 | Solve time [s] | Notes |
+| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Jacobi | Jacobi | CLI 1e-6/100 | CLI 0.1/0.02 | 13 | 1.584929 | -1.140% | 3.551e-6 | 5.323929 | best pressure-loss error, but local axial velocity oscillates |
+| CG | CG | CLI 1e-6/20000 | CLI 0.1/0.02 | 4 | 1.684419 | 5.066% | 4.547e-7 | 0.554151 | fast, pressure correction effectively stalls |
+| CG | Jacobi | CLI 1e-6/100 | CLI 0.1/0.02 | 4 | 1.684419 | 5.066% | 4.547e-7 | 0.719120 | confirms the current CG-momentum path is not yet the accuracy bottleneck alone |
+| Jacobi | Jacobi | CLI 1e-6/100 | fvSolution 0.7/0.3 | 2 | 1.531687 | -4.461% | 5.547e-7 | 1.208509 | broad CLI tolerance/iteration overrides still affect both equations |
+| Jacobi | Jacobi | fvSolution 1e-10/default 10000 | fvSolution 0.7/0.3 | 3 | 1.416486 | -11.646% | 1.797e-5 | 78.180144 | per-equation tolerances are read from `solvers.U/p`; Jacobi pressure correction reaches the guard |
 
 The continuity-growth guard prevents the old runaway behavior where long
 multi-step trials produced infinite or astronomically large values. The next
 numerical target is a better pressure-correction operator and a proper
-preconditioned pressure solve, not just lower relaxation factors. A tighter
-single global `--solveTolerance 1e-10` with Jacobi makes the pressure correction
-work harder but worsens the guarded medium-pipe result to `+14.6%`, so pressure
-and momentum tolerances need to be controlled separately from `fvSolution`.
+preconditioned pressure solve, not just lower relaxation factors. Reading the
+OpenFOAM-style tolerances exposes the current bottleneck clearly: strict
+`solvers.p.tolerance 1e-10` with Jacobi is expensive and less stable, so the
+next solver step is mapping `PCG`/preconditioners and pressure-specific
+iteration controls more faithfully.
 
 ## Mesh Study
 

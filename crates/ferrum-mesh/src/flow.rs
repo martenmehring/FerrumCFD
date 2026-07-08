@@ -30,6 +30,10 @@ pub struct LaminarSimpleOptions {
     pub pressure_linear_solver: LaminarSimpleLinearSolver,
     pub linear_tolerance: f64,
     pub max_linear_iterations: usize,
+    pub momentum_linear_tolerance: f64,
+    pub pressure_linear_tolerance: f64,
+    pub momentum_max_linear_iterations: usize,
+    pub pressure_max_linear_iterations: usize,
     pub max_simple_iterations: usize,
     pub simple_tolerance: f64,
     pub velocity_relaxation: f64,
@@ -287,8 +291,8 @@ pub fn solve_laminar_simple(
             &pressure_system.rhs,
             None,
             options.pressure_linear_solver,
-            options.linear_tolerance,
-            options.max_linear_iterations,
+            options.pressure_linear_tolerance,
+            options.pressure_max_linear_iterations,
         ) {
             Ok(report) => report,
             Err(error) if is_pressure_correction_breakdown(&error) => {
@@ -488,8 +492,8 @@ fn solve_momentum_predictor(
             &system.rhs,
             Some(&old_components[component]),
             options.momentum_linear_solver,
-            options.linear_tolerance,
-            options.max_linear_iterations,
+            options.momentum_linear_tolerance,
+            options.momentum_max_linear_iterations,
         )
         .map_err(|error| {
             invalid_input(format!(
@@ -1563,7 +1567,11 @@ fn validate_laminar_simple_options(options: &LaminarSimpleOptions) -> Result<()>
             options.diameter
         )));
     }
-    if options.max_linear_iterations == 0 || options.max_simple_iterations == 0 {
+    if options.max_linear_iterations == 0
+        || options.momentum_max_linear_iterations == 0
+        || options.pressure_max_linear_iterations == 0
+        || options.max_simple_iterations == 0
+    {
         return Err(invalid_input(
             "laminar SIMPLE iteration limits must be greater than zero".to_string(),
         ));
@@ -1574,6 +1582,8 @@ fn validate_laminar_simple_options(options: &LaminarSimpleOptions) -> Result<()>
             options.linear_tolerance
         )));
     }
+    validate_linear_tolerance("momentum", options.momentum_linear_tolerance)?;
+    validate_linear_tolerance("pressure", options.pressure_linear_tolerance)?;
     if !options.simple_tolerance.is_finite() || options.simple_tolerance < 0.0 {
         return Err(invalid_input(format!(
             "laminar SIMPLE tolerance must be non-negative and finite, got {}",
@@ -1586,6 +1596,15 @@ fn validate_laminar_simple_options(options: &LaminarSimpleOptions) -> Result<()>
         return Err(invalid_input(
             "laminar SIMPLE inlet and outlet patch names must not be empty".to_string(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_linear_tolerance(name: &str, value: f64) -> Result<()> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(invalid_input(format!(
+            "laminar SIMPLE {name} linear tolerance must be non-negative and finite, got {value}"
+        )));
     }
     Ok(())
 }
@@ -1867,6 +1886,10 @@ mod tests {
             pressure_linear_solver: LaminarSimpleLinearSolver::Cg,
             linear_tolerance: 1.0e-10,
             max_linear_iterations: 100,
+            momentum_linear_tolerance: 1.0e-10,
+            pressure_linear_tolerance: 1.0e-10,
+            momentum_max_linear_iterations: 100,
+            pressure_max_linear_iterations: 100,
             max_simple_iterations: 3,
             simple_tolerance: 1.0e-12,
             velocity_relaxation: 0.7,

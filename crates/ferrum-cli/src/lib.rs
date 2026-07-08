@@ -617,6 +617,29 @@ fn resolve_laminar_simple_options(
                 .to_string()
         })?;
 
+    let linear_tolerance = solve.linear_tolerance.unwrap_or(1.0e-10);
+    let max_linear_iterations = solve.max_linear_iterations.unwrap_or(10_000);
+    let momentum_linear_tolerance = solve
+        .momentum_linear_tolerance
+        .or(solve.linear_tolerance)
+        .or_else(|| fv_solution_number(plan, "solvers.U", "tolerance"))
+        .unwrap_or(1.0e-10);
+    let pressure_linear_tolerance = solve
+        .pressure_linear_tolerance
+        .or(solve.linear_tolerance)
+        .or_else(|| fv_solution_number(plan, "solvers.p", "tolerance"))
+        .unwrap_or(1.0e-10);
+    let momentum_max_linear_iterations = solve
+        .momentum_max_linear_iterations
+        .or(solve.max_linear_iterations)
+        .or_else(|| fv_solution_usize(plan, "solvers.U", "maxIter"))
+        .unwrap_or(10_000);
+    let pressure_max_linear_iterations = solve
+        .pressure_max_linear_iterations
+        .or(solve.max_linear_iterations)
+        .or_else(|| fv_solution_usize(plan, "solvers.p", "maxIter"))
+        .unwrap_or(10_000);
+
     Ok(LaminarSimpleOptions {
         density,
         dynamic_viscosity,
@@ -628,8 +651,12 @@ fn resolve_laminar_simple_options(
         linear_solver: solve.linear_solver,
         momentum_linear_solver: solve.momentum_linear_solver.unwrap_or(solve.linear_solver),
         pressure_linear_solver: solve.pressure_linear_solver.unwrap_or(solve.linear_solver),
-        linear_tolerance: solve.linear_tolerance,
-        max_linear_iterations: solve.max_linear_iterations,
+        linear_tolerance,
+        max_linear_iterations,
+        momentum_linear_tolerance,
+        pressure_linear_tolerance,
+        momentum_max_linear_iterations,
+        pressure_max_linear_iterations,
         max_simple_iterations: solve.max_simple_iterations,
         simple_tolerance: solve.simple_tolerance,
         velocity_relaxation: solve
@@ -664,6 +691,10 @@ fn fv_solution_number(plan: &SolverCasePlan, section: &str, key: &str) -> Option
     numerics_dictionary_number(&plan.numerics.fv_solution, section, key)
 }
 
+fn fv_solution_usize(plan: &SolverCasePlan, section: &str, key: &str) -> Option<usize> {
+    numerics_dictionary_usize(&plan.numerics.fv_solution, section, key)
+}
+
 fn numerics_dictionary_number(
     dictionary: &SolverNumericsDictionaryPlan,
     section: &str,
@@ -676,11 +707,32 @@ fn numerics_dictionary_number(
         .and_then(|entry| last_number(&entry.value))
 }
 
+fn numerics_dictionary_usize(
+    dictionary: &SolverNumericsDictionaryPlan,
+    section: &str,
+    key: &str,
+) -> Option<usize> {
+    dictionary
+        .entries
+        .iter()
+        .find(|entry| entry.section == section && entry.key == key)
+        .and_then(|entry| last_usize(&entry.value))
+}
+
 fn last_number(value: &str) -> Option<f64> {
     value.split_whitespace().rev().find_map(|token| {
         token
             .trim_matches(|ch| ch == '[' || ch == ']')
             .parse::<f64>()
+            .ok()
+    })
+}
+
+fn last_usize(value: &str) -> Option<usize> {
+    value.split_whitespace().rev().find_map(|token| {
+        token
+            .trim_matches(|ch| ch == '[' || ch == ']')
+            .parse::<usize>()
             .ok()
     })
 }
@@ -1508,8 +1560,28 @@ fn write_json_laminar_simple_options(
         options.max_linear_iterations,
     )?;
     writeln!(writer, ",")?;
+    write_json_number_field(
+        writer,
+        4,
+        "momentumMaxLinearIterations",
+        options.momentum_max_linear_iterations,
+    )?;
+    writeln!(writer, ",")?;
+    write_json_number_field(
+        writer,
+        4,
+        "pressureMaxLinearIterations",
+        options.pressure_max_linear_iterations,
+    )?;
+    writeln!(writer, ",")?;
     write_json_key(writer, 4, "linearTolerance")?;
     write_json_optional_number(writer, Some(options.linear_tolerance))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "momentumLinearTolerance")?;
+    write_json_optional_number(writer, Some(options.momentum_linear_tolerance))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "pressureLinearTolerance")?;
+    write_json_optional_number(writer, Some(options.pressure_linear_tolerance))?;
     writeln!(writer, ",")?;
     write_json_key(writer, 4, "velocityRelaxation")?;
     write_json_optional_number(writer, Some(options.velocity_relaxation))?;
@@ -1766,8 +1838,28 @@ fn write_laminar_simple_report_markdown(
     )?;
     writeln!(
         writer,
+        "| Momentum linear tolerance | {} |",
+        format_scientific(options.momentum_linear_tolerance)
+    )?;
+    writeln!(
+        writer,
+        "| Momentum max linear iterations | {} |",
+        options.momentum_max_linear_iterations
+    )?;
+    writeln!(
+        writer,
         "| Pressure linear solver | {} |",
         options.pressure_linear_solver
+    )?;
+    writeln!(
+        writer,
+        "| Pressure linear tolerance | {} |",
+        format_scientific(options.pressure_linear_tolerance)
+    )?;
+    writeln!(
+        writer,
+        "| Pressure max linear iterations | {} |",
+        options.pressure_max_linear_iterations
     )?;
     writeln!(writer)?;
     writeln!(writer, "## Result")?;
@@ -3002,8 +3094,12 @@ struct LaminarSimpleSolveArgs {
     linear_solver: LaminarSimpleLinearSolver,
     momentum_linear_solver: Option<LaminarSimpleLinearSolver>,
     pressure_linear_solver: Option<LaminarSimpleLinearSolver>,
-    linear_tolerance: f64,
-    max_linear_iterations: usize,
+    linear_tolerance: Option<f64>,
+    max_linear_iterations: Option<usize>,
+    momentum_linear_tolerance: Option<f64>,
+    pressure_linear_tolerance: Option<f64>,
+    momentum_max_linear_iterations: Option<usize>,
+    pressure_max_linear_iterations: Option<usize>,
     max_simple_iterations: usize,
     simple_tolerance: f64,
     velocity_relaxation: Option<f64>,
@@ -3061,6 +3157,12 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
     let mut scalar_diffusion_linear_solver = ScalarDiffusionLinearSolver::Cg;
     let mut scalar_diffusion_tolerance = 1.0e-10;
     let mut scalar_diffusion_max_iterations = 10_000;
+    let mut laminar_linear_tolerance = None;
+    let mut laminar_max_linear_iterations = None;
+    let mut momentum_linear_tolerance = None;
+    let mut pressure_linear_tolerance = None;
+    let mut momentum_max_linear_iterations = None;
+    let mut pressure_max_linear_iterations = None;
     let mut max_simple_iterations = 1;
     let mut simple_tolerance = 1.0e-8;
     let mut velocity_relaxation = None;
@@ -3257,6 +3359,7 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
                     .get(index + 1)
                     .ok_or_else(|| "--solveTolerance requires a non-negative number".to_string())?;
                 scalar_diffusion_tolerance = parse_non_negative_f64_arg("--solveTolerance", value)?;
+                laminar_linear_tolerance = Some(scalar_diffusion_tolerance);
                 linear_solve_option_seen = true;
                 index += 2;
             }
@@ -3266,7 +3369,60 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
                     .ok_or_else(|| "--maxIterations requires a positive integer".to_string())?;
                 scalar_diffusion_max_iterations =
                     parse_positive_usize_arg("--maxIterations", value)?;
+                laminar_max_linear_iterations = Some(scalar_diffusion_max_iterations);
                 linear_solve_option_seen = true;
+                index += 2;
+            }
+            "-momentumSolveTolerance"
+            | "--momentumSolveTolerance"
+            | "-momentum-solve-tolerance"
+            | "--momentum-solve-tolerance" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--momentumSolveTolerance requires a non-negative number".to_string()
+                })?;
+                momentum_linear_tolerance = Some(parse_non_negative_f64_arg(
+                    "--momentumSolveTolerance",
+                    value,
+                )?);
+                laminar_simple_option_seen = true;
+                index += 2;
+            }
+            "-pressureSolveTolerance"
+            | "--pressureSolveTolerance"
+            | "-pressure-solve-tolerance"
+            | "--pressure-solve-tolerance" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--pressureSolveTolerance requires a non-negative number".to_string()
+                })?;
+                pressure_linear_tolerance = Some(parse_non_negative_f64_arg(
+                    "--pressureSolveTolerance",
+                    value,
+                )?);
+                laminar_simple_option_seen = true;
+                index += 2;
+            }
+            "-momentumMaxIterations"
+            | "--momentumMaxIterations"
+            | "-momentum-max-iterations"
+            | "--momentum-max-iterations" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--momentumMaxIterations requires a positive integer".to_string()
+                })?;
+                momentum_max_linear_iterations =
+                    Some(parse_positive_usize_arg("--momentumMaxIterations", value)?);
+                laminar_simple_option_seen = true;
+                index += 2;
+            }
+            "-pressureMaxIterations"
+            | "--pressureMaxIterations"
+            | "-pressure-max-iterations"
+            | "--pressure-max-iterations" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--pressureMaxIterations requires a positive integer".to_string()
+                })?;
+                pressure_max_linear_iterations =
+                    Some(parse_positive_usize_arg("--pressureMaxIterations", value)?);
+                laminar_simple_option_seen = true;
                 index += 2;
             }
             "-maxSimpleIterations"
@@ -3380,8 +3536,12 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
             linear_solver: laminar_simple_linear_solver,
             momentum_linear_solver,
             pressure_linear_solver,
-            linear_tolerance: scalar_diffusion_tolerance,
-            max_linear_iterations: scalar_diffusion_max_iterations,
+            linear_tolerance: laminar_linear_tolerance,
+            max_linear_iterations: laminar_max_linear_iterations,
+            momentum_linear_tolerance,
+            pressure_linear_tolerance,
+            momentum_max_linear_iterations,
+            pressure_max_linear_iterations,
             max_simple_iterations,
             simple_tolerance,
             velocity_relaxation,
@@ -3724,6 +3884,14 @@ fn print_solver_usage() {
     println!(
         "  --pressureLinearSolver <s> override laminar SIMPLE pressure-correction solver (cg or jacobi)"
     );
+    println!(
+        "  --momentumSolveTolerance <v> override laminar SIMPLE U solve tolerance (default: --solveTolerance, fvSolution solvers.U.tolerance, or 1e-10)"
+    );
+    println!(
+        "  --pressureSolveTolerance <v> override laminar SIMPLE p solve tolerance (default: --solveTolerance, fvSolution solvers.p.tolerance, or 1e-10)"
+    );
+    println!("  --momentumMaxIterations <n> override laminar SIMPLE U linear iteration cap");
+    println!("  --pressureMaxIterations <n> override laminar SIMPLE p linear iteration cap");
     println!("  --pressureDrop <Pa>  pressure drop for --solvePoiseuille/--solveLaminarSimple");
     println!("  --rho <kg/m3>        density for --solveLaminarSimple");
     println!("  --mu <Pa.s>          dynamic viscosity for --solvePoiseuille/--solveLaminarSimple");
@@ -3779,7 +3947,7 @@ fn normalize_case_path(path: &Path) -> PathBuf {
 mod tests {
     use super::{
         ScalarDiffusionLinearSolver, SolverNumericsDictionaryPlan, numerics_dictionary_number,
-        parse_solver_args, write_json_solver_state, write_json_string,
+        numerics_dictionary_usize, parse_solver_args, write_json_solver_state, write_json_string,
     };
     use ferrum_mesh::flow::LaminarSimpleLinearSolver;
     use ferrum_mesh::solver_state::{
@@ -3934,6 +4102,12 @@ mod tests {
         assert_eq!(solve.linear_solver, LaminarSimpleLinearSolver::Jacobi);
         assert_eq!(solve.momentum_linear_solver, None);
         assert_eq!(solve.pressure_linear_solver, None);
+        assert_eq!(solve.linear_tolerance, None);
+        assert_eq!(solve.max_linear_iterations, None);
+        assert_eq!(solve.momentum_linear_tolerance, None);
+        assert_eq!(solve.pressure_linear_tolerance, None);
+        assert_eq!(solve.momentum_max_linear_iterations, None);
+        assert_eq!(solve.pressure_max_linear_iterations, None);
         assert_eq!(solve.max_simple_iterations, 7);
         assert_eq!(solve.simple_tolerance, 1e-7);
         assert_eq!(solve.velocity_relaxation, Some(0.6));
@@ -3974,6 +4148,37 @@ mod tests {
     }
 
     #[test]
+    fn parses_laminar_simple_split_linear_controls() {
+        let args = vec![
+            "--solveLaminarSimple".to_string(),
+            "--solveTolerance".to_string(),
+            "1e-6".to_string(),
+            "--maxIterations".to_string(),
+            "200".to_string(),
+            "--momentumSolveTolerance".to_string(),
+            "1e-7".to_string(),
+            "--pressureSolveTolerance".to_string(),
+            "1e-9".to_string(),
+            "--momentumMaxIterations".to_string(),
+            "300".to_string(),
+            "--pressureMaxIterations".to_string(),
+            "400".to_string(),
+        ];
+
+        let parsed = parse_solver_args(&args).expect("solver args should parse");
+        let solve = parsed
+            .laminar_simple_solve
+            .expect("laminar SIMPLE solve args");
+
+        assert_eq!(solve.linear_tolerance, Some(1e-6));
+        assert_eq!(solve.max_linear_iterations, Some(200));
+        assert_eq!(solve.momentum_linear_tolerance, Some(1e-7));
+        assert_eq!(solve.pressure_linear_tolerance, Some(1e-9));
+        assert_eq!(solve.momentum_max_linear_iterations, Some(300));
+        assert_eq!(solve.pressure_max_linear_iterations, Some(400));
+    }
+
+    #[test]
     fn parses_laminar_simple_relaxation_as_case_defaults_when_not_overridden() {
         let args = vec!["--solveLaminarSimple".to_string()];
 
@@ -4002,6 +4207,11 @@ mod tests {
                     key: "U".to_string(),
                     value: "0.7".to_string(),
                 },
+                ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
+                    section: "solvers.p".to_string(),
+                    key: "maxIter".to_string(),
+                    value: "250".to_string(),
+                },
             ],
         };
 
@@ -4016,6 +4226,10 @@ mod tests {
         assert_eq!(
             numerics_dictionary_number(&dictionary, "relaxationFactors.fields", "U"),
             None
+        );
+        assert_eq!(
+            numerics_dictionary_usize(&dictionary, "solvers.p", "maxIter"),
+            Some(250)
         );
     }
 
