@@ -10,6 +10,15 @@ pub struct PolyMesh {
     pub faces: Vec<Vec<usize>>,
     pub owner: Vec<usize>,
     pub neighbour: Vec<usize>,
+    pub patches: Vec<BoundaryPatch>,
+}
+
+#[derive(Debug)]
+pub struct BoundaryPatch {
+    pub name: String,
+    pub patch_type: String,
+    pub faces: usize,
+    pub start_face: usize,
 }
 
 impl PolyMesh {
@@ -18,6 +27,7 @@ impl PolyMesh {
         let faces = read_faces(&path.join("faces"))?;
         let owner = read_label_list(&path.join("owner"))?;
         let neighbour = read_label_list(&path.join("neighbour"))?;
+        let patches = read_boundary(&path.join("boundary"))?;
 
         if faces.len() != owner.len() {
             return Err(MeshError::InvalidInput(format!(
@@ -38,6 +48,7 @@ impl PolyMesh {
             faces,
             owner,
             neighbour,
+            patches,
         })
     }
 
@@ -94,6 +105,38 @@ fn read_label_list(path: &Path) -> Result<Vec<usize>> {
             })
         })
         .collect()
+}
+
+fn read_boundary(path: &Path) -> Result<Vec<BoundaryPatch>> {
+    let lines = clean_lines(path)?;
+    let mut cursor = DictCursor::after_count_and_open(path, lines)?;
+    let mut patches = Vec::new();
+
+    while let Some(name) = cursor.next_entry_name()? {
+        cursor.expect("{")?;
+        let mut patch_type = None;
+        let mut faces = None;
+        let mut start_face = None;
+        while !cursor.peek_is("}")? {
+            let line = cursor.next_required()?;
+            if let Some(value) = parse_dict_value(&line, "type") {
+                patch_type = Some(value.to_string());
+            } else if let Some(value) = parse_dict_value(&line, "nFaces") {
+                faces = Some(parse_usize(value, path)?);
+            } else if let Some(value) = parse_dict_value(&line, "startFace") {
+                start_face = Some(parse_usize(value, path)?);
+            }
+        }
+        cursor.expect("}")?;
+        patches.push(BoundaryPatch {
+            name,
+            patch_type: patch_type.unwrap_or_else(|| "patch".to_string()),
+            faces: faces.ok_or_else(|| missing_key(path, "nFaces"))?,
+            start_face: start_face.ok_or_else(|| missing_key(path, "startFace"))?,
+        });
+    }
+
+    Ok(patches)
 }
 
 fn read_list_entries(path: &Path) -> Result<Vec<String>> {
@@ -181,4 +224,83 @@ fn parse_usize(value: &str, path: &Path) -> Result<usize> {
     value.trim().parse::<usize>().map_err(|_| {
         MeshError::InvalidInput(format!("invalid label '{}' in {}", value, path.display()))
     })
+}
+
+fn parse_dict_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let rest = line.strip_prefix(key)?.trim();
+    Some(rest.trim_end_matches(';').trim())
+}
+
+fn missing_key(path: &Path, key: &str) -> MeshError {
+    MeshError::InvalidInput(format!("missing '{key}' entry in {}", path.display()))
+}
+
+struct DictCursor {
+    path: PathBuf,
+    lines: Vec<String>,
+    index: usize,
+}
+
+impl DictCursor {
+    fn after_count_and_open(path: &Path, lines: Vec<String>) -> Result<Self> {
+        let mut index = lines
+            .iter()
+            .position(|line| line.parse::<usize>().is_ok())
+            .ok_or_else(|| {
+                MeshError::InvalidInput(format!("missing dictionary count in {}", path.display()))
+            })?;
+        index += 1;
+        while index < lines.len() && lines[index] != "(" {
+            index += 1;
+        }
+        if index == lines.len() {
+            return Err(MeshError::InvalidInput(format!(
+                "missing dictionary opening '(' in {}",
+                path.display()
+            )));
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            lines,
+            index: index + 1,
+        })
+    }
+
+    fn next_entry_name(&mut self) -> Result<Option<String>> {
+        if self.index >= self.lines.len() {
+            return Ok(None);
+        }
+        if self.lines[self.index] == ")" || self.lines[self.index] == ");" {
+            return Ok(None);
+        }
+        Ok(Some(self.next_required()?))
+    }
+
+    fn peek_is(&self, expected: &str) -> Result<bool> {
+        Ok(self.lines.get(self.index).ok_or_else(|| {
+            MeshError::InvalidInput(format!("unexpected EOF in {}", self.path.display()))
+        })? == expected)
+    }
+
+    fn expect(&mut self, expected: &str) -> Result<()> {
+        let line = self.next_required()?;
+        if line == expected {
+            Ok(())
+        } else {
+            Err(MeshError::InvalidInput(format!(
+                "expected '{}' but found '{}' in {}",
+                expected,
+                line,
+                self.path.display()
+            )))
+        }
+    }
+
+    fn next_required(&mut self) -> Result<String> {
+        let line = self.lines.get(self.index).cloned().ok_or_else(|| {
+            MeshError::InvalidInput(format!("unexpected EOF in {}", self.path.display()))
+        })?;
+        self.index += 1;
+        Ok(line)
+    }
 }

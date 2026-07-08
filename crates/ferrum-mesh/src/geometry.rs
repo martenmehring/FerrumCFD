@@ -362,6 +362,7 @@ mod tests {
             ],
             owner: vec![0; 6],
             neighbour: Vec::new(),
+            patches: Vec::new(),
         };
 
         let summary = summarize_poly_mesh_geometry(Path::new("case"), &mesh).unwrap();

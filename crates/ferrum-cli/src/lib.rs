@@ -11,6 +11,7 @@ use ferrum_mesh::foam::{FoamWriteOptions, write_openfoam_case_with_options};
 use ferrum_mesh::geometry::{GeometrySummary, summarize_case_geometry};
 use ferrum_mesh::gmsh::read_msh22_ascii;
 use ferrum_mesh::interfaces::{read_interface_config, validate_interface_config};
+use ferrum_mesh::patches::{PatchValidationSummary, validate_case_patches};
 use ferrum_mesh::regions::{
     InterfaceRegistrySummary, InterfaceSummary, build_interface_registry,
     read_region_mesh_summaries, split_regions_by_cell_zones,
@@ -198,6 +199,7 @@ fn check_mesh(args: Vec<String>) -> Result<(), String> {
     print_backend_config(&case_dir)?;
     print_initial_fields(&case_dir)?;
     print_geometry_summary(&case_dir)?;
+    print_patch_validation(&case_dir)?;
 
     let unmatched = summary.unmatched_boundary_faces.unwrap_or(0);
     let duplicate = summary.duplicate_boundary_faces.unwrap_or(0);
@@ -488,6 +490,26 @@ fn print_geometry(geometry: &GeometrySummary) {
         format_scientific(geometry.max_face_area),
         format_scientific(geometry.total_boundary_area)
     );
+}
+
+fn print_patch_validation(case_dir: &Path) -> Result<(), String> {
+    let summary = validate_case_patches(case_dir).map_err(|error| error.to_string())?;
+    print_patch_validation_summary(&summary);
+    Ok(())
+}
+
+fn print_patch_validation_summary(summary: &PatchValidationSummary) {
+    println!(
+        "patch validation: patches={} empty={} wedge={} symmetryPlane={} warnings={}",
+        summary.patches,
+        summary.empty_patches,
+        summary.wedge_patches,
+        summary.symmetry_patches,
+        summary.warnings.len()
+    );
+    for warning in &summary.warnings {
+        println!("patch validation warning: {warning}");
+    }
 }
 
 fn format_scientific(value: f64) -> String {

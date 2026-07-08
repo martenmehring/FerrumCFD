@@ -76,12 +76,14 @@ Solver rule:
 
 Validation rule:
 
-- `checkFerrumMesh` should eventually reject invalid `empty` setups, such as
-  non-empty patches in the suppressed direction or more than one cell through
-  the reduced dimension.
-- `checkFerrumMesh` should eventually reject invalid `wedge` setups, such as
-  missing wedge pairs, wrong patch pairing, inconsistent angles, or geometry
-  that cannot be treated as axisymmetric.
+- `checkFerrumMesh` now counts `empty`, `wedge`, and `symmetryPlane` patches,
+  checks boundary patch face ranges, and warns about odd wedge patch counts.
+- `checkFerrumMesh` should eventually reject deeper invalid `empty` setups,
+  such as non-empty patches in the suppressed direction or more than one cell
+  through the reduced dimension.
+- `checkFerrumMesh` should eventually reject deeper invalid `wedge` setups,
+  such as wrong patch pairing, inconsistent angles, or geometry that cannot be
+  treated as axisymmetric.
 - Field files in `0/` must later use boundary conditions compatible with the
   mesh patch type.
 

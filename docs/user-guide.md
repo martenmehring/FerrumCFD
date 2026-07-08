@@ -241,6 +241,7 @@ The current checker reports:
 - face zones
 - cell zones
 - geometry summary: face areas, boundary area, and cell volumes
+- special patch validation for `empty`, `wedge`, and `symmetryPlane`
 - generated region meshes below `constant/<region>/polyMesh`
 - topology warnings from import
 
@@ -252,6 +253,7 @@ Example geometry output:
 ```text
 geometry: cells=523600 faces=1580785 totalVolume=4.921636e4 minCellVolume=1.413155e-2 maxCellVolume=8.414263e-1 nonPositiveCellVolumes=0
 geometry faces: minArea=3.532886e-3 maxArea=2.714353e0 totalBoundaryArea=1.437881e4
+patch validation: patches=7 empty=0 wedge=0 symmetryPlane=0 warnings=0
 ```
 
 ## Split Multi-Region Meshes
@@ -314,6 +316,9 @@ frontAndBack
 
 Important solver rule: `empty` must later be interpreted by FerrumCFD solvers as
 a true reduced-dimension constraint. It must not be treated as a normal patch.
+`checkFerrumMesh` now counts `empty` patches and warns about invalid patch face
+ranges, but full reduced-dimension geometry validation is still a future
+quality check.
 
 ## Axisymmetric Meshes
 
@@ -328,6 +333,8 @@ gmshToFerrumFoam path\to\axisymmetric.msh -case cases\reactor_axi -wedgePatch we
 
 Important solver rule: `wedge` must later be interpreted as an axisymmetric
 constraint by the discretisation and field operations.
+`checkFerrumMesh` now counts `wedge` patches and warns when the number of wedge
+patches is odd, because axisymmetric wedge patches normally come in pairs.
 
 ## Generic Patch Types
 
