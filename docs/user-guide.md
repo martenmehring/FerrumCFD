@@ -425,6 +425,8 @@ ferrumBackends
 
     cpu
     {
+        cpus auto;
+        coresPerCpu auto;
         threads auto;
         threadPinning off;
         numa auto;
@@ -470,11 +472,20 @@ particular stiff chemistry setup performs better on CPU.
 
 CPU resource policy:
 
+- `cpus auto;` lets FerrumCFD discover the number of physical CPU packages or
+  sockets.
+- `cpus N;` declares that `N` physical CPUs may be used.
+- `coresPerCpu auto;` lets FerrumCFD discover cores per CPU package.
+- `coresPerCpu N;` declares `N` physical cores per CPU package.
 - `threads auto;` lets FerrumCFD choose a sensible worker count.
 - `threads N;` pins the solver policy to `N` CPU worker threads.
 - `threadPinning auto|on|off;` is reserved for explicit CPU affinity control.
 - `numa auto|on|off;` leaves room for multi-socket CPU machines without forcing
   a NUMA policy before the runtime exists.
+
+For mixed CPU/GPU runs, both `cpu { ... }` and `gpu { ... }` should be present.
+`checkFerrumMesh` warns if a policy selects or may select both CPU and GPU but
+does not explicitly describe both resource pools.
 
 GPU resource policy:
 
@@ -487,16 +498,17 @@ GPU resource policy:
 `checkFerrumMesh` reads `system/ferrumBackends` when the file exists:
 
 ```text
-backend config: default=cpu cpuThreads=auto cpuPinning=off cpuNuma=auto gpuBackend=auto gpuDevices=auto multiGpu=auto precision=f64
+backend config: default=cpu cpuCpus=auto cpuCoresPerCpu=auto cpuThreads=auto cpuPinning=off cpuNuma=auto gpuBackend=auto gpuDevices=auto multiGpu=auto precision=f64
   mesh: import=cpu, checks=cpu
   flow: nonlinearSolve=auto, residual=auto, jacobian=auto, linearSolve=auto, pressureCorrection=auto
   chemistry: residual=auto, jacobian=auto, nonlinearSolve=auto, odeSolve=auto
+backend resources: usesCpu=true usesGpu=true mixed=true
 ```
 
 Allowed execution choices are `cpu`, `gpu`, and `auto`. The `gpu.backend`
 setting currently accepts `auto`, `wgpu`, `cuda`, and `hip`; `gpu.precision`
-accepts `auto`, `f32`, and `f64`. CPU `threads` accepts `auto` or a positive
-integer.
+accepts `auto`, `f32`, and `f64`. CPU `cpus`, `coresPerCpu`, and `threads`
+accept `auto` or a positive integer.
 
 ## Current Limitations
 

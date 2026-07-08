@@ -137,6 +137,8 @@ ferrumBackends
 
     cpu
     {
+        cpus auto;          // physical CPU packages/sockets, or a positive integer
+        coresPerCpu auto;   // physical cores per CPU package, or a positive integer
         threads auto;
         threadPinning off;
         numa auto;
@@ -166,6 +168,13 @@ CPU remains a deliberate execution target, not a fallback of last resort. Users
 must be able to keep a solve on CPU when the GPU is needed elsewhere, when a
 small case would not amortize device transfers, or when a specific model has
 better CPU behavior.
+
+Multi-CPU systems must be represented explicitly enough for a future scheduler
+to make reproducible decisions. `cpus` describes physical CPU packages/sockets,
+`coresPerCpu` describes physical cores per package, and `threads` describes the
+worker-thread budget FerrumCFD may use. For mixed CPU/GPU policies, the case
+should provide both CPU and GPU resource blocks so the solver can report where
+each major stage is intended to run.
 
 ## Mesh Geometry Direction
 

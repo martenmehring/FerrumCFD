@@ -4,7 +4,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 use case::{InitCaseOptions, init_case};
-use ferrum_mesh::backends::read_backend_config;
+use ferrum_mesh::backends::{read_backend_config, validate_backend_resources};
 use ferrum_mesh::check::read_case_summary;
 use ferrum_mesh::fields::{FieldFile, read_initial_fields};
 use ferrum_mesh::foam::{FoamWriteOptions, write_openfoam_case_with_options};
@@ -364,8 +364,10 @@ fn print_backend_config(case_dir: &Path) -> Result<(), String> {
     };
 
     println!(
-        "backend config: default={} cpuThreads={} cpuPinning={} cpuNuma={} gpuBackend={} gpuDevices={} multiGpu={} precision={}",
+        "backend config: default={} cpuCpus={} cpuCoresPerCpu={} cpuThreads={} cpuPinning={} cpuNuma={} gpuBackend={} gpuDevices={} multiGpu={} precision={}",
         config.default,
+        config.cpu.cpus,
+        config.cpu.cores_per_cpu,
         config.cpu.threads,
         config.cpu.thread_pinning,
         config.cpu.numa,
@@ -386,6 +388,14 @@ fn print_backend_config(case_dir: &Path) -> Result<(), String> {
             .collect::<Vec<_>>()
             .join(", ");
         println!("  {}: {}", section.name, selections);
+    }
+    let validation = validate_backend_resources(&config);
+    println!(
+        "backend resources: usesCpu={} usesGpu={} mixed={}",
+        validation.uses_cpu, validation.uses_gpu, validation.mixed_execution
+    );
+    for warning in &validation.warnings {
+        println!("backend resource warning: {warning}");
     }
 
     Ok(())

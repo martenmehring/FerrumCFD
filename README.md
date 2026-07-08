@@ -64,7 +64,7 @@ The importer currently targets the membrane reactor test mesh shape:
   `internalField`, and `boundaryField` summaries
 - mesh geometry summaries compute face areas, boundary area, and cell volumes
 - backend policy can select CPU/GPU/auto per solver stage, including nonlinear
-  solver steps, with CPU thread and GPU device metadata
+  solver steps, with multi-CPU, core-count, thread, and GPU device metadata
 
 `splitFerrumMeshRegions` can write one region mesh per imported cell zone under
 `constant/<region>/polyMesh`.

@@ -11,6 +11,8 @@ pub struct BackendConfig {
     pub sections: Vec<BackendSection>,
     pub cpu: CpuConfig,
     pub gpu: GpuConfig,
+    pub cpu_explicit: bool,
+    pub gpu_explicit: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,6 +36,8 @@ pub struct BackendSelection {
 
 #[derive(Debug)]
 pub struct CpuConfig {
+    pub cpus: String,
+    pub cores_per_cpu: String,
     pub threads: String,
     pub thread_pinning: String,
     pub numa: String,
@@ -47,9 +51,19 @@ pub struct GpuConfig {
     pub precision: String,
 }
 
+#[derive(Debug)]
+pub struct BackendResourceValidation {
+    pub uses_cpu: bool,
+    pub uses_gpu: bool,
+    pub mixed_execution: bool,
+    pub warnings: Vec<String>,
+}
+
 impl Default for CpuConfig {
     fn default() -> Self {
         Self {
+            cpus: "auto".to_string(),
+            cores_per_cpu: "auto".to_string(),
             threads: "auto".to_string(),
             thread_pinning: "off".to_string(),
             numa: "auto".to_string(),
@@ -90,6 +104,54 @@ pub fn read_backend_config(case_dir: &Path) -> Result<Option<BackendConfig>> {
     let mut config = parse_backend_config_str(&content, &path)?;
     config.path = path;
     Ok(Some(config))
+}
+
+pub fn validate_backend_resources(config: &BackendConfig) -> BackendResourceValidation {
+    let mut uses_cpu = choice_can_use_cpu(config.default);
+    let mut uses_gpu = choice_can_use_gpu(config.default);
+
+    for section in &config.sections {
+        for entry in &section.entries {
+            uses_cpu |= choice_can_use_cpu(entry.choice);
+            uses_gpu |= choice_can_use_gpu(entry.choice);
+        }
+    }
+
+    let mixed_execution = uses_cpu && uses_gpu;
+    let mut warnings = Vec::new();
+    if uses_cpu && !config.cpu_explicit {
+        warnings.push(
+            "CPU execution is selected or possible, but no explicit cpu resource block was provided"
+                .to_string(),
+        );
+    }
+    if uses_gpu && !config.gpu_explicit {
+        warnings.push(
+            "GPU execution is selected or possible, but no explicit gpu resource block was provided"
+                .to_string(),
+        );
+    }
+    if mixed_execution && (!config.cpu_explicit || !config.gpu_explicit) {
+        warnings.push(
+            "mixed CPU/GPU execution should specify both cpu and gpu resources explicitly"
+                .to_string(),
+        );
+    }
+
+    BackendResourceValidation {
+        uses_cpu,
+        uses_gpu,
+        mixed_execution,
+        warnings,
+    }
+}
+
+fn choice_can_use_cpu(choice: BackendChoice) -> bool {
+    matches!(choice, BackendChoice::Cpu | BackendChoice::Auto)
+}
+
+fn choice_can_use_gpu(choice: BackendChoice) -> bool {
+    matches!(choice, BackendChoice::Gpu | BackendChoice::Auto)
 }
 
 fn parse_backend_config_str(content: &str, path: &Path) -> Result<BackendConfig> {
@@ -143,10 +205,12 @@ fn parse_backend_entry(cursor: &mut TokenCursor, builder: &mut BackendConfigBuil
         "gpu" => {
             cursor.expect("{")?;
             builder.gpu = parse_gpu_block(cursor)?;
+            builder.gpu_explicit = true;
         }
         "cpu" => {
             cursor.expect("{")?;
             builder.cpu = parse_cpu_block(cursor)?;
+            builder.cpu_explicit = true;
         }
         _ => {
             cursor.expect("{")?;
@@ -177,6 +241,16 @@ fn parse_cpu_block(cursor: &mut TokenCursor) -> Result<CpuConfig> {
         let key = cursor.next_required()?;
         let values = cursor.read_value_until_semicolon()?;
         match key.as_str() {
+            "cpus" => {
+                let value = single_value(&values, "CPU cpus", cursor.path())?;
+                validate_auto_or_positive_integer(&value, "CPU cpus", cursor.path())?;
+                cpu.cpus = value;
+            }
+            "coresPerCpu" => {
+                let value = single_value(&values, "CPU coresPerCpu", cursor.path())?;
+                validate_auto_or_positive_integer(&value, "CPU coresPerCpu", cursor.path())?;
+                cpu.cores_per_cpu = value;
+            }
             "threads" => {
                 let value = single_value(&values, "CPU threads", cursor.path())?;
                 validate_auto_or_positive_integer(&value, "CPU threads", cursor.path())?;
@@ -374,6 +448,8 @@ struct BackendConfigBuilder {
     sections: Vec<BackendSection>,
     cpu: CpuConfig,
     gpu: GpuConfig,
+    cpu_explicit: bool,
+    gpu_explicit: bool,
 }
 
 impl BackendConfigBuilder {
@@ -384,6 +460,8 @@ impl BackendConfigBuilder {
             sections: Vec::new(),
             cpu: CpuConfig::default(),
             gpu: GpuConfig::default(),
+            cpu_explicit: false,
+            gpu_explicit: false,
         }
     }
 
@@ -394,6 +472,8 @@ impl BackendConfigBuilder {
             sections: self.sections,
             cpu: self.cpu,
             gpu: self.gpu,
+            cpu_explicit: self.cpu_explicit,
+            gpu_explicit: self.gpu_explicit,
         })
     }
 }
@@ -424,6 +504,8 @@ mod tests {
 
         cpu
         {
+            cpus auto;
+            coresPerCpu auto;
             threads auto;
             threadPinning off;
             numa auto;
@@ -449,6 +531,10 @@ mod tests {
         let config = parse_backend_config_str(content, Path::new("ferrumBackends")).unwrap();
         assert_eq!(config.default, BackendChoice::Cpu);
         assert_eq!(config.sections.len(), 2);
+        assert!(config.cpu_explicit);
+        assert!(config.gpu_explicit);
+        assert_eq!(config.cpu.cpus, "auto");
+        assert_eq!(config.cpu.cores_per_cpu, "auto");
         assert_eq!(config.cpu.threads, "auto");
         assert_eq!(config.sections[1].entries[0].step, "nonlinearSolve");
         assert_eq!(config.sections[1].entries[0].choice, BackendChoice::Gpu);
@@ -464,6 +550,17 @@ mod tests {
         ferrumBackends
         {
             default auto;
+            cpu
+            {
+                cpus auto;
+                coresPerCpu auto;
+                threads auto;
+            }
+            gpu
+            {
+                backend auto;
+                devices (auto);
+            }
             flow
             {
                 residual gpu;
@@ -501,5 +598,21 @@ mod tests {
 
         let error = parse_backend_config_str(content, Path::new("ferrumBackends")).unwrap_err();
         assert!(error.to_string().contains("positive integer"));
+    }
+
+    #[test]
+    fn warns_when_mixed_policy_missing_explicit_resources() {
+        let content = r#"
+        default cpu;
+        flow
+        {
+            residual gpu;
+        }
+        "#;
+
+        let config = parse_backend_config_str(content, Path::new("ferrumBackends")).unwrap();
+        let validation = super::validate_backend_resources(&config);
+        assert!(validation.mixed_execution);
+        assert_eq!(validation.warnings.len(), 3);
     }
 }

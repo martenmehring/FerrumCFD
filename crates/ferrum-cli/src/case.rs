@@ -197,6 +197,8 @@ fn write_ferrum_backends(writer: &mut BufWriter<File>) -> Result<(), std::io::Er
     writeln!(writer)?;
     writeln!(writer, "cpu")?;
     writeln!(writer, "{{")?;
+    writeln!(writer, "    cpus auto;")?;
+    writeln!(writer, "    coresPerCpu auto;")?;
     writeln!(writer, "    threads auto;")?;
     writeln!(writer, "    threadPinning off;")?;
     writeln!(writer, "    numa auto;")?;
