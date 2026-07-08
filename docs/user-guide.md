@@ -98,6 +98,7 @@ The current checker reports:
 - boundary patches and patch types
 - face zones
 - cell zones
+- generated region meshes below `constant/<region>/polyMesh`
 - topology warnings from import
 
 This is not yet a full OpenFOAM-grade `checkMesh`, but it is the command that
@@ -124,6 +125,11 @@ For region interface patches:
 - existing external boundary patch names and types are preserved
 - internal interface names are taken from `faceZones` where available
 - interface patch type is currently written as `patch`
+
+OpenFOAM-style `faceZones` contain `faceLabels` and a `flipMap`. FerrumCFD
+currently uses the `faceLabels` to identify interface faces and skips `flipMap`
+during region splitting. The splitter determines local face orientation from
+`owner` and `neighbour` instead.
 
 ## 2D Meshes
 

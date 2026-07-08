@@ -91,6 +91,60 @@ pub fn split_regions_by_cell_zones(case_dir: &Path) -> Result<RegionSplitSummary
     })
 }
 
+pub fn read_region_mesh_summaries(case_dir: &Path) -> Result<Vec<RegionSummary>> {
+    let constant_dir = case_dir.join("constant");
+    if !constant_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut summaries = Vec::new();
+    for entry in fs::read_dir(&constant_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let region_name = entry.file_name().to_string_lossy().to_string();
+        if region_name == "polyMesh" {
+            continue;
+        }
+
+        let poly_mesh_dir = path.join("polyMesh");
+        if !poly_mesh_dir.is_dir() {
+            continue;
+        }
+
+        let mesh = PolyMesh::read(&poly_mesh_dir)?;
+        summaries.push(summarize_poly_mesh(region_name, poly_mesh_dir, &mesh));
+    }
+
+    summaries.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(summaries)
+}
+
+fn summarize_poly_mesh(name: String, path: PathBuf, mesh: &PolyMesh) -> RegionSummary {
+    RegionSummary {
+        name,
+        path,
+        points: mesh.points.len(),
+        cells: mesh.cell_count(),
+        faces: mesh.faces.len(),
+        internal_faces: mesh.neighbour.len(),
+        boundary_faces: mesh.faces.len().saturating_sub(mesh.neighbour.len()),
+        patches: mesh
+            .patches
+            .iter()
+            .map(|patch| RegionPatchSummary {
+                name: patch.name.clone(),
+                patch_type: patch.patch_type.clone(),
+                faces: patch.faces,
+                start_face: patch.start_face,
+            })
+            .collect(),
+    }
+}
+
 fn build_cell_to_zone(cell_zones: &[CellZone], cell_count: usize) -> Result<Vec<Option<usize>>> {
     let mut cell_to_zone: Vec<Option<usize>> = vec![None; cell_count];
     for (zone_index, zone) in cell_zones.iter().enumerate() {

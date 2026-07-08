@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use ferrum_mesh::check::read_case_summary;
 use ferrum_mesh::foam::{FoamWriteOptions, write_openfoam_case_with_options};
 use ferrum_mesh::gmsh::read_msh22_ascii;
-use ferrum_mesh::regions::split_regions_by_cell_zones;
+use ferrum_mesh::regions::{read_region_mesh_summaries, split_regions_by_cell_zones};
 
 pub fn run_ferrum() -> i32 {
     let args = env::args().skip(1).collect::<Vec<_>>();
@@ -155,6 +155,29 @@ fn check_mesh(args: Vec<String>) -> Result<(), String> {
         println!(
             "topology warnings: unmatchedBoundaryFaces={unmatched}, duplicateBoundaryFaces={duplicate}, nonManifoldFaces={non_manifold}"
         );
+    }
+
+    let regions = read_region_mesh_summaries(&case_dir).map_err(|error| error.to_string())?;
+    if !regions.is_empty() {
+        println!("region meshes:");
+        for region in regions {
+            println!(
+                "  {}: points={}, cells={}, faces={}, internal={}, boundary={}, path={}",
+                region.name,
+                region.points,
+                region.cells,
+                region.faces,
+                region.internal_faces,
+                region.boundary_faces,
+                region.path.display()
+            );
+            for patch in &region.patches {
+                println!(
+                    "    patch {} type={} faces={} startFace={}",
+                    patch.name, patch.patch_type, patch.faces, patch.start_face
+                );
+            }
+        }
     }
 
     Ok(())
