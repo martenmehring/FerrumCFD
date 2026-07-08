@@ -531,6 +531,22 @@ fn print_solver_runner_dry_run(dry_run: &SolverRunnerDryRun) {
         dry_run.preview_write_events,
         dry_run.truncated
     );
+    println!(
+        "runner runtime: cpuRequested={} cpuHandle={} cpuKernels={} cpuThreads={} gpuRequested={} gpuHandle={} gpuKernels={} gpuBackend={} gpuDevices={} gpuPrecision={}",
+        yes_no(dry_run.runtime.cpu.requested),
+        dry_run.runtime.cpu.handle,
+        yes_no(dry_run.runtime.cpu.kernels_available),
+        dry_run.runtime.cpu.threads,
+        yes_no(dry_run.runtime.gpu.requested),
+        dry_run.runtime.gpu.handle,
+        yes_no(dry_run.runtime.gpu.kernels_available),
+        dry_run.runtime.gpu.backend,
+        format_devices(&dry_run.runtime.gpu.devices),
+        dry_run.runtime.gpu.precision
+    );
+    for warning in &dry_run.runtime.warnings {
+        println!("runner runtime warning: {warning}");
+    }
     for warning in &dry_run.warnings {
         println!("runner dry-run warning: {warning}");
     }
@@ -545,9 +561,14 @@ fn print_solver_runner_dry_run(dry_run: &SolverRunnerDryRun) {
                 stage,
                 choice,
                 source,
+                dispatch,
             } => {
                 println!(
-                    "    step {step} stage {section}.{stage}: backend={choice} source={source}"
+                    "    step {step} stage {section}.{stage}: backend={choice} source={source} runtimeTarget={} runtimeHandle={} executable={} status={}",
+                    dispatch.target,
+                    dispatch.handle,
+                    yes_no(dispatch.executable),
+                    dispatch.status
                 );
             }
             SolverRunnerDryRunEvent::Write { step, time } => {

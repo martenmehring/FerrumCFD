@@ -87,8 +87,8 @@ The importer currently targets the membrane reactor test mesh shape:
   writes the same plan as machine-readable JSON; executable solver kernels are
   not implemented yet
 - `--runnerDryRun` previews the future solver runner for a capped number of
-  steps and logs planned CPU/GPU stage dispatch without updating fields or
-  solving equations
+  steps and logs planned CPU/GPU stage dispatch, runtime handles, and missing
+  executable backend status without updating fields or solving equations
 
 `splitFerrumMeshRegions` can write one region mesh per imported cell zone under
 `constant/<region>/polyMesh`.

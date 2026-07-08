@@ -14,6 +14,7 @@ pub struct SolverRunnerDryRun {
     pub stage_count: usize,
     pub preview_write_events: usize,
     pub truncated: bool,
+    pub runtime: SolverRuntimePlan,
     pub events: Vec<SolverRunnerDryRunEvent>,
     pub warnings: Vec<String>,
 }
@@ -30,6 +31,7 @@ pub enum SolverRunnerDryRunEvent {
         stage: String,
         choice: BackendChoice,
         source: SolverRunStageSource,
+        dispatch: SolverRuntimeDispatch,
     },
     Write {
         step: usize,
@@ -37,9 +39,81 @@ pub enum SolverRunnerDryRunEvent {
     },
 }
 
+#[derive(Clone, Debug)]
+pub struct SolverRuntimePlan {
+    pub cpu: SolverCpuRuntimeHandle,
+    pub gpu: SolverGpuRuntimeHandle,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SolverCpuRuntimeHandle {
+    pub requested: bool,
+    pub handle: String,
+    pub cpus: String,
+    pub cores_per_cpu: String,
+    pub threads: String,
+    pub thread_pinning: String,
+    pub numa: String,
+    pub kernels_available: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct SolverGpuRuntimeHandle {
+    pub requested: bool,
+    pub handle: String,
+    pub backend: String,
+    pub devices: Vec<String>,
+    pub multi_gpu: String,
+    pub precision: String,
+    pub kernels_available: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct SolverRuntimeDispatch {
+    pub target: SolverRuntimeTarget,
+    pub handle: String,
+    pub executable: bool,
+    pub status: SolverRuntimeDispatchStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SolverRuntimeTarget {
+    Cpu,
+    Gpu,
+    Auto,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SolverRuntimeDispatchStatus {
+    PlannedOnly,
+    GpuRuntimeUnavailable,
+    AutoPolicyUnresolved,
+}
+
 impl Default for SolverRunnerDryRunOptions {
     fn default() -> Self {
         Self { max_steps: 3 }
+    }
+}
+
+impl std::fmt::Display for SolverRuntimeTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cpu => formatter.write_str("cpu"),
+            Self::Gpu => formatter.write_str("gpu"),
+            Self::Auto => formatter.write_str("auto"),
+        }
+    }
+}
+
+impl std::fmt::Display for SolverRuntimeDispatchStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PlannedOnly => formatter.write_str("planned-only"),
+            Self::GpuRuntimeUnavailable => formatter.write_str("gpu-runtime-unavailable"),
+            Self::AutoPolicyUnresolved => formatter.write_str("auto-policy-unresolved"),
+        }
     }
 }
 
@@ -62,6 +136,7 @@ pub fn build_solver_runner_dry_run(
                 .to_string(),
         );
     }
+    let runtime = build_solver_runtime_plan(plan);
 
     let mut events = Vec::new();
     let mut write_events = 0;
@@ -76,6 +151,7 @@ pub fn build_solver_runner_dry_run(
                 stage: stage.step.clone(),
                 choice: stage.choice,
                 source: stage.source,
+                dispatch: resolve_runtime_dispatch(stage.choice, &runtime),
             });
         }
 
@@ -92,8 +168,74 @@ pub fn build_solver_runner_dry_run(
         stage_count: plan.run.stages.len(),
         preview_write_events: write_events,
         truncated,
+        runtime,
         events,
         warnings,
+    }
+}
+
+fn build_solver_runtime_plan(plan: &SolverCasePlan) -> SolverRuntimePlan {
+    let cpu = SolverCpuRuntimeHandle {
+        requested: plan.backends.uses_cpu,
+        handle: format!(
+            "cpu:cpus={}:coresPerCpu={}:threads={}",
+            plan.backends.cpu.cpus, plan.backends.cpu.cores_per_cpu, plan.backends.cpu.threads
+        ),
+        cpus: plan.backends.cpu.cpus.clone(),
+        cores_per_cpu: plan.backends.cpu.cores_per_cpu.clone(),
+        threads: plan.backends.cpu.threads.clone(),
+        thread_pinning: plan.backends.cpu.thread_pinning.clone(),
+        numa: plan.backends.cpu.numa.clone(),
+        kernels_available: false,
+    };
+    let gpu = SolverGpuRuntimeHandle {
+        requested: plan.backends.uses_gpu,
+        handle: format!(
+            "gpu:{}:devices={}",
+            plan.backends.gpu.backend,
+            plan.backends.gpu.devices.join(",")
+        ),
+        backend: plan.backends.gpu.backend.clone(),
+        devices: plan.backends.gpu.devices.clone(),
+        multi_gpu: plan.backends.gpu.multi_gpu.clone(),
+        precision: plan.backends.gpu.precision.clone(),
+        kernels_available: false,
+    };
+
+    let mut warnings = Vec::new();
+    if gpu.requested {
+        warnings.push(
+            "GPU execution is selected or possible, but executable GPU solver kernels are not implemented yet"
+                .to_string(),
+        );
+    }
+
+    SolverRuntimePlan { cpu, gpu, warnings }
+}
+
+fn resolve_runtime_dispatch(
+    choice: BackendChoice,
+    runtime: &SolverRuntimePlan,
+) -> SolverRuntimeDispatch {
+    match choice {
+        BackendChoice::Cpu => SolverRuntimeDispatch {
+            target: SolverRuntimeTarget::Cpu,
+            handle: runtime.cpu.handle.clone(),
+            executable: runtime.cpu.kernels_available,
+            status: SolverRuntimeDispatchStatus::PlannedOnly,
+        },
+        BackendChoice::Gpu => SolverRuntimeDispatch {
+            target: SolverRuntimeTarget::Gpu,
+            handle: runtime.gpu.handle.clone(),
+            executable: runtime.gpu.kernels_available,
+            status: SolverRuntimeDispatchStatus::GpuRuntimeUnavailable,
+        },
+        BackendChoice::Auto => SolverRuntimeDispatch {
+            target: SolverRuntimeTarget::Auto,
+            handle: "auto-policy".to_string(),
+            executable: false,
+            status: SolverRuntimeDispatchStatus::AutoPolicyUnresolved,
+        },
     }
 }
 
@@ -168,6 +310,7 @@ mod tests {
     };
 
     use super::{SolverRunnerDryRunEvent, SolverRunnerDryRunOptions, build_solver_runner_dry_run};
+    use super::{SolverRuntimeDispatchStatus, SolverRuntimeTarget};
 
     #[test]
     fn expands_capped_time_step_dry_run() {
@@ -180,6 +323,30 @@ mod tests {
         assert_eq!(dry_run.preview_steps, 3);
         assert_eq!(dry_run.stage_count, 2);
         assert_eq!(dry_run.preview_write_events, 1);
+        assert!(dry_run.runtime.gpu.requested);
+        assert!(
+            dry_run
+                .runtime
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("GPU execution"))
+        );
+        let gpu_stage = dry_run
+            .events
+            .iter()
+            .find_map(|event| match event {
+                SolverRunnerDryRunEvent::Stage {
+                    stage, dispatch, ..
+                } if stage == "residual" => Some(dispatch),
+                _ => None,
+            })
+            .expect("gpu residual dispatch");
+        assert_eq!(gpu_stage.target, SolverRuntimeTarget::Gpu);
+        assert_eq!(
+            gpu_stage.status,
+            SolverRuntimeDispatchStatus::GpuRuntimeUnavailable
+        );
+        assert!(!gpu_stage.executable);
         assert!(dry_run.truncated);
         assert!(matches!(
             dry_run.events.first(),

@@ -452,8 +452,11 @@ human-readable output.
 With `--runnerDryRun`, FerrumCFD expands the current run plan into a capped
 runner preview. The preview logs time-step starts, planned stage dispatch such
 as `flow.residual` or `interfaces.flux`, backend choice, and planned write
-events. `--maxRunnerSteps <n>` limits the preview length. This does not update
-fields, advance physics, or solve equations.
+events. It also prints runtime handles derived from `system/ferrumBackends`,
+including CPU thread policy and GPU backend/device metadata. GPU stages are
+reported as planned dispatch only until executable GPU solver kernels exist.
+`--maxRunnerSteps <n>` limits the preview length. This does not update fields,
+advance physics, or solve equations.
 
 ## Interface Model Setup
 

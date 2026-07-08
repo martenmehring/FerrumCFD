@@ -244,9 +244,12 @@ and interface stages such as `interfaces.flux`,
 
 `--runnerDryRun` is the first runner boundary. It expands the run plan into a
 capped sequence of time-step starts, stage dispatch decisions, and planned
-write events. It must remain explicit that this mode does not update fields,
-advance physics, assemble matrices, or solve equations. Its job is to harden
-the scheduling contract before CPU/GPU solver kernels exist.
+write events. It also resolves lightweight CPU/GPU runtime handles from
+`ferrumBackends`, including CPU thread metadata and GPU backend/device
+metadata. GPU dispatch must be reported as unavailable until executable GPU
+solver kernels exist. It must remain explicit that this mode does not update
+fields, advance physics, assemble matrices, or solve equations. Its job is to
+harden the scheduling contract before CPU/GPU solver kernels exist.
 
 `fvSchemes` and `fvSolution` parsing is currently structural. The preflight can
 report entries such as `ddtSchemes.default=Euler` or
