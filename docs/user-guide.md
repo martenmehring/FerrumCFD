@@ -369,7 +369,7 @@ ferrum initCase cases\my_case
 ferrum gmshToFoam path\to\mesh.msh -case cases\my_case
 ferrum checkMesh -case cases\my_case
 ferrum splitMeshRegions -case cases\my_case -cellZones
-ferrum solve -case cases\my_case --preflight
+ferrum solve -case cases\my_case --preflight --planJson target\ferrumSolverPlan.json
 ```
 
 The dedicated aliases remain available because they are closer to OpenFOAM
@@ -391,12 +391,13 @@ later CPU/GPU solver code should consume.
 
 ```powershell
 ferrumSolver -case cases\my_case --preflight
+ferrumSolver -case cases\my_case --preflight --planJson target\ferrumSolverPlan.json
 ```
 
 Equivalent combined command:
 
 ```powershell
-ferrum solve -case cases\my_case --preflight
+ferrum solve -case cases\my_case --preflight --planJson target\ferrumSolverPlan.json
 ```
 
 The preflight reads:
@@ -438,6 +439,11 @@ It also reads material and transport property dictionaries below `constant/`
 and `constant/<region>/`. At this stage FerrumCFD checks the structure and
 dimension-vector shape, but solver modules will later decide which properties
 are required for each physics model.
+
+With `--planJson <file>`, the same solver-neutral plan is also written as JSON.
+That file is intended for future run managers, GUI tools, benchmark scripts,
+and CPU/GPU solver launch code. The text preflight remains the normal
+human-readable output.
 
 ## Interface Model Setup
 

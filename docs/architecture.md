@@ -197,6 +197,9 @@ consume them yet.
 `ferrumSolver` currently builds a solver-neutral case plan instead of executing
 CFD kernels. This is intentional. The plan is the boundary between the
 OpenFOAM-like case layout and the future backend-specific solver runtime.
+The normal output is human-readable text; `--planJson <file>` writes the same
+plan as machine-readable JSON for future solver launchers, GUIs, benchmarks,
+and regression tests.
 
 The preflight reads:
 

@@ -1,6 +1,8 @@
 mod case;
 
 use std::env;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use case::{InitCaseOptions, init_case};
@@ -22,8 +24,8 @@ use ferrum_mesh::regions::{
     read_region_mesh_summaries, split_regions_by_cell_zones,
 };
 use ferrum_mesh::solver_plan::{
-    SolverBackendPlan, SolverCasePlan, SolverNumericsDictionaryPlan, SolverPropertiesPlan,
-    build_solver_case_plan,
+    SolverBackendPlan, SolverCasePlan, SolverFieldPlan, SolverInterfacePlan, SolverMeshPlan,
+    SolverNumericsDictionaryPlan, SolverNumericsPlan, SolverPropertiesPlan, build_solver_case_plan,
 };
 
 pub fn run_ferrum() -> i32 {
@@ -308,9 +310,18 @@ fn solve_case(args: Vec<String>) -> Result<(), String> {
         return Ok(());
     }
 
-    let case_dir = parse_solver_args(&args)?;
-    let plan = build_solver_case_plan(&case_dir).map_err(|error| error.to_string())?;
+    let options = parse_solver_args(&args)?;
+    let plan = build_solver_case_plan(&options.case_dir).map_err(|error| error.to_string())?;
     print_solver_case_plan(&plan);
+    if let Some(path) = options.plan_json {
+        write_solver_plan_json(&plan, &path).map_err(|error| {
+            format!(
+                "could not write solver plan JSON to {} ({error})",
+                path.display()
+            )
+        })?;
+        println!("wrote solver plan json: {}", path.display());
+    }
     Ok(())
 }
 
@@ -467,6 +478,455 @@ fn print_solver_backend_plan(plan: &SolverBackendPlan) {
     for stage in &plan.stages {
         println!("  {}.{}={}", stage.section, stage.step, stage.choice);
     }
+}
+
+fn write_solver_plan_json(plan: &SolverCasePlan, path: &Path) -> std::io::Result<()> {
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+
+    writeln!(writer, "{{")?;
+    write_json_key(&mut writer, 2, "caseDir")?;
+    write_json_string(&mut writer, &plan.case_dir.display().to_string())?;
+    writeln!(writer, ",")?;
+    write_json_control(&mut writer, plan)?;
+    writeln!(writer, ",")?;
+    write_json_mesh(&mut writer, &plan.mesh)?;
+    writeln!(writer, ",")?;
+    write_json_fields(&mut writer, &plan.fields)?;
+    writeln!(writer, ",")?;
+    write_json_properties(&mut writer, &plan.properties)?;
+    writeln!(writer, ",")?;
+    write_json_numerics(&mut writer, &plan.numerics)?;
+    writeln!(writer, ",")?;
+    write_json_interfaces(&mut writer, &plan.interfaces)?;
+    writeln!(writer, ",")?;
+    write_json_backends(&mut writer, &plan.backends)?;
+    writeln!(writer, ",")?;
+    write_json_key(&mut writer, 2, "warnings")?;
+    write_json_string_array(&mut writer, &plan.warnings)?;
+    writeln!(writer)?;
+    writeln!(writer, "}}")?;
+
+    writer.flush()
+}
+
+fn write_json_control(writer: &mut impl Write, plan: &SolverCasePlan) -> std::io::Result<()> {
+    write_json_key(writer, 2, "control")?;
+    writeln!(writer, "{{")?;
+    write_json_key(writer, 4, "application")?;
+    write_json_string(writer, &plan.control.application)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "startFrom")?;
+    write_json_string(writer, &plan.control.start_from)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "startTime")?;
+    write_json_optional_number(writer, plan.control.start_time)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "stopAt")?;
+    write_json_string(writer, &plan.control.stop_at)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "endTime")?;
+    write_json_optional_number(writer, plan.control.end_time)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "deltaT")?;
+    write_json_optional_number(writer, plan.control.delta_t)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "writeControl")?;
+    write_json_string(writer, &plan.control.write_control)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "writeInterval")?;
+    write_json_optional_number(writer, plan.control.write_interval)?;
+    writeln!(writer)?;
+    write_indent(writer, 2)?;
+    write!(writer, "}}")
+}
+
+fn write_json_mesh(writer: &mut impl Write, plan: &SolverMeshPlan) -> std::io::Result<()> {
+    write_json_key(writer, 2, "mesh")?;
+    writeln!(writer, "{{")?;
+    write_json_key(writer, 4, "dimensionality")?;
+    write_json_string(writer, &plan.dimensionality.to_string())?;
+    writeln!(writer, ",")?;
+    write_json_number_field(writer, 4, "points", plan.points)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(writer, 4, "cells", plan.cells)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(writer, 4, "faces", plan.faces)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(writer, 4, "internalFaces", plan.internal_faces)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(writer, 4, "boundaryFaces", plan.boundary_faces)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(writer, 4, "patches", plan.patches)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(writer, 4, "emptyPatches", plan.empty_patches)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(writer, 4, "wedgePatches", plan.wedge_patches)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(writer, 4, "symmetryPatches", plan.symmetry_patches)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "regionMeshes")?;
+    writeln!(writer, "[")?;
+    for (index, region) in plan.region_meshes.iter().enumerate() {
+        write_indent(writer, 6)?;
+        writeln!(writer, "{{")?;
+        write_json_key(writer, 8, "name")?;
+        write_json_string(writer, &region.name)?;
+        writeln!(writer, ",")?;
+        write_json_number_field(writer, 8, "cells", region.cells)?;
+        writeln!(writer, ",")?;
+        write_json_number_field(writer, 8, "patches", region.patches)?;
+        writeln!(writer)?;
+        write_indent(writer, 6)?;
+        if index + 1 == plan.region_meshes.len() {
+            writeln!(writer, "}}")?;
+        } else {
+            writeln!(writer, "}},")?;
+        }
+    }
+    write_indent(writer, 4)?;
+    writeln!(writer, "]")?;
+    write_indent(writer, 2)?;
+    write!(writer, "}}")
+}
+
+fn write_json_fields(writer: &mut impl Write, plan: &SolverFieldPlan) -> std::io::Result<()> {
+    write_json_key(writer, 2, "fields")?;
+    writeln!(writer, "[")?;
+    for (index, field) in plan.fields.iter().enumerate() {
+        write_indent(writer, 4)?;
+        writeln!(writer, "{{")?;
+        write_json_key(writer, 6, "region")?;
+        write_json_optional_string(writer, field.region.as_deref())?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 6, "name")?;
+        write_json_string(writer, &field.name)?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 6, "className")?;
+        write_json_optional_string(writer, field.class_name.as_deref())?;
+        writeln!(writer, ",")?;
+        write_json_number_field(writer, 6, "boundaryPatches", field.boundary_patches)?;
+        writeln!(writer)?;
+        write_indent(writer, 4)?;
+        if index + 1 == plan.fields.len() {
+            writeln!(writer, "}}")?;
+        } else {
+            writeln!(writer, "}},")?;
+        }
+    }
+    write_indent(writer, 2)?;
+    write!(writer, "]")
+}
+
+fn write_json_properties(
+    writer: &mut impl Write,
+    plan: &SolverPropertiesPlan,
+) -> std::io::Result<()> {
+    write_json_key(writer, 2, "properties")?;
+    writeln!(writer, "{{")?;
+    write_json_key(writer, 4, "dictionaries")?;
+    writeln!(writer, "[")?;
+    for (index, dictionary) in plan.dictionaries.iter().enumerate() {
+        write_indent(writer, 6)?;
+        writeln!(writer, "{{")?;
+        write_json_key(writer, 8, "name")?;
+        write_json_string(writer, &dictionary.name)?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 8, "region")?;
+        write_json_optional_string(writer, dictionary.region.as_deref())?;
+        writeln!(writer, ",")?;
+        write_json_number_field(writer, 8, "sections", dictionary.sections)?;
+        writeln!(writer, ",")?;
+        write_json_number_field(writer, 8, "entries", dictionary.entries)?;
+        writeln!(writer)?;
+        write_indent(writer, 6)?;
+        if index + 1 == plan.dictionaries.len() {
+            writeln!(writer, "}}")?;
+        } else {
+            writeln!(writer, "}},")?;
+        }
+    }
+    write_indent(writer, 4)?;
+    writeln!(writer, "],")?;
+    write_json_key(writer, 4, "entries")?;
+    writeln!(writer, "[")?;
+    for (index, entry) in plan.entries.iter().enumerate() {
+        write_indent(writer, 6)?;
+        writeln!(writer, "{{")?;
+        write_json_key(writer, 8, "dictionary")?;
+        write_json_string(writer, &entry.dictionary)?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 8, "section")?;
+        write_json_optional_string(writer, entry.section.as_deref())?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 8, "key")?;
+        write_json_string(writer, &entry.key)?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 8, "value")?;
+        write_json_string(writer, &entry.value)?;
+        writeln!(writer)?;
+        write_indent(writer, 6)?;
+        if index + 1 == plan.entries.len() {
+            writeln!(writer, "}}")?;
+        } else {
+            writeln!(writer, "}},")?;
+        }
+    }
+    write_indent(writer, 4)?;
+    writeln!(writer, "]")?;
+    write_indent(writer, 2)?;
+    write!(writer, "}}")
+}
+
+fn write_json_numerics(writer: &mut impl Write, plan: &SolverNumericsPlan) -> std::io::Result<()> {
+    write_json_key(writer, 2, "numerics")?;
+    writeln!(writer, "{{")?;
+    write_json_numerics_dictionary(writer, 4, "fvSchemes", &plan.fv_schemes)?;
+    writeln!(writer, ",")?;
+    write_json_numerics_dictionary(writer, 4, "fvSolution", &plan.fv_solution)?;
+    writeln!(writer)?;
+    write_indent(writer, 2)?;
+    write!(writer, "}}")
+}
+
+fn write_json_numerics_dictionary(
+    writer: &mut impl Write,
+    indent: usize,
+    name: &str,
+    plan: &SolverNumericsDictionaryPlan,
+) -> std::io::Result<()> {
+    write_json_key(writer, indent, name)?;
+    writeln!(writer, "{{")?;
+    write_json_key(writer, indent + 2, "present")?;
+    write!(writer, "{}", plan.present)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "sections")?;
+    writeln!(writer, "[")?;
+    for (index, section) in plan.sections.iter().enumerate() {
+        write_indent(writer, indent + 4)?;
+        writeln!(writer, "{{")?;
+        write_json_key(writer, indent + 6, "path")?;
+        write_json_string(writer, &section.path)?;
+        writeln!(writer, ",")?;
+        write_json_number_field(writer, indent + 6, "entries", section.entries)?;
+        writeln!(writer)?;
+        write_indent(writer, indent + 4)?;
+        if index + 1 == plan.sections.len() {
+            writeln!(writer, "}}")?;
+        } else {
+            writeln!(writer, "}},")?;
+        }
+    }
+    write_indent(writer, indent + 2)?;
+    writeln!(writer, "],")?;
+    write_json_key(writer, indent + 2, "entries")?;
+    writeln!(writer, "[")?;
+    for (index, entry) in plan.entries.iter().enumerate() {
+        write_indent(writer, indent + 4)?;
+        writeln!(writer, "{{")?;
+        write_json_key(writer, indent + 6, "section")?;
+        write_json_string(writer, &entry.section)?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, indent + 6, "key")?;
+        write_json_string(writer, &entry.key)?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, indent + 6, "value")?;
+        write_json_string(writer, &entry.value)?;
+        writeln!(writer)?;
+        write_indent(writer, indent + 4)?;
+        if index + 1 == plan.entries.len() {
+            writeln!(writer, "}}")?;
+        } else {
+            writeln!(writer, "}},")?;
+        }
+    }
+    write_indent(writer, indent + 2)?;
+    writeln!(writer, "]")?;
+    write_indent(writer, indent)?;
+    write!(writer, "}}")
+}
+
+fn write_json_interfaces(
+    writer: &mut impl Write,
+    plan: &SolverInterfacePlan,
+) -> std::io::Result<()> {
+    write_json_key(writer, 2, "interfaces")?;
+    writeln!(writer, "{{")?;
+    write_json_bool_field(writer, 4, "registryAvailable", plan.registry_available)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(
+        writer,
+        4,
+        "discoveredInterfaces",
+        plan.discovered_interfaces,
+    )?;
+    writeln!(writer, ",")?;
+    write_json_number_field(writer, 4, "boundaryFaceZones", plan.boundary_face_zones)?;
+    writeln!(writer, ",")?;
+    write_json_bool_field(writer, 4, "configPresent", plan.config_present)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(
+        writer,
+        4,
+        "configuredInterfaces",
+        plan.configured_interfaces,
+    )?;
+    writeln!(writer)?;
+    write_indent(writer, 2)?;
+    write!(writer, "}}")
+}
+
+fn write_json_backends(writer: &mut impl Write, plan: &SolverBackendPlan) -> std::io::Result<()> {
+    write_json_key(writer, 2, "backends")?;
+    writeln!(writer, "{{")?;
+    write_json_bool_field(writer, 4, "configPresent", plan.config_present)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "default")?;
+    write_json_string(writer, &plan.default.to_string())?;
+    writeln!(writer, ",")?;
+    write_json_bool_field(writer, 4, "usesCpu", plan.uses_cpu)?;
+    writeln!(writer, ",")?;
+    write_json_bool_field(writer, 4, "usesGpu", plan.uses_gpu)?;
+    writeln!(writer, ",")?;
+    write_json_bool_field(writer, 4, "mixedExecution", plan.mixed_execution)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "cpu")?;
+    writeln!(writer, "{{")?;
+    write_json_string_field(writer, 6, "cpus", &plan.cpu.cpus)?;
+    writeln!(writer, ",")?;
+    write_json_string_field(writer, 6, "coresPerCpu", &plan.cpu.cores_per_cpu)?;
+    writeln!(writer, ",")?;
+    write_json_string_field(writer, 6, "threads", &plan.cpu.threads)?;
+    writeln!(writer, ",")?;
+    write_json_string_field(writer, 6, "threadPinning", &plan.cpu.thread_pinning)?;
+    writeln!(writer, ",")?;
+    write_json_string_field(writer, 6, "numa", &plan.cpu.numa)?;
+    writeln!(writer)?;
+    write_indent(writer, 4)?;
+    writeln!(writer, "}},")?;
+    write_json_key(writer, 4, "gpu")?;
+    writeln!(writer, "{{")?;
+    write_json_string_field(writer, 6, "backend", &plan.gpu.backend)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 6, "devices")?;
+    write_json_string_array(writer, &plan.gpu.devices)?;
+    writeln!(writer, ",")?;
+    write_json_string_field(writer, 6, "multiGpu", &plan.gpu.multi_gpu)?;
+    writeln!(writer, ",")?;
+    write_json_string_field(writer, 6, "precision", &plan.gpu.precision)?;
+    writeln!(writer)?;
+    write_indent(writer, 4)?;
+    writeln!(writer, "}},")?;
+    write_json_key(writer, 4, "stages")?;
+    writeln!(writer, "[")?;
+    for (index, stage) in plan.stages.iter().enumerate() {
+        write_indent(writer, 6)?;
+        writeln!(writer, "{{")?;
+        write_json_key(writer, 8, "section")?;
+        write_json_string(writer, &stage.section)?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 8, "step")?;
+        write_json_string(writer, &stage.step)?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 8, "choice")?;
+        write_json_string(writer, &stage.choice.to_string())?;
+        writeln!(writer)?;
+        write_indent(writer, 6)?;
+        if index + 1 == plan.stages.len() {
+            writeln!(writer, "}}")?;
+        } else {
+            writeln!(writer, "}},")?;
+        }
+    }
+    write_indent(writer, 4)?;
+    writeln!(writer, "]")?;
+    write_indent(writer, 2)?;
+    write!(writer, "}}")
+}
+
+fn write_json_key(writer: &mut impl Write, indent: usize, key: &str) -> std::io::Result<()> {
+    write_indent(writer, indent)?;
+    write_json_string(writer, key)?;
+    write!(writer, ": ")
+}
+
+fn write_json_number_field(
+    writer: &mut impl Write,
+    indent: usize,
+    key: &str,
+    value: usize,
+) -> std::io::Result<()> {
+    write_json_key(writer, indent, key)?;
+    write!(writer, "{value}")
+}
+
+fn write_json_bool_field(
+    writer: &mut impl Write,
+    indent: usize,
+    key: &str,
+    value: bool,
+) -> std::io::Result<()> {
+    write_json_key(writer, indent, key)?;
+    write!(writer, "{value}")
+}
+
+fn write_json_string_field(
+    writer: &mut impl Write,
+    indent: usize,
+    key: &str,
+    value: &str,
+) -> std::io::Result<()> {
+    write_json_key(writer, indent, key)?;
+    write_json_string(writer, value)
+}
+
+fn write_json_optional_number(writer: &mut impl Write, value: Option<f64>) -> std::io::Result<()> {
+    match value {
+        Some(value) if value.is_finite() => write!(writer, "{value}"),
+        Some(value) => write_json_string(writer, &value.to_string()),
+        None => write!(writer, "null"),
+    }
+}
+
+fn write_json_optional_string(writer: &mut impl Write, value: Option<&str>) -> std::io::Result<()> {
+    match value {
+        Some(value) => write_json_string(writer, value),
+        None => write!(writer, "null"),
+    }
+}
+
+fn write_json_string_array(writer: &mut impl Write, values: &[String]) -> std::io::Result<()> {
+    write!(writer, "[")?;
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            write!(writer, ", ")?;
+        }
+        write_json_string(writer, value)?;
+    }
+    write!(writer, "]")
+}
+
+fn write_json_string(writer: &mut impl Write, value: &str) -> std::io::Result<()> {
+    write!(writer, "\"")?;
+    for ch in value.chars() {
+        match ch {
+            '"' => write!(writer, "\\\"")?,
+            '\\' => write!(writer, "\\\\")?,
+            '\n' => write!(writer, "\\n")?,
+            '\r' => write!(writer, "\\r")?,
+            '\t' => write!(writer, "\\t")?,
+            ch if ch.is_control() => write!(writer, "\\u{:04x}", ch as u32)?,
+            ch => write!(writer, "{ch}")?,
+        }
+    }
+    write!(writer, "\"")
+}
+
+fn write_indent(writer: &mut impl Write, indent: usize) -> std::io::Result<()> {
+    for _ in 0..indent {
+        write!(writer, " ")?;
+    }
+    Ok(())
 }
 
 fn print_interface_registry(registry: &InterfaceRegistrySummary) {
@@ -758,8 +1218,14 @@ fn parse_case_dir(args: &[String], default: PathBuf) -> Result<PathBuf, String> 
     Ok(default)
 }
 
-fn parse_solver_args(args: &[String]) -> Result<PathBuf, String> {
+struct SolverArgs {
+    case_dir: PathBuf,
+    plan_json: Option<PathBuf>,
+}
+
+fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
     let mut case_dir = PathBuf::from(".");
+    let mut plan_json = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -773,10 +1239,20 @@ fn parse_solver_args(args: &[String]) -> Result<PathBuf, String> {
             "-preflight" | "--preflight" | "-dryRun" | "--dry-run" => {
                 index += 1;
             }
+            "-planJson" | "--planJson" | "-plan-json" | "--plan-json" => {
+                let path = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--planJson requires a file path".to_string())?;
+                plan_json = Some(PathBuf::from(path));
+                index += 2;
+            }
             other => return Err(format!("unknown ferrumSolver option '{other}'")),
         }
     }
-    Ok(case_dir)
+    Ok(SolverArgs {
+        case_dir,
+        plan_json,
+    })
 }
 
 fn parse_init_case_args(args: &[String]) -> Result<InitCaseOptions, String> {
@@ -949,14 +1425,14 @@ fn print_help() {
     println!("  ferrum gmshToFoam <mesh.msh> [-case <caseDir>] [patch type options]");
     println!("  ferrum checkMesh [-case <caseDir>]");
     println!("  ferrum splitMeshRegions [-case <caseDir>] [-cellZones]");
-    println!("  ferrum solve [-case <caseDir>] [--preflight]");
+    println!("  ferrum solve [-case <caseDir>] [--preflight] [--planJson <file>]");
     println!();
     println!("aliases:");
     println!("  initFerrumCase <caseDir> [--region <name> ...] [--force]");
     println!("  gmshToFerrumFoam <mesh.msh> [-case <caseDir>] [patch type options]");
     println!("  checkFerrumMesh [-case <caseDir>]");
     println!("  splitFerrumMeshRegions [-case <caseDir>] [-cellZones]");
-    println!("  ferrumSolver [-case <caseDir>] [--preflight]");
+    println!("  ferrumSolver [-case <caseDir>] [--preflight] [--planJson <file>]");
     println!();
     print_patch_type_options();
 }
@@ -976,7 +1452,7 @@ fn print_init_case_usage() {
 }
 
 fn print_solver_usage() {
-    println!("usage: ferrumSolver [-case <caseDir>] [--preflight]");
+    println!("usage: ferrumSolver [-case <caseDir>] [--preflight] [--planJson <file>]");
     println!();
     println!("reads a FerrumCFD/OpenFOAM-like case and prints the solver preflight plan:");
     println!("  system/controlDict");
@@ -987,6 +1463,9 @@ fn print_solver_usage() {
     println!("  constant/<property dictionaries>");
     println!("  constant/interfaces");
     println!("  0/<fields>");
+    println!();
+    println!("options:");
+    println!("  --planJson <file>    also write the solver-neutral plan as JSON");
     println!();
     println!("solver kernels are not executed yet");
 }
@@ -1010,4 +1489,41 @@ fn print_patch_type_options() {
 #[allow(dead_code)]
 fn normalize_case_path(path: &Path) -> PathBuf {
     path.to_path_buf()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_solver_args, write_json_string};
+    use std::path::PathBuf;
+
+    #[test]
+    fn parses_solver_plan_json_option() {
+        let args = vec![
+            "-case".to_string(),
+            "cases/reactor".to_string(),
+            "--preflight".to_string(),
+            "--planJson".to_string(),
+            "system/solverPlan.json".to_string(),
+        ];
+
+        let parsed = parse_solver_args(&args).expect("solver args should parse");
+
+        assert_eq!(parsed.case_dir, PathBuf::from("cases/reactor"));
+        assert_eq!(
+            parsed.plan_json,
+            Some(PathBuf::from("system/solverPlan.json"))
+        );
+    }
+
+    #[test]
+    fn escapes_json_strings() {
+        let mut output = Vec::new();
+
+        write_json_string(&mut output, "a\"b\\c\n\t").expect("json string should write");
+
+        assert_eq!(
+            String::from_utf8(output).expect("valid utf8"),
+            "\"a\\\"b\\\\c\\n\\t\""
+        );
+    }
 }

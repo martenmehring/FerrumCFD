@@ -13,7 +13,7 @@ tracked in [docs/architecture.md](docs/architecture.md).
 cargo run -p ferrum-cli --bin ferrum -- initCase examples\membrane_reactor
 cargo run -p ferrum-cli --bin ferrum -- gmshToFoam path\to\mesh.msh -case examples\membrane_reactor
 cargo run -p ferrum-cli --bin ferrum -- checkMesh -case examples\membrane_reactor
-cargo run -p ferrum-cli --bin ferrum -- solve -case examples\membrane_reactor --preflight
+cargo run -p ferrum-cli --bin ferrum -- solve -case examples\membrane_reactor --preflight --planJson target\ferrumSolverPlan.json
 ```
 
 Alias binaries are provided too:
@@ -23,7 +23,7 @@ cargo run -p ferrum-cli --bin initFerrumCase -- examples\membrane_reactor
 cargo run -p ferrum-cli --bin gmshToFerrumFoam -- path\to\mesh.msh -case examples\membrane_reactor
 cargo run -p ferrum-cli --bin checkFerrumMesh -- -case examples\membrane_reactor
 cargo run -p ferrum-cli --bin splitFerrumMeshRegions -- -case examples\membrane_reactor -cellZones
-cargo run -p ferrum-cli --bin ferrumSolver -- -case examples\membrane_reactor --preflight
+cargo run -p ferrum-cli --bin ferrumSolver -- -case examples\membrane_reactor --preflight --planJson target\ferrumSolverPlan.json
 ```
 
 ## 2D And Axisymmetric Meshes
@@ -80,7 +80,8 @@ The importer currently targets the membrane reactor test mesh shape:
 - backend policy validation warns about duplicate stages, likely misspelled
   built-in stage names, and inconsistent CPU/GPU resource declarations
 - `ferrumSolver` currently performs a solver preflight and prints a
-  solver-neutral case plan; executable solver kernels are not implemented yet
+  solver-neutral case plan; `--planJson <file>` also writes the same plan as
+  machine-readable JSON; executable solver kernels are not implemented yet
 
 `splitFerrumMeshRegions` can write one region mesh per imported cell zone under
 `constant/<region>/polyMesh`.

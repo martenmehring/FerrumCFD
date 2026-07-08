@@ -140,15 +140,17 @@ fn build_topology(mesh: &Mesh) -> Topology {
     for face in &mesh.boundary_faces {
         let key = FaceKey::from_nodes(face.nodes);
         let patch_name = sanitize_name(&mesh.physical_name(face.physical_tag));
-        match boundary_by_key.insert(
-            key,
-            BoundaryPatchRef {
-                name: patch_name,
-                physical_tag: Some(face.physical_tag),
-            },
-        ) {
-            Some(_) => duplicate_boundary_faces += 1,
-            None => {}
+        if boundary_by_key
+            .insert(
+                key,
+                BoundaryPatchRef {
+                    name: patch_name,
+                    physical_tag: Some(face.physical_tag),
+                },
+            )
+            .is_some()
+        {
+            duplicate_boundary_faces += 1;
         }
     }
 
@@ -352,15 +354,14 @@ fn write_face_zones(
     let mut zones = BTreeMap::<i32, Vec<usize>>::new();
     for face in &mesh.boundary_faces {
         let key = FaceKey::from_nodes(face.nodes);
-        if let Some(&topology_index) = topology_index_by_key.get(&key) {
-            if let Some(&ordered_index) =
+        if let Some(&topology_index) = topology_index_by_key.get(&key)
+            && let Some(&ordered_index) =
                 ordered.ordered_label_by_topology_index.get(&topology_index)
-            {
-                zones
-                    .entry(face.physical_tag)
-                    .or_default()
-                    .push(ordered_index);
-            }
+        {
+            zones
+                .entry(face.physical_tag)
+                .or_default()
+                .push(ordered_index);
         }
     }
 
