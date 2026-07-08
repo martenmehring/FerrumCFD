@@ -1,0 +1,20 @@
+FerrumCFD mesh summary
+source=manual laminar_pipe benchmark
+case=examples\laminar_pipe
+points=20
+cells=4
+faces=21
+internal_faces=3
+boundary_faces=18
+unmatched_boundary_faces=0
+duplicate_boundary_faces=0
+non_manifold_faces=0
+
+[patches]
+inlet type=patch tag=1 faces=1 startFace=3
+outlet type=patch tag=2 faces=1 startFace=4
+wall type=wall tag=3 faces=16 startFace=5
+
+[face_zones]
+
+[cell_zones]

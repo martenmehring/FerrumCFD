@@ -5,6 +5,11 @@ Generated example cases can be written here with `gmshToFerrumFoam`.
 Mesh inputs and generated `constant/` or `system/` case output are ignored by
 Git because they can be large and may contain private geometry.
 
+Versioned examples:
+
+- `laminar_pipe`: tiny preflight benchmark for laminar water flow, constant wall
+  temperature, and Hagen-Poiseuille pressure-loss references.
+
 Useful local test commands:
 
 ```powershell

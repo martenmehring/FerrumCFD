@@ -11,3 +11,8 @@
 /examples/*/constant/
 /examples/*/system/
 
+# Small canonical examples are intentionally versioned.
+!/examples/laminar_pipe/constant/
+!/examples/laminar_pipe/constant/**
+!/examples/laminar_pipe/system/
+!/examples/laminar_pipe/system/**
