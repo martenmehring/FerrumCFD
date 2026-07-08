@@ -9,7 +9,6 @@ FoamFile
 
 dimensions [0 1 -1 0 0 0 0];
 
-// Mean axial velocity used by the analytical reference.
 internalField uniform (0.02 0 0);
 
 boundaryField

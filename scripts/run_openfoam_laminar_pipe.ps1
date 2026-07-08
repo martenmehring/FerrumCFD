@@ -108,6 +108,87 @@ function Read-InternalScalarField([string]$Path) {
     return @($values)
 }
 
+function Read-PipeBenchmarkParameters([string]$CaseRoot) {
+    $path = Join-Path $CaseRoot "constant\pipeBenchmark"
+    $result = [ordered]@{
+        rho = $null
+        analyticDeltaPPa = $null
+        axialCells = $null
+        radialCells = $null
+        angularSectors = $null
+        cells = $null
+    }
+    if (!(Test-Path -LiteralPath $path)) {
+        return [pscustomobject]$result
+    }
+
+    $content = Get-Content -LiteralPath $path -Raw
+    $rhoMatch = [regex]::Match($content, "(?m)^\s*rho\s+\[[^\]]+\]\s+([-+0-9.eE]+)\s*;")
+    if ($rhoMatch.Success) {
+        $result.rho = [double]::Parse($rhoMatch.Groups[1].Value, [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    $deltaMatch = [regex]::Match($content, "(?m)^\s*expectedDeltaP\s+\[[^\]]+\]\s+([-+0-9.eE]+)\s*;")
+    if ($deltaMatch.Success) {
+        $result.analyticDeltaPPa = [double]::Parse($deltaMatch.Groups[1].Value, [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    foreach ($name in @("axialCells", "radialCells", "angularSectors", "cells")) {
+        $match = [regex]::Match($content, "(?m)^\s*$name\s+(\d+)\s*;")
+        if ($match.Success) {
+            $result[$name] = [int]::Parse($match.Groups[1].Value, [System.Globalization.CultureInfo]::InvariantCulture)
+        }
+    }
+    return [pscustomobject]$result
+}
+
+function Get-Average([double[]]$Values) {
+    if ($Values.Count -eq 0) {
+        return $null
+    }
+    $sum = 0.0
+    foreach ($value in $Values) {
+        $sum += $value
+    }
+    return $sum / [double]$Values.Count
+}
+
+function Measure-AxialPressureLoss($Values, $Benchmark) {
+    if ($Values.Count -lt 2) {
+        return $null
+    }
+
+    if ($null -ne $Benchmark.axialCells -and $null -ne $Benchmark.radialCells -and $null -ne $Benchmark.angularSectors) {
+        $cellsPerSlice = [int]$Benchmark.radialCells * [int]$Benchmark.angularSectors
+        $lastStart = ([int]$Benchmark.axialCells - 1) * $cellsPerSlice
+        if ($cellsPerSlice -gt 0 -and $Values.Count -ge ($lastStart + $cellsPerSlice)) {
+            $inlet = New-Object System.Collections.Generic.List[double]
+            $outlet = New-Object System.Collections.Generic.List[double]
+            for ($i = 0; $i -lt $cellsPerSlice; $i++) {
+                $inlet.Add([double]$Values[$i]) | Out-Null
+                $outlet.Add([double]$Values[$lastStart + $i]) | Out-Null
+            }
+            $inletAverage = Get-Average $inlet.ToArray()
+            $outletAverage = Get-Average $outlet.ToArray()
+            return [pscustomobject][ordered]@{
+                method = "axialSliceAverage"
+                inletSamples = $inlet.Count
+                outletSamples = $outlet.Count
+                inletAverage = $inletAverage
+                outletAverage = $outletAverage
+                delta = $inletAverage - $outletAverage
+            }
+        }
+    }
+
+    return [pscustomobject][ordered]@{
+        method = "firstLastCell"
+        inletSamples = 1
+        outletSamples = 1
+        inletAverage = [double]$Values[0]
+        outletAverage = [double]$Values[$Values.Count - 1]
+        delta = [double]$Values[0] - [double]$Values[$Values.Count - 1]
+    }
+}
+
 function Read-LastFoamTiming([string]$LogPath) {
     if (!(Test-Path -LiteralPath $LogPath)) {
         return $null
@@ -124,11 +205,16 @@ function Read-LastFoamTiming([string]$LogPath) {
     }
 }
 
-$rho = 998.2
-$analyticDeltaPPa = 1.6032
+$benchmark = Read-PipeBenchmarkParameters $CaseRoot
+$rho = if ($null -ne $benchmark.rho) { [double]$benchmark.rho } else { 998.2 }
+$analyticDeltaPPa = if ($null -ne $benchmark.analyticDeltaPPa) { [double]$benchmark.analyticDeltaPPa } else { 1.6032 }
 $analyticDeltaPKinematic = $analyticDeltaPPa / $rho
-$initialPressurePa = @(1.6032, 1.2024, 0.8016, 0.4008)
-$initialPressureKinematic = $initialPressurePa | ForEach-Object { Format-F64 ($_ / $rho) }
+$initialPressurePa = @(Read-InternalScalarField (Join-Path $CaseRoot "0\p") | ForEach-Object { [double]$_ })
+if ($initialPressurePa.Count -lt 2) {
+    $initialPressurePa = @(1.6032, 1.2024, 0.8016, 0.4008)
+}
+$initialPressureKinematicLines = @($initialPressurePa | ForEach-Object { "    $(Format-F64 ($_ / $rho))" })
+$initialPressureBlock = $initialPressureKinematicLines -join "`n"
 
 if (Test-Path -LiteralPath $WorkDir) {
     Remove-Item -LiteralPath $WorkDir -Recurse -Force
@@ -174,12 +260,9 @@ FoamFile
 // The benchmark JSON converts it back to SI pressure in Pa.
 dimensions [0 2 -2 0 0 0 0];
 internalField nonuniform List<scalar>
-4
+$($initialPressureKinematicLines.Count)
 (
-    $($initialPressureKinematic[0])
-    $($initialPressureKinematic[1])
-    $($initialPressureKinematic[2])
-    $($initialPressureKinematic[3])
+$initialPressureBlock
 );
 
 boundaryField
@@ -329,13 +412,18 @@ $latestTime = Get-LatestTimeDirectory $WorkDir
 $openFoamDelta = $null
 if ($null -ne $latestTime) {
     $pValues = Read-InternalScalarField (Join-Path $latestTime.FullName "p")
-    if ($pValues.Count -ge 2) {
-        $deltaKinematic = [double]$pValues[0] - [double]$pValues[$pValues.Count - 1]
-        $deltaPa = $deltaKinematic * $rho
+    $loss = Measure-AxialPressureLoss $pValues $benchmark
+    if ($null -ne $loss) {
+        $deltaPa = $loss.delta * $rho
         $openFoamDelta = [ordered]@{
             latestTime = $latestTime.Name
             samples = $pValues.Count
-            deltaPKinematic = $deltaKinematic
+            method = $loss.method
+            inletSamples = $loss.inletSamples
+            outletSamples = $loss.outletSamples
+            inletAverageKinematic = $loss.inletAverage
+            outletAverageKinematic = $loss.outletAverage
+            deltaPKinematic = $loss.delta
             deltaPPa = $deltaPa
             relativeErrorToAnalytic = if ($analyticDeltaPPa -ne 0.0) { ($deltaPa - $analyticDeltaPPa) / $analyticDeltaPPa } else { $null }
         }
@@ -357,6 +445,12 @@ $result = [ordered]@{
         rho = $rho
         deltaPPa = $analyticDeltaPPa
         deltaPKinematic = $analyticDeltaPKinematic
+    }
+    mesh = [ordered]@{
+        axialCells = $benchmark.axialCells
+        radialCells = $benchmark.radialCells
+        angularSectors = $benchmark.angularSectors
+        cells = $benchmark.cells
     }
     runControl = [ordered]@{
         application = "simpleFoam"

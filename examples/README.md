@@ -7,9 +7,9 @@ Git because they can be large and may contain private geometry.
 
 Versioned examples:
 
-- `laminar_pipe`: tiny preflight benchmark for laminar water flow, constant wall
-  temperature, Hagen-Poiseuille pressure-loss references, and OpenFOAM
-  comparison scripts that record runtime.
+- `laminar_pipe`: generated circular pipe benchmark for laminar water flow,
+  constant wall temperature, Hagen-Poiseuille pressure-loss references, and
+  OpenFOAM comparison scripts that record runtime as a benchmark-only artifact.
 
 Useful local test commands:
 

@@ -78,11 +78,25 @@ function Format-NullablePercent($Value) {
     return (([double]$Value) * 100.0).ToString("F3", [System.Globalization.CultureInfo]::InvariantCulture) + "%"
 }
 
+function Read-AnalyticDeltaP([string]$CaseRoot) {
+    $path = Join-Path $CaseRoot "constant\pipeBenchmark"
+    if (!(Test-Path -LiteralPath $path)) {
+        return 1.6032
+    }
+    $content = Get-Content -LiteralPath $path -Raw
+    $match = [regex]::Match($content, "(?m)^\s*expectedDeltaP\s+\[[^\]]+\]\s+([-+0-9.eE]+)\s*;")
+    if (!$match.Success) {
+        return 1.6032
+    }
+    return [double]::Parse($match.Groups[1].Value, [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
 function Write-MarkdownReport($Path, $Result) {
     $comparison = $Result.comparison
     $ferrum = $Result.ferrum
     $openFoam = $Result.openFoam
     $status = $Result.benchmarkStatus
+    $mesh = $Result.mesh
     $lines = New-Object System.Collections.Generic.List[string]
 
     $lines.Add("# Laminar Pipe Benchmark")
@@ -97,6 +111,18 @@ function Write-MarkdownReport($Path, $Result) {
     $lines.Add("| OpenFOAM reference | $($status.openFoamReference) |")
     $lines.Add("| Ferrum executable solver comparison | $($status.ferrumSolverComparison) |")
     $lines.Add("")
+    if ($null -ne $mesh) {
+        $lines.Add("## Mesh")
+        $lines.Add("")
+        $lines.Add("| Property | Value |")
+        $lines.Add("| --- | ---: |")
+        $lines.Add("| Type | $($mesh.type) |")
+        $lines.Add("| Axial cells | $($mesh.axialCells) |")
+        $lines.Add("| Radial cells | $($mesh.radialCells) |")
+        $lines.Add("| Angular sectors | $($mesh.angularSectors) |")
+        $lines.Add("| Total cells | $($mesh.cells) |")
+        $lines.Add("")
+    }
     $lines.Add("## Pressure Loss")
     $lines.Add("")
     $lines.Add("| Source | deltaP [Pa] | Relative error to analytic |")
@@ -104,6 +130,11 @@ function Write-MarkdownReport($Path, $Result) {
     $lines.Add("| Analytic Hagen-Poiseuille | $(Format-NullableNumber $Result.analytic.deltaPPa "G8") | 0% |")
     $lines.Add("| OpenFOAM simpleFoam | $(Format-NullableNumber $comparison.openFoamDeltaPPa "G8") | $(Format-NullablePercent $comparison.openFoamRelativeErrorToAnalytic) |")
     $lines.Add("| FerrumCFD solver | n/a | n/a |")
+    if ($null -ne $comparison.openFoamPressureLossMethod) {
+        $method = $comparison.openFoamPressureLossMethod
+        $lines.Add("")
+        $lines.Add("OpenFOAM pressure loss sampling: ``$method`` with $($comparison.openFoamInletSamples) inlet and $($comparison.openFoamOutletSamples) outlet samples.")
+    }
     $lines.Add("")
     $lines.Add("## Timing")
     $lines.Add("")
@@ -128,12 +159,15 @@ function Write-MarkdownReport($Path, $Result) {
     Set-Content -LiteralPath $Path -Value $lines -Encoding UTF8
 }
 
-$analyticDeltaPPa = 1.6032
+$analyticDeltaPPa = Read-AnalyticDeltaP $CaseRoot
 $ferrumRun = Invoke-FerrumPreflight -CaseRoot $CaseRoot -PlanJson $FerrumPlanJson
 $ferrumPlan = Get-Content -LiteralPath $FerrumPlanJson -Raw | ConvertFrom-Json
 $openFoam = $null
 if (Test-Path -LiteralPath $OpenFoamJson) {
     $openFoam = Get-Content -LiteralPath $OpenFoamJson -Raw | ConvertFrom-Json
+    if ($null -ne $openFoam.analytic -and $null -ne $openFoam.analytic.deltaPPa) {
+        $analyticDeltaPPa = [double]$openFoam.analytic.deltaPPa
+    }
 }
 
 $openFoamDeltaPPa = $null
@@ -147,10 +181,23 @@ if ($null -ne $openFoam) {
     $openFoamWallClock = $openFoam.openFoam.wallClockSeconds
 }
 $openFoamRunControl = if ($null -ne $openFoam) { $openFoam.runControl } else { $null }
+$openFoamPressureLoss = if ($null -ne $openFoam) { $openFoam.openFoam.pressureLoss } else { $null }
+$mesh = if ($null -ne $openFoam -and $null -ne $openFoam.mesh) {
+    [ordered]@{
+        type = "structuredCircularPipe"
+        axialCells = $openFoam.mesh.axialCells
+        radialCells = $openFoam.mesh.radialCells
+        angularSectors = $openFoam.mesh.angularSectors
+        cells = $openFoam.mesh.cells
+    }
+} else {
+    $null
+}
 
 $notes = @(
-    "The current laminar_pipe mesh is a very coarse square surrogate, not a resolved circular pipe.",
-    "OpenFOAM-to-analytic pressure-loss differences are treated as mesh/model error at this stage.",
+    "The current laminar_pipe mesh is a generated structured circular pipe controlled by scripts/generate_laminar_pipe_case.ps1.",
+    "OpenFOAM is generated only under target/openfoam/laminar_pipe for comparison and is not the default FerrumCFD workflow.",
+    "OpenFOAM-to-analytic pressure-loss differences are treated as mesh/discretization/setup error at this stage.",
     "FerrumCFD currently contributes preflight timing and field-buffer readiness only; executable solver timing will be added when the flow solver exists."
 )
 
@@ -168,6 +215,7 @@ $result = [ordered]@{
         pressureLossModel = "HagenPoiseuille"
         deltaPPa = $analyticDeltaPPa
     }
+    mesh = $mesh
     ferrum = [ordered]@{
         mode = "preflight-no-solver"
         executableSolver = $false
@@ -188,6 +236,9 @@ $result = [ordered]@{
     comparison = [ordered]@{
         openFoamDeltaPPa = $openFoamDeltaPPa
         openFoamRelativeErrorToAnalytic = $openFoamRelativeError
+        openFoamPressureLossMethod = if ($null -ne $openFoamPressureLoss) { $openFoamPressureLoss.method } else { $null }
+        openFoamInletSamples = if ($null -ne $openFoamPressureLoss) { $openFoamPressureLoss.inletSamples } else { $null }
+        openFoamOutletSamples = if ($null -ne $openFoamPressureLoss) { $openFoamPressureLoss.outletSamples } else { $null }
         ferrumDeltaPPa = $null
         ferrumRelativeErrorToOpenFoam = $null
         ferrumSolverComparison = "pending executable FerrumCFD flow solver"
