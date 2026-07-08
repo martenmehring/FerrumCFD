@@ -30,6 +30,13 @@ cargo run -p ferrum-cli --bin ferrumSolver -- -case examples\laminar_pipe --solv
 cargo run -p ferrum-cli --bin ferrumSolver -- -case examples\laminar_pipe --solvePoiseuille --linearSolver cg
 ```
 
+Run the first Ferrum/OpenFOAM/analytic Poiseuille benchmark with:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_poiseuille_benchmark.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_pipe_convergence.ps1 -OpenFoamSteps 200
+```
+
 ## 2D And Axisymmetric Meshes
 
 FerrumCFD follows the OpenFOAM mesh workflow:
@@ -118,12 +125,13 @@ The importer currently targets the membrane reactor test mesh shape:
   and missing executable backend status without updating fields or solving
   equations
 - `examples/laminar_pipe` provides a generated circular-pipe SI benchmark with
-  a flow-normalized parabolic inlet, analytical Hagen-Poiseuille data, and
-  OpenFOAM comparison/convergence scripts that record wall-clock runtime
+  a flow-normalized parabolic inlet, analytical Hagen-Poiseuille data,
+  executable Ferrum Poiseuille solves, and OpenFOAM comparison/convergence
+  scripts that record wall-clock runtime
 - `examples/gmsh_pipe/pipe_prism2.geo` provides a parametric Gmsh pipe with two
   near-wall prism layers; `scripts/run_gmsh_pipe_mesh_study.ps1` creates
-  coarse/medium/fine Gmsh meshes for OpenFOAM convergence and later FerrumCFD
-  solver validation on the selected reference mesh
+  coarse/medium/fine Gmsh meshes for OpenFOAM convergence and FerrumCFD
+  Poiseuille validation on the selected reference mesh
 
 `splitFerrumMeshRegions` can write one region mesh per imported cell zone under
 `constant/<region>/polyMesh`.

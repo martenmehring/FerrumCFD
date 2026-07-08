@@ -1,6 +1,8 @@
 # Gmsh Pipe Mesh Study
 
-Local benchmark run on the Gmsh pipe mesh study with WSL OpenFOAM.
+Local benchmark run on the Gmsh pipe mesh study with WSL OpenFOAM. This is the
+historical OpenFOAM reference record; the current script also writes FerrumCFD
+Poiseuille solve error and timing columns for new runs.
 All FerrumCFD-facing values are SI. OpenFOAM incompressible pressure is
 converted from kinematic pressure to Pa with `rho = 998.2 kg/m3`.
 
@@ -36,8 +38,8 @@ the full-length pressure loss.
 
 `medium` is the practical development mesh: it is much faster than `fine` and
 already near the analytical solution. `fine` is the current reference candidate
-for the first FerrumCFD solver comparison because it is below 1% error after the
-sampling-length correction.
+for stricter FerrumCFD/OpenFOAM comparison because it is below 1% OpenFOAM error
+after the sampling-length correction.
 
 A later `veryFine` run is useful before claiming final mesh independence, but it
-is not necessary before starting the first FerrumCFD laminar pipe solver.
+is not necessary before extending the first FerrumCFD laminar pipe benchmark.

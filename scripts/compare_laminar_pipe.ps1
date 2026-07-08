@@ -3,7 +3,12 @@ param(
     [string]$OpenFoamJson = "",
     [string]$FerrumPlanJson = "",
     [string]$OutFile = "",
-    [string]$ReportFile = ""
+    [string]$ReportFile = "",
+    [switch]$SkipFerrumSolve,
+    [ValidateSet("jacobi", "cg")]
+    [string]$FerrumLinearSolver = "cg",
+    [double]$FerrumSolveTolerance = 1e-8,
+    [int]$FerrumMaxIterations = 20000
 )
 
 $ErrorActionPreference = "Stop"
@@ -23,6 +28,12 @@ if ([string]::IsNullOrWhiteSpace($OutFile)) {
 if ([string]::IsNullOrWhiteSpace($ReportFile)) {
     $ReportFile = Join-Path $RepoRoot "target\benchmarks\laminar_pipe_compare.md"
 }
+if ($FerrumSolveTolerance -le 0.0) {
+    throw "FerrumSolveTolerance must be positive"
+}
+if ($FerrumMaxIterations -le 0) {
+    throw "FerrumMaxIterations must be positive"
+}
 
 function Invoke-FerrumPreflight([string]$CaseRoot, [string]$PlanJson) {
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $PlanJson) | Out-Null
@@ -39,8 +50,13 @@ function Invoke-FerrumPreflight([string]$CaseRoot, [string]$PlanJson) {
 
     $script:ferrumExitCode = $null
     $elapsed = Measure-Command {
-        & $command @arguments *> $logPath
-        $script:ferrumExitCode = $LASTEXITCODE
+        Push-Location $RepoRoot
+        try {
+            & $command @arguments *> $logPath
+            $script:ferrumExitCode = $LASTEXITCODE
+        } finally {
+            Pop-Location
+        }
     }
     $exitCode = if ($null -eq $script:ferrumExitCode) { 0 } else { $script:ferrumExitCode }
     if ($exitCode -ne 0) {
@@ -52,6 +68,152 @@ function Invoke-FerrumPreflight([string]$CaseRoot, [string]$PlanJson) {
         log = $logPath
         planJson = $PlanJson
         wallClockSeconds = $elapsed.TotalSeconds
+    }
+}
+
+function Parse-KeyValueLine([string]$Line) {
+    $result = @{}
+    foreach ($match in [regex]::Matches($Line, "([A-Za-z][A-Za-z0-9]*)=([^\s]+)")) {
+        $result[$match.Groups[1].Value] = $match.Groups[2].Value
+    }
+    return $result
+}
+
+function ConvertTo-NullableDouble($Value) {
+    if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) {
+        return $null
+    }
+    return [double]::Parse([string]$Value, [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+function ConvertTo-NullableInt($Value) {
+    if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) {
+        return $null
+    }
+    return [int]::Parse([string]$Value, [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+function ConvertTo-NullableBool($Value) {
+    if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) {
+        return $null
+    }
+    $text = ([string]$Value).ToLowerInvariant()
+    if ($text -eq "true") { return $true }
+    if ($text -eq "false") { return $false }
+    if ($text -eq "yes") { return $true }
+    if ($text -eq "no") { return $false }
+    return $null
+}
+
+function Format-CommandLine([string]$Command, [string[]]$Arguments) {
+    $parts = New-Object System.Collections.Generic.List[string]
+    $parts.Add($Command)
+    foreach ($argument in $Arguments) {
+        if ($argument -match "\s") {
+            $parts.Add('"' + $argument.Replace('"', '\"') + '"')
+        } else {
+            $parts.Add($argument)
+        }
+    }
+    return ($parts -join " ")
+}
+
+function Invoke-FerrumPoiseuilleSolve(
+    [string]$CaseRoot,
+    [string]$LogPath,
+    [string]$LinearSolver,
+    [double]$SolveTolerance,
+    [int]$MaxIterations,
+    [double]$AnalyticDeltaPPa
+) {
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $LogPath) | Out-Null
+    $exe = Join-Path $RepoRoot "target\debug\ferrumSolver.exe"
+    if (Test-Path -LiteralPath $exe) {
+        $command = $exe
+        $arguments = @(
+            "-case", $CaseRoot,
+            "--solvePoiseuille",
+            "--linearSolver", $LinearSolver,
+            "--solveTolerance", $SolveTolerance.ToString("G17", [System.Globalization.CultureInfo]::InvariantCulture),
+            "--maxIterations", $MaxIterations.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+        )
+    } else {
+        $command = "cargo"
+        $arguments = @(
+            "run", "-p", "ferrum-cli", "--bin", "ferrumSolver", "--",
+            "-case", $CaseRoot,
+            "--solvePoiseuille",
+            "--linearSolver", $LinearSolver,
+            "--solveTolerance", $SolveTolerance.ToString("G17", [System.Globalization.CultureInfo]::InvariantCulture),
+            "--maxIterations", $MaxIterations.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+        )
+    }
+
+    $script:ferrumSolveExitCode = $null
+    $elapsed = Measure-Command {
+        Push-Location $RepoRoot
+        try {
+            & $command @arguments *> $LogPath
+            $script:ferrumSolveExitCode = $LASTEXITCODE
+        } finally {
+            Pop-Location
+        }
+    }
+    $exitCode = if ($null -eq $script:ferrumSolveExitCode) { 0 } else { $script:ferrumSolveExitCode }
+    if ($exitCode -ne 0) {
+        throw "Ferrum Poiseuille solve failed with exit code $exitCode. See $LogPath"
+    }
+
+    $output = Get-Content -LiteralPath $LogPath
+    $solveLine = @($output | Where-Object { $_ -match "^poiseuille solve:" } | Select-Object -Last 1)
+    $resultLine = @($output | Where-Object { $_ -match "^poiseuille result:" } | Select-Object -Last 1)
+    if ($solveLine.Count -eq 0 -or $resultLine.Count -eq 0) {
+        throw "Ferrum Poiseuille solve did not print expected result lines. See $LogPath"
+    }
+
+    $solve = Parse-KeyValueLine $solveLine[0]
+    $result = Parse-KeyValueLine $resultLine[0]
+    $pressureDropFromMean = ConvertTo-NullableDouble $result["pressureDropFromMean"]
+    $pressureDropRelativeError = if ($null -ne $pressureDropFromMean -and $AnalyticDeltaPPa -ne 0.0) {
+        ($pressureDropFromMean - $AnalyticDeltaPPa) / $AnalyticDeltaPPa
+    } else {
+        $null
+    }
+
+    return [ordered]@{
+        mode = "source-driven-axial-stokes"
+        executableSolver = $true
+        backend = $solve["backend"]
+        linearSolver = $solve["linearSolver"]
+        command = Format-CommandLine -Command $command -Arguments $arguments
+        log = $LogPath
+        exitCode = $exitCode
+        commandWallClockSeconds = $elapsed.TotalSeconds
+        solveWallClockSeconds = ConvertTo-NullableDouble $solve["wallClockSeconds"]
+        cells = ConvertTo-NullableInt $solve["cells"]
+        nnz = ConvertTo-NullableInt $solve["nnz"]
+        iterations = ConvertTo-NullableInt $solve["iterations"]
+        converged = ConvertTo-NullableBool $solve["converged"]
+        residualNorm = ConvertTo-NullableDouble $solve["residualNorm"]
+        inputs = [ordered]@{
+            pressureDropPa = ConvertTo-NullableDouble $solve["pressureDrop"]
+            dynamicViscosityPaS = ConvertTo-NullableDouble $solve["dynamicViscosity"]
+            lengthM = ConvertTo-NullableDouble $solve["length"]
+            diameterM = ConvertTo-NullableDouble $solve["diameter"]
+            source = ConvertTo-NullableDouble $solve["source"]
+            wallPatches = $solve["wallPatches"]
+        }
+        result = [ordered]@{
+            meanVelocityMps = ConvertTo-NullableDouble $result["meanVelocity"]
+            analyticMeanVelocityMps = ConvertTo-NullableDouble $result["analyticMeanVelocity"]
+            relativeMeanVelocityErrorToAnalytic = ConvertTo-NullableDouble $result["relativeMeanVelocityError"]
+            flowRateM3s = ConvertTo-NullableDouble $result["flowRate"]
+            analyticFlowRateM3s = ConvertTo-NullableDouble $result["analyticFlowRate"]
+            pressureDropFromMeanPa = $pressureDropFromMean
+            relativePressureDropErrorToAnalytic = $pressureDropRelativeError
+            minVelocityMps = ConvertTo-NullableDouble $result["minVelocity"]
+            maxVelocityMps = ConvertTo-NullableDouble $result["maxVelocity"]
+        }
     }
 }
 
@@ -92,6 +254,43 @@ function Read-AnalyticDeltaP([string]$CaseRoot) {
     return [double]::Parse($match.Groups[1].Value, [System.Globalization.CultureInfo]::InvariantCulture)
 }
 
+function Read-DimensionedScalar($Content, [string]$Name) {
+    if ([string]::IsNullOrWhiteSpace($Content)) {
+        return $null
+    }
+    $match = [regex]::Match($Content, "(?m)^\s*$Name\s+(?:\[[^\]]+\]\s+)?([-+0-9.eE]+)\s*;")
+    if (!$match.Success) {
+        return $null
+    }
+    return [double]::Parse($match.Groups[1].Value, [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Read-PipeBenchmarkPhysics([string]$CaseRoot) {
+    $benchmarkPath = Join-Path $CaseRoot "constant\pipeBenchmark"
+    $transportPath = Join-Path $CaseRoot "constant\transportProperties"
+    $benchmark = if (Test-Path -LiteralPath $benchmarkPath) { Get-Content -LiteralPath $benchmarkPath -Raw } else { "" }
+    $transport = if (Test-Path -LiteralPath $transportPath) { Get-Content -LiteralPath $transportPath -Raw } else { "" }
+
+    $rho = Read-DimensionedScalar -Content $benchmark -Name "rho"
+    if ($null -eq $rho) {
+        $rho = Read-DimensionedScalar -Content $transport -Name "rho"
+    }
+    $mu = Read-DimensionedScalar -Content $benchmark -Name "mu"
+    if ($null -eq $mu) {
+        $mu = Read-DimensionedScalar -Content $transport -Name "mu"
+    }
+
+    return [ordered]@{
+        lengthM = Read-DimensionedScalar -Content $benchmark -Name "length"
+        diameterM = Read-DimensionedScalar -Content $benchmark -Name "diameter"
+        rhoKgPerM3 = $rho
+        dynamicViscosityPaS = $mu
+        meanVelocityMps = Read-DimensionedScalar -Content $benchmark -Name "meanVelocity"
+        referenceTemperatureK = Read-DimensionedScalar -Content $benchmark -Name "referenceTemperature"
+        analyticDeltaPPa = Read-DimensionedScalar -Content $benchmark -Name "expectedDeltaP"
+    }
+}
+
 function Read-PipeBenchmarkMesh([string]$CaseRoot) {
     $path = Join-Path $CaseRoot "constant\pipeBenchmark"
     if (!(Test-Path -LiteralPath $path)) {
@@ -125,9 +324,12 @@ function Read-PipeBenchmarkMesh([string]$CaseRoot) {
 function Write-MarkdownReport($Path, $Result) {
     $comparison = $Result.comparison
     $ferrum = $Result.ferrum
+    $ferrumPreflight = $ferrum.preflight
+    $ferrumSolve = $ferrum.solve
     $openFoam = $Result.openFoam
     $status = $Result.benchmarkStatus
     $mesh = $Result.mesh
+    $physics = $Result.physics
     $lines = New-Object System.Collections.Generic.List[string]
 
     $lines.Add("# Laminar Pipe Benchmark")
@@ -139,8 +341,8 @@ function Write-MarkdownReport($Path, $Result) {
     $lines.Add("| Check | Value |")
     $lines.Add("| --- | --- |")
     $lines.Add("| Ferrum preflight | $($status.ferrumPreflight) |")
+    $lines.Add("| Ferrum Poiseuille solve | $($status.ferrumSolverComparison) |")
     $lines.Add("| OpenFOAM reference | $($status.openFoamReference) |")
-    $lines.Add("| Ferrum executable solver comparison | $($status.ferrumSolverComparison) |")
     $lines.Add("")
     if ($null -ne $mesh) {
         $lines.Add("## Mesh")
@@ -157,13 +359,26 @@ function Write-MarkdownReport($Path, $Result) {
         $lines.Add("| Total cells | $(Format-NullableNumber $mesh.cells "G8") |")
         $lines.Add("")
     }
+    if ($null -ne $physics) {
+        $lines.Add("## Inputs")
+        $lines.Add("")
+        $lines.Add("| Quantity | Value |")
+        $lines.Add("| --- | ---: |")
+        $lines.Add("| Length [m] | $(Format-NullableNumber $physics.lengthM "G8") |")
+        $lines.Add("| Diameter [m] | $(Format-NullableNumber $physics.diameterM "G8") |")
+        $lines.Add("| Dynamic viscosity [Pa s] | $(Format-NullableNumber $physics.dynamicViscosityPaS "G8") |")
+        $lines.Add("| Density [kg/m3] | $(Format-NullableNumber $physics.rhoKgPerM3 "G8") |")
+        $lines.Add("| Mean velocity target [m/s] | $(Format-NullableNumber $physics.meanVelocityMps "G8") |")
+        $lines.Add("| Analytic deltaP [Pa] | $(Format-NullableNumber $Result.analytic.deltaPPa "G8") |")
+        $lines.Add("")
+    }
     $lines.Add("## Pressure Loss")
     $lines.Add("")
     $lines.Add("| Source | deltaP [Pa] | Relative error to analytic |")
     $lines.Add("| --- | ---: | ---: |")
     $lines.Add("| Analytic Hagen-Poiseuille | $(Format-NullableNumber $Result.analytic.deltaPPa "G8") | 0% |")
+    $lines.Add("| FerrumCFD Poiseuille | $(Format-NullableNumber $comparison.ferrumDeltaPPa "G8") | $(Format-NullablePercent $comparison.ferrumRelativeErrorToAnalytic) |")
     $lines.Add("| OpenFOAM simpleFoam | $(Format-NullableNumber $comparison.openFoamDeltaPPa "G8") | $(Format-NullablePercent $comparison.openFoamRelativeErrorToAnalytic) |")
-    $lines.Add("| FerrumCFD solver | n/a | n/a |")
     if ($null -ne $comparison.openFoamPressureLossMethod) {
         $method = $comparison.openFoamPressureLossMethod
         $lines.Add("")
@@ -173,12 +388,33 @@ function Write-MarkdownReport($Path, $Result) {
             $lines.Add("The sampled pressure difference was extrapolated to the full pipe length with effective length fraction ``$fraction``.")
         }
     }
+    if ($null -ne $ferrumSolve) {
+        $lines.Add("")
+        $lines.Add("Ferrum reconstructs deltaP from the solved mean velocity for this source-driven Stokes benchmark.")
+        $lines.Add("")
+        $lines.Add("## Ferrum Velocity")
+        $lines.Add("")
+        $lines.Add("| Quantity | Value |")
+        $lines.Add("| --- | ---: |")
+        $lines.Add("| Mean velocity [m/s] | $(Format-NullableNumber $ferrumSolve.result.meanVelocityMps "G8") |")
+        $lines.Add("| Analytic mean velocity [m/s] | $(Format-NullableNumber $ferrumSolve.result.analyticMeanVelocityMps "G8") |")
+        $lines.Add("| Relative mean-velocity error | $(Format-NullablePercent $ferrumSolve.result.relativeMeanVelocityErrorToAnalytic) |")
+        $lines.Add("| Iterations | $(Format-NullableNumber $ferrumSolve.iterations "G8") |")
+        $lines.Add("| Residual norm | $(Format-NullableNumber $ferrumSolve.residualNorm "G8") |")
+        $lines.Add("| Converged | $($ferrumSolve.converged) |")
+    }
     $lines.Add("")
     $lines.Add("## Timing")
     $lines.Add("")
     $lines.Add("| Runner | Wall clock [s] | Solver execution time [s] | Steps |")
     $lines.Add("| --- | ---: | ---: | ---: |")
-    $lines.Add("| Ferrum preflight | $(Format-NullableNumber $comparison.timing.ferrumPreflightWallClockSeconds "G6") | n/a | $($ferrum.runSchedule.estimatedSteps) planned |")
+    $plannedSteps = if ($null -ne $ferrumPreflight) { $ferrumPreflight.runSchedule.estimatedSteps } else { "n/a" }
+    $lines.Add("| Ferrum preflight | $(Format-NullableNumber $comparison.timing.ferrumPreflightWallClockSeconds "G6") | n/a | $plannedSteps planned |")
+    if ($null -ne $ferrumSolve) {
+        $lines.Add("| Ferrum Poiseuille solve | $(Format-NullableNumber $comparison.timing.ferrumCommandWallClockSeconds "G6") | $(Format-NullableNumber $comparison.timing.ferrumSolveWallClockSeconds "G6") | $($ferrumSolve.iterations) iterations |")
+    } else {
+        $lines.Add("| Ferrum Poiseuille solve | n/a | n/a | n/a |")
+    }
     if ($null -ne $openFoam) {
         $foamExecution = if ($null -ne $openFoam.foamTiming) { $openFoam.foamTiming.executionTimeSeconds } else { $null }
         $foamSteps = if ($null -ne $Result.openFoamRunControl) { $Result.openFoamRunControl.simulatedSteps } else { "n/a" }
@@ -197,7 +433,11 @@ function Write-MarkdownReport($Path, $Result) {
     Set-Content -LiteralPath $Path -Value $lines -Encoding UTF8
 }
 
+$physics = Read-PipeBenchmarkPhysics $CaseRoot
 $analyticDeltaPPa = Read-AnalyticDeltaP $CaseRoot
+if ($null -ne $physics.analyticDeltaPPa) {
+    $analyticDeltaPPa = [double]$physics.analyticDeltaPPa
+}
 $ferrumRun = Invoke-FerrumPreflight -CaseRoot $CaseRoot -PlanJson $FerrumPlanJson
 $ferrumPlan = Get-Content -LiteralPath $FerrumPlanJson -Raw | ConvertFrom-Json
 $openFoam = $null
@@ -218,17 +458,49 @@ if ($null -ne $openFoam -and $null -ne $openFoam.openFoam.pressureLoss) {
 if ($null -ne $openFoam) {
     $openFoamWallClock = $openFoam.openFoam.wallClockSeconds
 }
+$ferrumSolve = $null
+if (!$SkipFerrumSolve) {
+    $resultBaseName = [System.IO.Path]::GetFileNameWithoutExtension($OutFile)
+    $ferrumSolveLog = Join-Path (Split-Path -Parent $OutFile) "$resultBaseName.ferrum_poiseuille.log"
+    $ferrumSolve = Invoke-FerrumPoiseuilleSolve `
+        -CaseRoot $CaseRoot `
+        -LogPath $ferrumSolveLog `
+        -LinearSolver $FerrumLinearSolver `
+        -SolveTolerance $FerrumSolveTolerance `
+        -MaxIterations $FerrumMaxIterations `
+        -AnalyticDeltaPPa $analyticDeltaPPa
+}
+$ferrumDeltaPPa = if ($null -ne $ferrumSolve) { $ferrumSolve.result.pressureDropFromMeanPa } else { $null }
+$ferrumRelativeError = if ($null -ne $ferrumDeltaPPa -and $analyticDeltaPPa -ne 0.0) {
+    ($ferrumDeltaPPa - $analyticDeltaPPa) / $analyticDeltaPPa
+} else {
+    $null
+}
+$ferrumRelativeErrorToOpenFoam = if ($null -ne $ferrumDeltaPPa -and $null -ne $openFoamDeltaPPa -and $openFoamDeltaPPa -ne 0.0) {
+    ($ferrumDeltaPPa - $openFoamDeltaPPa) / $openFoamDeltaPPa
+} else {
+    $null
+}
+$ferrumSolverStatus = if ($SkipFerrumSolve) {
+    "skipped"
+} elseif ($null -ne $ferrumSolve -and $ferrumSolve.exitCode -eq 0 -and $ferrumSolve.converged -eq $true) {
+    "passed"
+} elseif ($null -ne $ferrumSolve) {
+    "failed"
+} else {
+    "missing"
+}
 $openFoamRunControl = if ($null -ne $openFoam) { $openFoam.runControl } else { $null }
 $openFoamPressureLoss = if ($null -ne $openFoam) { $openFoam.openFoam.pressureLoss } else { $null }
 $caseMesh = Read-PipeBenchmarkMesh $CaseRoot
 $mesh = if ($null -ne $openFoam -and $null -ne $openFoam.mesh) {
     [ordered]@{
-        type = if ($null -ne $openFoam.mesh.type) { $openFoam.mesh.type } else { "unknown" }
+        type = if ($null -ne $openFoam.mesh.type) { $openFoam.mesh.type } elseif ($null -ne $caseMesh -and $null -ne $caseMesh.type) { $caseMesh.type } else { "unknown" }
         axialCells = $openFoam.mesh.axialCells
         radialCells = $openFoam.mesh.radialCells
         angularSectors = $openFoam.mesh.angularSectors
         cells = $openFoam.mesh.cells
-        points = $openFoam.mesh.points
+        points = if ($null -ne $openFoam.mesh.points) { $openFoam.mesh.points } elseif ($null -ne $caseMesh) { $caseMesh.points } else { $null }
     }
 } elseif ($null -ne $caseMesh) {
     [ordered]@{
@@ -258,8 +530,18 @@ $notes = @(
     "The case mesh is described by constant/pipeBenchmark; it can be generated directly by FerrumCFD scripts or imported from Gmsh.",
     "OpenFOAM is generated only under target/ for comparison and is not the default FerrumCFD workflow.",
     "OpenFOAM-to-analytic pressure-loss differences are treated as mesh/discretization/setup error at this stage.",
-    "FerrumCFD currently contributes preflight timing and field-buffer readiness only; executable solver timing will be added when the flow solver exists."
+    "FerrumCFD's Poiseuille path is an executable source-driven axial Stokes benchmark, not a full SIMPLE pressure-velocity solver yet.",
+    "Ferrum reconstructs pressure loss from the solved mean velocity so it can be compared directly against Hagen-Poiseuille and OpenFOAM in SI units."
 )
+
+$runSchedule = [ordered]@{
+    startTime = $ferrumPlan.run.startTime
+    endTime = $ferrumPlan.run.endTime
+    deltaT = $ferrumPlan.run.deltaT
+    estimatedSteps = $ferrumPlan.run.estimatedSteps
+    estimatedWrites = $ferrumPlan.run.estimatedWriteEvents
+}
+$stateSummary = Get-StateSummary $ferrumPlan
 
 $result = [ordered]@{
     case = "laminar_pipe"
@@ -274,22 +556,26 @@ $result = [ordered]@{
     analytic = [ordered]@{
         pressureLossModel = "HagenPoiseuille"
         deltaPPa = $analyticDeltaPPa
+        meanVelocityMps = $physics.meanVelocityMps
     }
+    physics = $physics
     mesh = $mesh
     ferrum = [ordered]@{
-        mode = "preflight-no-solver"
-        executableSolver = $false
-        wallClockSeconds = $ferrumRun.wallClockSeconds
+        mode = if ($null -ne $ferrumSolve) { $ferrumSolve.mode } else { "preflight-only" }
+        executableSolver = $null -ne $ferrumSolve
+        wallClockSeconds = if ($null -ne $ferrumSolve) { $ferrumSolve.solveWallClockSeconds } else { $ferrumRun.wallClockSeconds }
         planJson = $ferrumRun.planJson
         log = $ferrumRun.log
-        runSchedule = [ordered]@{
-            startTime = $ferrumPlan.run.startTime
-            endTime = $ferrumPlan.run.endTime
-            deltaT = $ferrumPlan.run.deltaT
-            estimatedSteps = $ferrumPlan.run.estimatedSteps
-            estimatedWrites = $ferrumPlan.run.estimatedWriteEvents
+        runSchedule = $runSchedule
+        state = $stateSummary
+        preflight = [ordered]@{
+            wallClockSeconds = $ferrumRun.wallClockSeconds
+            planJson = $ferrumRun.planJson
+            log = $ferrumRun.log
+            runSchedule = $runSchedule
+            state = $stateSummary
         }
-        state = Get-StateSummary $ferrumPlan
+        solve = $ferrumSolve
     }
     openFoam = if ($null -ne $openFoam) { $openFoam.openFoam } else { $null }
     openFoamRunControl = $openFoamRunControl
@@ -301,19 +587,24 @@ $result = [ordered]@{
         openFoamOutletSamples = if ($null -ne $openFoamPressureLoss) { $openFoamPressureLoss.outletSamples } else { $null }
         openFoamSampledDeltaPPa = if ($null -ne $openFoamPressureLoss) { $openFoamPressureLoss.sampledDeltaPPa } else { $null }
         openFoamEffectiveLengthFraction = if ($null -ne $openFoamPressureLoss) { $openFoamPressureLoss.effectiveLengthFraction } else { $null }
-        ferrumDeltaPPa = $null
-        ferrumRelativeErrorToOpenFoam = $null
-        ferrumSolverComparison = "pending executable FerrumCFD flow solver"
+        ferrumDeltaPPa = $ferrumDeltaPPa
+        ferrumRelativeErrorToAnalytic = $ferrumRelativeError
+        ferrumRelativeErrorToOpenFoam = $ferrumRelativeErrorToOpenFoam
+        ferrumMeanVelocityMps = if ($null -ne $ferrumSolve) { $ferrumSolve.result.meanVelocityMps } else { $null }
+        ferrumMeanVelocityRelativeErrorToAnalytic = if ($null -ne $ferrumSolve) { $ferrumSolve.result.relativeMeanVelocityErrorToAnalytic } else { $null }
+        ferrumSolverComparison = $ferrumSolverStatus
         timing = [ordered]@{
             ferrumPreflightWallClockSeconds = $ferrumRun.wallClockSeconds
+            ferrumSolveWallClockSeconds = if ($null -ne $ferrumSolve) { $ferrumSolve.solveWallClockSeconds } else { $null }
+            ferrumCommandWallClockSeconds = if ($null -ne $ferrumSolve) { $ferrumSolve.commandWallClockSeconds } else { $null }
             openFoamWallClockSeconds = $openFoamWallClock
         }
     }
     benchmarkStatus = [ordered]@{
         ferrumPreflight = "passed"
         openFoamReference = $openFoamReferenceStatus
-        ferrumSolverComparison = "pending"
-        readyForCiGate = $false
+        ferrumSolverComparison = $ferrumSolverStatus
+        readyForCiGate = ($ferrumSolverStatus -eq "passed" -and $openFoamReferenceStatus -eq "passed")
         notes = $notes
     }
 }

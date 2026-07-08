@@ -12,7 +12,12 @@ param(
     [double]$Temperature = 293.15,
     [double]$WallTemperature = 333.15,
     [switch]$SkipOpenFoam,
-    [switch]$RequireOpenFoam
+    [switch]$RequireOpenFoam,
+    [switch]$SkipFerrumSolve,
+    [ValidateSet("jacobi", "cg")]
+    [string]$FerrumLinearSolver = "cg",
+    [double]$FerrumSolveTolerance = 1e-8,
+    [int]$FerrumMaxIterations = 20000
 )
 
 $ErrorActionPreference = "Stop"
@@ -28,6 +33,12 @@ if ($OpenFoamSteps -le 0) {
 }
 if ($Length -le 0.0 -or $Diameter -le 0.0 -or $MeanVelocity -le 0.0) {
     throw "Length, Diameter, and MeanVelocity must be positive SI values"
+}
+if ($FerrumSolveTolerance -le 0.0) {
+    throw "FerrumSolveTolerance must be positive"
+}
+if ($FerrumMaxIterations -le 0) {
+    throw "FerrumMaxIterations must be positive"
 }
 
 $culture = [System.Globalization.CultureInfo]::InvariantCulture
@@ -623,13 +634,14 @@ function Write-StudyMarkdown($Path, $Rows, $Summary) {
     $lines.Add('Gmsh generates every mesh in this study. FerrumCFD imports the same `.msh` files that are later used to build OpenFOAM benchmark cases.')
     $lines.Add("")
     $lines.Add("OpenFOAM SIMPLE steps per variant: $($Summary.openFoamSteps)")
+    $lines.Add("Ferrum linear solver: $($Summary.ferrumLinearSolver), tolerance: $($Summary.ferrumSolveTolerance), max iterations: $($Summary.ferrumMaxIterations)")
     $lines.Add("")
     $lines.Add("## Variants")
     $lines.Add("")
-    $lines.Add("| Variant | Axial | Cells | Points | Inlet faces | Ferrum check [s] | OpenFOAM deltaP [Pa] | Error to analytic | OpenFOAM wall [s] |")
-    $lines.Add("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+    $lines.Add("| Variant | Axial | Cells | Points | Inlet faces | Ferrum check [s] | Ferrum deltaP [Pa] | Ferrum error | Ferrum solve [s] | OpenFOAM deltaP [Pa] | OpenFOAM error | OpenFOAM wall [s] |")
+    $lines.Add("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
     foreach ($row in $Rows) {
-        $lines.Add("| $($row.variant) | $($row.gmsh.axialCells) | $($row.mesh.cells) | $($row.mesh.points) | $($row.mesh.inletFaces) | $(Format-NullableNumber $row.timings.checkFerrumMeshSeconds "G6") | $(Format-NullableNumber $row.openFoam.deltaPPa "G8") | $(Format-NullablePercent $row.openFoam.relativeErrorToAnalytic) | $(Format-NullableNumber $row.openFoam.wallClockSeconds "G6") |")
+        $lines.Add("| $($row.variant) | $($row.gmsh.axialCells) | $($row.mesh.cells) | $($row.mesh.points) | $($row.mesh.inletFaces) | $(Format-NullableNumber $row.timings.checkFerrumMeshSeconds "G6") | $(Format-NullableNumber $row.ferrum.pressureDropFromMeanPa "G8") | $(Format-NullablePercent $row.ferrum.relativePressureDropErrorToAnalytic) | $(Format-NullableNumber $row.ferrum.solveWallClockSeconds "G6") | $(Format-NullableNumber $row.openFoam.deltaPPa "G8") | $(Format-NullablePercent $row.openFoam.relativeErrorToAnalytic) | $(Format-NullableNumber $row.openFoam.wallClockSeconds "G6") |")
     }
     $lines.Add("")
     $lines.Add("## Files")
@@ -642,7 +654,7 @@ function Write-StudyMarkdown($Path, $Rows, $Summary) {
     $lines.Add("- This is the mesh-study path for validation. It does not make OpenFOAM part of normal FerrumCFD use.")
     $lines.Add("- Pressure loss is compared to Hagen-Poiseuille in SI units.")
     $lines.Add('- For imported Gmsh cases, OpenFOAM pressure loss is sampled by averaging cells adjacent to the `inlet` and `outlet` patches.')
-    $lines.Add("- FerrumCFD still performs import, mesh check, and preflight only until the executable solver is implemented.")
+    $lines.Add("- FerrumCFD runs the source-driven Poiseuille benchmark on the imported mesh; the full pressure-velocity solver is still future work.")
 
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
     Set-Content -LiteralPath $Path -Value $lines -Encoding UTF8
@@ -731,17 +743,27 @@ foreach ($variant in $variants) {
 
     Write-Output "variant $($variant.name): running Ferrum/OpenFOAM comparison"
     $compareElapsed = (Measure-Command {
-            & $compare `
-                -CaseRoot $caseRoot `
-                -OpenFoamJson $openFoamJson `
-                -FerrumPlanJson $planJson `
-                -OutFile $compareJson `
-                -ReportFile $compareReport *> $compareLog
+            $compareArgs = @{
+                CaseRoot = $caseRoot
+                OpenFoamJson = $openFoamJson
+                FerrumPlanJson = $planJson
+                OutFile = $compareJson
+                ReportFile = $compareReport
+                FerrumLinearSolver = $FerrumLinearSolver
+                FerrumSolveTolerance = $FerrumSolveTolerance
+                FerrumMaxIterations = $FerrumMaxIterations
+            }
+            if ($SkipFerrumSolve) {
+                $compareArgs.SkipFerrumSolve = $true
+            }
+            & $compare @compareArgs *> $compareLog
         }).TotalSeconds
 
     $comparison = Read-JsonFile $compareJson
     $openFoam = Read-JsonFile $openFoamJson
     $pressureLoss = if ($null -ne $openFoam -and $null -ne $openFoam.openFoam.pressureLoss) { $openFoam.openFoam.pressureLoss } else { $null }
+    $ferrumSolve = if ($null -ne $comparison -and $null -ne $comparison.ferrum.solve) { $comparison.ferrum.solve } else { $null }
+    $ferrumResult = if ($null -ne $ferrumSolve) { $ferrumSolve.result } else { $null }
 
     $rows.Add([pscustomobject][ordered]@{
             variant = $variant.name
@@ -771,7 +793,19 @@ foreach ($variant in $variants) {
             }
             ferrum = [pscustomobject][ordered]@{
                 preflightStatus = if ($null -ne $comparison) { $comparison.benchmarkStatus.ferrumPreflight } else { "missing" }
+                solveStatus = if ($null -ne $comparison) { $comparison.benchmarkStatus.ferrumSolverComparison } else { "missing" }
+                pressureDropFromMeanPa = if ($null -ne $ferrumResult) { $ferrumResult.pressureDropFromMeanPa } else { $null }
+                relativePressureDropErrorToAnalytic = if ($null -ne $ferrumResult) { $ferrumResult.relativePressureDropErrorToAnalytic } else { $null }
+                meanVelocityMps = if ($null -ne $ferrumResult) { $ferrumResult.meanVelocityMps } else { $null }
+                relativeMeanVelocityErrorToAnalytic = if ($null -ne $ferrumResult) { $ferrumResult.relativeMeanVelocityErrorToAnalytic } else { $null }
+                solveWallClockSeconds = if ($null -ne $ferrumSolve) { $ferrumSolve.solveWallClockSeconds } else { $null }
+                commandWallClockSeconds = if ($null -ne $ferrumSolve) { $ferrumSolve.commandWallClockSeconds } else { $null }
+                iterations = if ($null -ne $ferrumSolve) { $ferrumSolve.iterations } else { $null }
+                converged = if ($null -ne $ferrumSolve) { $ferrumSolve.converged } else { $null }
+                residualNorm = if ($null -ne $ferrumSolve) { $ferrumSolve.residualNorm } else { $null }
+                preflightWallClockSeconds = if ($null -ne $comparison) { $comparison.ferrum.preflight.wallClockSeconds } else { $null }
                 planJson = $planJson
+                resultJson = $compareJson
                 compareReport = $compareReport
             }
             openFoam = [pscustomobject][ordered]@{
@@ -808,6 +842,10 @@ $summary = [pscustomobject][ordered]@{
     gmsh = $gmsh
     openFoamMode = if ($SkipOpenFoam) { "skipped" } else { $Mode }
     openFoamSteps = if ($SkipOpenFoam) { 0 } else { $OpenFoamSteps }
+    ferrumSolve = if ($SkipFerrumSolve) { "skipped" } else { "poiseuille" }
+    ferrumLinearSolver = $FerrumLinearSolver
+    ferrumSolveTolerance = $FerrumSolveTolerance
+    ferrumMaxIterations = $FerrumMaxIterations
     units = [pscustomobject][ordered]@{
         default = "SI"
         length = "m"

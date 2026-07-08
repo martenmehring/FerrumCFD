@@ -453,8 +453,7 @@ the discrete patch values so the patch-integrated flow equals
 Run the OpenFOAM comparison only as a benchmark artifact:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_openfoam_laminar_pipe.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\compare_laminar_pipe.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_poiseuille_benchmark.ps1
 ```
 
 Run the mesh convergence study with:
@@ -477,13 +476,22 @@ The intended validation order is:
 - run OpenFOAM on the imported meshes and compare pressure loss to
   Hagen-Poiseuille
 - select the converged reference mesh
-- later run the FerrumCFD solver on exactly that mesh
+- run the FerrumCFD Poiseuille benchmark on exactly that mesh
+- use the selected mesh later for the full pressure-velocity and heat-transfer
+  solvers
 
 The generated OpenFOAM cases and reports stay below `target/benchmarks/`.
 They are not part of the normal FerrumCFD workflow. Increase `-OpenFoamSteps`
 when fine OpenFOAM cases still have moving SIMPLE residuals.
 The current local Gmsh pipe mesh-study record is summarized in
 `docs/benchmarks/gmsh-pipe-mesh-study.md`.
+
+`scripts\run_poiseuille_benchmark.ps1` runs OpenFOAM `simpleFoam`, runs
+`ferrumSolver --solvePoiseuille`, compares both with Hagen-Poiseuille, and
+writes `target/benchmarks/laminar_pipe_compare.json` plus
+`target/benchmarks/laminar_pipe_compare.md`. Use `-SkipOpenFoam
+-UseExistingOpenFoamJson` when only the Ferrum side should be rerun against an
+existing OpenFOAM result.
 
 ## Solver Preflight
 
@@ -616,6 +624,16 @@ The command reports numerical mean velocity, analytical mean velocity,
 relative error, flow rate, reconstructed pressure drop, solver iterations,
 residual, and wall-clock seconds. It does not write velocity or pressure fields
 back to the case.
+
+For the standard pipe benchmark, the automated comparison command is:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_poiseuille_benchmark.ps1 -OpenFoamSteps 200
+```
+
+The resulting Markdown table records Ferrum pressure-loss error, OpenFOAM
+pressure-loss error, Ferrum solve time, OpenFOAM wall time, and the shared SI
+inputs `deltaP`, `mu`, `L`, and `D`.
 
 It also checks basic `controlDict` consistency: recognized `startFrom`,
 `stopAt`, and `writeControl` modes, positive finite `deltaT`, valid

@@ -29,8 +29,7 @@ generator scales the discrete inlet values so the patch-integrated flow matches
 OpenFOAM comparison:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_openfoam_laminar_pipe.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\compare_laminar_pipe.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_poiseuille_benchmark.ps1
 ```
 
 The OpenFOAM reference case is generated under `target/openfoam/laminar_pipe`.
@@ -45,6 +44,7 @@ Generated benchmark files:
 - `target/benchmarks/laminar_pipe_openfoam.json`
 - `target/benchmarks/laminar_pipe_compare.json`
 - `target/benchmarks/laminar_pipe_compare.md`
+- `target/benchmarks/laminar_pipe_compare.ferrum_poiseuille.log`
 
 Mesh convergence:
 
@@ -54,8 +54,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_pipe_con
 ```
 
 The convergence script writes generated cases, OpenFOAM cases, logs, JSON, and
-Markdown reports under `target/benchmarks/laminar_pipe_convergence/`. Increase
-`-OpenFoamSteps` when a fine OpenFOAM case still shows moving SIMPLE residuals.
+Markdown reports under `target/benchmarks/laminar_pipe_convergence/`. It records
+Ferrum Poiseuille pressure-loss error, Ferrum solve time, OpenFOAM pressure-loss
+error, and OpenFOAM wall time for each mesh. Increase `-OpenFoamSteps` when a
+fine OpenFOAM case still shows moving SIMPLE residuals.
 
 The pressure-loss comparison averages the first and last axial cell slices, so
 the result is not tied to a single cell pair in the circular mesh.
@@ -65,7 +67,9 @@ Useful checks:
 ```powershell
 checkFerrumMesh -case examples\laminar_pipe
 ferrumSolver -case examples\laminar_pipe --runnerDryRun --maxRunnerSteps 2 --planJson target\laminar_pipe_plan.json
+ferrumSolver -case examples\laminar_pipe --solvePoiseuille --linearSolver cg
 ```
 
-No solver kernels are executed yet. This case is a preflight and benchmark
-contract for the future flow and heat-transfer solvers.
+The full CFD time loop is not implemented yet. This case already executes the
+source-driven CPU Poiseuille benchmark and remains the contract for the later
+flow and heat-transfer solvers.
