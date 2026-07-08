@@ -1,5 +1,6 @@
 use crate::backends::BackendChoice;
 use crate::solver_plan::{SolverCasePlan, SolverRunPlan, SolverRunStageSource};
+use crate::solver_state::SolverStatePlan;
 
 #[derive(Clone, Copy, Debug)]
 pub struct SolverRunnerDryRunOptions {
@@ -14,6 +15,7 @@ pub struct SolverRunnerDryRun {
     pub stage_count: usize,
     pub preview_write_events: usize,
     pub truncated: bool,
+    pub state: SolverStatePlan,
     pub runtime: SolverRuntimePlan,
     pub events: Vec<SolverRunnerDryRunEvent>,
     pub warnings: Vec<String>,
@@ -168,6 +170,7 @@ pub fn build_solver_runner_dry_run(
         stage_count: plan.run.stages.len(),
         preview_write_events: write_events,
         truncated,
+        state: plan.state.clone(),
         runtime,
         events,
         warnings,
@@ -308,6 +311,7 @@ mod tests {
         SolverNumericsDictionaryPlan, SolverNumericsPlan, SolverPropertiesPlan, SolverRunPlan,
         SolverRunStagePlan, SolverRunStageSource,
     };
+    use crate::solver_state::SolverStatePlan;
 
     use super::{SolverRunnerDryRunEvent, SolverRunnerDryRunOptions, build_solver_runner_dry_run};
     use super::{SolverRuntimeDispatchStatus, SolverRuntimeTarget};
@@ -411,6 +415,10 @@ mod tests {
                 region_meshes: Vec::new(),
             },
             fields: SolverFieldPlan { fields: Vec::new() },
+            state: SolverStatePlan {
+                fields: Vec::new(),
+                warnings: Vec::new(),
+            },
             properties: SolverPropertiesPlan {
                 dictionaries: Vec::new(),
                 entries: Vec::new(),

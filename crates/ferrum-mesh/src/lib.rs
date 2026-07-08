@@ -14,6 +14,7 @@ pub mod properties;
 pub mod regions;
 pub mod runner;
 pub mod solver_plan;
+pub mod solver_state;
 
 use std::collections::HashMap;
 

@@ -32,6 +32,7 @@ use ferrum_mesh::solver_plan::{
     SolverNumericsDictionaryPlan, SolverNumericsPlan, SolverPropertiesPlan, SolverRunPlan,
     build_solver_case_plan,
 };
+use ferrum_mesh::solver_state::SolverStatePlan;
 
 pub fn run_ferrum() -> i32 {
     let args = env::args().skip(1).collect::<Vec<_>>();
@@ -396,6 +397,7 @@ fn print_solver_case_plan(plan: &SolverCasePlan) {
             );
         }
     }
+    print_solver_state_plan(&plan.state);
     print_solver_properties(&plan.properties);
     print_solver_numerics_dictionary("fvSchemes", &plan.numerics.fv_schemes);
     print_solver_numerics_dictionary("fvSolution", &plan.numerics.fv_solution);
@@ -444,6 +446,51 @@ fn print_solver_properties(plan: &SolverPropertiesPlan) {
             format!("{}.{}", entry.dictionary, entry.key)
         };
         println!("    {path}={}", entry.value);
+    }
+}
+
+fn print_solver_state_plan(plan: &SolverStatePlan) {
+    let cpu_capable = plan
+        .fields
+        .iter()
+        .filter(|field| field.storage.cpu_capable)
+        .count();
+    let gpu_capable = plan
+        .fields
+        .iter()
+        .filter(|field| field.storage.gpu_capable)
+        .count();
+    println!(
+        "solver state: fields={} cpuCapable={} gpuCapable={}",
+        plan.fields.len(),
+        cpu_capable,
+        gpu_capable
+    );
+    for field in &plan.fields {
+        let name = if let Some(region) = &field.region {
+            format!("{region}/{}", field.name)
+        } else {
+            field.name.clone()
+        };
+        println!(
+            "  {}: class={} kind={} meshCells={} internal={} values={} expected={} valid={} boundaryPatches={}/{} cpu={} gpu={} storage={}",
+            name,
+            field.class_name.as_deref().unwrap_or("unknown"),
+            field.kind,
+            format_optional_usize(field.mesh_cells),
+            field.internal_field.kind,
+            format_optional_usize(field.internal_field.value_count),
+            format_optional_usize(field.internal_field.expected_count),
+            format_optional_bool(field.internal_field.valid_count),
+            field.boundary_patches,
+            format_optional_usize(field.mesh_boundary_patches),
+            yes_no(field.storage.cpu_capable),
+            yes_no(field.storage.gpu_capable),
+            field.storage.status
+        );
+    }
+    for warning in &plan.warnings {
+        println!("solver state warning: {warning}");
     }
 }
 
@@ -531,6 +578,7 @@ fn print_solver_runner_dry_run(dry_run: &SolverRunnerDryRun) {
         dry_run.preview_write_events,
         dry_run.truncated
     );
+    print_solver_runner_state(&dry_run.state);
     println!(
         "runner runtime: cpuRequested={} cpuHandle={} cpuKernels={} cpuThreads={} gpuRequested={} gpuHandle={} gpuKernels={} gpuBackend={} gpuDevices={} gpuPrecision={}",
         yes_no(dry_run.runtime.cpu.requested),
@@ -582,6 +630,46 @@ fn print_solver_runner_dry_run(dry_run: &SolverRunnerDryRun) {
     println!("runner dry-run status: no fields updated; no equations solved");
 }
 
+fn print_solver_runner_state(plan: &SolverStatePlan) {
+    let cpu_capable = plan
+        .fields
+        .iter()
+        .filter(|field| field.storage.cpu_capable)
+        .count();
+    let gpu_capable = plan
+        .fields
+        .iter()
+        .filter(|field| field.storage.gpu_capable)
+        .count();
+    println!(
+        "runner state: fields={} cpuCapable={} gpuCapable={}",
+        plan.fields.len(),
+        cpu_capable,
+        gpu_capable
+    );
+    for field in &plan.fields {
+        let name = if let Some(region) = &field.region {
+            format!("{region}/{}", field.name)
+        } else {
+            field.name.clone()
+        };
+        println!(
+            "  field {}: kind={} internal={} values={} expected={} cpu={} gpu={} storage={}",
+            name,
+            field.kind,
+            field.internal_field.kind,
+            format_optional_usize(field.internal_field.value_count),
+            format_optional_usize(field.internal_field.expected_count),
+            yes_no(field.storage.cpu_capable),
+            yes_no(field.storage.gpu_capable),
+            field.storage.status
+        );
+    }
+    for warning in &plan.warnings {
+        println!("runner state warning: {warning}");
+    }
+}
+
 fn write_solver_plan_json(plan: &SolverCasePlan, path: &Path) -> std::io::Result<()> {
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
@@ -595,6 +683,8 @@ fn write_solver_plan_json(plan: &SolverCasePlan, path: &Path) -> std::io::Result
     write_json_mesh(&mut writer, &plan.mesh)?;
     writeln!(writer, ",")?;
     write_json_fields(&mut writer, &plan.fields)?;
+    writeln!(writer, ",")?;
+    write_json_solver_state(&mut writer, &plan.state)?;
     writeln!(writer, ",")?;
     write_json_properties(&mut writer, &plan.properties)?;
     writeln!(writer, ",")?;
@@ -720,6 +810,87 @@ fn write_json_fields(writer: &mut impl Write, plan: &SolverFieldPlan) -> std::io
     }
     write_indent(writer, 2)?;
     write!(writer, "]")
+}
+
+fn write_json_solver_state(writer: &mut impl Write, plan: &SolverStatePlan) -> std::io::Result<()> {
+    write_json_key(writer, 2, "state")?;
+    writeln!(writer, "{{")?;
+    write_json_key(writer, 4, "fields")?;
+    writeln!(writer, "[")?;
+    for (index, field) in plan.fields.iter().enumerate() {
+        write_indent(writer, 6)?;
+        writeln!(writer, "{{")?;
+        write_json_key(writer, 8, "region")?;
+        write_json_optional_string(writer, field.region.as_deref())?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 8, "name")?;
+        write_json_string(writer, &field.name)?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 8, "className")?;
+        write_json_optional_string(writer, field.class_name.as_deref())?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 8, "kind")?;
+        write_json_string(writer, &field.kind.to_string())?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 8, "dimensions")?;
+        if let Some(dimensions) = &field.dimensions {
+            write_json_string_array(writer, dimensions)?;
+        } else {
+            write!(writer, "null")?;
+        }
+        writeln!(writer, ",")?;
+        write_json_key(writer, 8, "meshCells")?;
+        write_json_optional_usize(writer, field.mesh_cells)?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 8, "meshFaces")?;
+        write_json_optional_usize(writer, field.mesh_faces)?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 8, "internalField")?;
+        writeln!(writer, "{{")?;
+        write_json_key(writer, 10, "kind")?;
+        write_json_string(writer, &field.internal_field.kind.to_string())?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 10, "valueCount")?;
+        write_json_optional_usize(writer, field.internal_field.value_count)?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 10, "expectedCount")?;
+        write_json_optional_usize(writer, field.internal_field.expected_count)?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 10, "validCount")?;
+        write_json_optional_bool(writer, field.internal_field.valid_count)?;
+        writeln!(writer)?;
+        write_indent(writer, 8)?;
+        writeln!(writer, "}},")?;
+        write_json_number_field(writer, 8, "boundaryPatches", field.boundary_patches)?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 8, "meshBoundaryPatches")?;
+        write_json_optional_usize(writer, field.mesh_boundary_patches)?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 8, "storage")?;
+        writeln!(writer, "{{")?;
+        write_json_bool_field(writer, 10, "cpuCapable", field.storage.cpu_capable)?;
+        writeln!(writer, ",")?;
+        write_json_bool_field(writer, 10, "gpuCapable", field.storage.gpu_capable)?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 10, "status")?;
+        write_json_string(writer, &field.storage.status.to_string())?;
+        writeln!(writer)?;
+        write_indent(writer, 8)?;
+        writeln!(writer, "}}")?;
+        write_indent(writer, 6)?;
+        if index + 1 == plan.fields.len() {
+            writeln!(writer, "}}")?;
+        } else {
+            writeln!(writer, "}},")?;
+        }
+    }
+    write_indent(writer, 4)?;
+    writeln!(writer, "],")?;
+    write_json_key(writer, 4, "warnings")?;
+    write_json_string_array(writer, &plan.warnings)?;
+    writeln!(writer)?;
+    write_indent(writer, 2)?;
+    write!(writer, "}}")
 }
 
 fn write_json_properties(
@@ -1056,6 +1227,13 @@ fn write_json_optional_usize(writer: &mut impl Write, value: Option<usize>) -> s
     }
 }
 
+fn write_json_optional_bool(writer: &mut impl Write, value: Option<bool>) -> std::io::Result<()> {
+    match value {
+        Some(value) => write!(writer, "{value}"),
+        None => write!(writer, "null"),
+    }
+}
+
 fn write_json_optional_string(writer: &mut impl Write, value: Option<&str>) -> std::io::Result<()> {
     match value {
         Some(value) => write_json_string(writer, value),
@@ -1233,6 +1411,14 @@ fn format_optional_usize(value: Option<usize>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "missing".to_string())
+}
+
+fn format_optional_bool(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "missing",
+    }
 }
 
 fn yes_no(value: bool) -> &'static str {

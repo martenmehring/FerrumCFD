@@ -67,6 +67,9 @@ The importer currently targets the membrane reactor test mesh shape:
   `internalField`, and `boundaryField` summaries
 - field `boundaryField` entries are checked against mesh patch names and
   special patch types
+- solver-state preflight recognizes `volScalarField`, `volVectorField`, and
+  `surfaceScalarField`, checks internal field counts against mesh cells/faces,
+  and reports CPU/GPU field-storage capability without solving equations
 - mesh geometry summaries compute face areas, boundary area, and cell volumes
 - special patch validation counts `empty`, `wedge`, and `symmetryPlane`
   patches and reports basic patch-range warnings
@@ -87,8 +90,9 @@ The importer currently targets the membrane reactor test mesh shape:
   writes the same plan as machine-readable JSON; executable solver kernels are
   not implemented yet
 - `--runnerDryRun` previews the future solver runner for a capped number of
-  steps and logs planned CPU/GPU stage dispatch, runtime handles, and missing
-  executable backend status without updating fields or solving equations
+  steps and logs planned field state, CPU/GPU stage dispatch, runtime handles,
+  and missing executable backend status without updating fields or solving
+  equations
 
 `splitFerrumMeshRegions` can write one region mesh per imported cell zone under
 `constant/<region>/polyMesh`.

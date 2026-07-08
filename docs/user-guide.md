@@ -434,6 +434,14 @@ The preflight warns about basic numerical setup gaps, such as missing standard
 `fvSchemes` sections, missing `default` scheme entries, or initial fields that
 do not have a matching `fvSolution.solvers` entry.
 
+It also builds a solver-state preview from initial fields below `0/`.
+`volScalarField`, `volVectorField`, and `surfaceScalarField` are recognized as
+field-storage candidates. Volume fields are checked against mesh cell counts;
+surface fields are checked against mesh face counts. The report shows the
+field region, class, internal value count, expected count, boundary patch
+counts, and whether the field storage is CPU/GPU-capable. This still does not
+solve equations or change field values.
+
 It also checks basic `controlDict` consistency: recognized `startFrom`,
 `stopAt`, and `writeControl` modes, positive finite `deltaT`, valid
 `writeInterval`, and an `endTime` that is not earlier than `startTime` for
@@ -455,6 +463,8 @@ as `flow.residual` or `interfaces.flux`, backend choice, and planned write
 events. It also prints runtime handles derived from `system/ferrumBackends`,
 including CPU thread policy and GPU backend/device metadata. GPU stages are
 reported as planned dispatch only until executable GPU solver kernels exist.
+The same dry-run output also lists the solver-state fields that would be
+available to the future runner.
 `--maxRunnerSteps <n>` limits the preview length. This does not update fields,
 advance physics, or solve equations.
 
@@ -634,9 +644,10 @@ consumed by built-in solver code.
   stepping and solver-specific time-loop behavior are not implemented yet.
 - Geometry computation currently reports summary values; full OpenFOAM-grade
   geometry quality checks are not implemented yet.
-- Initial field parsing currently summarizes fields and boundary entries; it
-  validates boundary patch names and special patch boundary types, but it does
-  not yet validate dimensions against solver equations.
+- Initial field parsing currently summarizes fields, boundary entries, and
+  solver-state storage shape; it validates boundary patch names, special patch
+  boundary types, and internal value counts, but it does not yet validate
+  dimensions against solver equations.
 - `fvSchemes` and `fvSolution` are parsed and checked structurally for the
   solver preflight; their entries are not yet consumed by executable
   discretisation or linear solver kernels.
