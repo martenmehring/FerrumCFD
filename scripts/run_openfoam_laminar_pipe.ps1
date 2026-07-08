@@ -4,6 +4,8 @@ param(
     [string]$OutFile = "",
     [ValidateSet("Auto", "Native", "Wsl")]
     [string]$Mode = "Auto",
+    [int]$EndTime = 200,
+    [int]$WriteInterval = 0,
     [switch]$RequireOpenFoam
 )
 
@@ -17,6 +19,12 @@ if ([string]::IsNullOrWhiteSpace($WorkDir)) {
 }
 if ([string]::IsNullOrWhiteSpace($OutFile)) {
     $OutFile = Join-Path $RepoRoot "target\benchmarks\laminar_pipe_openfoam.json"
+}
+if ($EndTime -le 0) {
+    throw "EndTime must be a positive integer number of SIMPLE pseudo-time steps"
+}
+if ($WriteInterval -le 0) {
+    $WriteInterval = $EndTime
 }
 
 function Format-F64([double]$Value) {
@@ -225,7 +233,11 @@ New-Item -ItemType Directory -Force -Path (Join-Path $WorkDir "constant") | Out-
 New-Item -ItemType Directory -Force -Path (Join-Path $WorkDir "system") | Out-Null
 Copy-Item -LiteralPath (Join-Path $CaseRoot "constant\polyMesh") -Destination (Join-Path $WorkDir "constant\polyMesh") -Recurse
 
-Write-AsciiFile (Join-Path $WorkDir "0\U") @"
+$sourceU = Join-Path $CaseRoot "0\U"
+if (Test-Path -LiteralPath $sourceU) {
+    Copy-Item -LiteralPath $sourceU -Destination (Join-Path $WorkDir "0\U") -Force
+} else {
+    Write-AsciiFile (Join-Path $WorkDir "0\U") @"
 FoamFile
 {
     version 2.0;
@@ -245,6 +257,7 @@ boundaryField
     wall { type noSlip; }
 }
 "@
+}
 
 Write-AsciiFile (Join-Path $WorkDir "0\p") @"
 FoamFile
@@ -314,10 +327,10 @@ application simpleFoam;
 startFrom startTime;
 startTime 0;
 stopAt endTime;
-endTime 200;
+endTime $EndTime;
 deltaT 1;
 writeControl timeStep;
-writeInterval 200;
+writeInterval $WriteInterval;
 writeFormat ascii;
 writePrecision 10;
 runTimeModifiable false;
@@ -455,10 +468,10 @@ $result = [ordered]@{
     runControl = [ordered]@{
         application = "simpleFoam"
         startTime = 0
-        endTime = 200
+        endTime = $EndTime
         deltaT = 1
-        writeInterval = 200
-        simulatedSteps = 200
+        writeInterval = $WriteInterval
+        simulatedSteps = $EndTime
     }
     openFoam = [ordered]@{
         available = $null -ne $selectedMode

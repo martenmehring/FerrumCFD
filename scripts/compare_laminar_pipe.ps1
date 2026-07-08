@@ -91,6 +91,22 @@ function Read-AnalyticDeltaP([string]$CaseRoot) {
     return [double]::Parse($match.Groups[1].Value, [System.Globalization.CultureInfo]::InvariantCulture)
 }
 
+function Read-PipeBenchmarkMesh([string]$CaseRoot) {
+    $path = Join-Path $CaseRoot "constant\pipeBenchmark"
+    if (!(Test-Path -LiteralPath $path)) {
+        return $null
+    }
+    $content = Get-Content -LiteralPath $path -Raw
+    $result = [ordered]@{ type = "structuredCircularPipe"; axialCells = $null; radialCells = $null; angularSectors = $null; cells = $null }
+    foreach ($name in @("axialCells", "radialCells", "angularSectors", "cells")) {
+        $match = [regex]::Match($content, "(?m)^\s*$name\s+(\d+)\s*;")
+        if ($match.Success) {
+            $result[$name] = [int]::Parse($match.Groups[1].Value, [System.Globalization.CultureInfo]::InvariantCulture)
+        }
+    }
+    return [pscustomobject]$result
+}
+
 function Write-MarkdownReport($Path, $Result) {
     $comparison = $Result.comparison
     $ferrum = $Result.ferrum
@@ -182,6 +198,7 @@ if ($null -ne $openFoam) {
 }
 $openFoamRunControl = if ($null -ne $openFoam) { $openFoam.runControl } else { $null }
 $openFoamPressureLoss = if ($null -ne $openFoam) { $openFoam.openFoam.pressureLoss } else { $null }
+$caseMesh = Read-PipeBenchmarkMesh $CaseRoot
 $mesh = if ($null -ne $openFoam -and $null -ne $openFoam.mesh) {
     [ordered]@{
         type = "structuredCircularPipe"
@@ -190,8 +207,26 @@ $mesh = if ($null -ne $openFoam -and $null -ne $openFoam.mesh) {
         angularSectors = $openFoam.mesh.angularSectors
         cells = $openFoam.mesh.cells
     }
+} elseif ($null -ne $caseMesh) {
+    [ordered]@{
+        type = $caseMesh.type
+        axialCells = $caseMesh.axialCells
+        radialCells = $caseMesh.radialCells
+        angularSectors = $caseMesh.angularSectors
+        cells = $caseMesh.cells
+    }
 } else {
     $null
+}
+
+$openFoamReferenceStatus = if ($null -eq $openFoam) {
+    "missing"
+} elseif ($openFoam.openFoam.available -eq $false) {
+    "unavailable"
+} elseif ($openFoam.openFoam.exitCode -eq 0) {
+    "passed"
+} else {
+    "failed"
 }
 
 $notes = @(
@@ -249,7 +284,7 @@ $result = [ordered]@{
     }
     benchmarkStatus = [ordered]@{
         ferrumPreflight = "passed"
-        openFoamReference = if ($null -ne $openFoam -and $openFoam.openFoam.exitCode -eq 0) { "passed" } elseif ($null -ne $openFoam) { "failed" } else { "missing" }
+        openFoamReference = $openFoamReferenceStatus
         ferrumSolverComparison = "pending"
         readyForCiGate = $false
         notes = $notes

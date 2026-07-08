@@ -408,6 +408,40 @@ needed. For example, incompressible OpenFOAM solvers commonly store `p` as
 kinematic pressure in `m2/s2`. FerrumCFD benchmark scripts must convert those
 results back to SI pressure in `Pa` before comparison.
 
+## Laminar Pipe Benchmark
+
+`examples/laminar_pipe` is the first SI benchmark case. It uses a generated
+structured circular pipe, water near 20 C, and an analytical
+Hagen-Poiseuille pressure-loss reference.
+
+Regenerate the versioned medium-resolution case with:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\generate_laminar_pipe_case.ps1
+```
+
+The inlet velocity is a fully developed parabolic profile. The generator scales
+the discrete patch values so the patch-integrated flow equals
+`U_mean * inlet_area` for each mesh resolution.
+
+Run the OpenFOAM comparison only as a benchmark artifact:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_openfoam_laminar_pipe.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\compare_laminar_pipe.ps1
+```
+
+Run the mesh convergence study with:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_pipe_convergence.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_pipe_convergence.ps1 -OpenFoamSteps 1000
+```
+
+The generated OpenFOAM cases and reports stay below `target/benchmarks/`.
+They are not part of the normal FerrumCFD workflow. Increase `-OpenFoamSteps`
+when fine OpenFOAM cases still have moving SIMPLE residuals.
+
 ## Solver Preflight
 
 `ferrumSolver` is the solver front door. At this stage it does not execute CFD

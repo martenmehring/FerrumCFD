@@ -22,6 +22,10 @@ The default reference uses `D = 0.02 m`, `L = 1 m`, mean velocity
 pressure is stored in Pa, length in m, temperature in K, and velocity in m/s.
 Use explicit units only when a value is not SI.
 
+The inlet velocity boundary is a fully developed parabolic profile. The
+generator scales the discrete inlet values so the patch-integrated flow matches
+`U_mean * inlet_area` for each mesh resolution.
+
 OpenFOAM comparison:
 
 ```powershell
@@ -41,6 +45,17 @@ Generated benchmark files:
 - `target/benchmarks/laminar_pipe_openfoam.json`
 - `target/benchmarks/laminar_pipe_compare.json`
 - `target/benchmarks/laminar_pipe_compare.md`
+
+Mesh convergence:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_pipe_convergence.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_pipe_convergence.ps1 -OpenFoamSteps 1000
+```
+
+The convergence script writes generated cases, OpenFOAM cases, logs, JSON, and
+Markdown reports under `target/benchmarks/laminar_pipe_convergence/`. Increase
+`-OpenFoamSteps` when a fine OpenFOAM case still shows moving SIMPLE residuals.
 
 The pressure-loss comparison averages the first and last axial cell slices, so
 the result is not tied to a single cell pair in the circular mesh.

@@ -98,9 +98,9 @@ The importer currently targets the membrane reactor test mesh shape:
   steps and logs planned field state, CPU/GPU stage dispatch, runtime handles,
   and missing executable backend status without updating fields or solving
   equations
-- `examples/laminar_pipe` provides a small SI-first benchmark case with
-  analytical Hagen-Poiseuille data and OpenFOAM comparison scripts that record
-  wall-clock runtime
+- `examples/laminar_pipe` provides a generated circular-pipe SI benchmark with
+  a flow-normalized parabolic inlet, analytical Hagen-Poiseuille data, and
+  OpenFOAM comparison/convergence scripts that record wall-clock runtime
 
 `splitFerrumMeshRegions` can write one region mesh per imported cell zone under
 `constant/<region>/polyMesh`.

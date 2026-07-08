@@ -90,6 +90,11 @@ function Get-FaceNormal($Points, [int[]]$Indices) {
     return New-Point $nx $ny $nz
 }
 
+function Get-FaceArea($Points, [int[]]$Indices) {
+    $normal = Get-FaceNormal $Points $Indices
+    return 0.5 * [Math]::Sqrt($normal.x * $normal.x + $normal.y * $normal.y + $normal.z * $normal.z)
+}
+
 function Get-OrientedFace($Points, [int[]]$Indices, $CellCentroid) {
     $faceCentroid = Get-Centroid $Points $Indices
     $normal = Get-FaceNormal $Points $Indices
@@ -342,9 +347,11 @@ $patchOrder = @("inlet", "outlet", "wall")
 $orderedFaces = New-Object System.Collections.Generic.List[object]
 $orderedFaces.AddRange($internalFaces)
 $patchSummaries = New-Object System.Collections.Generic.List[object]
+$patchFaceLists = @{}
 foreach ($patchName in $patchOrder) {
     $startFace = $orderedFaces.Count
     $patchFaces = @($faces | Where-Object { $null -eq $_.neighbour -and $_.patch -eq $patchName })
+    $patchFaceLists[$patchName] = $patchFaces
     $orderedFaces.AddRange($patchFaces)
     $patchType = if ($patchName -eq "wall") { "wall" } else { "patch" }
     $patchSummaries.Add([pscustomobject]@{
@@ -383,7 +390,29 @@ $linesU.Add("{")
 $linesU.Add("    inlet")
 $linesU.Add("    {")
 $linesU.Add("        type fixedValue;")
-$linesU.Add("        value uniform ($(Format-F64 $MeanVelocity) 0 0);")
+$inletFaces = @($patchFaceLists["inlet"])
+$inletProfileValues = New-Object System.Collections.Generic.List[object]
+$inletArea = 0.0
+$inletUnscaledFlow = 0.0
+foreach ($face in $inletFaces) {
+    $area = Get-FaceArea $points $face.nodes
+    $r2 = $face.centroid.y * $face.centroid.y + $face.centroid.z * $face.centroid.z
+    $profile = 2.0 * $MeanVelocity * (1.0 - ($r2 / ($radius * $radius)))
+    if ($profile -lt 0.0) {
+        $profile = 0.0
+    }
+    $inletArea += $area
+    $inletUnscaledFlow += $profile * $area
+    $inletProfileValues.Add([pscustomobject]@{ profile = $profile; area = $area }) | Out-Null
+}
+$inletVelocityScale = if ($inletUnscaledFlow -gt 0.0) { ($MeanVelocity * $inletArea) / $inletUnscaledFlow } else { 1.0 }
+$linesU.Add("        value nonuniform List<vector>")
+$linesU.Add("        $($inletFaces.Count)")
+$linesU.Add("        (")
+foreach ($entry in $inletProfileValues) {
+    $linesU.Add("            ($(Format-F64 ($entry.profile * $inletVelocityScale)) 0 0)")
+}
+$linesU.Add("        );")
 $linesU.Add("    }")
 $linesU.Add("    outlet")
 $linesU.Add("    {")
@@ -468,6 +497,8 @@ $benchmarkLines.Add("")
 $benchmarkLines.Add("flowReference")
 $benchmarkLines.Add("{")
 $benchmarkLines.Add("    meanVelocity [0 1 -1 0 0 0 0] $(Format-F64 $MeanVelocity);")
+$benchmarkLines.Add("    inletVelocityProfile parabolicFullyDeveloped;")
+$benchmarkLines.Add("    inletVelocityScale [0 0 0 0 0 0 0] $(Format-F64 $inletVelocityScale);")
 $benchmarkLines.Add("    reynolds [0 0 0 0 0 0 0] $(Format-F64 $reynolds);")
 $benchmarkLines.Add("    pressureLossModel HagenPoiseuille;")
 $benchmarkLines.Add("    expectedDeltaP [1 -1 -2 0 0 0 0] $(Format-F64 $deltaP);")
