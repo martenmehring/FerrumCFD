@@ -24,6 +24,7 @@ pub struct SolverStateFieldPlan {
     pub boundary_patches: usize,
     pub mesh_boundary_patches: Option<usize>,
     pub storage: SolverStateStoragePlan,
+    pub cpu_buffer: SolverStateCpuBufferPlan,
 }
 
 #[derive(Clone, Debug)]
@@ -43,6 +44,14 @@ pub struct SolverStateStoragePlan {
     pub scalar_slots: Option<usize>,
     pub bytes_f64: Option<usize>,
     pub status: SolverStateStorageStatus,
+}
+
+#[derive(Clone, Debug)]
+pub struct SolverStateCpuBufferPlan {
+    pub materializable: bool,
+    pub scalar_slots: Option<usize>,
+    pub bytes_f64: Option<usize>,
+    pub status: SolverStateCpuBufferStatus,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,6 +74,16 @@ pub enum SolverStateValueKind {
 pub enum SolverStateStorageStatus {
     Loaded,
     UnsupportedClass,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SolverStateCpuBufferStatus {
+    UniformReady,
+    NonUniformDataNotLoaded,
+    UnsupportedClass,
+    InvalidShape,
+    MissingInternalField,
+    UnsupportedInternalField,
 }
 
 impl std::fmt::Display for SolverStateFieldKind {
@@ -94,6 +113,19 @@ impl std::fmt::Display for SolverStateStorageStatus {
         match self {
             Self::Loaded => formatter.write_str("loaded"),
             Self::UnsupportedClass => formatter.write_str("unsupported-class"),
+        }
+    }
+}
+
+impl std::fmt::Display for SolverStateCpuBufferStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UniformReady => formatter.write_str("uniform-ready"),
+            Self::NonUniformDataNotLoaded => formatter.write_str("nonuniform-data-not-loaded"),
+            Self::UnsupportedClass => formatter.write_str("unsupported-class"),
+            Self::InvalidShape => formatter.write_str("invalid-shape"),
+            Self::MissingInternalField => formatter.write_str("missing-internal-field"),
+            Self::UnsupportedInternalField => formatter.write_str("unsupported-internal-field"),
         }
     }
 }
@@ -128,6 +160,7 @@ fn build_state_field(
     validate_dimensions(field, &label, warnings);
     let internal_field = build_internal_field_plan(field, kind, expected_count, &label, warnings);
     let storage = build_storage_plan(kind, expected_count, &label, warnings);
+    let cpu_buffer = build_cpu_buffer_plan(&internal_field, &storage);
 
     SolverStateFieldPlan {
         region: field.region.clone(),
@@ -141,7 +174,24 @@ fn build_state_field(
         boundary_patches: field.boundary_patches.len(),
         mesh_boundary_patches: mesh.map(|mesh| mesh.patches.len()),
         storage,
+        cpu_buffer,
     }
+}
+
+pub fn materialize_uniform_cpu_buffer(field: &SolverStateFieldPlan) -> Option<Vec<f64>> {
+    if !field.cpu_buffer.materializable {
+        return None;
+    }
+
+    let components = field.internal_field.uniform_components.as_deref()?;
+    let value_count = field.internal_field.expected_count?;
+    let scalar_slots = field.cpu_buffer.scalar_slots?;
+    let mut buffer = Vec::new();
+    buffer.try_reserve_exact(scalar_slots).ok()?;
+    for _ in 0..value_count {
+        buffer.extend_from_slice(components);
+    }
+    Some(buffer)
 }
 
 fn mesh_for_field<'a>(
@@ -332,6 +382,48 @@ fn build_storage_plan(
     }
 }
 
+fn build_cpu_buffer_plan(
+    internal_field: &SolverStateInternalFieldPlan,
+    storage: &SolverStateStoragePlan,
+) -> SolverStateCpuBufferPlan {
+    let status = if storage.status != SolverStateStorageStatus::Loaded {
+        SolverStateCpuBufferStatus::UnsupportedClass
+    } else {
+        match internal_field.kind {
+            SolverStateValueKind::Uniform => {
+                let valid_shape = matches!(internal_field.valid_count, Some(true))
+                    && internal_field.expected_count.is_some()
+                    && storage.scalar_slots.is_some()
+                    && storage.bytes_f64.is_some()
+                    && storage
+                        .components
+                        .zip(internal_field.uniform_components.as_ref())
+                        .is_some_and(|(expected_components, components)| {
+                            components.len() == expected_components
+                        });
+                if valid_shape {
+                    SolverStateCpuBufferStatus::UniformReady
+                } else {
+                    SolverStateCpuBufferStatus::InvalidShape
+                }
+            }
+            SolverStateValueKind::NonUniform if internal_field.valid_count == Some(false) => {
+                SolverStateCpuBufferStatus::InvalidShape
+            }
+            SolverStateValueKind::NonUniform => SolverStateCpuBufferStatus::NonUniformDataNotLoaded,
+            SolverStateValueKind::Other => SolverStateCpuBufferStatus::UnsupportedInternalField,
+            SolverStateValueKind::Missing => SolverStateCpuBufferStatus::MissingInternalField,
+        }
+    };
+
+    SolverStateCpuBufferPlan {
+        materializable: status == SolverStateCpuBufferStatus::UniformReady,
+        scalar_slots: storage.scalar_slots,
+        bytes_f64: storage.bytes_f64,
+        status,
+    }
+}
+
 fn components_per_value(kind: SolverStateFieldKind) -> Option<usize> {
     match kind {
         SolverStateFieldKind::VolScalar | SolverStateFieldKind::SurfaceScalar => Some(1),
@@ -386,7 +478,8 @@ mod tests {
     use crate::poly_mesh::{BoundaryPatch, PolyMesh};
 
     use super::{
-        SolverStateFieldKind, SolverStateStorageStatus, SolverStateValueKind, build_state_field,
+        SolverStateCpuBufferStatus, SolverStateFieldKind, SolverStateStorageStatus,
+        SolverStateValueKind, build_state_field, materialize_uniform_cpu_buffer,
     };
 
     #[test]
@@ -413,6 +506,13 @@ mod tests {
         assert_eq!(state.storage.scalar_slots, Some(4));
         assert_eq!(state.storage.bytes_f64, Some(32));
         assert_eq!(state.storage.status, SolverStateStorageStatus::Loaded);
+        assert!(state.cpu_buffer.materializable);
+        assert_eq!(state.cpu_buffer.scalar_slots, Some(4));
+        assert_eq!(state.cpu_buffer.bytes_f64, Some(32));
+        assert_eq!(
+            state.cpu_buffer.status,
+            SolverStateCpuBufferStatus::UniformReady
+        );
         assert!(warnings.is_empty());
     }
 
@@ -436,7 +536,43 @@ mod tests {
         assert_eq!(state.storage.components, Some(3));
         assert_eq!(state.storage.scalar_slots, Some(12));
         assert_eq!(state.storage.bytes_f64, Some(96));
+        assert_eq!(
+            state.cpu_buffer.status,
+            SolverStateCpuBufferStatus::UniformReady
+        );
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn materializes_uniform_scalar_cpu_buffer() {
+        let field = field(
+            "p",
+            "volScalarField",
+            Some(FieldValueSummary::Uniform("7".to_string())),
+        );
+        let mesh = mesh(4);
+        let mut warnings = Vec::new();
+
+        let state = build_state_field(&field, Some(&mesh), &mut warnings);
+        let buffer = materialize_uniform_cpu_buffer(&state).expect("uniform scalar materializes");
+
+        assert_eq!(buffer, vec![7.0, 7.0, 7.0, 7.0]);
+    }
+
+    #[test]
+    fn materializes_uniform_vector_cpu_buffer() {
+        let field = field(
+            "U",
+            "volVectorField",
+            Some(FieldValueSummary::Uniform("( 1 2 3 )".to_string())),
+        );
+        let mesh = mesh(3);
+        let mut warnings = Vec::new();
+
+        let state = build_state_field(&field, Some(&mesh), &mut warnings);
+        let buffer = materialize_uniform_cpu_buffer(&state).expect("uniform vector materializes");
+
+        assert_eq!(buffer, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
     }
 
     #[test]
@@ -456,6 +592,12 @@ mod tests {
             state.internal_field.uniform_components,
             Some(vec![1.0, 2.0])
         );
+        assert!(!state.cpu_buffer.materializable);
+        assert_eq!(
+            state.cpu_buffer.status,
+            SolverStateCpuBufferStatus::InvalidShape
+        );
+        assert!(materialize_uniform_cpu_buffer(&state).is_none());
         assert!(
             warnings
                 .iter()
@@ -482,6 +624,11 @@ mod tests {
         assert_eq!(state.internal_field.value_count, Some(3));
         assert_eq!(state.internal_field.expected_count, Some(4));
         assert_eq!(state.internal_field.valid_count, Some(false));
+        assert!(!state.cpu_buffer.materializable);
+        assert_eq!(
+            state.cpu_buffer.status,
+            SolverStateCpuBufferStatus::InvalidShape
+        );
         assert!(
             warnings
                 .iter()
@@ -508,11 +655,43 @@ mod tests {
             state.storage.status,
             SolverStateStorageStatus::UnsupportedClass
         );
+        assert!(!state.cpu_buffer.materializable);
+        assert_eq!(
+            state.cpu_buffer.status,
+            SolverStateCpuBufferStatus::UnsupportedClass
+        );
         assert!(
             warnings
                 .iter()
                 .any(|warning| warning.contains("unsupported class"))
         );
+    }
+
+    #[test]
+    fn keeps_valid_nonuniform_cpu_buffer_unmaterialized_until_values_are_loaded() {
+        let field = field(
+            "phi",
+            "surfaceScalarField",
+            Some(FieldValueSummary::NonUniform {
+                value_type: Some("List<scalar>".to_string()),
+                count: Some(5),
+            }),
+        );
+        let mesh = mesh(4);
+        let mut warnings = Vec::new();
+
+        let state = build_state_field(&field, Some(&mesh), &mut warnings);
+
+        assert_eq!(state.internal_field.valid_count, Some(true));
+        assert!(!state.cpu_buffer.materializable);
+        assert_eq!(
+            state.cpu_buffer.status,
+            SolverStateCpuBufferStatus::NonUniformDataNotLoaded
+        );
+        assert_eq!(state.cpu_buffer.scalar_slots, Some(5));
+        assert_eq!(state.cpu_buffer.bytes_f64, Some(40));
+        assert!(materialize_uniform_cpu_buffer(&state).is_none());
+        assert!(warnings.is_empty());
     }
 
     fn field(name: &str, class_name: &str, internal_field: Option<FieldValueSummary>) -> FieldFile {

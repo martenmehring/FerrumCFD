@@ -465,11 +465,17 @@ fn print_solver_state_plan(plan: &SolverStatePlan) {
         .iter()
         .filter_map(|field| field.storage.bytes_f64)
         .sum::<usize>();
+    let cpu_buffers = plan
+        .fields
+        .iter()
+        .filter(|field| field.cpu_buffer.materializable)
+        .count();
     println!(
-        "solver state: fields={} cpuCapable={} gpuCapable={} bytesF64={}",
+        "solver state: fields={} cpuCapable={} gpuCapable={} cpuBuffers={} bytesF64={}",
         plan.fields.len(),
         cpu_capable,
         gpu_capable,
+        cpu_buffers,
         bytes_f64
     );
     for field in &plan.fields {
@@ -479,7 +485,7 @@ fn print_solver_state_plan(plan: &SolverStatePlan) {
             field.name.clone()
         };
         println!(
-            "  {}: class={} kind={} meshCells={} internal={} values={} expected={} valid={} components={} scalarSlots={} bytesF64={} uniform={} boundaryPatches={}/{} cpu={} gpu={} storage={}",
+            "  {}: class={} kind={} meshCells={} internal={} values={} expected={} valid={} components={} scalarSlots={} bytesF64={} uniform={} boundaryPatches={}/{} cpu={} gpu={} storage={} cpuBuffer={} cpuBufferStatus={}",
             name,
             field.class_name.as_deref().unwrap_or("unknown"),
             field.kind,
@@ -496,7 +502,9 @@ fn print_solver_state_plan(plan: &SolverStatePlan) {
             format_optional_usize(field.mesh_boundary_patches),
             yes_no(field.storage.cpu_capable),
             yes_no(field.storage.gpu_capable),
-            field.storage.status
+            field.storage.status,
+            yes_no(field.cpu_buffer.materializable),
+            field.cpu_buffer.status
         );
     }
     for warning in &plan.warnings {
@@ -656,11 +664,17 @@ fn print_solver_runner_state(plan: &SolverStatePlan) {
         .iter()
         .filter_map(|field| field.storage.bytes_f64)
         .sum::<usize>();
+    let cpu_buffers = plan
+        .fields
+        .iter()
+        .filter(|field| field.cpu_buffer.materializable)
+        .count();
     println!(
-        "runner state: fields={} cpuCapable={} gpuCapable={} bytesF64={}",
+        "runner state: fields={} cpuCapable={} gpuCapable={} cpuBuffers={} bytesF64={}",
         plan.fields.len(),
         cpu_capable,
         gpu_capable,
+        cpu_buffers,
         bytes_f64
     );
     for field in &plan.fields {
@@ -670,7 +684,7 @@ fn print_solver_runner_state(plan: &SolverStatePlan) {
             field.name.clone()
         };
         println!(
-            "  field {}: kind={} internal={} values={} expected={} components={} scalarSlots={} bytesF64={} uniform={} cpu={} gpu={} storage={}",
+            "  field {}: kind={} internal={} values={} expected={} components={} scalarSlots={} bytesF64={} uniform={} cpu={} gpu={} storage={} cpuBuffer={} cpuBufferStatus={}",
             name,
             field.kind,
             field.internal_field.kind,
@@ -682,7 +696,9 @@ fn print_solver_runner_state(plan: &SolverStatePlan) {
             format_optional_f64_list(field.internal_field.uniform_components.as_deref()),
             yes_no(field.storage.cpu_capable),
             yes_no(field.storage.gpu_capable),
-            field.storage.status
+            field.storage.status,
+            yes_no(field.cpu_buffer.materializable),
+            field.cpu_buffer.status
         );
     }
     for warning in &plan.warnings {
@@ -906,6 +922,26 @@ fn write_json_solver_state(writer: &mut impl Write, plan: &SolverStatePlan) -> s
         writeln!(writer, ",")?;
         write_json_key(writer, 10, "status")?;
         write_json_string(writer, &field.storage.status.to_string())?;
+        writeln!(writer)?;
+        write_indent(writer, 8)?;
+        writeln!(writer, "}},")?;
+        write_json_key(writer, 8, "cpuBuffer")?;
+        writeln!(writer, "{{")?;
+        write_json_bool_field(
+            writer,
+            10,
+            "materializable",
+            field.cpu_buffer.materializable,
+        )?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 10, "scalarSlots")?;
+        write_json_optional_usize(writer, field.cpu_buffer.scalar_slots)?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 10, "bytesF64")?;
+        write_json_optional_usize(writer, field.cpu_buffer.bytes_f64)?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 10, "status")?;
+        write_json_string(writer, &field.cpu_buffer.status.to_string())?;
         writeln!(writer)?;
         write_indent(writer, 8)?;
         writeln!(writer, "}}")?;
@@ -1950,7 +1986,12 @@ fn normalize_case_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_solver_args, write_json_string};
+    use super::{parse_solver_args, write_json_solver_state, write_json_string};
+    use ferrum_mesh::solver_state::{
+        SolverStateCpuBufferPlan, SolverStateCpuBufferStatus, SolverStateFieldKind,
+        SolverStateFieldPlan, SolverStateInternalFieldPlan, SolverStatePlan,
+        SolverStateStoragePlan, SolverStateStorageStatus, SolverStateValueKind,
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -1996,5 +2037,60 @@ mod tests {
             String::from_utf8(output).expect("valid utf8"),
             "\"a\\\"b\\\\c\\n\\t\""
         );
+    }
+
+    #[test]
+    fn writes_solver_state_cpu_buffer_json() {
+        let plan = SolverStatePlan {
+            fields: vec![SolverStateFieldPlan {
+                region: None,
+                name: "p".to_string(),
+                class_name: Some("volScalarField".to_string()),
+                kind: SolverStateFieldKind::VolScalar,
+                dimensions: Some(vec![
+                    "0".to_string(),
+                    "2".to_string(),
+                    "-2".to_string(),
+                    "0".to_string(),
+                    "0".to_string(),
+                    "0".to_string(),
+                    "0".to_string(),
+                ]),
+                mesh_cells: Some(4),
+                mesh_faces: Some(5),
+                internal_field: SolverStateInternalFieldPlan {
+                    kind: SolverStateValueKind::Uniform,
+                    value_count: Some(4),
+                    expected_count: Some(4),
+                    valid_count: Some(true),
+                    uniform_components: Some(vec![0.0]),
+                },
+                boundary_patches: 1,
+                mesh_boundary_patches: Some(1),
+                storage: SolverStateStoragePlan {
+                    cpu_capable: true,
+                    gpu_capable: true,
+                    components: Some(1),
+                    scalar_slots: Some(4),
+                    bytes_f64: Some(32),
+                    status: SolverStateStorageStatus::Loaded,
+                },
+                cpu_buffer: SolverStateCpuBufferPlan {
+                    materializable: true,
+                    scalar_slots: Some(4),
+                    bytes_f64: Some(32),
+                    status: SolverStateCpuBufferStatus::UniformReady,
+                },
+            }],
+            warnings: Vec::new(),
+        };
+        let mut output = Vec::new();
+
+        write_json_solver_state(&mut output, &plan).expect("solver state json should write");
+        let json = String::from_utf8(output).expect("valid utf8");
+
+        assert!(json.contains("\"cpuBuffer\""));
+        assert!(json.contains("\"materializable\": true"));
+        assert!(json.contains("\"status\": \"uniform-ready\""));
     }
 }
