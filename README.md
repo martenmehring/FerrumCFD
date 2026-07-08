@@ -27,6 +27,7 @@ cargo run -p ferrum-cli --bin splitFerrumMeshRegions -- -case examples\membrane_
 cargo run -p ferrum-cli --bin ferrumSolver -- -case examples\membrane_reactor --preflight --planJson target\ferrumSolverPlan.json
 cargo run -p ferrum-cli --bin ferrumSolver -- -case examples\membrane_reactor --runnerDryRun --maxRunnerSteps 2
 cargo run -p ferrum-cli --bin ferrumSolver -- -case examples\laminar_pipe --solveScalarDiffusion T --diffusivity 1 --linearSolver cg
+cargo run -p ferrum-cli --bin ferrumSolver -- -case examples\laminar_pipe --solvePoiseuille --linearSolver cg
 ```
 
 ## 2D And Axisymmetric Meshes
@@ -87,6 +88,11 @@ The importer currently targets the membrane reactor test mesh shape:
   from runtime mesh geometry with internal-face diffusion, `fixedValue`,
   `zeroGradient`, and volume source terms; it reports iterations, residual,
   solution summary, and wall-clock time without writing field files
+- `--solvePoiseuille` runs a source-driven axial Stokes/Poiseuille benchmark on
+  the pipe mesh, reads default `deltaP`, `mu`, `L`, and `D` from the existing
+  benchmark dictionaries when present, and reports mean velocity, flow rate,
+  Hagen-Poiseuille reference values, relative error, residual, and wall-clock
+  time without writing field files
 - mesh geometry summaries compute face areas, boundary area, and cell volumes
 - special patch validation counts `empty`, `wedge`, and `symmetryPlane`
   patches and reports basic patch-range warnings
@@ -105,8 +111,8 @@ The importer currently targets the membrane reactor test mesh shape:
   solver-neutral case plan, including the estimated time/write schedule and
   resolved backend choice per built-in run stage; `--planJson <file>` also
   writes the same plan as machine-readable JSON; `--solveScalarDiffusion
-  <field>` can execute one CPU scalar diffusion solve, but full CFD time-loop
-  execution is not implemented yet
+  <field>` and `--solvePoiseuille` can execute one CPU equation solve, but full
+  CFD time-loop execution is not implemented yet
 - `--runnerDryRun` previews the future solver runner for a capped number of
   steps and logs planned field state, CPU/GPU stage dispatch, runtime handles,
   and missing executable backend status without updating fields or solving

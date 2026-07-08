@@ -350,6 +350,13 @@ through that stack: it reads one scalar field, assembles one CPU system, solves
 it with CG or Jacobi, reports residual and wall-clock time, and deliberately
 does not write fields or enter the full CFD time loop.
 
+`ferrumSolver --solvePoiseuille` is the first flow benchmark path. It uses the
+same scalar operator for the fully developed axial Stokes balance driven by
+`deltaP/L`, applies wall no-slip as `Ux=0`, compares the resulting volume
+average against Hagen-Poiseuille, and reports timing and residuals. This is a
+controlled bridge toward the later momentum-pressure solver; it is not yet a
+SIMPLE, PISO, or full Navier-Stokes implementation.
+
 Important design constraint:
 
 ```text

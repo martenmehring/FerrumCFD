@@ -28,6 +28,10 @@ use ferrum_mesh::linear::{
     linear_solver_capabilities,
 };
 use ferrum_mesh::patches::{PatchValidationSummary, validate_case_patches};
+use ferrum_mesh::poiseuille::{
+    PoiseuilleOptions, poiseuille_diffusion_options, poiseuille_reference,
+    summarize_poiseuille_solution,
+};
 use ferrum_mesh::regions::{
     InterfaceRegistrySummary, InterfaceSummary, build_interface_registry,
     read_region_mesh_summaries, split_regions_by_cell_zones,
@@ -341,6 +345,9 @@ fn solve_case(args: Vec<String>) -> Result<(), String> {
     if let Some(solve) = &options.scalar_diffusion_solve {
         run_scalar_diffusion_solve(&plan, solve)?;
     }
+    if let Some(solve) = &options.poiseuille_solve {
+        run_poiseuille_solve(&plan, solve)?;
+    }
     if let Some(path) = options.plan_json {
         write_solver_plan_json(&plan, &path).map_err(|error| {
             format!(
@@ -351,6 +358,153 @@ fn solve_case(args: Vec<String>) -> Result<(), String> {
         println!("wrote solver plan json: {}", path.display());
     }
     Ok(())
+}
+
+fn run_poiseuille_solve(plan: &SolverCasePlan, solve: &PoiseuilleSolveArgs) -> Result<(), String> {
+    let options = resolve_poiseuille_options(plan, solve)?;
+    let reference = poiseuille_reference(&options).map_err(|error| error.to_string())?;
+    let diffusion_options =
+        poiseuille_diffusion_options(&options).map_err(|error| error.to_string())?;
+    let system = assemble_scalar_diffusion_system(&plan.runtime_data.mesh, &diffusion_options)
+        .map_err(|error| error.to_string())?;
+
+    let started = Instant::now();
+    let report = match solve.linear_solver {
+        ScalarDiffusionLinearSolver::Cg => conjugate_gradient_solve(
+            &system.matrix,
+            &system.rhs,
+            None,
+            ConjugateGradientOptions {
+                max_iterations: solve.max_iterations,
+                tolerance: solve.tolerance,
+            },
+        ),
+        ScalarDiffusionLinearSolver::Jacobi => jacobi_solve(
+            &system.matrix,
+            &system.rhs,
+            None,
+            JacobiOptions {
+                max_iterations: solve.max_iterations,
+                tolerance: solve.tolerance,
+                omega: 1.0,
+            },
+        ),
+    }
+    .map_err(|error| error.to_string())?;
+    let wall_clock_seconds = started.elapsed().as_secs_f64();
+    let summary =
+        summarize_poiseuille_solution(&plan.runtime_data.mesh, &report.solution, &options)
+            .map_err(|error| error.to_string())?;
+
+    println!(
+        "poiseuille solve: backend=cpu linearSolver={} cells={} nnz={} pressureDrop={} dynamicViscosity={} length={} diameter={} source={} wallPatches={} iterations={} converged={} residualNorm={} wallClockSeconds={:.6}",
+        solve.linear_solver,
+        system.stats.cells,
+        system.matrix.nnz(),
+        format_scientific(options.pressure_drop),
+        format_scientific(options.dynamic_viscosity),
+        format_scientific(options.length),
+        format_scientific(options.diameter),
+        format_scientific(reference.source),
+        options.wall_patches.join(","),
+        report.iterations,
+        yes_no(report.converged),
+        format_scientific(report.residual_norm),
+        wall_clock_seconds
+    );
+    println!(
+        "poiseuille result: meanVelocity={} analyticMeanVelocity={} relativeMeanVelocityError={} flowRate={} analyticFlowRate={} pressureDropFromMean={} minVelocity={} maxVelocity={}",
+        format_scientific(summary.mean_velocity),
+        format_scientific(summary.analytic_mean_velocity),
+        format_scientific(summary.relative_mean_velocity_error),
+        format_scientific(summary.flow_rate),
+        format_scientific(summary.analytic_flow_rate),
+        format_scientific(summary.pressure_drop_from_mean),
+        format_scientific(summary.min_velocity),
+        format_scientific(summary.max_velocity)
+    );
+    println!("poiseuille status: no field files written");
+
+    Ok(())
+}
+
+fn resolve_poiseuille_options(
+    plan: &SolverCasePlan,
+    solve: &PoiseuilleSolveArgs,
+) -> Result<PoiseuilleOptions, String> {
+    let pressure_drop = solve
+        .pressure_drop
+        .or_else(|| {
+            property_number(
+                plan,
+                "pipeBenchmark",
+                Some("flowReference"),
+                "expectedDeltaP",
+            )
+        })
+        .ok_or_else(|| {
+            "Poiseuille solve requires --pressureDrop or pipeBenchmark.flowReference.expectedDeltaP"
+                .to_string()
+        })?;
+    let dynamic_viscosity = solve
+        .dynamic_viscosity
+        .or_else(|| property_number(plan, "transportProperties", None, "mu"))
+        .or_else(|| property_number(plan, "pipeBenchmark", Some("water"), "mu"))
+        .ok_or_else(|| {
+            "Poiseuille solve requires --mu or transportProperties.mu/pipeBenchmark.water.mu"
+                .to_string()
+        })?;
+    let length = solve
+        .length
+        .or_else(|| property_number(plan, "pipeBenchmark", Some("geometry"), "length"))
+        .ok_or_else(|| {
+            "Poiseuille solve requires --length or pipeBenchmark.geometry.length".to_string()
+        })?;
+    let diameter = solve
+        .diameter
+        .or_else(|| property_number(plan, "pipeBenchmark", Some("geometry"), "diameter"))
+        .ok_or_else(|| {
+            "Poiseuille solve requires --diameter or pipeBenchmark.geometry.diameter".to_string()
+        })?;
+    let wall_patches = if solve.wall_patches.is_empty() {
+        vec!["wall".to_string()]
+    } else {
+        solve.wall_patches.clone()
+    };
+
+    Ok(PoiseuilleOptions {
+        pressure_drop,
+        dynamic_viscosity,
+        length,
+        diameter,
+        wall_patches,
+    })
+}
+
+fn property_number(
+    plan: &SolverCasePlan,
+    dictionary: &str,
+    section: Option<&str>,
+    key: &str,
+) -> Option<f64> {
+    plan.properties
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.dictionary == dictionary
+                && entry.section.as_deref() == section
+                && entry.key == key
+        })
+        .and_then(|entry| last_number(&entry.value))
+}
+
+fn last_number(value: &str) -> Option<f64> {
+    value.split_whitespace().rev().find_map(|token| {
+        token
+            .trim_matches(|ch| ch == '[' || ch == ']')
+            .parse::<f64>()
+            .ok()
+    })
 }
 
 fn run_scalar_diffusion_solve(
@@ -2108,6 +2262,7 @@ struct SolverArgs {
     runner_dry_run: bool,
     max_runner_steps: usize,
     scalar_diffusion_solve: Option<ScalarDiffusionSolveArgs>,
+    poiseuille_solve: Option<PoiseuilleSolveArgs>,
 }
 
 #[derive(Debug)]
@@ -2115,6 +2270,18 @@ struct ScalarDiffusionSolveArgs {
     field: String,
     diffusivity: f64,
     source: f64,
+    linear_solver: ScalarDiffusionLinearSolver,
+    tolerance: f64,
+    max_iterations: usize,
+}
+
+#[derive(Debug)]
+struct PoiseuilleSolveArgs {
+    pressure_drop: Option<f64>,
+    dynamic_viscosity: Option<f64>,
+    length: Option<f64>,
+    diameter: Option<f64>,
+    wall_patches: Vec<String>,
     linear_solver: ScalarDiffusionLinearSolver,
     tolerance: f64,
     max_iterations: usize,
@@ -2148,6 +2315,14 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
     let mut max_runner_steps = SolverRunnerDryRunOptions::default().max_steps;
     let mut scalar_diffusion_field = None;
     let mut scalar_diffusion_option_seen = false;
+    let mut poiseuille_solve = false;
+    let mut poiseuille_option_seen = false;
+    let mut pressure_drop = None;
+    let mut dynamic_viscosity = None;
+    let mut length = None;
+    let mut diameter = None;
+    let mut wall_patches = Vec::new();
+    let mut linear_solve_option_seen = false;
     let mut scalar_diffusion_diffusivity = 1.0;
     let mut scalar_diffusion_source = 0.0;
     let mut scalar_diffusion_linear_solver = ScalarDiffusionLinearSolver::Cg;
@@ -2202,6 +2377,11 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
                 scalar_diffusion_field = Some(field.to_string());
                 index += 2;
             }
+            "-solvePoiseuille" | "--solvePoiseuille" | "-solve-poiseuille"
+            | "--solve-poiseuille" => {
+                poiseuille_solve = true;
+                index += 1;
+            }
             "-diffusivity" | "--diffusivity" => {
                 let value = args
                     .get(index + 1)
@@ -2218,12 +2398,55 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
                 scalar_diffusion_option_seen = true;
                 index += 2;
             }
+            "-pressureDrop" | "--pressureDrop" | "-pressure-drop" | "--pressure-drop" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--pressureDrop requires a positive pressure drop in Pa".to_string()
+                })?;
+                pressure_drop = Some(parse_positive_f64_arg("--pressureDrop", value)?);
+                poiseuille_option_seen = true;
+                index += 2;
+            }
+            "-mu" | "--mu" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--mu requires a positive dynamic viscosity in Pa s".to_string()
+                })?;
+                dynamic_viscosity = Some(parse_positive_f64_arg("--mu", value)?);
+                poiseuille_option_seen = true;
+                index += 2;
+            }
+            "-length" | "--length" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--length requires a positive pipe length in m".to_string())?;
+                length = Some(parse_positive_f64_arg("--length", value)?);
+                poiseuille_option_seen = true;
+                index += 2;
+            }
+            "-diameter" | "--diameter" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--diameter requires a positive pipe diameter in m".to_string()
+                })?;
+                diameter = Some(parse_positive_f64_arg("--diameter", value)?);
+                poiseuille_option_seen = true;
+                index += 2;
+            }
+            "-wallPatch" | "--wallPatch" | "-wall-patch" | "--wall-patch" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--wallPatch requires a patch name".to_string())?;
+                if value.trim().is_empty() {
+                    return Err("--wallPatch patch name must not be empty".to_string());
+                }
+                wall_patches.push(value.to_string());
+                poiseuille_option_seen = true;
+                index += 2;
+            }
             "-linearSolver" | "--linearSolver" | "-linear-solver" | "--linear-solver" => {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "--linearSolver requires 'cg' or 'jacobi'".to_string())?;
                 scalar_diffusion_linear_solver = parse_scalar_diffusion_linear_solver(value)?;
-                scalar_diffusion_option_seen = true;
+                linear_solve_option_seen = true;
                 index += 2;
             }
             "-solveTolerance" | "--solveTolerance" | "-solve-tolerance" | "--solve-tolerance" => {
@@ -2231,7 +2454,7 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
                     .get(index + 1)
                     .ok_or_else(|| "--solveTolerance requires a non-negative number".to_string())?;
                 scalar_diffusion_tolerance = parse_non_negative_f64_arg("--solveTolerance", value)?;
-                scalar_diffusion_option_seen = true;
+                linear_solve_option_seen = true;
                 index += 2;
             }
             "-maxIterations" | "--maxIterations" | "-max-iterations" | "--max-iterations" => {
@@ -2240,7 +2463,7 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
                     .ok_or_else(|| "--maxIterations requires a positive integer".to_string())?;
                 scalar_diffusion_max_iterations =
                     parse_positive_usize_arg("--maxIterations", value)?;
-                scalar_diffusion_option_seen = true;
+                linear_solve_option_seen = true;
                 index += 2;
             }
             other => return Err(format!("unknown ferrumSolver option '{other}'")),
@@ -2259,12 +2482,42 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
             "scalar diffusion solve options require --solveScalarDiffusion <field>".to_string(),
         );
     }
+    let poiseuille_solve = if poiseuille_solve {
+        Some(PoiseuilleSolveArgs {
+            pressure_drop,
+            dynamic_viscosity,
+            length,
+            diameter,
+            wall_patches,
+            linear_solver: scalar_diffusion_linear_solver,
+            tolerance: scalar_diffusion_tolerance,
+            max_iterations: scalar_diffusion_max_iterations,
+        })
+    } else {
+        None
+    };
+    if poiseuille_solve.is_none() && poiseuille_option_seen {
+        return Err("Poiseuille solve options require --solvePoiseuille".to_string());
+    }
+    if scalar_diffusion_solve.is_none() && poiseuille_solve.is_none() && linear_solve_option_seen {
+        return Err(
+            "linear solve options require --solveScalarDiffusion <field> or --solvePoiseuille"
+                .to_string(),
+        );
+    }
+    if scalar_diffusion_solve.is_some() && poiseuille_solve.is_some() {
+        return Err(
+            "--solveScalarDiffusion and --solvePoiseuille cannot be used in the same command yet"
+                .to_string(),
+        );
+    }
     Ok(SolverArgs {
         case_dir,
         plan_json,
         runner_dry_run,
         max_runner_steps,
         scalar_diffusion_solve,
+        poiseuille_solve,
     })
 }
 
@@ -2514,7 +2767,7 @@ fn print_init_case_usage() {
 
 fn print_solver_usage() {
     println!(
-        "usage: ferrumSolver [-case <caseDir>] [--preflight] [--planJson <file>] [--runnerDryRun] [--maxRunnerSteps <n>] [--solveScalarDiffusion <field>]"
+        "usage: ferrumSolver [-case <caseDir>] [--preflight] [--planJson <file>] [--runnerDryRun] [--maxRunnerSteps <n>] [--solveScalarDiffusion <field>|--solvePoiseuille]"
     );
     println!();
     println!("reads a FerrumCFD/OpenFOAM-like case and prints the solver preflight plan:");
@@ -2532,13 +2785,19 @@ fn print_solver_usage() {
     println!("  --runnerDryRun       preview the future solver runner without solving equations");
     println!("  --maxRunnerSteps <n> limit runner dry-run preview steps (default: 3)");
     println!("  --solveScalarDiffusion <field> assemble and solve one CPU scalar diffusion system");
+    println!("  --solvePoiseuille    solve a source-driven axial Stokes/Poiseuille benchmark");
     println!(
         "  --diffusivity <v>    scalar diffusion coefficient for --solveScalarDiffusion (default: 1)"
     );
     println!(
         "  --source <v>         uniform volume source for --solveScalarDiffusion (default: 0)"
     );
-    println!("  --linearSolver <s>   cg or jacobi for --solveScalarDiffusion (default: cg)");
+    println!("  --linearSolver <s>   cg or jacobi for executable solves (default: cg)");
+    println!("  --pressureDrop <Pa>  pressure drop for --solvePoiseuille");
+    println!("  --mu <Pa.s>          dynamic viscosity for --solvePoiseuille");
+    println!("  --length <m>         pipe length for --solvePoiseuille");
+    println!("  --diameter <m>       pipe diameter for --solvePoiseuille");
+    println!("  --wallPatch <name>   wall patch for --solvePoiseuille (default: wall)");
     println!("  --solveTolerance <v> absolute residual tolerance (default: 1e-10)");
     println!("  --maxIterations <n>  linear solver iteration cap (default: 10000)");
     println!();
@@ -2653,6 +2912,48 @@ mod tests {
             parse_solver_args(&args).expect_err("diffusivity without solve field should fail");
 
         assert!(error.contains("--solveScalarDiffusion"));
+    }
+
+    #[test]
+    fn parses_poiseuille_solve_options() {
+        let args = vec![
+            "--solvePoiseuille".to_string(),
+            "--pressureDrop".to_string(),
+            "1.6032".to_string(),
+            "--mu".to_string(),
+            "0.001002".to_string(),
+            "--length".to_string(),
+            "1.0".to_string(),
+            "--diameter".to_string(),
+            "0.02".to_string(),
+            "--wallPatch".to_string(),
+            "pipeWall".to_string(),
+            "--linearSolver".to_string(),
+            "cg".to_string(),
+        ];
+
+        let parsed = parse_solver_args(&args).expect("solver args should parse");
+        let solve = parsed.poiseuille_solve.expect("poiseuille solve args");
+
+        assert_eq!(solve.pressure_drop, Some(1.6032));
+        assert_eq!(solve.dynamic_viscosity, Some(0.001002));
+        assert_eq!(solve.length, Some(1.0));
+        assert_eq!(solve.diameter, Some(0.02));
+        assert_eq!(solve.wall_patches, vec!["pipeWall"]);
+        assert_eq!(solve.linear_solver, ScalarDiffusionLinearSolver::Cg);
+    }
+
+    #[test]
+    fn rejects_mixed_executable_solves() {
+        let args = vec![
+            "--solveScalarDiffusion".to_string(),
+            "T".to_string(),
+            "--solvePoiseuille".to_string(),
+        ];
+
+        let error = parse_solver_args(&args).expect_err("mixed executable solves should fail");
+
+        assert!(error.contains("cannot be used in the same command"));
     }
 
     #[test]

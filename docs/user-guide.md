@@ -496,6 +496,7 @@ ferrumSolver -case cases\my_case --preflight
 ferrumSolver -case cases\my_case --preflight --planJson target\ferrumSolverPlan.json
 ferrumSolver -case cases\my_case --runnerDryRun --maxRunnerSteps 2
 ferrumSolver -case examples\laminar_pipe --solveScalarDiffusion T --diffusivity 1 --linearSolver cg
+ferrumSolver -case examples\laminar_pipe --solvePoiseuille --linearSolver cg
 ```
 
 Equivalent combined command:
@@ -588,6 +589,33 @@ Supported field boundary types for this path are currently `fixedValue uniform
 `symmetryPlane`. The command reports matrix nonzeros, boundary-face counts,
 iteration count, convergence, residual norm, solution min/max/mean, and
 wall-clock seconds. It does not write updated field files back to the case.
+
+`--solvePoiseuille` is the first pressure-loss benchmark path. It solves the
+fully developed axial Stokes balance as a source-driven scalar equation:
+
+```text
+-mu * laplacian(Ux) = deltaP / L
+```
+
+with `Ux=0` on wall patches and `zeroGradient` elsewhere. By default it reads
+`deltaP`, `mu`, `L`, and `D` from the `examples/laminar_pipe` benchmark
+dictionaries. Values can also be supplied explicitly:
+
+```powershell
+ferrumSolver -case examples\laminar_pipe --solvePoiseuille --pressureDrop 1.6032 --mu 0.001002 --length 1 --diameter 0.02 --wallPatch wall --linearSolver cg
+```
+
+The analytical reference is Hagen-Poiseuille:
+
+```text
+U_mean = deltaP * D^2 / (32 * mu * L)
+deltaP = 32 * mu * L * U_mean / D^2
+```
+
+The command reports numerical mean velocity, analytical mean velocity,
+relative error, flow rate, reconstructed pressure drop, solver iterations,
+residual, and wall-clock seconds. It does not write velocity or pressure fields
+back to the case.
 
 It also checks basic `controlDict` consistency: recognized `startFrom`,
 `stopAt`, and `writeControl` modes, positive finite `deltaT`, valid
@@ -802,8 +830,8 @@ consumed by built-in solver code.
 - Constant property dictionaries are parsed structurally; solver-specific
   required material models and coefficients are not enforced yet.
 - `ferrumSolver` is currently a preflight/run planner; `--runnerDryRun`
-  previews scheduling only. `--solveScalarDiffusion <field>` can execute one
-  CPU scalar diffusion solve, but full CFD time-loop execution is not
-  implemented yet.
+  previews scheduling only. `--solveScalarDiffusion <field>` and
+  `--solvePoiseuille` can each execute one CPU equation solve, but full CFD
+  time-loop execution is not implemented yet.
 - CPU/GPU backend selection is validated as configuration and not yet
   executable solver behavior.

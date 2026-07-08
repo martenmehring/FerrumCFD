@@ -11,6 +11,7 @@ pub mod interfaces;
 pub mod linear;
 pub mod numerics;
 pub mod patches;
+pub mod poiseuille;
 pub mod poly_mesh;
 pub mod properties;
 pub mod regions;
