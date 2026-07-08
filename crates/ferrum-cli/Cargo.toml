@@ -28,3 +28,6 @@ path = "src/bin/check_ferrum_mesh.rs"
 name = "splitFerrumMeshRegions"
 path = "src/bin/split_ferrum_mesh_regions.rs"
 
+[[bin]]
+name = "initFerrumCase"
+path = "src/bin/init_ferrum_case.rs"

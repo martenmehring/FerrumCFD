@@ -16,6 +16,7 @@ The debug binaries are written to:
 
 ```text
 target/debug/ferrum.exe
+target/debug/initFerrumCase.exe
 target/debug/gmshToFerrumFoam.exe
 target/debug/checkFerrumMesh.exe
 target/debug/splitFerrumMeshRegions.exe
@@ -26,6 +27,42 @@ During development, commands can also be run through Cargo:
 ```powershell
 cargo run -p ferrum-cli --bin gmshToFerrumFoam -- --help
 ```
+
+## Initialize A Case
+
+Create a basic FerrumCFD case structure with:
+
+```powershell
+initFerrumCase cases\my_case
+```
+
+Equivalent combined command:
+
+```powershell
+ferrum initCase cases\my_case
+```
+
+For a multi-region case, region folders can be created immediately:
+
+```powershell
+initFerrumCase cases\reactor --regions inner_zone,membrane,outer_zone
+```
+
+The initializer writes templates for:
+
+```text
+0/
+constant/
+constant/polyMesh/
+constant/interfaces
+constant/transportProperties
+system/controlDict
+system/fvSchemes
+system/fvSolution
+system/ferrumBackends
+```
+
+Existing template files are not overwritten unless `--force` is passed.
 
 ## Case Layout
 
@@ -42,11 +79,14 @@ case/
       boundary
       faceZones
       cellZones
+    interfaces
+    transportProperties
     ferrumMeshSummary.txt
   system/
     controlDict
     fvSchemes
     fvSolution
+    ferrumBackends
 ```
 
 Multi-region splitting writes region meshes below `constant/<region>/polyMesh`:
@@ -227,6 +267,7 @@ Shortcuts:
 The `ferrum` binary exposes OpenFOAM-like subcommands:
 
 ```powershell
+ferrum initCase cases\my_case
 ferrum gmshToFoam path\to\mesh.msh -case cases\my_case
 ferrum checkMesh -case cases\my_case
 ferrum splitMeshRegions -case cases\my_case -cellZones
@@ -236,10 +277,37 @@ The dedicated aliases remain available because they are closer to OpenFOAM
 muscle memory:
 
 ```powershell
+initFerrumCase
 gmshToFerrumFoam
 checkFerrumMesh
 splitFerrumMeshRegions
 ```
+
+## Interface Model Setup
+
+Users should normally not edit `flipMap` by hand. `flipMap` belongs to the
+mesh/faceZone definition and is read from the mesh data. Model intent belongs in
+`constant/interfaces`.
+
+Example:
+
+```text
+interfaces
+{
+    reactor_wall
+    {
+        regions (fluid solid);
+        faceZone wall_interface;
+        orientation fluid_to_solid;
+        model heatTransfer;
+    }
+}
+```
+
+The orientation says which direction is positive for model quantities such as
+pressure jump, heat flux, species flux, or membrane permeation. FerrumCFD then
+maps that model direction onto mesh `owner`/`neighbour` and `flipMap`
+orientation metadata.
 
 ## Backend Selection Direction
 

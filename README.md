@@ -10,6 +10,7 @@ tracked in [docs/architecture.md](docs/architecture.md).
 ## First Commands
 
 ```powershell
+cargo run -p ferrum-cli --bin ferrum -- initCase examples\membrane_reactor
 cargo run -p ferrum-cli --bin ferrum -- gmshToFoam path\to\mesh.msh -case examples\membrane_reactor
 cargo run -p ferrum-cli --bin ferrum -- checkMesh -case examples\membrane_reactor
 ```
@@ -17,6 +18,7 @@ cargo run -p ferrum-cli --bin ferrum -- checkMesh -case examples\membrane_reacto
 Alias binaries are provided too:
 
 ```powershell
+cargo run -p ferrum-cli --bin initFerrumCase -- examples\membrane_reactor
 cargo run -p ferrum-cli --bin gmshToFerrumFoam -- path\to\mesh.msh -case examples\membrane_reactor
 cargo run -p ferrum-cli --bin checkFerrumMesh -- -case examples\membrane_reactor
 cargo run -p ferrum-cli --bin splitFerrumMeshRegions -- -case examples\membrane_reactor -cellZones

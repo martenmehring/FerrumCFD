@@ -35,6 +35,7 @@ case/
 The user-facing command flow should remain familiar:
 
 ```powershell
+initFerrumCase case
 gmshToFerrumFoam mesh.msh -case case
 checkFerrumMesh -case case
 splitFerrumMeshRegions -case case -cellZones
@@ -186,6 +187,12 @@ The interface registry should therefore stay model-neutral. It should describe
 the geometry and orientation. Physics modules decide which law to apply, such
 as a pressure-difference law, temperature-difference law, concentration jump,
 or membrane permeance law.
+
+User-facing model orientation should be configured in `constant/interfaces`.
+Users should not normally edit `flipMap` manually; it is source mesh metadata.
+The interface dictionary expresses intent, for example `orientation
+fluid_to_solid`, and FerrumCFD maps that intent onto owner/neighbour and
+faceZone orientation data.
 
 ## Reference Points
 

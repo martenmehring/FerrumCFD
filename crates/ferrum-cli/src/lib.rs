@@ -1,6 +1,9 @@
+mod case;
+
 use std::env;
 use std::path::{Path, PathBuf};
 
+use case::{InitCaseOptions, init_case};
 use ferrum_mesh::check::read_case_summary;
 use ferrum_mesh::foam::{FoamWriteOptions, write_openfoam_case_with_options};
 use ferrum_mesh::gmsh::read_msh22_ascii;
@@ -36,6 +39,7 @@ pub enum Alias {
     GmshToFerrumFoam,
     CheckFerrumMesh,
     SplitFerrumMeshRegions,
+    InitFerrumCase,
 }
 
 enum CommandMode {
@@ -49,6 +53,7 @@ fn run_command(mode: CommandMode, args: Vec<String>) -> Result<(), String> {
         CommandMode::Alias(Alias::GmshToFerrumFoam) => gmsh_to_foam(args),
         CommandMode::Alias(Alias::CheckFerrumMesh) => check_mesh(args),
         CommandMode::Alias(Alias::SplitFerrumMeshRegions) => split_mesh_regions(args),
+        CommandMode::Alias(Alias::InitFerrumCase) => init_case_command(args),
     }
 }
 
@@ -63,8 +68,42 @@ fn run_ferrum_subcommand(mut args: Vec<String>) -> Result<(), String> {
         "gmshToFoam" | "gmshToFerrumFoam" => gmsh_to_foam(args),
         "checkMesh" | "checkFerrumMesh" => check_mesh(args),
         "splitMeshRegions" | "splitFerrumMeshRegions" => split_mesh_regions(args),
+        "initCase" | "initFerrumCase" => init_case_command(args),
         other => Err(format!("unknown ferrum command '{other}'")),
     }
+}
+
+fn init_case_command(args: Vec<String>) -> Result<(), String> {
+    if args.is_empty() || args.iter().any(|arg| is_help(arg)) {
+        print_init_case_usage();
+        return Ok(());
+    }
+
+    let options = parse_init_case_args(&args)?;
+    let summary = init_case(&options)?;
+
+    println!("Initialized FerrumCFD case: {}", summary.case_dir.display());
+    if !summary.created_dirs.is_empty() {
+        println!("created directories:");
+        for path in &summary.created_dirs {
+            println!("  {}", path.display());
+        }
+    }
+    if !summary.written_files.is_empty() {
+        println!("written files:");
+        for path in &summary.written_files {
+            println!("  {}", path.display());
+        }
+    }
+    if !summary.skipped_files.is_empty() {
+        println!("skipped existing files:");
+        for path in &summary.skipped_files {
+            println!("  {}", path.display());
+        }
+        println!("use --force to overwrite existing template files");
+    }
+
+    Ok(())
 }
 
 fn gmsh_to_foam(args: Vec<String>) -> Result<(), String> {
@@ -307,6 +346,65 @@ fn parse_case_dir(args: &[String], default: PathBuf) -> Result<PathBuf, String> 
     Ok(default)
 }
 
+fn parse_init_case_args(args: &[String]) -> Result<InitCaseOptions, String> {
+    let case_dir = PathBuf::from(
+        args.first()
+            .ok_or_else(|| "initFerrumCase requires a case directory".to_string())?,
+    );
+    let mut force = false;
+    let mut regions = Vec::new();
+
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--force" | "-force" => {
+                force = true;
+                index += 1;
+            }
+            "-region" | "--region" => {
+                let region = args
+                    .get(index + 1)
+                    .ok_or_else(|| "-region requires a region name".to_string())?;
+                regions.push(validate_case_name(region, "region")?);
+                index += 2;
+            }
+            "-regions" | "--regions" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "-regions requires a comma-separated region list".to_string())?;
+                for region in value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    regions.push(validate_case_name(region, "region")?);
+                }
+                index += 2;
+            }
+            other => return Err(format!("unknown initFerrumCase option '{other}'")),
+        }
+    }
+
+    regions.sort();
+    regions.dedup();
+
+    Ok(InitCaseOptions {
+        case_dir,
+        force,
+        regions,
+    })
+}
+
+fn validate_case_name(value: &str, label: &str) -> Result<String, String> {
+    if value.is_empty() {
+        return Err(format!("{label} name must not be empty"));
+    }
+    if !is_openfoam_word(value) {
+        return Err(format!("invalid {label} name '{value}'"));
+    }
+    Ok(value.to_string())
+}
+
 struct GmshToFoamArgs {
     mesh_path: PathBuf,
     case_dir: PathBuf,
@@ -414,16 +512,32 @@ fn print_help() {
     println!("FerrumCFD mesh tools");
     println!();
     println!("usage:");
+    println!("  ferrum initCase <caseDir> [--region <name> ...] [--force]");
     println!("  ferrum gmshToFoam <mesh.msh> [-case <caseDir>] [patch type options]");
     println!("  ferrum checkMesh [-case <caseDir>]");
     println!("  ferrum splitMeshRegions [-case <caseDir>] [-cellZones]");
     println!();
     println!("aliases:");
+    println!("  initFerrumCase <caseDir> [--region <name> ...] [--force]");
     println!("  gmshToFerrumFoam <mesh.msh> [-case <caseDir>] [patch type options]");
     println!("  checkFerrumMesh [-case <caseDir>]");
     println!("  splitFerrumMeshRegions [-case <caseDir>] [-cellZones]");
     println!();
     print_patch_type_options();
+}
+
+fn print_init_case_usage() {
+    println!("usage: initFerrumCase <caseDir> [--region <name> ...] [--regions a,b] [--force]");
+    println!();
+    println!("creates an OpenFOAM-like FerrumCFD case skeleton:");
+    println!("  0/");
+    println!("  constant/");
+    println!("  constant/polyMesh/");
+    println!("  constant/interfaces");
+    println!("  system/controlDict");
+    println!("  system/fvSchemes");
+    println!("  system/fvSolution");
+    println!("  system/ferrumBackends");
 }
 
 fn print_gmsh_to_foam_usage() {
