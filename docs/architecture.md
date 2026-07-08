@@ -125,7 +125,8 @@ ferrumBackends
 }
 ```
 
-This dictionary is a design target, not a stable format yet.
+This dictionary is parsed and validated as case metadata, but not yet consumed
+by executable solvers.
 
 ## Solver Architecture Direction
 

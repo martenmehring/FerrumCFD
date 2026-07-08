@@ -183,6 +183,10 @@ fn write_fv_solution(writer: &mut BufWriter<File>) -> Result<(), std::io::Error>
 
 fn write_ferrum_backends(writer: &mut BufWriter<File>) -> Result<(), std::io::Error> {
     write_foam_header(writer, "dictionary", "ferrumBackends", "system")?;
+    writeln!(
+        writer,
+        "// Execution policy only: physics models must remain backend-neutral."
+    )?;
     writeln!(writer, "default cpu;")?;
     writeln!(writer)?;
     writeln!(writer, "mesh")?;

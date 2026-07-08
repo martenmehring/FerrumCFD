@@ -4,6 +4,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 use case::{InitCaseOptions, init_case};
+use ferrum_mesh::backends::read_backend_config;
 use ferrum_mesh::check::read_case_summary;
 use ferrum_mesh::foam::{FoamWriteOptions, write_openfoam_case_with_options};
 use ferrum_mesh::gmsh::read_msh22_ascii;
@@ -192,6 +193,7 @@ fn check_mesh(args: Vec<String>) -> Result<(), String> {
     let interfaces = build_interface_registry(&case_dir).map_err(|error| error.to_string())?;
     print_interface_registry(&interfaces);
     print_interface_config(&case_dir, &interfaces)?;
+    print_backend_config(&case_dir)?;
 
     let unmatched = summary.unmatched_boundary_faces.unwrap_or(0);
     let duplicate = summary.duplicate_boundary_faces.unwrap_or(0);
@@ -346,6 +348,33 @@ fn print_interface_config(
     }
     for warning in &validation.warnings {
         println!("interface config warning: {warning}");
+    }
+
+    Ok(())
+}
+
+fn print_backend_config(case_dir: &Path) -> Result<(), String> {
+    let Some(config) = read_backend_config(case_dir).map_err(|error| error.to_string())? else {
+        println!("backend config: none (no system/ferrumBackends)");
+        return Ok(());
+    };
+
+    println!(
+        "backend config: default={} gpuBackend={} gpuDevice={} precision={}",
+        config.default, config.gpu.backend, config.gpu.device, config.gpu.precision
+    );
+    for section in &config.sections {
+        if section.entries.is_empty() {
+            continue;
+        }
+
+        let selections = section
+            .entries
+            .iter()
+            .map(|entry| format!("{}={}", entry.step, entry.choice))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("  {}: {}", section.name, selections);
     }
 
     Ok(())

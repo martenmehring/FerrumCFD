@@ -322,10 +322,16 @@ interface config:
   reactor_wall: faceZone=wall_interface sign=fluid->solid model=heatTransfer meshFaces=240
 ```
 
+In a membrane reactor this is the correct place to define the positive
+reference direction for permeation. If the sweep pressure becomes high enough
+to push water back, the membrane model should compute the opposite sign. No
+mesh `flipMap` change is required.
+
 ## Backend Selection Direction
 
-Backend selection is a design target, not a finished feature yet. The long-term
-goal is to let users choose CPU, GPU, or mixed execution per solver component.
+Backend selection is parsed and validated as case configuration, but it is not
+executable solver behavior yet. The long-term goal is to let users choose CPU,
+GPU, or mixed execution per solver component.
 
 Example direction:
 
@@ -352,13 +358,25 @@ The important rule is practical resource use: small or non-time-critical cases
 must be allowed to stay on CPU, while expensive residuals, linear solves, or
 other suitable kernels can run on GPU.
 
+`checkFerrumMesh` reads `system/ferrumBackends` when the file exists:
+
+```text
+backend config: default=cpu gpuBackend=auto gpuDevice=auto precision=f64
+  mesh: import=cpu, checks=cpu
+  flow: residual=auto, linearSolve=auto
+```
+
+Allowed execution choices are `cpu`, `gpu`, and `auto`. The `gpu.backend`
+setting currently accepts `auto`, `wgpu`, `cuda`, and `hip`; `gpu.precision`
+accepts `auto`, `f32`, and `f64`.
+
 ## Current Limitations
 
 - Gmsh import currently supports Gmsh 2.2 ASCII, `quad4` surfaces, and `hex8`
   cells.
 - Region splitting currently reads Ferrum-generated ASCII `polyMesh` files.
 - `checkFerrumMesh` is currently a structural summary plus basic topology
-  warning report.
+  warning report, with interface and backend configuration validation.
 - Solver support is not implemented yet.
-- CPU/GPU backend selection is documented as a design target and not yet
-  executable behavior.
+- CPU/GPU backend selection is validated as configuration and not yet
+  executable solver behavior.
