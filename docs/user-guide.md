@@ -402,6 +402,8 @@ ferrum solve -case cases\my_case --preflight
 The preflight reads:
 
 - `system/controlDict`
+- `system/fvSchemes`
+- `system/fvSolution`
 - `system/ferrumBackends`
 - `constant/polyMesh`
 - generated region meshes below `constant/<region>/polyMesh`
@@ -415,8 +417,9 @@ The output reports the detected dimensionality:
 - `axisymmetric-wedge` when `wedge` patches are present
 - `mixed-special-patches` when both `empty` and `wedge` appear
 
-It also prints the backend plan, including CPU sockets/cores/thread policy,
-GPU backend/devices, and per-stage choices such as `flow.residual=gpu` or
+It also prints the parsed numerical setup from `fvSchemes` and `fvSolution`
+and the backend plan, including CPU sockets/cores/thread policy, GPU
+backend/devices, and per-stage choices such as `flow.residual=gpu` or
 `chemistry.odeSolve=cpu`. This is metadata only for now, but it is the intended
 boundary between OpenFOAM-like case input and the future Rust/GPU solver stack.
 
@@ -576,6 +579,9 @@ accept `auto` or a positive integer.
 - Initial field parsing currently summarizes fields and boundary entries; it
   validates boundary patch names and special patch boundary types, but it does
   not yet validate dimensions against solver equations.
+- `fvSchemes` and `fvSolution` are parsed structurally for the solver preflight;
+  their entries are not yet consumed by executable discretisation or linear
+  solver kernels.
 - `ferrumSolver` is currently a preflight planner; CFD solver kernels are not
   implemented yet.
 - CPU/GPU backend selection is validated as configuration and not yet

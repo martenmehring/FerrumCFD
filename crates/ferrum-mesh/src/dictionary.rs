@@ -13,6 +13,7 @@ pub fn tokenize(content: &str) -> Vec<Token> {
     for (line_index, line) in content.lines().enumerate() {
         let mut current = String::new();
         let mut chars = line.chars().peekable();
+        let mut inline_paren_depth = 0usize;
 
         while let Some(ch) = chars.next() {
             if ch == '/' && chars.peek() == Some(&'/') {
@@ -32,6 +33,19 @@ pub fn tokenize(content: &str) -> Vec<Token> {
 
             if ch.is_whitespace() {
                 push_token(&mut tokens, &mut current, line_index + 1);
+                inline_paren_depth = 0;
+                continue;
+            }
+
+            if ch == '(' && !current.is_empty() {
+                inline_paren_depth += 1;
+                current.push(ch);
+                continue;
+            }
+
+            if ch == ')' && inline_paren_depth > 0 {
+                inline_paren_depth -= 1;
+                current.push(ch);
                 continue;
             }
 
@@ -201,5 +215,35 @@ impl TokenCursor {
         })?;
         self.index += 1;
         Ok(token)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tokenize;
+
+    #[test]
+    fn keeps_function_style_dictionary_keys_together() {
+        let tokens = tokenize("grad(U) Gauss linear;");
+        let values = tokens
+            .iter()
+            .map(|token| token.value.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(values, vec!["grad(U)", "Gauss", "linear", ";"]);
+    }
+
+    #[test]
+    fn keeps_parenthesized_values_as_lists() {
+        let tokens = tokenize("internalField uniform (0 0 0);");
+        let values = tokens
+            .iter()
+            .map(|token| token.value.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            values,
+            vec!["internalField", "uniform", "(", "0", "0", "0", ")", ";"]
+        );
     }
 }

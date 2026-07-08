@@ -194,6 +194,8 @@ OpenFOAM-like case layout and the future backend-specific solver runtime.
 The preflight reads:
 
 - `system/controlDict` for run timing and the selected application name
+- `system/fvSchemes` for user-facing discretisation choices
+- `system/fvSolution` for user-facing solver and algorithm settings
 - `constant/polyMesh` for topology, patches, and special reduced-dimension
   patch types
 - generated region meshes below `constant/<region>/polyMesh`
@@ -205,6 +207,12 @@ The plan classifies the case as `3d`, `2d-empty`, `axisymmetric-wedge`, or
 `mixed-special-patches`. Later solver modules should consume this explicit
 classification rather than rediscovering reduced-dimensional behavior from
 raw patch strings in scattered equation code.
+
+`fvSchemes` and `fvSolution` parsing is currently structural. The preflight can
+report entries such as `ddtSchemes.default=Euler` or
+`SIMPLE.nNonOrthogonalCorrectors=0`, but executable solver code must later
+decide which schemes and linear/nonlinear solver settings are valid for each
+equation system.
 
 ## Mesh Geometry Direction
 

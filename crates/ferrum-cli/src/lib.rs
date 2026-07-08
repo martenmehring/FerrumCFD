@@ -19,7 +19,9 @@ use ferrum_mesh::regions::{
     InterfaceRegistrySummary, InterfaceSummary, build_interface_registry,
     read_region_mesh_summaries, split_regions_by_cell_zones,
 };
-use ferrum_mesh::solver_plan::{SolverBackendPlan, SolverCasePlan, build_solver_case_plan};
+use ferrum_mesh::solver_plan::{
+    SolverBackendPlan, SolverCasePlan, SolverNumericsDictionaryPlan, build_solver_case_plan,
+};
 
 pub fn run_ferrum() -> i32 {
     let args = env::args().skip(1).collect::<Vec<_>>();
@@ -366,6 +368,8 @@ fn print_solver_case_plan(plan: &SolverCasePlan) {
             );
         }
     }
+    print_solver_numerics_dictionary("fvSchemes", &plan.numerics.fv_schemes);
+    print_solver_numerics_dictionary("fvSolution", &plan.numerics.fv_solution);
     println!(
         "interfaces: registry={} discovered={} boundaryFaceZones={} config={} configured={}",
         yes_no(plan.interfaces.registry_available),
@@ -384,6 +388,19 @@ fn print_solver_case_plan(plan: &SolverCasePlan) {
         }
     }
     println!("solver execution: preflight only; solver kernels are not implemented yet");
+}
+
+fn print_solver_numerics_dictionary(name: &str, plan: &SolverNumericsDictionaryPlan) {
+    println!(
+        "{}: present={} sections={} entries={}",
+        name,
+        yes_no(plan.present),
+        plan.sections.len(),
+        plan.entries.len()
+    );
+    for entry in &plan.entries {
+        println!("  {}.{}={}", entry.section, entry.key, entry.value);
+    }
 }
 
 fn print_solver_backend_plan(plan: &SolverBackendPlan) {
@@ -928,6 +945,8 @@ fn print_solver_usage() {
     println!();
     println!("reads a FerrumCFD/OpenFOAM-like case and prints the solver preflight plan:");
     println!("  system/controlDict");
+    println!("  system/fvSchemes");
+    println!("  system/fvSolution");
     println!("  system/ferrumBackends");
     println!("  constant/polyMesh");
     println!("  constant/interfaces");

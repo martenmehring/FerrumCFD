@@ -5,6 +5,7 @@ use crate::backends::{BackendChoice, read_backend_config, validate_backend_resou
 use crate::control::{ControlDict, read_control_dict};
 use crate::fields::{read_initial_fields, validate_initial_field_boundaries};
 use crate::interfaces::{read_interface_config, validate_interface_config};
+use crate::numerics::{NumericsSection, format_numerics_value, read_fv_schemes, read_fv_solution};
 use crate::patches::{PatchValidationSummary, validate_poly_mesh_patches};
 use crate::poly_mesh::PolyMesh;
 use crate::regions::{build_interface_registry, read_region_mesh_summaries};
@@ -15,6 +16,7 @@ pub struct SolverCasePlan {
     pub control: ControlDict,
     pub mesh: SolverMeshPlan,
     pub fields: SolverFieldPlan,
+    pub numerics: SolverNumericsPlan,
     pub interfaces: SolverInterfacePlan,
     pub backends: SolverBackendPlan,
     pub warnings: Vec<String>,
@@ -61,6 +63,32 @@ pub struct SolverFieldEntryPlan {
     pub name: String,
     pub class_name: Option<String>,
     pub boundary_patches: usize,
+}
+
+#[derive(Debug)]
+pub struct SolverNumericsPlan {
+    pub fv_schemes: SolverNumericsDictionaryPlan,
+    pub fv_solution: SolverNumericsDictionaryPlan,
+}
+
+#[derive(Debug)]
+pub struct SolverNumericsDictionaryPlan {
+    pub present: bool,
+    pub sections: Vec<SolverNumericsSectionPlan>,
+    pub entries: Vec<SolverNumericsEntryPlan>,
+}
+
+#[derive(Debug)]
+pub struct SolverNumericsSectionPlan {
+    pub path: String,
+    pub entries: usize,
+}
+
+#[derive(Debug)]
+pub struct SolverNumericsEntryPlan {
+    pub section: String,
+    pub key: String,
+    pub value: String,
 }
 
 #[derive(Debug)]
@@ -155,6 +183,8 @@ pub fn build_solver_case_plan(case_dir: &Path) -> Result<SolverCasePlan> {
             .map(|warning| format!("field boundary: {warning}")),
     );
 
+    let numerics = build_numerics_plan(case_dir, &mut warnings)?;
+
     let interface_config = read_interface_config(case_dir)?;
     let config_present = interface_config.is_some();
     let configured_interfaces = interface_config
@@ -217,6 +247,7 @@ pub fn build_solver_case_plan(case_dir: &Path) -> Result<SolverCasePlan> {
                 })
                 .collect(),
         },
+        numerics,
         interfaces,
         backends,
         warnings,
@@ -252,6 +283,71 @@ fn classify_dimensionality(patch_validation: &PatchValidationSummary) -> SolverD
         (true, false) => SolverDimensionality::TwoD,
         (false, true) => SolverDimensionality::Axisymmetric,
         (true, true) => SolverDimensionality::MixedSpecialPatches,
+    }
+}
+
+fn build_numerics_plan(case_dir: &Path, warnings: &mut Vec<String>) -> Result<SolverNumericsPlan> {
+    let fv_schemes = match read_fv_schemes(case_dir)? {
+        Some(schemes) => build_numerics_dictionary_plan(true, &schemes.sections),
+        None => {
+            warnings.push("no system/fvSchemes found; discretisation plan is empty".to_string());
+            build_numerics_dictionary_plan(false, &[])
+        }
+    };
+
+    let fv_solution = match read_fv_solution(case_dir)? {
+        Some(solution) => build_numerics_dictionary_plan(true, &solution.sections),
+        None => {
+            warnings.push("no system/fvSolution found; solver settings plan is empty".to_string());
+            build_numerics_dictionary_plan(false, &[])
+        }
+    };
+
+    Ok(SolverNumericsPlan {
+        fv_schemes,
+        fv_solution,
+    })
+}
+
+fn build_numerics_dictionary_plan(
+    present: bool,
+    sections: &[NumericsSection],
+) -> SolverNumericsDictionaryPlan {
+    let mut section_plans = Vec::new();
+    let mut entries = Vec::new();
+    append_numerics_sections(sections, None, &mut section_plans, &mut entries);
+    SolverNumericsDictionaryPlan {
+        present,
+        sections: section_plans,
+        entries,
+    }
+}
+
+fn append_numerics_sections(
+    sections: &[NumericsSection],
+    parent: Option<&str>,
+    section_plans: &mut Vec<SolverNumericsSectionPlan>,
+    entries: &mut Vec<SolverNumericsEntryPlan>,
+) {
+    for section in sections {
+        let path = if let Some(parent) = parent {
+            format!("{parent}.{}", section.name)
+        } else {
+            section.name.clone()
+        };
+
+        section_plans.push(SolverNumericsSectionPlan {
+            path: path.clone(),
+            entries: section.entries.len(),
+        });
+        for entry in &section.entries {
+            entries.push(SolverNumericsEntryPlan {
+                section: path.clone(),
+                key: entry.key.clone(),
+                value: format_numerics_value(&entry.value),
+            });
+        }
+        append_numerics_sections(&section.sections, Some(&path), section_plans, entries);
     }
 }
 
