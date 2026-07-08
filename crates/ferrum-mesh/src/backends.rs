@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -56,6 +57,11 @@ pub struct BackendResourceValidation {
     pub uses_cpu: bool,
     pub uses_gpu: bool,
     pub mixed_execution: bool,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct BackendPolicyValidation {
     pub warnings: Vec<String>,
 }
 
@@ -146,8 +152,128 @@ pub fn validate_backend_resources(config: &BackendConfig) -> BackendResourceVali
     }
 }
 
+pub fn validate_backend_policy(config: &BackendConfig) -> BackendPolicyValidation {
+    let mut warnings = Vec::new();
+    warn_duplicate_sections(config, &mut warnings);
+    warn_duplicate_steps(config, &mut warnings);
+    warn_unknown_builtin_policy_entries(config, &mut warnings);
+    warn_inconsistent_resource_policy(config, &mut warnings);
+
+    BackendPolicyValidation { warnings }
+}
+
 fn choice_can_use_cpu(choice: BackendChoice) -> bool {
     matches!(choice, BackendChoice::Cpu | BackendChoice::Auto)
+}
+
+fn warn_duplicate_sections(config: &BackendConfig, warnings: &mut Vec<String>) {
+    let mut counts = HashMap::<&str, usize>::new();
+    for section in &config.sections {
+        *counts.entry(section.name.as_str()).or_insert(0) += 1;
+    }
+
+    for (section, count) in counts {
+        if count > 1 {
+            warnings.push(format!(
+                "backend section '{section}' appears {count} times; merge duplicate sections to avoid ambiguous stage policy"
+            ));
+        }
+    }
+}
+
+fn warn_duplicate_steps(config: &BackendConfig, warnings: &mut Vec<String>) {
+    for section in &config.sections {
+        let mut seen = HashSet::<&str>::new();
+        for entry in &section.entries {
+            if !seen.insert(entry.step.as_str()) {
+                warnings.push(format!(
+                    "backend stage '{}.{}' is configured more than once",
+                    section.name, entry.step
+                ));
+            }
+        }
+    }
+}
+
+fn warn_unknown_builtin_policy_entries(config: &BackendConfig, warnings: &mut Vec<String>) {
+    for section in &config.sections {
+        let Some(known_steps) = known_backend_steps(&section.name) else {
+            warnings.push(format!(
+                "backend section '{}' is not a known built-in section; custom sections are allowed but are not consumed by current solver preflight",
+                section.name
+            ));
+            continue;
+        };
+
+        for entry in &section.entries {
+            if !known_steps.contains(&entry.step.as_str()) {
+                warnings.push(format!(
+                    "backend stage '{}.{}' is not a known built-in stage",
+                    section.name, entry.step
+                ));
+            }
+        }
+    }
+}
+
+fn warn_inconsistent_resource_policy(config: &BackendConfig, warnings: &mut Vec<String>) {
+    let numeric_devices = config
+        .gpu
+        .devices
+        .iter()
+        .filter(|device| device.as_str() != "auto")
+        .count();
+    if numeric_devices > 1 && config.gpu.multi_gpu == "off" {
+        warnings.push(format!(
+            "gpu.devices selects {numeric_devices} devices but gpu.multiGpu is off"
+        ));
+    }
+    if config.gpu.multi_gpu == "on" && config.gpu.devices.iter().any(|device| device == "auto") {
+        warnings.push(
+            "gpu.multiGpu is on but gpu.devices contains auto; list explicit device ids for reproducible multi-GPU runs"
+                .to_string(),
+        );
+    }
+
+    if let (Some(cpus), Some(cores_per_cpu), Some(threads)) = (
+        parse_explicit_usize(&config.cpu.cpus),
+        parse_explicit_usize(&config.cpu.cores_per_cpu),
+        parse_explicit_usize(&config.cpu.threads),
+    ) {
+        let declared_cores = cpus.saturating_mul(cores_per_cpu);
+        if declared_cores > 0 && threads > declared_cores {
+            warnings.push(format!(
+                "cpu.threads={threads} exceeds declared physical core budget cpus*coresPerCpu={declared_cores}"
+            ));
+        }
+    }
+}
+
+fn known_backend_steps(section: &str) -> Option<HashSet<&'static str>> {
+    let steps = match section {
+        "mesh" => ["import", "checks"].as_slice(),
+        "flow" => [
+            "nonlinearSolve",
+            "residual",
+            "jacobian",
+            "linearSolve",
+            "pressureCorrection",
+        ]
+        .as_slice(),
+        "chemistry" => ["nonlinearSolve", "residual", "jacobian", "odeSolve"].as_slice(),
+        "heat" => ["nonlinearSolve", "residual", "jacobian", "linearSolve"].as_slice(),
+        "species" => ["nonlinearSolve", "residual", "jacobian", "linearSolve"].as_slice(),
+        _ => return None,
+    };
+
+    Some(steps.iter().copied().collect())
+}
+
+fn parse_explicit_usize(value: &str) -> Option<usize> {
+    if value == "auto" {
+        return None;
+    }
+    value.parse::<usize>().ok()
 }
 
 fn choice_can_use_gpu(choice: BackendChoice) -> bool {
@@ -614,5 +740,76 @@ mod tests {
         let validation = super::validate_backend_resources(&config);
         assert!(validation.mixed_execution);
         assert_eq!(validation.warnings.len(), 3);
+    }
+
+    #[test]
+    fn warns_for_duplicate_and_unknown_backend_stages() {
+        let content = r#"
+        flow
+        {
+            residual gpu;
+            residual cpu;
+            linearSlove gpu;
+        }
+        customModel
+        {
+            thing gpu;
+        }
+        "#;
+
+        let config = parse_backend_config_str(content, Path::new("ferrumBackends")).unwrap();
+        let validation = super::validate_backend_policy(&config);
+
+        assert!(
+            validation
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("flow.residual"))
+        );
+        assert!(
+            validation
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("linearSlove"))
+        );
+        assert!(
+            validation
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("customModel"))
+        );
+    }
+
+    #[test]
+    fn warns_for_inconsistent_resource_policy() {
+        let content = r#"
+        cpu
+        {
+            cpus 2;
+            coresPerCpu 4;
+            threads 16;
+        }
+        gpu
+        {
+            devices (0 1);
+            multiGpu off;
+        }
+        "#;
+
+        let config = parse_backend_config_str(content, Path::new("ferrumBackends")).unwrap();
+        let validation = super::validate_backend_policy(&config);
+
+        assert!(
+            validation
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("gpu.devices selects 2 devices"))
+        );
+        assert!(
+            validation
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("cpu.threads=16"))
+        );
     }
 }

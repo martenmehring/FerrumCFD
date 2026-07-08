@@ -4,7 +4,9 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 use case::{InitCaseOptions, init_case};
-use ferrum_mesh::backends::{read_backend_config, validate_backend_resources};
+use ferrum_mesh::backends::{
+    read_backend_config, validate_backend_policy, validate_backend_resources,
+};
 use ferrum_mesh::check::read_case_summary;
 use ferrum_mesh::fields::{
     FieldBoundaryValidationSummary, FieldFile, InitialFieldSet, read_initial_fields,
@@ -577,6 +579,10 @@ fn print_backend_config(case_dir: &Path) -> Result<(), String> {
     );
     for warning in &validation.warnings {
         println!("backend resource warning: {warning}");
+    }
+    let policy_validation = validate_backend_policy(&config);
+    for warning in &policy_validation.warnings {
+        println!("backend policy warning: {warning}");
     }
 
     Ok(())

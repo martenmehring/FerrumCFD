@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use crate::Result;
-use crate::backends::{BackendChoice, read_backend_config, validate_backend_resources};
+use crate::backends::{
+    BackendChoice, read_backend_config, validate_backend_policy, validate_backend_resources,
+};
 use crate::control::{ControlDict, read_control_dict, validate_control_dict};
 use crate::fields::{read_initial_fields, validate_initial_field_boundaries};
 use crate::interfaces::{read_interface_config, validate_interface_config};
@@ -553,6 +555,13 @@ fn build_backend_plan(case_dir: &Path, warnings: &mut Vec<String>) -> Result<Sol
             .warnings
             .iter()
             .map(|warning| format!("backend resources: {warning}")),
+    );
+    let policy_validation = validate_backend_policy(&config);
+    warnings.extend(
+        policy_validation
+            .warnings
+            .iter()
+            .map(|warning| format!("backend policy: {warning}")),
     );
 
     let stages = config

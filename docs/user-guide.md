@@ -583,6 +583,12 @@ setting currently accepts `auto`, `wgpu`, `cuda`, and `hip`; `gpu.precision`
 accepts `auto`, `f32`, and `f64`. CPU `cpus`, `coresPerCpu`, and `threads`
 accept `auto` or a positive integer.
 
+The backend preflight also warns about duplicate stage entries, likely
+misspelled built-in stage names, and resource contradictions such as selecting
+multiple GPU devices while `multiGpu off` is configured. Custom backend
+sections are allowed, but the current preflight reports that they are not yet
+consumed by built-in solver code.
+
 ## Current Limitations
 
 - Gmsh import currently supports Gmsh 2.2 ASCII, `quad4` surfaces, and `hex8`

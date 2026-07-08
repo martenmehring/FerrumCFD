@@ -77,6 +77,8 @@ The importer currently targets the membrane reactor test mesh shape:
   positive `deltaT`, valid time controls, and write intervals
 - backend policy can select CPU/GPU/auto per solver stage, including nonlinear
   solver steps, with multi-CPU, core-count, thread, and GPU device metadata
+- backend policy validation warns about duplicate stages, likely misspelled
+  built-in stage names, and inconsistent CPU/GPU resource declarations
 - `ferrumSolver` currently performs a solver preflight and prints a
   solver-neutral case plan; executable solver kernels are not implemented yet
 

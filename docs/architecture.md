@@ -185,6 +185,13 @@ worker-thread budget FerrumCFD may use. For mixed CPU/GPU policies, the case
 should provide both CPU and GPU resource blocks so the solver can report where
 each major stage is intended to run.
 
+Backend policy validation should catch obvious configuration mistakes without
+blocking future physics modules. Known built-in sections such as `mesh`,
+`flow`, `chemistry`, `heat`, and `species` can warn about misspelled stages or
+duplicate entries. Unknown sections remain allowed as forward-compatible custom
+policy, but the preflight should report that current built-in solvers do not
+consume them yet.
+
 ## Solver Preflight Boundary
 
 `ferrumSolver` currently builds a solver-neutral case plan instead of executing
