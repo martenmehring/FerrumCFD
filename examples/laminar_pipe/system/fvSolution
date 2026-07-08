@@ -9,7 +9,7 @@ FoamFile
 
 solvers
 {
-    p { solver PCG; tolerance 1e-10; relTol 0; }
+    p { solver PCG; preconditioner DIC; tolerance 1e-10; relTol 0; }
     U { solver smoothSolver; tolerance 1e-10; relTol 0; }
     T { solver smoothSolver; tolerance 1e-10; relTol 0; }
 }

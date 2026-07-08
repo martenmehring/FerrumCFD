@@ -14,6 +14,8 @@ pub struct LinearSolverCapabilities {
     pub cpu_csr: bool,
     pub cpu_jacobi: bool,
     pub cpu_conjugate_gradient: bool,
+    pub cpu_preconditioned_conjugate_gradient: bool,
+    pub cpu_diagonal_preconditioner: bool,
     pub gpu_linear_solvers: bool,
 }
 
@@ -28,6 +30,19 @@ pub struct JacobiOptions {
 pub struct ConjugateGradientOptions {
     pub max_iterations: usize,
     pub tolerance: f64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CgPreconditioner {
+    None,
+    Diagonal,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PreconditionedConjugateGradientOptions {
+    pub max_iterations: usize,
+    pub tolerance: f64,
+    pub preconditioner: CgPreconditioner,
 }
 
 #[derive(Clone, Debug)]
@@ -179,11 +194,23 @@ impl Default for ConjugateGradientOptions {
     }
 }
 
+impl Default for PreconditionedConjugateGradientOptions {
+    fn default() -> Self {
+        Self {
+            max_iterations: 1_000,
+            tolerance: 1.0e-10,
+            preconditioner: CgPreconditioner::Diagonal,
+        }
+    }
+}
+
 pub fn linear_solver_capabilities() -> LinearSolverCapabilities {
     LinearSolverCapabilities {
         cpu_csr: true,
         cpu_jacobi: true,
         cpu_conjugate_gradient: true,
+        cpu_preconditioned_conjugate_gradient: true,
+        cpu_diagonal_preconditioner: true,
         gpu_linear_solvers: false,
     }
 }
@@ -357,6 +384,150 @@ pub fn conjugate_gradient_solve(
     })
 }
 
+pub fn preconditioned_conjugate_gradient_solve(
+    matrix: &CsrMatrix,
+    rhs: &[f64],
+    initial: Option<&[f64]>,
+    options: PreconditionedConjugateGradientOptions,
+) -> Result<IterativeSolveReport> {
+    validate_iterative_solve_input(matrix, rhs, initial, options.tolerance)?;
+
+    let preconditioner = BuiltPreconditioner::build(matrix, options.preconditioner)?;
+    let mut x = initial
+        .map(|values| values.to_vec())
+        .unwrap_or_else(|| vec![0.0; rhs.len()]);
+    let mut r = residual(matrix, &x, rhs)?;
+    let mut residual_norm = l2_norm(&r);
+    if residual_norm <= options.tolerance {
+        return Ok(IterativeSolveReport {
+            solution: x,
+            iterations: 0,
+            residual_norm,
+            converged: true,
+        });
+    }
+
+    let mut z = preconditioner.apply(&r);
+    let mut rz = dot(&r, &z);
+    if !rz.is_finite() {
+        return Err(invalid_input(
+            "preconditioned conjugate-gradient residual product is not finite".to_string(),
+        ));
+    }
+    if rz.abs() <= f64::EPSILON {
+        return Ok(IterativeSolveReport {
+            solution: x,
+            iterations: 0,
+            residual_norm,
+            converged: false,
+        });
+    }
+
+    let mut p = z.clone();
+    for iteration in 1..=options.max_iterations {
+        let ap = matrix.matvec(&p)?;
+        let denominator = dot(&p, &ap);
+        if !denominator.is_finite() {
+            return Err(invalid_input(
+                "preconditioned conjugate-gradient denominator is not finite; matrix is likely not SPD"
+                    .to_string(),
+            ));
+        }
+        let denominator_scale = l2_norm(&p) * l2_norm(&ap);
+        if denominator_scale <= f64::EPSILON
+            || denominator.abs() <= f64::EPSILON * denominator_scale
+        {
+            return Ok(IterativeSolveReport {
+                solution: x,
+                iterations: iteration.saturating_sub(1),
+                residual_norm,
+                converged: false,
+            });
+        }
+
+        let alpha = rz / denominator;
+        for row in 0..x.len() {
+            x[row] += alpha * p[row];
+            r[row] -= alpha * ap[row];
+        }
+
+        residual_norm = l2_norm(&r);
+        if residual_norm <= options.tolerance {
+            return Ok(IterativeSolveReport {
+                solution: x,
+                iterations: iteration,
+                residual_norm,
+                converged: true,
+            });
+        }
+
+        z = preconditioner.apply(&r);
+        let next_rz = dot(&r, &z);
+        if !next_rz.is_finite() {
+            return Err(invalid_input(
+                "preconditioned conjugate-gradient residual product is not finite".to_string(),
+            ));
+        }
+        if rz.abs() <= f64::EPSILON {
+            return Ok(IterativeSolveReport {
+                solution: x,
+                iterations: iteration,
+                residual_norm,
+                converged: false,
+            });
+        }
+        let beta = next_rz / rz;
+        for row in 0..p.len() {
+            p[row] = z[row] + beta * p[row];
+        }
+        rz = next_rz;
+    }
+
+    Ok(IterativeSolveReport {
+        solution: x,
+        iterations: options.max_iterations,
+        residual_norm,
+        converged: false,
+    })
+}
+
+enum BuiltPreconditioner {
+    None,
+    Diagonal(Vec<f64>),
+}
+
+impl BuiltPreconditioner {
+    fn build(matrix: &CsrMatrix, kind: CgPreconditioner) -> Result<Self> {
+        match kind {
+            CgPreconditioner::None => Ok(Self::None),
+            CgPreconditioner::Diagonal => {
+                let diagonal = matrix.diagonal()?;
+                let mut inverse = Vec::with_capacity(diagonal.len());
+                for (row, value) in diagonal.iter().copied().enumerate() {
+                    if !value.is_finite() || value.abs() <= f64::EPSILON {
+                        return Err(invalid_input(format!(
+                            "row {row} has invalid diagonal preconditioner value {value}"
+                        )));
+                    }
+                    inverse.push(1.0 / value);
+                }
+                Ok(Self::Diagonal(inverse))
+            }
+        }
+    }
+
+    fn apply(&self, residual: &[f64]) -> Vec<f64> {
+        match self {
+            Self::None => residual.to_vec(),
+            Self::Diagonal(inverse) => residual
+                .iter()
+                .zip(inverse)
+                .map(|(value, inverse)| value * inverse)
+                .collect(),
+        }
+    }
+}
+
 fn validate_csr(
     rows: usize,
     cols: usize,
@@ -459,8 +630,9 @@ fn invalid_input(message: String) -> MeshError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConjugateGradientOptions, CsrMatrix, JacobiOptions, conjugate_gradient_solve, jacobi_solve,
-        residual,
+        CgPreconditioner, ConjugateGradientOptions, CsrMatrix, JacobiOptions,
+        PreconditionedConjugateGradientOptions, conjugate_gradient_solve, jacobi_solve,
+        preconditioned_conjugate_gradient_solve, residual,
     };
 
     #[test]
@@ -526,6 +698,27 @@ mod tests {
         assert!(report.converged);
         assert!(report.iterations <= 2);
         assert_close(&report.solution, &[1.0, 1.0, 1.0], 1.0e-12);
+        assert!(report.residual_norm <= 1.0e-12);
+    }
+
+    #[test]
+    fn preconditioned_conjugate_gradient_solves_diagonal_system() {
+        let matrix = CsrMatrix::from_rows(vec![vec![(0, 4.0)], vec![(1, 2.0)]], 2).expect("matrix");
+        let report = preconditioned_conjugate_gradient_solve(
+            &matrix,
+            &[8.0, 6.0],
+            None,
+            PreconditionedConjugateGradientOptions {
+                max_iterations: 4,
+                tolerance: 1.0e-12,
+                preconditioner: CgPreconditioner::Diagonal,
+            },
+        )
+        .expect("pcg solve");
+
+        assert!(report.converged);
+        assert_eq!(report.iterations, 1);
+        assert_close(&report.solution, &[2.0, 3.0], 1.0e-14);
         assert!(report.residual_norm <= 1.0e-12);
     }
 

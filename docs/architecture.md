@@ -368,8 +368,11 @@ experiments can run CG for momentum and Jacobi for pressure correction without
 changing the case files. OpenFOAM-style `fvSolution` entries are the default
 source for pressure and velocity under-relaxation and for per-equation linear
 tolerances: `relaxationFactors.equations.U`, `relaxationFactors.fields.p`,
-`solvers.U.tolerance`, `solvers.p.tolerance`, and optional `maxIter` values.
-CLI flags remain explicit experiment overrides.
+`solvers.U.tolerance`, `solvers.p.tolerance`, `solvers.p.solver PCG`,
+`solvers.p.preconditioner DIC`, and optional `maxIter` values. `PCG` dispatches
+to Ferrum's CPU preconditioned-CG path. OpenFOAM `DIC`/`FDIC` currently maps to
+a diagonal PCG preconditioner, while true incomplete-Cholesky is tracked as a
+later numerical upgrade. CLI flags remain explicit experiment overrides.
 The pressure-correction bridge now follows the OpenFOAM shape more closely:
 it builds cell-wise `rAU = V/A(U)`, assembles a variable-coefficient pressure
 correction equation, and corrects `phi` with the pressure-equation flux instead

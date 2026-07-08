@@ -21,8 +21,8 @@ use ferrum_mesh::fields::{
 };
 use ferrum_mesh::flow::{
     ContinuitySummary, FlowBoundarySummary, FlowOperatorSummary, LaminarSimpleIterationSummary,
-    LaminarSimpleLinearSolver, LaminarSimpleOptions, LaminarSimpleReport,
-    LaminarSimpleSolutionSummary, solve_laminar_simple,
+    LaminarSimpleLinearSolver, LaminarSimpleOptions, LaminarSimplePreconditioner,
+    LaminarSimpleReport, LaminarSimpleSolutionSummary, solve_laminar_simple,
 };
 use ferrum_mesh::foam::{FoamWriteOptions, write_openfoam_case_with_options};
 use ferrum_mesh::geometry::{GeometrySummary, summarize_case_geometry};
@@ -502,10 +502,12 @@ fn run_laminar_simple_solve(
     let wall_clock_seconds = started.elapsed().as_secs_f64();
 
     println!(
-        "laminarSimple solve: backend=cpu linearSolver={} momentumLinearSolver={} pressureLinearSolver={} cells={} faces={} simpleIterations={} converged={} initialContinuityL2={} finalContinuityL2={} momentumResidualNorm={} pressureCorrectionResidualNorm={} momentumLinearIterations={} pressureLinearIterations={} wallClockSeconds={:.6}",
+        "laminarSimple solve: backend=cpu linearSolver={} momentumLinearSolver={} momentumPreconditioner={} pressureLinearSolver={} pressurePreconditioner={} cells={} faces={} simpleIterations={} converged={} initialContinuityL2={} finalContinuityL2={} momentumResidualNorm={} pressureCorrectionResidualNorm={} momentumLinearIterations={} pressureLinearIterations={} wallClockSeconds={:.6}",
         options.linear_solver,
         options.momentum_linear_solver,
+        options.momentum_preconditioner,
         options.pressure_linear_solver,
+        options.pressure_preconditioner,
         report.cells,
         report.faces,
         report.simple_iterations,
@@ -639,6 +641,39 @@ fn resolve_laminar_simple_options(
         .or(solve.max_linear_iterations)
         .or_else(|| fv_solution_usize(plan, "solvers.p", "maxIter"))
         .unwrap_or(10_000);
+    let linear_solver = solve
+        .linear_solver
+        .unwrap_or(LaminarSimpleLinearSolver::Jacobi);
+    let momentum_linear_solver = solve
+        .momentum_linear_solver
+        .or(solve.linear_solver)
+        .or_else(|| fv_solution_laminar_solver(plan, "solvers.U", "solver"))
+        .unwrap_or(LaminarSimpleLinearSolver::Jacobi);
+    let pressure_linear_solver = solve
+        .pressure_linear_solver
+        .or(solve.linear_solver)
+        .or_else(|| fv_solution_laminar_solver(plan, "solvers.p", "solver"))
+        .unwrap_or(LaminarSimpleLinearSolver::Jacobi);
+    let momentum_preconditioner = solve
+        .momentum_preconditioner
+        .or_else(|| {
+            if momentum_linear_solver == LaminarSimpleLinearSolver::Pcg {
+                fv_solution_laminar_preconditioner(plan, "solvers.U", "preconditioner")
+            } else {
+                None
+            }
+        })
+        .unwrap_or(LaminarSimplePreconditioner::None);
+    let pressure_preconditioner = solve
+        .pressure_preconditioner
+        .or_else(|| {
+            if pressure_linear_solver == LaminarSimpleLinearSolver::Pcg {
+                fv_solution_laminar_preconditioner(plan, "solvers.p", "preconditioner")
+            } else {
+                None
+            }
+        })
+        .unwrap_or(LaminarSimplePreconditioner::None);
 
     Ok(LaminarSimpleOptions {
         density,
@@ -648,9 +683,11 @@ fn resolve_laminar_simple_options(
         diameter,
         inlet_patch: solve.inlet_patch.clone(),
         outlet_patch: solve.outlet_patch.clone(),
-        linear_solver: solve.linear_solver,
-        momentum_linear_solver: solve.momentum_linear_solver.unwrap_or(solve.linear_solver),
-        pressure_linear_solver: solve.pressure_linear_solver.unwrap_or(solve.linear_solver),
+        linear_solver,
+        momentum_linear_solver,
+        pressure_linear_solver,
+        momentum_preconditioner,
+        pressure_preconditioner,
         linear_tolerance,
         max_linear_iterations,
         momentum_linear_tolerance,
@@ -691,8 +728,38 @@ fn fv_solution_number(plan: &SolverCasePlan, section: &str, key: &str) -> Option
     numerics_dictionary_number(&plan.numerics.fv_solution, section, key)
 }
 
+fn fv_solution_laminar_solver(
+    plan: &SolverCasePlan,
+    section: &str,
+    key: &str,
+) -> Option<LaminarSimpleLinearSolver> {
+    numerics_dictionary_value(&plan.numerics.fv_solution, section, key)
+        .and_then(parse_openfoam_laminar_solver)
+}
+
+fn fv_solution_laminar_preconditioner(
+    plan: &SolverCasePlan,
+    section: &str,
+    key: &str,
+) -> Option<LaminarSimplePreconditioner> {
+    numerics_dictionary_value(&plan.numerics.fv_solution, section, key)
+        .and_then(parse_openfoam_laminar_preconditioner)
+}
+
 fn fv_solution_usize(plan: &SolverCasePlan, section: &str, key: &str) -> Option<usize> {
     numerics_dictionary_usize(&plan.numerics.fv_solution, section, key)
+}
+
+fn numerics_dictionary_value<'a>(
+    dictionary: &'a SolverNumericsDictionaryPlan,
+    section: &str,
+    key: &str,
+) -> Option<&'a str> {
+    dictionary
+        .entries
+        .iter()
+        .find(|entry| entry.section == section && entry.key == key)
+        .map(|entry| entry.value.as_str())
 }
 
 fn numerics_dictionary_number(
@@ -735,6 +802,25 @@ fn last_usize(value: &str) -> Option<usize> {
             .parse::<usize>()
             .ok()
     })
+}
+
+fn parse_openfoam_laminar_solver(value: &str) -> Option<LaminarSimpleLinearSolver> {
+    match value.trim() {
+        "PCG" | "pcg" => Some(LaminarSimpleLinearSolver::Pcg),
+        "CG" | "cg" => Some(LaminarSimpleLinearSolver::Cg),
+        "smoothSolver" | "smoothSolver;" | "Jacobi" | "jacobi" => {
+            Some(LaminarSimpleLinearSolver::Jacobi)
+        }
+        _ => None,
+    }
+}
+
+fn parse_openfoam_laminar_preconditioner(value: &str) -> Option<LaminarSimplePreconditioner> {
+    match value.trim() {
+        "none" | "None" => Some(LaminarSimplePreconditioner::None),
+        "DIC" | "FDIC" | "diagonal" | "Diagonal" => Some(LaminarSimplePreconditioner::Diagonal),
+        _ => None,
+    }
 }
 
 fn run_scalar_diffusion_solve(
@@ -969,10 +1055,12 @@ fn print_solver_case_plan(plan: &SolverCasePlan) {
 fn print_linear_solver_capabilities() {
     let capabilities = linear_solver_capabilities();
     println!(
-        "linear solvers: cpuCsr={} cpuJacobi={} cpuCg={} gpuLinearSolvers={}",
+        "linear solvers: cpuCsr={} cpuJacobi={} cpuCg={} cpuPcg={} cpuDiagonalPreconditioner={} gpuLinearSolvers={}",
         yes_no(capabilities.cpu_csr),
         yes_no(capabilities.cpu_jacobi),
         yes_no(capabilities.cpu_conjugate_gradient),
+        yes_no(capabilities.cpu_preconditioned_conjugate_gradient),
+        yes_no(capabilities.cpu_diagonal_preconditioner),
         yes_no(capabilities.gpu_linear_solvers)
     );
 }
@@ -1520,8 +1608,22 @@ fn write_json_laminar_simple_options(
     write_json_string_field(
         writer,
         4,
+        "momentumPreconditioner",
+        &options.momentum_preconditioner.to_string(),
+    )?;
+    writeln!(writer, ",")?;
+    write_json_string_field(
+        writer,
+        4,
         "pressureLinearSolver",
         &options.pressure_linear_solver.to_string(),
+    )?;
+    writeln!(writer, ",")?;
+    write_json_string_field(
+        writer,
+        4,
+        "pressurePreconditioner",
+        &options.pressure_preconditioner.to_string(),
     )?;
     writeln!(writer, ",")?;
     write_json_key(writer, 4, "density")?;
@@ -1838,6 +1940,11 @@ fn write_laminar_simple_report_markdown(
     )?;
     writeln!(
         writer,
+        "| Momentum preconditioner | {} |",
+        options.momentum_preconditioner
+    )?;
+    writeln!(
+        writer,
         "| Momentum linear tolerance | {} |",
         format_scientific(options.momentum_linear_tolerance)
     )?;
@@ -1850,6 +1957,11 @@ fn write_laminar_simple_report_markdown(
         writer,
         "| Pressure linear solver | {} |",
         options.pressure_linear_solver
+    )?;
+    writeln!(
+        writer,
+        "| Pressure preconditioner | {} |",
+        options.pressure_preconditioner
     )?;
     writeln!(
         writer,
@@ -3091,9 +3203,11 @@ struct LaminarSimpleSolveArgs {
     diameter: Option<f64>,
     inlet_patch: String,
     outlet_patch: String,
-    linear_solver: LaminarSimpleLinearSolver,
+    linear_solver: Option<LaminarSimpleLinearSolver>,
     momentum_linear_solver: Option<LaminarSimpleLinearSolver>,
     pressure_linear_solver: Option<LaminarSimpleLinearSolver>,
+    momentum_preconditioner: Option<LaminarSimplePreconditioner>,
+    pressure_preconditioner: Option<LaminarSimplePreconditioner>,
     linear_tolerance: Option<f64>,
     max_linear_iterations: Option<usize>,
     momentum_linear_tolerance: Option<f64>,
@@ -3149,9 +3263,11 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
     let mut outlet_patch = "outlet".to_string();
     let mut wall_patches = Vec::new();
     let mut linear_solve_option_seen = false;
-    let mut linear_solver_name_seen = false;
+    let mut laminar_linear_solver = None;
     let mut momentum_linear_solver = None;
     let mut pressure_linear_solver = None;
+    let mut momentum_preconditioner = None;
+    let mut pressure_preconditioner = None;
     let mut scalar_diffusion_diffusivity = 1.0;
     let mut scalar_diffusion_source = 0.0;
     let mut scalar_diffusion_linear_solver = ScalarDiffusionLinearSolver::Cg;
@@ -3320,11 +3436,11 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
                 index += 2;
             }
             "-linearSolver" | "--linearSolver" | "-linear-solver" | "--linear-solver" => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| "--linearSolver requires 'cg' or 'jacobi'".to_string())?;
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--linearSolver requires 'cg', 'pcg', or 'jacobi'".to_string()
+                })?;
                 scalar_diffusion_linear_solver = parse_scalar_diffusion_linear_solver(value)?;
-                linear_solver_name_seen = true;
+                laminar_linear_solver = Some(parse_laminar_simple_linear_solver(value)?);
                 linear_solve_option_seen = true;
                 index += 2;
             }
@@ -3333,11 +3449,9 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
             | "-momentum-linear-solver"
             | "--momentum-linear-solver" => {
                 let value = args.get(index + 1).ok_or_else(|| {
-                    "--momentumLinearSolver requires 'cg' or 'jacobi'".to_string()
+                    "--momentumLinearSolver requires 'cg', 'pcg', or 'jacobi'".to_string()
                 })?;
-                momentum_linear_solver = Some(map_laminar_simple_linear_solver(
-                    parse_scalar_diffusion_linear_solver(value)?,
-                ));
+                momentum_linear_solver = Some(parse_laminar_simple_linear_solver(value)?);
                 laminar_simple_option_seen = true;
                 index += 2;
             }
@@ -3346,11 +3460,31 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
             | "-pressure-linear-solver"
             | "--pressure-linear-solver" => {
                 let value = args.get(index + 1).ok_or_else(|| {
-                    "--pressureLinearSolver requires 'cg' or 'jacobi'".to_string()
+                    "--pressureLinearSolver requires 'cg', 'pcg', or 'jacobi'".to_string()
                 })?;
-                pressure_linear_solver = Some(map_laminar_simple_linear_solver(
-                    parse_scalar_diffusion_linear_solver(value)?,
-                ));
+                pressure_linear_solver = Some(parse_laminar_simple_linear_solver(value)?);
+                laminar_simple_option_seen = true;
+                index += 2;
+            }
+            "-momentumPreconditioner"
+            | "--momentumPreconditioner"
+            | "-momentum-preconditioner"
+            | "--momentum-preconditioner" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--momentumPreconditioner requires 'none', 'diagonal', or 'DIC'".to_string()
+                })?;
+                momentum_preconditioner = Some(parse_laminar_simple_preconditioner(value)?);
+                laminar_simple_option_seen = true;
+                index += 2;
+            }
+            "-pressurePreconditioner"
+            | "--pressurePreconditioner"
+            | "-pressure-preconditioner"
+            | "--pressure-preconditioner" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--pressurePreconditioner requires 'none', 'diagonal', or 'DIC'".to_string()
+                })?;
+                pressure_preconditioner = Some(parse_laminar_simple_preconditioner(value)?);
                 laminar_simple_option_seen = true;
                 index += 2;
             }
@@ -3520,11 +3654,6 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
         None
     };
     let laminar_simple_solve = if laminar_simple_solve {
-        let laminar_simple_linear_solver = if linear_solver_name_seen {
-            map_laminar_simple_linear_solver(scalar_diffusion_linear_solver)
-        } else {
-            LaminarSimpleLinearSolver::Jacobi
-        };
         Some(LaminarSimpleSolveArgs {
             density,
             dynamic_viscosity,
@@ -3533,9 +3662,11 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
             diameter,
             inlet_patch,
             outlet_patch,
-            linear_solver: laminar_simple_linear_solver,
+            linear_solver: laminar_linear_solver,
             momentum_linear_solver,
             pressure_linear_solver,
+            momentum_preconditioner,
+            pressure_preconditioner,
             linear_tolerance: laminar_linear_tolerance,
             max_linear_iterations: laminar_max_linear_iterations,
             momentum_linear_tolerance,
@@ -3588,15 +3719,6 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
     })
 }
 
-fn map_laminar_simple_linear_solver(
-    solver: ScalarDiffusionLinearSolver,
-) -> LaminarSimpleLinearSolver {
-    match solver {
-        ScalarDiffusionLinearSolver::Cg => LaminarSimpleLinearSolver::Cg,
-        ScalarDiffusionLinearSolver::Jacobi => LaminarSimpleLinearSolver::Jacobi,
-    }
-}
-
 fn parse_scalar_diffusion_linear_solver(
     value: &str,
 ) -> Result<ScalarDiffusionLinearSolver, String> {
@@ -3607,6 +3729,20 @@ fn parse_scalar_diffusion_linear_solver(
             "invalid --linearSolver value '{other}'; expected 'cg' or 'jacobi'"
         )),
     }
+}
+
+fn parse_laminar_simple_linear_solver(value: &str) -> Result<LaminarSimpleLinearSolver, String> {
+    parse_openfoam_laminar_solver(value).ok_or_else(|| {
+        format!("invalid laminar SIMPLE linear solver '{value}'; expected 'cg', 'pcg', or 'jacobi'")
+    })
+}
+
+fn parse_laminar_simple_preconditioner(value: &str) -> Result<LaminarSimplePreconditioner, String> {
+    parse_openfoam_laminar_preconditioner(value).ok_or_else(|| {
+        format!(
+            "invalid laminar SIMPLE preconditioner '{value}'; expected 'none', 'diagonal', or 'DIC'"
+        )
+    })
 }
 
 fn parse_positive_usize_arg(label: &str, value: &str) -> Result<usize, String> {
@@ -3878,11 +4014,19 @@ fn print_solver_usage() {
         "  --source <v>         uniform volume source for --solveScalarDiffusion (default: 0)"
     );
     println!(
-        "  --linearSolver <s>   cg or jacobi for executable solves (default: cg; laminar SIMPLE default: jacobi)"
+        "  --linearSolver <s>   cg, pcg, or jacobi for executable solves (default: cg; laminar SIMPLE default: fvSolution or jacobi)"
     );
-    println!("  --momentumLinearSolver <s> override laminar SIMPLE momentum solver (cg or jacobi)");
     println!(
-        "  --pressureLinearSolver <s> override laminar SIMPLE pressure-correction solver (cg or jacobi)"
+        "  --momentumLinearSolver <s> override laminar SIMPLE momentum solver (cg, pcg, or jacobi)"
+    );
+    println!(
+        "  --pressureLinearSolver <s> override laminar SIMPLE pressure-correction solver (cg, pcg, or jacobi)"
+    );
+    println!(
+        "  --momentumPreconditioner <s> override laminar SIMPLE U preconditioner (none, diagonal, DIC)"
+    );
+    println!(
+        "  --pressurePreconditioner <s> override laminar SIMPLE p preconditioner (none, diagonal, DIC)"
     );
     println!(
         "  --momentumSolveTolerance <v> override laminar SIMPLE U solve tolerance (default: --solveTolerance, fvSolution solvers.U.tolerance, or 1e-10)"
@@ -3947,9 +4091,11 @@ fn normalize_case_path(path: &Path) -> PathBuf {
 mod tests {
     use super::{
         ScalarDiffusionLinearSolver, SolverNumericsDictionaryPlan, numerics_dictionary_number,
-        numerics_dictionary_usize, parse_solver_args, write_json_solver_state, write_json_string,
+        numerics_dictionary_usize, numerics_dictionary_value,
+        parse_openfoam_laminar_preconditioner, parse_openfoam_laminar_solver, parse_solver_args,
+        write_json_solver_state, write_json_string,
     };
-    use ferrum_mesh::flow::LaminarSimpleLinearSolver;
+    use ferrum_mesh::flow::{LaminarSimpleLinearSolver, LaminarSimplePreconditioner};
     use ferrum_mesh::solver_state::{
         SolverStateCpuBufferPlan, SolverStateCpuBufferStatus, SolverStateFieldKind,
         SolverStateFieldPlan, SolverStateInternalFieldPlan, SolverStatePlan,
@@ -4099,9 +4245,11 @@ mod tests {
         assert_eq!(solve.pressure_drop, Some(1.6032));
         assert_eq!(solve.length, Some(1.0));
         assert_eq!(solve.diameter, Some(0.02));
-        assert_eq!(solve.linear_solver, LaminarSimpleLinearSolver::Jacobi);
+        assert_eq!(solve.linear_solver, None);
         assert_eq!(solve.momentum_linear_solver, None);
         assert_eq!(solve.pressure_linear_solver, None);
+        assert_eq!(solve.momentum_preconditioner, None);
+        assert_eq!(solve.pressure_preconditioner, None);
         assert_eq!(solve.linear_tolerance, None);
         assert_eq!(solve.max_linear_iterations, None);
         assert_eq!(solve.momentum_linear_tolerance, None);
@@ -4124,11 +4272,13 @@ mod tests {
         let args = vec![
             "--solveLaminarSimple".to_string(),
             "--linearSolver".to_string(),
-            "jacobi".to_string(),
+            "pcg".to_string(),
             "--momentumLinearSolver".to_string(),
             "cg".to_string(),
             "--pressureLinearSolver".to_string(),
-            "jacobi".to_string(),
+            "pcg".to_string(),
+            "--pressurePreconditioner".to_string(),
+            "DIC".to_string(),
         ];
 
         let parsed = parse_solver_args(&args).expect("solver args should parse");
@@ -4136,14 +4286,18 @@ mod tests {
             .laminar_simple_solve
             .expect("laminar SIMPLE solve args");
 
-        assert_eq!(solve.linear_solver, LaminarSimpleLinearSolver::Jacobi);
+        assert_eq!(solve.linear_solver, Some(LaminarSimpleLinearSolver::Pcg));
         assert_eq!(
             solve.momentum_linear_solver,
             Some(LaminarSimpleLinearSolver::Cg)
         );
         assert_eq!(
             solve.pressure_linear_solver,
-            Some(LaminarSimpleLinearSolver::Jacobi)
+            Some(LaminarSimpleLinearSolver::Pcg)
+        );
+        assert_eq!(
+            solve.pressure_preconditioner,
+            Some(LaminarSimplePreconditioner::Diagonal)
         );
     }
 
@@ -4209,6 +4363,16 @@ mod tests {
                 },
                 ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
                     section: "solvers.p".to_string(),
+                    key: "solver".to_string(),
+                    value: "PCG".to_string(),
+                },
+                ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
+                    section: "solvers.p".to_string(),
+                    key: "preconditioner".to_string(),
+                    value: "DIC".to_string(),
+                },
+                ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
+                    section: "solvers.p".to_string(),
                     key: "maxIter".to_string(),
                     value: "250".to_string(),
                 },
@@ -4230,6 +4394,16 @@ mod tests {
         assert_eq!(
             numerics_dictionary_usize(&dictionary, "solvers.p", "maxIter"),
             Some(250)
+        );
+        assert_eq!(
+            numerics_dictionary_value(&dictionary, "solvers.p", "solver")
+                .and_then(parse_openfoam_laminar_solver),
+            Some(LaminarSimpleLinearSolver::Pcg)
+        );
+        assert_eq!(
+            numerics_dictionary_value(&dictionary, "solvers.p", "preconditioner")
+                .and_then(parse_openfoam_laminar_preconditioner),
+            Some(LaminarSimplePreconditioner::Diagonal)
         );
     }
 

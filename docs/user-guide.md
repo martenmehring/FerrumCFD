@@ -663,9 +663,12 @@ By default, `--solveLaminarSimple` reads OpenFOAM-style relaxation factors from
 `system/fvSolution`: `relaxationFactors.equations.U` for velocity and
 `relaxationFactors.fields.p` for pressure. The CLI flags above are explicit
 overrides for experiments. It also reads `solvers.U.tolerance`,
-`solvers.p.tolerance`, and optional `maxIter` values from `system/fvSolution`.
-The generic `--solveTolerance` and `--maxIterations` flags remain broad
-overrides for both equations.
+`solvers.p.tolerance`, `solvers.p.solver PCG`, `solvers.p.preconditioner DIC`,
+and optional `maxIter` values from `system/fvSolution`. The current CPU
+preconditioner maps OpenFOAM `DIC`/`FDIC` to Ferrum's diagonal PCG
+preconditioner; a full incomplete-Cholesky factorization is still future
+solver work. The generic `--solveTolerance` and `--maxIterations` flags remain
+broad overrides for both equations.
 
 The current default for this path is one damped Jacobi CPU SIMPLE step. The
 report records residuals, SIMPLE iterations, wall-clock time, finite-volume
@@ -676,7 +679,7 @@ structure more closely than a plain recompute from corrected cell velocity.
 Multi-step SIMPLE runs now have a continuity-growth guard: when a step grows
 the continuity norm too aggressively, Ferrum rolls back to the previous finite
 state and stops the trial. This prevents runaway reports, but multiple
-correction steps and robust PCG-grade pressure correction are still
+correction steps and fully OpenFOAM-grade pressure preconditioning are still
 solver-development work.
 
 For the standard pipe benchmark, the automated comparison command is:

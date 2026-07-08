@@ -2,8 +2,9 @@ use std::collections::BTreeMap;
 
 use crate::fields::{FieldFile, FieldValueSummary, InitialFieldSet};
 use crate::linear::{
-    ConjugateGradientOptions, CsrMatrix, JacobiOptions, conjugate_gradient_solve, jacobi_solve,
-    l2_norm,
+    CgPreconditioner, ConjugateGradientOptions, CsrMatrix, JacobiOptions,
+    PreconditionedConjugateGradientOptions, conjugate_gradient_solve, jacobi_solve, l2_norm,
+    preconditioned_conjugate_gradient_solve,
 };
 use crate::runtime::{SolverRuntimeData, SolverRuntimeMeshData};
 use crate::{MeshError, Point3, Result};
@@ -14,6 +15,13 @@ const MAX_LAMINAR_SIMPLE_STEP_CONTINUITY_GROWTH: f64 = 2.0;
 pub enum LaminarSimpleLinearSolver {
     Cg,
     Jacobi,
+    Pcg,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LaminarSimplePreconditioner {
+    None,
+    Diagonal,
 }
 
 #[derive(Clone, Debug)]
@@ -28,6 +36,8 @@ pub struct LaminarSimpleOptions {
     pub linear_solver: LaminarSimpleLinearSolver,
     pub momentum_linear_solver: LaminarSimpleLinearSolver,
     pub pressure_linear_solver: LaminarSimpleLinearSolver,
+    pub momentum_preconditioner: LaminarSimplePreconditioner,
+    pub pressure_preconditioner: LaminarSimplePreconditioner,
     pub linear_tolerance: f64,
     pub max_linear_iterations: usize,
     pub momentum_linear_tolerance: f64,
@@ -138,6 +148,16 @@ impl std::fmt::Display for LaminarSimpleLinearSolver {
         match self {
             Self::Cg => formatter.write_str("cg"),
             Self::Jacobi => formatter.write_str("jacobi"),
+            Self::Pcg => formatter.write_str("pcg"),
+        }
+    }
+}
+
+impl std::fmt::Display for LaminarSimplePreconditioner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => formatter.write_str("none"),
+            Self::Diagonal => formatter.write_str("diagonal"),
         }
     }
 }
@@ -291,6 +311,7 @@ pub fn solve_laminar_simple(
             &pressure_system.rhs,
             None,
             options.pressure_linear_solver,
+            options.pressure_preconditioner,
             options.pressure_linear_tolerance,
             options.pressure_max_linear_iterations,
         ) {
@@ -492,6 +513,7 @@ fn solve_momentum_predictor(
             &system.rhs,
             Some(&old_components[component]),
             options.momentum_linear_solver,
+            options.momentum_preconditioner,
             options.momentum_linear_tolerance,
             options.momentum_max_linear_iterations,
         )
@@ -525,6 +547,7 @@ fn solve_scalar_system(
     rhs: &[f64],
     initial: Option<&[f64]>,
     solver: LaminarSimpleLinearSolver,
+    preconditioner: LaminarSimplePreconditioner,
     tolerance: f64,
     max_iterations: usize,
 ) -> Result<ScalarSolveReport> {
@@ -536,6 +559,16 @@ fn solve_scalar_system(
             ConjugateGradientOptions {
                 max_iterations,
                 tolerance,
+            },
+        )?,
+        LaminarSimpleLinearSolver::Pcg => preconditioned_conjugate_gradient_solve(
+            matrix,
+            rhs,
+            initial,
+            PreconditionedConjugateGradientOptions {
+                max_iterations,
+                tolerance,
+                preconditioner: map_cg_preconditioner(preconditioner),
             },
         )?,
         LaminarSimpleLinearSolver::Jacobi => jacobi_solve(
@@ -554,6 +587,13 @@ fn solve_scalar_system(
         iterations: report.iterations,
         residual_norm: report.residual_norm,
     })
+}
+
+fn map_cg_preconditioner(preconditioner: LaminarSimplePreconditioner) -> CgPreconditioner {
+    match preconditioner {
+        LaminarSimplePreconditioner::None => CgPreconditioner::None,
+        LaminarSimplePreconditioner::Diagonal => CgPreconditioner::Diagonal,
+    }
 }
 
 fn is_pressure_correction_breakdown(error: &MeshError) -> bool {
@@ -1584,6 +1624,16 @@ fn validate_laminar_simple_options(options: &LaminarSimpleOptions) -> Result<()>
     }
     validate_linear_tolerance("momentum", options.momentum_linear_tolerance)?;
     validate_linear_tolerance("pressure", options.pressure_linear_tolerance)?;
+    validate_solver_preconditioner(
+        "momentum",
+        options.momentum_linear_solver,
+        options.momentum_preconditioner,
+    )?;
+    validate_solver_preconditioner(
+        "pressure",
+        options.pressure_linear_solver,
+        options.pressure_preconditioner,
+    )?;
     if !options.simple_tolerance.is_finite() || options.simple_tolerance < 0.0 {
         return Err(invalid_input(format!(
             "laminar SIMPLE tolerance must be non-negative and finite, got {}",
@@ -1596,6 +1646,21 @@ fn validate_laminar_simple_options(options: &LaminarSimpleOptions) -> Result<()>
         return Err(invalid_input(
             "laminar SIMPLE inlet and outlet patch names must not be empty".to_string(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_solver_preconditioner(
+    name: &str,
+    solver: LaminarSimpleLinearSolver,
+    preconditioner: LaminarSimplePreconditioner,
+) -> Result<()> {
+    if preconditioner != LaminarSimplePreconditioner::None
+        && solver != LaminarSimpleLinearSolver::Pcg
+    {
+        return Err(invalid_input(format!(
+            "laminar SIMPLE {name} preconditioner {preconditioner} requires pcg solver, got {solver}"
+        )));
     }
     Ok(())
 }
@@ -1793,10 +1858,10 @@ mod tests {
     use crate::solver_state::SolverStateFieldKind;
 
     use super::{
-        LaminarSimpleLinearSolver, LaminarSimpleOptions, ScalarFaceTreatment,
-        assemble_variable_scalar_component_system, compute_face_flux, net_cell_flux,
-        pressure_correction_flux, reciprocal_momentum_diagonal, solve_laminar_simple,
-        vector_face_treatments,
+        LaminarSimpleLinearSolver, LaminarSimpleOptions, LaminarSimplePreconditioner,
+        ScalarFaceTreatment, assemble_variable_scalar_component_system, compute_face_flux,
+        net_cell_flux, pressure_correction_flux, reciprocal_momentum_diagonal,
+        solve_laminar_simple, vector_face_treatments,
     };
     use crate::Point3;
 
@@ -1884,6 +1949,8 @@ mod tests {
             linear_solver: LaminarSimpleLinearSolver::Cg,
             momentum_linear_solver: LaminarSimpleLinearSolver::Cg,
             pressure_linear_solver: LaminarSimpleLinearSolver::Cg,
+            momentum_preconditioner: LaminarSimplePreconditioner::None,
+            pressure_preconditioner: LaminarSimplePreconditioner::None,
             linear_tolerance: 1.0e-10,
             max_linear_iterations: 100,
             momentum_linear_tolerance: 1.0e-10,

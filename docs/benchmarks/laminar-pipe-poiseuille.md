@@ -66,15 +66,17 @@ ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --maxSimpleIterati
 | CG | Jacobi | CLI 1e-6/100 | CLI 0.1/0.02 | 4 | 1.684419 | 5.066% | 4.547e-7 | 0.719120 | confirms the current CG-momentum path is not yet the accuracy bottleneck alone |
 | Jacobi | Jacobi | CLI 1e-6/100 | fvSolution 0.7/0.3 | 2 | 1.531687 | -4.461% | 5.547e-7 | 1.208509 | broad CLI tolerance/iteration overrides still affect both equations |
 | Jacobi | Jacobi | fvSolution 1e-10/default 10000 | fvSolution 0.7/0.3 | 3 | 1.416486 | -11.646% | 1.797e-5 | 78.180144 | per-equation tolerances are read from `solvers.U/p`; Jacobi pressure correction reaches the guard |
+| Jacobi | PCG + diagonal | fvSolution 1e-10/default 10000 | fvSolution 0.7/0.3 | 1 | 1.810351 | 12.921% | 8.352e-11 | 6.522542 | `solvers.p.solver PCG` and `preconditioner DIC` are read; DIC maps to Ferrum diagonal PCG preconditioner |
 
 The continuity-growth guard prevents the old runaway behavior where long
 multi-step trials produced infinite or astronomically large values. The next
 numerical target is a better pressure-correction operator and a proper
 preconditioned pressure solve, not just lower relaxation factors. Reading the
-OpenFOAM-style tolerances exposes the current bottleneck clearly: strict
-`solvers.p.tolerance 1e-10` with Jacobi is expensive and less stable, so the
-next solver step is mapping `PCG`/preconditioners and pressure-specific
-iteration controls more faithfully.
+OpenFOAM-style `PCG` pressure solver removes the very slow Jacobi pressure
+correction, but the solver can still satisfy continuity while the velocity and
+pressure-drop error remain high. The next numerical target is therefore a
+better SIMPLE convergence check and momentum-pressure coupling, plus a true
+incomplete-Cholesky-style preconditioner.
 
 ## Mesh Study
 
