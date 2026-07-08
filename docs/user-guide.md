@@ -20,6 +20,7 @@ target/debug/initFerrumCase.exe
 target/debug/gmshToFerrumFoam.exe
 target/debug/checkFerrumMesh.exe
 target/debug/splitFerrumMeshRegions.exe
+target/debug/ferrumSolver.exe
 ```
 
 During development, commands can also be run through Cargo:
@@ -368,6 +369,7 @@ ferrum initCase cases\my_case
 ferrum gmshToFoam path\to\mesh.msh -case cases\my_case
 ferrum checkMesh -case cases\my_case
 ferrum splitMeshRegions -case cases\my_case -cellZones
+ferrum solve -case cases\my_case --preflight
 ```
 
 The dedicated aliases remain available because they are closer to OpenFOAM
@@ -378,7 +380,45 @@ initFerrumCase
 gmshToFerrumFoam
 checkFerrumMesh
 splitFerrumMeshRegions
+ferrumSolver
 ```
+
+## Solver Preflight
+
+`ferrumSolver` is the solver front door. At this stage it does not execute CFD
+kernels yet. It reads the case and prints the solver-neutral run plan that
+later CPU/GPU solver code should consume.
+
+```powershell
+ferrumSolver -case cases\my_case --preflight
+```
+
+Equivalent combined command:
+
+```powershell
+ferrum solve -case cases\my_case --preflight
+```
+
+The preflight reads:
+
+- `system/controlDict`
+- `system/ferrumBackends`
+- `constant/polyMesh`
+- generated region meshes below `constant/<region>/polyMesh`
+- `constant/interfaces`
+- initial fields below `0/`
+
+The output reports the detected dimensionality:
+
+- `3d` for normal 3D meshes
+- `2d-empty` when `empty` patches are present
+- `axisymmetric-wedge` when `wedge` patches are present
+- `mixed-special-patches` when both `empty` and `wedge` appear
+
+It also prints the backend plan, including CPU sockets/cores/thread policy,
+GPU backend/devices, and per-stage choices such as `flow.residual=gpu` or
+`chemistry.odeSolve=cpu`. This is metadata only for now, but it is the intended
+boundary between OpenFOAM-like case input and the future Rust/GPU solver stack.
 
 ## Interface Model Setup
 
@@ -536,6 +576,7 @@ accept `auto` or a positive integer.
 - Initial field parsing currently summarizes fields and boundary entries; it
   validates boundary patch names and special patch boundary types, but it does
   not yet validate dimensions against solver equations.
-- Solver support is not implemented yet.
+- `ferrumSolver` is currently a preflight planner; CFD solver kernels are not
+  implemented yet.
 - CPU/GPU backend selection is validated as configuration and not yet
   executable solver behavior.

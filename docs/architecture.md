@@ -39,7 +39,7 @@ initFerrumCase case
 gmshToFerrumFoam mesh.msh -case case
 checkFerrumMesh -case case
 splitFerrumMeshRegions -case case -cellZones
-ferrumSolver -case case
+ferrumSolver -case case --preflight
 ```
 
 The goal is not to copy OpenFOAM internals. The goal is to keep the established
@@ -52,6 +52,7 @@ FerrumCFD now has a shared OpenFOAM-style token/cursor parser used by case
 dictionaries such as:
 
 - `constant/interfaces`
+- `system/controlDict`
 - `system/ferrumBackends`
 - initial field files below `0/`
 
@@ -183,6 +184,27 @@ to make reproducible decisions. `cpus` describes physical CPU packages/sockets,
 worker-thread budget FerrumCFD may use. For mixed CPU/GPU policies, the case
 should provide both CPU and GPU resource blocks so the solver can report where
 each major stage is intended to run.
+
+## Solver Preflight Boundary
+
+`ferrumSolver` currently builds a solver-neutral case plan instead of executing
+CFD kernels. This is intentional. The plan is the boundary between the
+OpenFOAM-like case layout and the future backend-specific solver runtime.
+
+The preflight reads:
+
+- `system/controlDict` for run timing and the selected application name
+- `constant/polyMesh` for topology, patches, and special reduced-dimension
+  patch types
+- generated region meshes below `constant/<region>/polyMesh`
+- initial fields below `0/`
+- `constant/interfaces` for model-facing interface sign conventions
+- `system/ferrumBackends` for CPU/GPU resource and stage policy
+
+The plan classifies the case as `3d`, `2d-empty`, `axisymmetric-wedge`, or
+`mixed-special-patches`. Later solver modules should consume this explicit
+classification rather than rediscovering reduced-dimensional behavior from
+raw patch strings in scattered equation code.
 
 ## Mesh Geometry Direction
 

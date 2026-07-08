@@ -19,6 +19,7 @@ use ferrum_mesh::regions::{
     InterfaceRegistrySummary, InterfaceSummary, build_interface_registry,
     read_region_mesh_summaries, split_regions_by_cell_zones,
 };
+use ferrum_mesh::solver_plan::{SolverBackendPlan, SolverCasePlan, build_solver_case_plan};
 
 pub fn run_ferrum() -> i32 {
     let args = env::args().skip(1).collect::<Vec<_>>();
@@ -48,6 +49,7 @@ pub enum Alias {
     CheckFerrumMesh,
     SplitFerrumMeshRegions,
     InitFerrumCase,
+    FerrumSolver,
 }
 
 enum CommandMode {
@@ -62,6 +64,7 @@ fn run_command(mode: CommandMode, args: Vec<String>) -> Result<(), String> {
         CommandMode::Alias(Alias::CheckFerrumMesh) => check_mesh(args),
         CommandMode::Alias(Alias::SplitFerrumMeshRegions) => split_mesh_regions(args),
         CommandMode::Alias(Alias::InitFerrumCase) => init_case_command(args),
+        CommandMode::Alias(Alias::FerrumSolver) => solve_case(args),
     }
 }
 
@@ -77,6 +80,7 @@ fn run_ferrum_subcommand(mut args: Vec<String>) -> Result<(), String> {
         "checkMesh" | "checkFerrumMesh" => check_mesh(args),
         "splitMeshRegions" | "splitFerrumMeshRegions" => split_mesh_regions(args),
         "initCase" | "initFerrumCase" => init_case_command(args),
+        "solve" | "solver" | "ferrumSolver" => solve_case(args),
         other => Err(format!("unknown ferrum command '{other}'")),
     }
 }
@@ -293,6 +297,130 @@ fn split_mesh_regions(args: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
+fn solve_case(args: Vec<String>) -> Result<(), String> {
+    if args.iter().any(|arg| is_help(arg)) {
+        print_solver_usage();
+        return Ok(());
+    }
+
+    let case_dir = parse_solver_args(&args)?;
+    let plan = build_solver_case_plan(&case_dir).map_err(|error| error.to_string())?;
+    print_solver_case_plan(&plan);
+    Ok(())
+}
+
+fn print_solver_case_plan(plan: &SolverCasePlan) {
+    println!("Ferrum solver preflight");
+    println!("case: {}", plan.case_dir.display());
+    println!(
+        "control: application={} startFrom={} startTime={} stopAt={} endTime={} deltaT={} writeControl={} writeInterval={}",
+        plan.control.application,
+        plan.control.start_from,
+        format_optional_number(plan.control.start_time),
+        plan.control.stop_at,
+        format_optional_number(plan.control.end_time),
+        format_optional_number(plan.control.delta_t),
+        plan.control.write_control,
+        format_optional_number(plan.control.write_interval)
+    );
+    println!(
+        "mesh: dimensionality={} points={} cells={} faces={} internal={} boundary={} patches={}",
+        plan.mesh.dimensionality,
+        plan.mesh.points,
+        plan.mesh.cells,
+        plan.mesh.faces,
+        plan.mesh.internal_faces,
+        plan.mesh.boundary_faces,
+        plan.mesh.patches
+    );
+    println!(
+        "special patches: empty={} wedge={} symmetryPlane={}",
+        plan.mesh.empty_patches, plan.mesh.wedge_patches, plan.mesh.symmetry_patches
+    );
+    if plan.mesh.region_meshes.is_empty() {
+        println!("region meshes: none");
+    } else {
+        println!("region meshes:");
+        for region in &plan.mesh.region_meshes {
+            println!(
+                "  {}: cells={} patches={}",
+                region.name, region.cells, region.patches
+            );
+        }
+    }
+    if plan.fields.fields.is_empty() {
+        println!("fields: none");
+    } else {
+        println!("fields:");
+        for field in &plan.fields.fields {
+            let name = if let Some(region) = &field.region {
+                format!("{region}/{}", field.name)
+            } else {
+                field.name.clone()
+            };
+            println!(
+                "  {}: class={} boundaryPatches={}",
+                name,
+                field.class_name.as_deref().unwrap_or("unknown"),
+                field.boundary_patches
+            );
+        }
+    }
+    println!(
+        "interfaces: registry={} discovered={} boundaryFaceZones={} config={} configured={}",
+        yes_no(plan.interfaces.registry_available),
+        plan.interfaces.discovered_interfaces,
+        plan.interfaces.boundary_face_zones,
+        yes_no(plan.interfaces.config_present),
+        plan.interfaces.configured_interfaces
+    );
+    print_solver_backend_plan(&plan.backends);
+    if plan.warnings.is_empty() {
+        println!("preflight warnings: none");
+    } else {
+        println!("preflight warnings:");
+        for warning in &plan.warnings {
+            println!("  {warning}");
+        }
+    }
+    println!("solver execution: preflight only; solver kernels are not implemented yet");
+}
+
+fn print_solver_backend_plan(plan: &SolverBackendPlan) {
+    println!(
+        "backend plan: config={} default={} usesCpu={} usesGpu={} mixed={}",
+        yes_no(plan.config_present),
+        plan.default,
+        plan.uses_cpu,
+        plan.uses_gpu,
+        plan.mixed_execution
+    );
+    println!(
+        "cpu resources: cpus={} coresPerCpu={} threads={} threadPinning={} numa={}",
+        plan.cpu.cpus,
+        plan.cpu.cores_per_cpu,
+        plan.cpu.threads,
+        plan.cpu.thread_pinning,
+        plan.cpu.numa
+    );
+    println!(
+        "gpu resources: backend={} devices={} multiGpu={} precision={}",
+        plan.gpu.backend,
+        format_devices(&plan.gpu.devices),
+        plan.gpu.multi_gpu,
+        plan.gpu.precision
+    );
+    if plan.stages.is_empty() {
+        println!("backend stages: default only");
+        return;
+    }
+
+    println!("backend stages:");
+    for stage in &plan.stages {
+        println!("  {}.{}={}", stage.section, stage.step, stage.choice);
+    }
+}
+
 fn print_interface_registry(registry: &InterfaceRegistrySummary) {
     if !registry.interfaces.is_empty() {
         println!("interfaces:");
@@ -413,6 +541,16 @@ fn format_devices(devices: &[String]) -> String {
         return devices[0].clone();
     }
     format!("({})", devices.join(" "))
+}
+
+fn format_optional_number(value: Option<f64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "missing".to_string())
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
 }
 
 fn print_initial_fields(fields: &InitialFieldSet) {
@@ -566,6 +704,27 @@ fn parse_case_dir(args: &[String], default: PathBuf) -> Result<PathBuf, String> 
         }
     }
     Ok(default)
+}
+
+fn parse_solver_args(args: &[String]) -> Result<PathBuf, String> {
+    let mut case_dir = PathBuf::from(".");
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-case" | "--case" => {
+                case_dir = PathBuf::from(
+                    args.get(index + 1)
+                        .ok_or_else(|| "-case requires a directory".to_string())?,
+                );
+                index += 2;
+            }
+            "-preflight" | "--preflight" | "-dryRun" | "--dry-run" => {
+                index += 1;
+            }
+            other => return Err(format!("unknown ferrumSolver option '{other}'")),
+        }
+    }
+    Ok(case_dir)
 }
 
 fn parse_init_case_args(args: &[String]) -> Result<InitCaseOptions, String> {
@@ -738,12 +897,14 @@ fn print_help() {
     println!("  ferrum gmshToFoam <mesh.msh> [-case <caseDir>] [patch type options]");
     println!("  ferrum checkMesh [-case <caseDir>]");
     println!("  ferrum splitMeshRegions [-case <caseDir>] [-cellZones]");
+    println!("  ferrum solve [-case <caseDir>] [--preflight]");
     println!();
     println!("aliases:");
     println!("  initFerrumCase <caseDir> [--region <name> ...] [--force]");
     println!("  gmshToFerrumFoam <mesh.msh> [-case <caseDir>] [patch type options]");
     println!("  checkFerrumMesh [-case <caseDir>]");
     println!("  splitFerrumMeshRegions [-case <caseDir>] [-cellZones]");
+    println!("  ferrumSolver [-case <caseDir>] [--preflight]");
     println!();
     print_patch_type_options();
 }
@@ -760,6 +921,19 @@ fn print_init_case_usage() {
     println!("  system/fvSchemes");
     println!("  system/fvSolution");
     println!("  system/ferrumBackends");
+}
+
+fn print_solver_usage() {
+    println!("usage: ferrumSolver [-case <caseDir>] [--preflight]");
+    println!();
+    println!("reads a FerrumCFD/OpenFOAM-like case and prints the solver preflight plan:");
+    println!("  system/controlDict");
+    println!("  system/ferrumBackends");
+    println!("  constant/polyMesh");
+    println!("  constant/interfaces");
+    println!("  0/<fields>");
+    println!();
+    println!("solver kernels are not executed yet");
 }
 
 fn print_gmsh_to_foam_usage() {

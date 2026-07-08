@@ -1,5 +1,6 @@
 pub mod backends;
 pub mod check;
+pub mod control;
 pub mod dictionary;
 pub mod fields;
 pub mod foam;
@@ -9,6 +10,7 @@ pub mod interfaces;
 pub mod patches;
 pub mod poly_mesh;
 pub mod regions;
+pub mod solver_plan;
 
 use std::collections::HashMap;
 

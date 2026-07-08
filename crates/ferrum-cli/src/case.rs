@@ -135,6 +135,7 @@ fn write_case_readme(
     writeln!(writer, "gmshToFerrumFoam path\\to\\mesh.msh -case .")?;
     writeln!(writer, "checkFerrumMesh -case .")?;
     writeln!(writer, "splitFerrumMeshRegions -case . -cellZones")?;
+    writeln!(writer, "ferrumSolver -case . --preflight")?;
     writeln!(writer, "```")?;
     if !regions.is_empty() {
         writeln!(writer)?;
