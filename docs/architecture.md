@@ -242,6 +242,12 @@ default backend. This includes nonlinear solver stages, chemistry ODE solves,
 and interface stages such as `interfaces.flux`,
 `interfaces.coupling`, and `interfaces.sourceTerms`.
 
+`--runnerDryRun` is the first runner boundary. It expands the run plan into a
+capped sequence of time-step starts, stage dispatch decisions, and planned
+write events. It must remain explicit that this mode does not update fields,
+advance physics, assemble matrices, or solve equations. Its job is to harden
+the scheduling contract before CPU/GPU solver kernels exist.
+
 `fvSchemes` and `fvSolution` parsing is currently structural. The preflight can
 report entries such as `ddtSchemes.default=Euler` or
 `SIMPLE.nNonOrthogonalCorrectors=0`, but executable solver code must later

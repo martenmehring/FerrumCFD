@@ -23,6 +23,10 @@ use ferrum_mesh::regions::{
     InterfaceRegistrySummary, InterfaceSummary, build_interface_registry,
     read_region_mesh_summaries, split_regions_by_cell_zones,
 };
+use ferrum_mesh::runner::{
+    SolverRunnerDryRun, SolverRunnerDryRunEvent, SolverRunnerDryRunOptions,
+    build_solver_runner_dry_run,
+};
 use ferrum_mesh::solver_plan::{
     SolverBackendPlan, SolverCasePlan, SolverFieldPlan, SolverInterfacePlan, SolverMeshPlan,
     SolverNumericsDictionaryPlan, SolverNumericsPlan, SolverPropertiesPlan, SolverRunPlan,
@@ -314,6 +318,15 @@ fn solve_case(args: Vec<String>) -> Result<(), String> {
     let options = parse_solver_args(&args)?;
     let plan = build_solver_case_plan(&options.case_dir).map_err(|error| error.to_string())?;
     print_solver_case_plan(&plan);
+    if options.runner_dry_run {
+        let dry_run = build_solver_runner_dry_run(
+            &plan,
+            SolverRunnerDryRunOptions {
+                max_steps: options.max_runner_steps,
+            },
+        );
+        print_solver_runner_dry_run(&dry_run);
+    }
     if let Some(path) = options.plan_json {
         write_solver_plan_json(&plan, &path).map_err(|error| {
             format!(
@@ -404,7 +417,7 @@ fn print_solver_case_plan(plan: &SolverCasePlan) {
             println!("  {warning}");
         }
     }
-    println!("solver execution: preflight only; solver kernels are not implemented yet");
+    println!("solver execution: no solver kernels are executed yet");
 }
 
 fn print_solver_properties(plan: &SolverPropertiesPlan) {
@@ -506,6 +519,46 @@ fn print_solver_run_plan(plan: &SolverRunPlan) {
             stage.section, stage.step, stage.choice, stage.source
         );
     }
+}
+
+fn print_solver_runner_dry_run(dry_run: &SolverRunnerDryRun) {
+    println!(
+        "runner dry-run: plannedSteps={} previewSteps={} maxPreviewSteps={} stageCount={} previewWriteEvents={} truncated={}",
+        format_optional_usize(dry_run.planned_steps),
+        dry_run.preview_steps,
+        dry_run.max_steps,
+        dry_run.stage_count,
+        dry_run.preview_write_events,
+        dry_run.truncated
+    );
+    for warning in &dry_run.warnings {
+        println!("runner dry-run warning: {warning}");
+    }
+    for event in &dry_run.events {
+        match event {
+            SolverRunnerDryRunEvent::StepStart { step, time } => {
+                println!("  step {step}: time={}", format_optional_number(*time));
+            }
+            SolverRunnerDryRunEvent::Stage {
+                step,
+                section,
+                stage,
+                choice,
+                source,
+            } => {
+                println!(
+                    "    step {step} stage {section}.{stage}: backend={choice} source={source}"
+                );
+            }
+            SolverRunnerDryRunEvent::Write { step, time } => {
+                println!(
+                    "    step {step} write: time={} action=planned-output",
+                    format_optional_number(*time)
+                );
+            }
+        }
+    }
+    println!("runner dry-run status: no fields updated; no equations solved");
 }
 
 fn write_solver_plan_json(plan: &SolverCasePlan, path: &Path) -> std::io::Result<()> {
@@ -1318,14 +1371,19 @@ fn parse_case_dir(args: &[String], default: PathBuf) -> Result<PathBuf, String> 
     Ok(default)
 }
 
+#[derive(Debug)]
 struct SolverArgs {
     case_dir: PathBuf,
     plan_json: Option<PathBuf>,
+    runner_dry_run: bool,
+    max_runner_steps: usize,
 }
 
 fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
     let mut case_dir = PathBuf::from(".");
     let mut plan_json = None;
+    let mut runner_dry_run = false;
+    let mut max_runner_steps = SolverRunnerDryRunOptions::default().max_steps;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -1346,12 +1404,30 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
                 plan_json = Some(PathBuf::from(path));
                 index += 2;
             }
+            "-runnerDryRun" | "--runnerDryRun" | "-runner-dry-run" | "--runner-dry-run" => {
+                runner_dry_run = true;
+                index += 1;
+            }
+            "-maxRunnerSteps" | "--maxRunnerSteps" | "-max-runner-steps" | "--max-runner-steps" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--maxRunnerSteps requires a positive integer".to_string())?;
+                max_runner_steps = value.parse::<usize>().map_err(|_| {
+                    format!("invalid --maxRunnerSteps value '{value}'; expected a positive integer")
+                })?;
+                if max_runner_steps == 0 {
+                    return Err("--maxRunnerSteps must be greater than zero".to_string());
+                }
+                index += 2;
+            }
             other => return Err(format!("unknown ferrumSolver option '{other}'")),
         }
     }
     Ok(SolverArgs {
         case_dir,
         plan_json,
+        runner_dry_run,
+        max_runner_steps,
     })
 }
 
@@ -1525,14 +1601,14 @@ fn print_help() {
     println!("  ferrum gmshToFoam <mesh.msh> [-case <caseDir>] [patch type options]");
     println!("  ferrum checkMesh [-case <caseDir>]");
     println!("  ferrum splitMeshRegions [-case <caseDir>] [-cellZones]");
-    println!("  ferrum solve [-case <caseDir>] [--preflight] [--planJson <file>]");
+    println!("  ferrum solve [-case <caseDir>] [--preflight] [--planJson <file>] [--runnerDryRun]");
     println!();
     println!("aliases:");
     println!("  initFerrumCase <caseDir> [--region <name> ...] [--force]");
     println!("  gmshToFerrumFoam <mesh.msh> [-case <caseDir>] [patch type options]");
     println!("  checkFerrumMesh [-case <caseDir>]");
     println!("  splitFerrumMeshRegions [-case <caseDir>] [-cellZones]");
-    println!("  ferrumSolver [-case <caseDir>] [--preflight] [--planJson <file>]");
+    println!("  ferrumSolver [-case <caseDir>] [--preflight] [--planJson <file>] [--runnerDryRun]");
     println!();
     print_patch_type_options();
 }
@@ -1552,7 +1628,9 @@ fn print_init_case_usage() {
 }
 
 fn print_solver_usage() {
-    println!("usage: ferrumSolver [-case <caseDir>] [--preflight] [--planJson <file>]");
+    println!(
+        "usage: ferrumSolver [-case <caseDir>] [--preflight] [--planJson <file>] [--runnerDryRun] [--maxRunnerSteps <n>]"
+    );
     println!();
     println!("reads a FerrumCFD/OpenFOAM-like case and prints the solver preflight plan:");
     println!("  system/controlDict");
@@ -1566,6 +1644,8 @@ fn print_solver_usage() {
     println!();
     println!("options:");
     println!("  --planJson <file>    also write the solver-neutral plan as JSON");
+    println!("  --runnerDryRun       preview the future solver runner without solving equations");
+    println!("  --maxRunnerSteps <n> limit runner dry-run preview steps (default: 3)");
     println!();
     println!("solver kernels are not executed yet");
 }
@@ -1604,6 +1684,9 @@ mod tests {
             "--preflight".to_string(),
             "--planJson".to_string(),
             "system/solverPlan.json".to_string(),
+            "--runnerDryRun".to_string(),
+            "--maxRunnerSteps".to_string(),
+            "4".to_string(),
         ];
 
         let parsed = parse_solver_args(&args).expect("solver args should parse");
@@ -1613,6 +1696,17 @@ mod tests {
             parsed.plan_json,
             Some(PathBuf::from("system/solverPlan.json"))
         );
+        assert!(parsed.runner_dry_run);
+        assert_eq!(parsed.max_runner_steps, 4);
+    }
+
+    #[test]
+    fn rejects_zero_runner_preview_steps() {
+        let args = vec!["--maxRunnerSteps".to_string(), "0".to_string()];
+
+        let error = parse_solver_args(&args).expect_err("zero preview steps should fail");
+
+        assert!(error.contains("greater than zero"));
     }
 
     #[test]

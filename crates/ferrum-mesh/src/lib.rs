@@ -12,6 +12,7 @@ pub mod patches;
 pub mod poly_mesh;
 pub mod properties;
 pub mod regions;
+pub mod runner;
 pub mod solver_plan;
 
 use std::collections::HashMap;

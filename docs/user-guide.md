@@ -370,6 +370,7 @@ ferrum gmshToFoam path\to\mesh.msh -case cases\my_case
 ferrum checkMesh -case cases\my_case
 ferrum splitMeshRegions -case cases\my_case -cellZones
 ferrum solve -case cases\my_case --preflight --planJson target\ferrumSolverPlan.json
+ferrum solve -case cases\my_case --runnerDryRun --maxRunnerSteps 2
 ```
 
 The dedicated aliases remain available because they are closer to OpenFOAM
@@ -392,6 +393,7 @@ later CPU/GPU solver code should consume.
 ```powershell
 ferrumSolver -case cases\my_case --preflight
 ferrumSolver -case cases\my_case --preflight --planJson target\ferrumSolverPlan.json
+ferrumSolver -case cases\my_case --runnerDryRun --maxRunnerSteps 2
 ```
 
 Equivalent combined command:
@@ -446,6 +448,12 @@ With `--planJson <file>`, the same solver-neutral plan is also written as JSON.
 That file is intended for future run managers, GUI tools, benchmark scripts,
 and CPU/GPU solver launch code. The text preflight remains the normal
 human-readable output.
+
+With `--runnerDryRun`, FerrumCFD expands the current run plan into a capped
+runner preview. The preview logs time-step starts, planned stage dispatch such
+as `flow.residual` or `interfaces.flux`, backend choice, and planned write
+events. `--maxRunnerSteps <n>` limits the preview length. This does not update
+fields, advance physics, or solve equations.
 
 ## Interface Model Setup
 
@@ -631,7 +639,7 @@ consumed by built-in solver code.
   discretisation or linear solver kernels.
 - Constant property dictionaries are parsed structurally; solver-specific
   required material models and coefficients are not enforced yet.
-- `ferrumSolver` is currently a preflight/run planner; CFD solver kernels are
-  not implemented yet.
+- `ferrumSolver` is currently a preflight/run planner; `--runnerDryRun`
+  previews scheduling only, and CFD solver kernels are not implemented yet.
 - CPU/GPU backend selection is validated as configuration and not yet
   executable solver behavior.
