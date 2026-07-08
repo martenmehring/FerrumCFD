@@ -116,15 +116,99 @@ function Read-InternalScalarField([string]$Path) {
     return @($values)
 }
 
+function Read-FoamLabelList([string]$Path) {
+    if (!(Test-Path -LiteralPath $Path)) {
+        return @()
+    }
+
+    $lines = Get-Content -LiteralPath $Path
+    $count = $null
+    $countIndex = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $trimmed = $lines[$i].Trim()
+        if ($trimmed -match "^\d+$") {
+            $count = [int]::Parse($trimmed, [System.Globalization.CultureInfo]::InvariantCulture)
+            $countIndex = $i
+            break
+        }
+    }
+    if ($countIndex -lt 0) {
+        return @()
+    }
+
+    $values = New-Object System.Collections.Generic.List[int]
+    for ($i = $countIndex + 1; $i -lt $lines.Count -and $values.Count -lt $count; $i++) {
+        foreach ($match in [regex]::Matches($lines[$i], "-?\d+")) {
+            $values.Add([int]::Parse($match.Value, [System.Globalization.CultureInfo]::InvariantCulture)) | Out-Null
+            if ($values.Count -eq $count) {
+                break
+            }
+        }
+    }
+
+    if ($values.Count -ne $count) {
+        return @()
+    }
+    return [int[]]$values.ToArray()
+}
+
+function Read-BoundaryPatchRanges([string]$BoundaryPath) {
+    $patches = @{}
+    if (!(Test-Path -LiteralPath $BoundaryPath)) {
+        return $patches
+    }
+
+    $lines = Get-Content -LiteralPath $BoundaryPath
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $name = $lines[$i].Trim()
+        if ($name -eq "" -or $name -in @("FoamFile", "(", ")") -or $name -match "^\d+$") {
+            continue
+        }
+
+        $j = $i + 1
+        while ($j -lt $lines.Count -and $lines[$j].Trim() -eq "") {
+            $j++
+        }
+        if ($j -ge $lines.Count -or $lines[$j].Trim() -ne "{") {
+            continue
+        }
+
+        $nFaces = $null
+        $startFace = $null
+        for ($k = $j + 1; $k -lt $lines.Count; $k++) {
+            $entry = $lines[$k].Trim()
+            if ($entry -eq "}") {
+                break
+            }
+            if ($entry -match "^nFaces\s+(\d+)\s*;") {
+                $nFaces = [int]::Parse($Matches[1], [System.Globalization.CultureInfo]::InvariantCulture)
+            } elseif ($entry -match "^startFace\s+(\d+)\s*;") {
+                $startFace = [int]::Parse($Matches[1], [System.Globalization.CultureInfo]::InvariantCulture)
+            }
+        }
+
+        if ($null -ne $nFaces -and $null -ne $startFace) {
+            $patches[$name] = [pscustomobject][ordered]@{
+                name = $name
+                nFaces = $nFaces
+                startFace = $startFace
+            }
+        }
+    }
+    return $patches
+}
+
 function Read-PipeBenchmarkParameters([string]$CaseRoot) {
     $path = Join-Path $CaseRoot "constant\pipeBenchmark"
     $result = [ordered]@{
+        type = $null
         rho = $null
         analyticDeltaPPa = $null
         axialCells = $null
         radialCells = $null
         angularSectors = $null
         cells = $null
+        points = $null
     }
     if (!(Test-Path -LiteralPath $path)) {
         return [pscustomobject]$result
@@ -145,6 +229,16 @@ function Read-PipeBenchmarkParameters([string]$CaseRoot) {
             $result[$name] = [int]::Parse($match.Groups[1].Value, [System.Globalization.CultureInfo]::InvariantCulture)
         }
     }
+    foreach ($name in @("points")) {
+        $match = [regex]::Match($content, "(?m)^\s*$name\s+(\d+)\s*;")
+        if ($match.Success) {
+            $result[$name] = [int]::Parse($match.Groups[1].Value, [System.Globalization.CultureInfo]::InvariantCulture)
+        }
+    }
+    $typeMatch = [regex]::Match($content, "(?m)^\s*type\s+([A-Za-z0-9_]+)\s*;")
+    if ($typeMatch.Success) {
+        $result.type = $typeMatch.Groups[1].Value
+    }
     return [pscustomobject]$result
 }
 
@@ -159,7 +253,50 @@ function Get-Average([double[]]$Values) {
     return $sum / [double]$Values.Count
 }
 
-function Measure-AxialPressureLoss($Values, $Benchmark) {
+function Measure-PatchOwnerPressureLoss($Values, [string]$CaseRoot) {
+    $patches = Read-BoundaryPatchRanges (Join-Path $CaseRoot "constant\polyMesh\boundary")
+    if (!$patches.ContainsKey("inlet") -or !$patches.ContainsKey("outlet")) {
+        return $null
+    }
+
+    $owner = Read-FoamLabelList (Join-Path $CaseRoot "constant\polyMesh\owner")
+    if ($owner.Count -eq 0) {
+        return $null
+    }
+
+    $inlet = New-Object System.Collections.Generic.List[double]
+    $outlet = New-Object System.Collections.Generic.List[double]
+    foreach ($entry in @(@{ patch = $patches["inlet"]; values = $inlet }, @{ patch = $patches["outlet"]; values = $outlet })) {
+        $patch = $entry.patch
+        for ($face = $patch.startFace; $face -lt ($patch.startFace + $patch.nFaces); $face++) {
+            if ($face -lt 0 -or $face -ge $owner.Count) {
+                continue
+            }
+            $cell = $owner[$face]
+            if ($cell -lt 0 -or $cell -ge $Values.Count) {
+                continue
+            }
+            $entry.values.Add([double]$Values[$cell]) | Out-Null
+        }
+    }
+
+    if ($inlet.Count -eq 0 -or $outlet.Count -eq 0) {
+        return $null
+    }
+
+    $inletAverage = Get-Average $inlet.ToArray()
+    $outletAverage = Get-Average $outlet.ToArray()
+    return [pscustomobject][ordered]@{
+        method = "boundaryPatchOwnerAverage"
+        inletSamples = $inlet.Count
+        outletSamples = $outlet.Count
+        inletAverage = $inletAverage
+        outletAverage = $outletAverage
+        delta = $inletAverage - $outletAverage
+    }
+}
+
+function Measure-AxialPressureLoss($Values, $Benchmark, [string]$CaseRoot) {
     if ($Values.Count -lt 2) {
         return $null
     }
@@ -185,6 +322,11 @@ function Measure-AxialPressureLoss($Values, $Benchmark) {
                 delta = $inletAverage - $outletAverage
             }
         }
+    }
+
+    $patchLoss = Measure-PatchOwnerPressureLoss $Values $CaseRoot
+    if ($null -ne $patchLoss) {
+        return $patchLoss
     }
 
     return [pscustomobject][ordered]@{
@@ -218,11 +360,20 @@ $rho = if ($null -ne $benchmark.rho) { [double]$benchmark.rho } else { 998.2 }
 $analyticDeltaPPa = if ($null -ne $benchmark.analyticDeltaPPa) { [double]$benchmark.analyticDeltaPPa } else { 1.6032 }
 $analyticDeltaPKinematic = $analyticDeltaPPa / $rho
 $initialPressurePa = @(Read-InternalScalarField (Join-Path $CaseRoot "0\p") | ForEach-Object { [double]$_ })
-if ($initialPressurePa.Count -lt 2) {
-    $initialPressurePa = @(1.6032, 1.2024, 0.8016, 0.4008)
+$initialPressureField = "internalField uniform 0;"
+if ($initialPressurePa.Count -eq 1) {
+    $initialPressureField = "internalField uniform $(Format-F64 ([double]$initialPressurePa[0] / $rho));"
+} elseif ($initialPressurePa.Count -gt 1) {
+    $initialPressureKinematicLines = @($initialPressurePa | ForEach-Object { "    $(Format-F64 ($_ / $rho))" })
+    $initialPressureBlock = $initialPressureKinematicLines -join "`n"
+    $initialPressureField = @"
+internalField nonuniform List<scalar>
+$($initialPressureKinematicLines.Count)
+(
+$initialPressureBlock
+);
+"@
 }
-$initialPressureKinematicLines = @($initialPressurePa | ForEach-Object { "    $(Format-F64 ($_ / $rho))" })
-$initialPressureBlock = $initialPressureKinematicLines -join "`n"
 
 if (Test-Path -LiteralPath $WorkDir) {
     Remove-Item -LiteralPath $WorkDir -Recurse -Force
@@ -272,11 +423,7 @@ FoamFile
 // OpenFOAM incompressible p is kinematic pressure in m2/s2.
 // The benchmark JSON converts it back to SI pressure in Pa.
 dimensions [0 2 -2 0 0 0 0];
-internalField nonuniform List<scalar>
-$($initialPressureKinematicLines.Count)
-(
-$initialPressureBlock
-);
+$initialPressureField
 
 boundaryField
 {
@@ -425,7 +572,7 @@ $latestTime = Get-LatestTimeDirectory $WorkDir
 $openFoamDelta = $null
 if ($null -ne $latestTime) {
     $pValues = Read-InternalScalarField (Join-Path $latestTime.FullName "p")
-    $loss = Measure-AxialPressureLoss $pValues $benchmark
+    $loss = Measure-AxialPressureLoss $pValues $benchmark $WorkDir
     if ($null -ne $loss) {
         $deltaPa = $loss.delta * $rho
         $openFoamDelta = [ordered]@{
@@ -460,10 +607,12 @@ $result = [ordered]@{
         deltaPKinematic = $analyticDeltaPKinematic
     }
     mesh = [ordered]@{
+        type = $benchmark.type
         axialCells = $benchmark.axialCells
         radialCells = $benchmark.radialCells
         angularSectors = $benchmark.angularSectors
         cells = $benchmark.cells
+        points = $benchmark.points
     }
     runControl = [ordered]@{
         application = "simpleFoam"

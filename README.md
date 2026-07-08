@@ -101,6 +101,10 @@ The importer currently targets the membrane reactor test mesh shape:
 - `examples/laminar_pipe` provides a generated circular-pipe SI benchmark with
   a flow-normalized parabolic inlet, analytical Hagen-Poiseuille data, and
   OpenFOAM comparison/convergence scripts that record wall-clock runtime
+- `examples/gmsh_pipe/pipe_prism2.geo` provides a parametric Gmsh pipe with two
+  near-wall prism layers; `scripts/run_gmsh_pipe_mesh_study.ps1` creates
+  coarse/medium/fine Gmsh meshes for OpenFOAM convergence and later FerrumCFD
+  solver validation on the selected reference mesh
 
 `splitFerrumMeshRegions` can write one region mesh per imported cell zone under
 `constant/<region>/polyMesh`.

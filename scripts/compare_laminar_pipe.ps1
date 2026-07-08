@@ -26,7 +26,8 @@ if ([string]::IsNullOrWhiteSpace($ReportFile)) {
 
 function Invoke-FerrumPreflight([string]$CaseRoot, [string]$PlanJson) {
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $PlanJson) | Out-Null
-    $logPath = Join-Path (Split-Path -Parent $PlanJson) "laminar_pipe_ferrum_preflight.log"
+    $planBaseName = [System.IO.Path]::GetFileNameWithoutExtension($PlanJson)
+    $logPath = Join-Path (Split-Path -Parent $PlanJson) "$planBaseName.preflight.log"
     $exe = Join-Path $RepoRoot "target\debug\ferrumSolver.exe"
     if (Test-Path -LiteralPath $exe) {
         $command = $exe
@@ -97,11 +98,25 @@ function Read-PipeBenchmarkMesh([string]$CaseRoot) {
         return $null
     }
     $content = Get-Content -LiteralPath $path -Raw
-    $result = [ordered]@{ type = "structuredCircularPipe"; axialCells = $null; radialCells = $null; angularSectors = $null; cells = $null }
-    foreach ($name in @("axialCells", "radialCells", "angularSectors", "cells")) {
+    $result = [ordered]@{
+        type = $null
+        variant = $null
+        axialCells = $null
+        radialCells = $null
+        angularSectors = $null
+        cells = $null
+        points = $null
+    }
+    foreach ($name in @("axialCells", "radialCells", "angularSectors", "cells", "points")) {
         $match = [regex]::Match($content, "(?m)^\s*$name\s+(\d+)\s*;")
         if ($match.Success) {
             $result[$name] = [int]::Parse($match.Groups[1].Value, [System.Globalization.CultureInfo]::InvariantCulture)
+        }
+    }
+    foreach ($name in @("type", "variant")) {
+        $match = [regex]::Match($content, "(?m)^\s*$name\s+([A-Za-z0-9_]+)\s*;")
+        if ($match.Success) {
+            $result[$name] = $match.Groups[1].Value
         }
     }
     return [pscustomobject]$result
@@ -133,10 +148,13 @@ function Write-MarkdownReport($Path, $Result) {
         $lines.Add("| Property | Value |")
         $lines.Add("| --- | ---: |")
         $lines.Add("| Type | $($mesh.type) |")
-        $lines.Add("| Axial cells | $($mesh.axialCells) |")
-        $lines.Add("| Radial cells | $($mesh.radialCells) |")
-        $lines.Add("| Angular sectors | $($mesh.angularSectors) |")
-        $lines.Add("| Total cells | $($mesh.cells) |")
+        $lines.Add("| Axial cells | $(Format-NullableNumber $mesh.axialCells "G8") |")
+        $lines.Add("| Radial cells | $(Format-NullableNumber $mesh.radialCells "G8") |")
+        $lines.Add("| Angular sectors | $(Format-NullableNumber $mesh.angularSectors "G8") |")
+        if ($null -ne $mesh.points) {
+            $lines.Add("| Points | $(Format-NullableNumber $mesh.points "G8") |")
+        }
+        $lines.Add("| Total cells | $(Format-NullableNumber $mesh.cells "G8") |")
         $lines.Add("")
     }
     $lines.Add("## Pressure Loss")
@@ -201,19 +219,22 @@ $openFoamPressureLoss = if ($null -ne $openFoam) { $openFoam.openFoam.pressureLo
 $caseMesh = Read-PipeBenchmarkMesh $CaseRoot
 $mesh = if ($null -ne $openFoam -and $null -ne $openFoam.mesh) {
     [ordered]@{
-        type = "structuredCircularPipe"
+        type = if ($null -ne $openFoam.mesh.type) { $openFoam.mesh.type } else { "unknown" }
         axialCells = $openFoam.mesh.axialCells
         radialCells = $openFoam.mesh.radialCells
         angularSectors = $openFoam.mesh.angularSectors
         cells = $openFoam.mesh.cells
+        points = $openFoam.mesh.points
     }
 } elseif ($null -ne $caseMesh) {
     [ordered]@{
-        type = $caseMesh.type
+        type = if ($null -ne $caseMesh.type) { $caseMesh.type } else { "unknown" }
+        variant = $caseMesh.variant
         axialCells = $caseMesh.axialCells
         radialCells = $caseMesh.radialCells
         angularSectors = $caseMesh.angularSectors
         cells = $caseMesh.cells
+        points = $caseMesh.points
     }
 } else {
     $null
@@ -230,8 +251,8 @@ $openFoamReferenceStatus = if ($null -eq $openFoam) {
 }
 
 $notes = @(
-    "The current laminar_pipe mesh is a generated structured circular pipe controlled by scripts/generate_laminar_pipe_case.ps1.",
-    "OpenFOAM is generated only under target/openfoam/laminar_pipe for comparison and is not the default FerrumCFD workflow.",
+    "The case mesh is described by constant/pipeBenchmark; it can be generated directly by FerrumCFD scripts or imported from Gmsh.",
+    "OpenFOAM is generated only under target/ for comparison and is not the default FerrumCFD workflow.",
     "OpenFOAM-to-analytic pressure-loss differences are treated as mesh/discretization/setup error at this stage.",
     "FerrumCFD currently contributes preflight timing and field-buffer readiness only; executable solver timing will be added when the flow solver exists."
 )

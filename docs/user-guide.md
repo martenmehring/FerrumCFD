@@ -215,6 +215,18 @@ installation; pass `-GmshExe <path-to-gmsh.exe>` when needed. This Gmsh pipe is
 a benchmark fixture for comparing FerrumCFD and OpenFOAM on the same mesh. It
 does not make OpenFOAM part of the normal FerrumCFD workflow.
 
+For a Gmsh-based pipe mesh study, run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_gmsh_pipe_mesh_study.ps1
+```
+
+This generates `coarse`, `medium`, and `fine` variants from the same `.geo`,
+imports each one into FerrumCFD, writes SI fields and benchmark metadata, runs
+`checkFerrumMesh`, and optionally runs OpenFOAM for the same imported mesh. Use
+`-SkipOpenFoam` for a quick Ferrum-only preparation pass, or increase
+`-OpenFoamSteps` for a proper OpenFOAM convergence study.
+
 ## Interface Registry
 
 FerrumCFD derives a general interface registry from the imported mesh. It is not
@@ -451,6 +463,21 @@ Run the mesh convergence study with:
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_pipe_convergence.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_pipe_convergence.ps1 -OpenFoamSteps 1000
 ```
+
+For the Gmsh-first workflow, use:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_gmsh_pipe_mesh_study.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_gmsh_pipe_mesh_study.ps1 -OpenFoamSteps 1000
+```
+
+The intended validation order is:
+
+- generate several Gmsh meshes
+- run OpenFOAM on the imported meshes and compare pressure loss to
+  Hagen-Poiseuille
+- select the converged reference mesh
+- later run the FerrumCFD solver on exactly that mesh
 
 The generated OpenFOAM cases and reports stay below `target/benchmarks/`.
 They are not part of the normal FerrumCFD workflow. Increase `-OpenFoamSteps`
