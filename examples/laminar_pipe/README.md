@@ -25,9 +25,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\compare_laminar_pipe
 ```
 
 The OpenFOAM reference case is generated under `target/openfoam/laminar_pipe`
-and the benchmark JSON files are written under `target/benchmarks/`. OpenFOAM
-incompressible solvers use kinematic pressure in `m2/s2`; the script converts
-that value back to SI pressure in Pa using `rho`.
+and benchmark JSON/Markdown files are written under `target/benchmarks/`.
+OpenFOAM incompressible solvers use kinematic pressure in `m2/s2`; the script
+converts that value back to SI pressure in Pa using `rho`.
+
+Generated benchmark files:
+
+- `target/benchmarks/laminar_pipe_openfoam.json`
+- `target/benchmarks/laminar_pipe_compare.json`
+- `target/benchmarks/laminar_pipe_compare.md`
 
 The first OpenFOAM comparison uses the same very coarse square surrogate mesh,
 so its pressure drop is expected to differ from the circular Hagen-Poiseuille
