@@ -4,13 +4,17 @@ use std::env;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use case::{InitCaseOptions, init_case};
 use ferrum_mesh::backends::{
     read_backend_config, validate_backend_policy, validate_backend_resources,
 };
 use ferrum_mesh::check::read_case_summary;
-use ferrum_mesh::diffusion::diffusion_assembly_capabilities;
+use ferrum_mesh::diffusion::{
+    assemble_scalar_diffusion_system, diffusion_assembly_capabilities,
+    scalar_diffusion_options_from_field,
+};
 use ferrum_mesh::fields::{
     FieldBoundaryValidationSummary, FieldFile, InitialFieldSet, read_initial_fields,
     validate_initial_field_boundaries,
@@ -19,7 +23,10 @@ use ferrum_mesh::foam::{FoamWriteOptions, write_openfoam_case_with_options};
 use ferrum_mesh::geometry::{GeometrySummary, summarize_case_geometry};
 use ferrum_mesh::gmsh::read_msh22_ascii;
 use ferrum_mesh::interfaces::{read_interface_config, validate_interface_config};
-use ferrum_mesh::linear::linear_solver_capabilities;
+use ferrum_mesh::linear::{
+    ConjugateGradientOptions, JacobiOptions, conjugate_gradient_solve, jacobi_solve,
+    linear_solver_capabilities,
+};
 use ferrum_mesh::patches::{PatchValidationSummary, validate_case_patches};
 use ferrum_mesh::regions::{
     InterfaceRegistrySummary, InterfaceSummary, build_interface_registry,
@@ -331,6 +338,9 @@ fn solve_case(args: Vec<String>) -> Result<(), String> {
         );
         print_solver_runner_dry_run(&dry_run);
     }
+    if let Some(solve) = &options.scalar_diffusion_solve {
+        run_scalar_diffusion_solve(&plan, solve)?;
+    }
     if let Some(path) = options.plan_json {
         write_solver_plan_json(&plan, &path).map_err(|error| {
             format!(
@@ -341,6 +351,148 @@ fn solve_case(args: Vec<String>) -> Result<(), String> {
         println!("wrote solver plan json: {}", path.display());
     }
     Ok(())
+}
+
+fn run_scalar_diffusion_solve(
+    plan: &SolverCasePlan,
+    solve: &ScalarDiffusionSolveArgs,
+) -> Result<(), String> {
+    let fields = read_initial_fields(&plan.case_dir).map_err(|error| error.to_string())?;
+    let field = find_field_selection(&fields, &solve.field)?;
+    let options = scalar_diffusion_options_from_field(field, solve.diffusivity, solve.source)
+        .map_err(|error| error.to_string())?;
+    let system = assemble_scalar_diffusion_system(&plan.runtime_data.mesh, &options)
+        .map_err(|error| error.to_string())?;
+    let initial = runtime_initial_guess(plan, field);
+
+    let started = Instant::now();
+    let report = match solve.linear_solver {
+        ScalarDiffusionLinearSolver::Cg => conjugate_gradient_solve(
+            &system.matrix,
+            &system.rhs,
+            initial,
+            ConjugateGradientOptions {
+                max_iterations: solve.max_iterations,
+                tolerance: solve.tolerance,
+            },
+        ),
+        ScalarDiffusionLinearSolver::Jacobi => jacobi_solve(
+            &system.matrix,
+            &system.rhs,
+            initial,
+            JacobiOptions {
+                max_iterations: solve.max_iterations,
+                tolerance: solve.tolerance,
+                omega: 1.0,
+            },
+        ),
+    }
+    .map_err(|error| error.to_string())?;
+    let wall_clock_seconds = started.elapsed().as_secs_f64();
+    let solution = summarize_scalar_solution(&report.solution);
+
+    println!(
+        "scalar diffusion solve: field={} backend=cpu linearSolver={} cells={} nnz={} diffusivity={} source={} fixedValueFaces={} zeroGradientFaces={} constraintFaces={} initialGuess={} iterations={} converged={} residualNorm={} wallClockSeconds={:.6}",
+        field_label(field),
+        solve.linear_solver,
+        system.stats.cells,
+        system.matrix.nnz(),
+        format_scientific(solve.diffusivity),
+        format_scientific(solve.source),
+        system.stats.fixed_value_faces,
+        system.stats.zero_gradient_faces,
+        system.stats.constraint_faces,
+        if initial.is_some() { "field" } else { "zero" },
+        report.iterations,
+        yes_no(report.converged),
+        format_scientific(report.residual_norm),
+        wall_clock_seconds
+    );
+    println!(
+        "scalar diffusion solution: min={} max={} mean={}",
+        format_scientific(solution.min),
+        format_scientific(solution.max),
+        format_scientific(solution.mean)
+    );
+    println!("scalar diffusion status: no field files written");
+
+    Ok(())
+}
+
+fn find_field_selection<'a>(
+    fields: &'a InitialFieldSet,
+    selection: &str,
+) -> Result<&'a FieldFile, String> {
+    let matches = fields
+        .fields
+        .iter()
+        .filter(|field| field_matches_selection(field, selection))
+        .collect::<Vec<_>>();
+
+    match matches.as_slice() {
+        [field] => Ok(field),
+        [] => Err(format!(
+            "field '{selection}' was not found below {}",
+            fields.case_dir.join("0").display()
+        )),
+        _ => Err(format!(
+            "field '{selection}' is ambiguous; use '<region>/<field>'"
+        )),
+    }
+}
+
+fn field_matches_selection(field: &FieldFile, selection: &str) -> bool {
+    if let Some((region, name)) = selection.split_once('/') {
+        field.region.as_deref() == Some(region) && field.name == name
+    } else {
+        field.name == selection
+    }
+}
+
+fn runtime_initial_guess<'a>(plan: &'a SolverCasePlan, field: &FieldFile) -> Option<&'a [f64]> {
+    plan.runtime_data
+        .fields
+        .iter()
+        .find(|buffer| {
+            buffer.region == field.region
+                && buffer.name == field.name
+                && buffer.components == 1
+                && buffer.values.len() == plan.runtime_data.mesh.cells
+        })
+        .map(|buffer| buffer.values.as_slice())
+}
+
+fn field_label(field: &FieldFile) -> String {
+    if let Some(region) = &field.region {
+        format!("{region}/{}", field.name)
+    } else {
+        field.name.clone()
+    }
+}
+
+fn summarize_scalar_solution(values: &[f64]) -> ScalarSolutionSummary {
+    if values.is_empty() {
+        return ScalarSolutionSummary {
+            min: 0.0,
+            max: 0.0,
+            mean: 0.0,
+        };
+    }
+
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    let mut sum = 0.0;
+    for value in values {
+        min = min.min(*value);
+        max = max.max(*value);
+        sum += *value;
+    }
+
+    ScalarSolutionSummary {
+        min,
+        max,
+        mean: sum / values.len() as f64,
+    }
 }
 
 fn print_solver_case_plan(plan: &SolverCasePlan) {
@@ -1955,6 +2107,38 @@ struct SolverArgs {
     plan_json: Option<PathBuf>,
     runner_dry_run: bool,
     max_runner_steps: usize,
+    scalar_diffusion_solve: Option<ScalarDiffusionSolveArgs>,
+}
+
+#[derive(Debug)]
+struct ScalarDiffusionSolveArgs {
+    field: String,
+    diffusivity: f64,
+    source: f64,
+    linear_solver: ScalarDiffusionLinearSolver,
+    tolerance: f64,
+    max_iterations: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScalarDiffusionLinearSolver {
+    Cg,
+    Jacobi,
+}
+
+struct ScalarSolutionSummary {
+    min: f64,
+    max: f64,
+    mean: f64,
+}
+
+impl std::fmt::Display for ScalarDiffusionLinearSolver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cg => formatter.write_str("cg"),
+            Self::Jacobi => formatter.write_str("jacobi"),
+        }
+    }
 }
 
 fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
@@ -1962,6 +2146,13 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
     let mut plan_json = None;
     let mut runner_dry_run = false;
     let mut max_runner_steps = SolverRunnerDryRunOptions::default().max_steps;
+    let mut scalar_diffusion_field = None;
+    let mut scalar_diffusion_option_seen = false;
+    let mut scalar_diffusion_diffusivity = 1.0;
+    let mut scalar_diffusion_source = 0.0;
+    let mut scalar_diffusion_linear_solver = ScalarDiffusionLinearSolver::Cg;
+    let mut scalar_diffusion_tolerance = 1.0e-10;
+    let mut scalar_diffusion_max_iterations = 10_000;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -1998,15 +2189,131 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
                 }
                 index += 2;
             }
+            "-solveScalarDiffusion"
+            | "--solveScalarDiffusion"
+            | "-solve-scalar-diffusion"
+            | "--solve-scalar-diffusion" => {
+                let field = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--solveScalarDiffusion requires a field name".to_string())?;
+                if field.trim().is_empty() {
+                    return Err("--solveScalarDiffusion field name must not be empty".to_string());
+                }
+                scalar_diffusion_field = Some(field.to_string());
+                index += 2;
+            }
+            "-diffusivity" | "--diffusivity" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--diffusivity requires a positive number".to_string())?;
+                scalar_diffusion_diffusivity = parse_positive_f64_arg("--diffusivity", value)?;
+                scalar_diffusion_option_seen = true;
+                index += 2;
+            }
+            "-source" | "--source" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--source requires a finite number".to_string())?;
+                scalar_diffusion_source = parse_finite_f64_arg("--source", value)?;
+                scalar_diffusion_option_seen = true;
+                index += 2;
+            }
+            "-linearSolver" | "--linearSolver" | "-linear-solver" | "--linear-solver" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--linearSolver requires 'cg' or 'jacobi'".to_string())?;
+                scalar_diffusion_linear_solver = parse_scalar_diffusion_linear_solver(value)?;
+                scalar_diffusion_option_seen = true;
+                index += 2;
+            }
+            "-solveTolerance" | "--solveTolerance" | "-solve-tolerance" | "--solve-tolerance" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--solveTolerance requires a non-negative number".to_string())?;
+                scalar_diffusion_tolerance = parse_non_negative_f64_arg("--solveTolerance", value)?;
+                scalar_diffusion_option_seen = true;
+                index += 2;
+            }
+            "-maxIterations" | "--maxIterations" | "-max-iterations" | "--max-iterations" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--maxIterations requires a positive integer".to_string())?;
+                scalar_diffusion_max_iterations =
+                    parse_positive_usize_arg("--maxIterations", value)?;
+                scalar_diffusion_option_seen = true;
+                index += 2;
+            }
             other => return Err(format!("unknown ferrumSolver option '{other}'")),
         }
+    }
+    let scalar_diffusion_solve = scalar_diffusion_field.map(|field| ScalarDiffusionSolveArgs {
+        field,
+        diffusivity: scalar_diffusion_diffusivity,
+        source: scalar_diffusion_source,
+        linear_solver: scalar_diffusion_linear_solver,
+        tolerance: scalar_diffusion_tolerance,
+        max_iterations: scalar_diffusion_max_iterations,
+    });
+    if scalar_diffusion_solve.is_none() && scalar_diffusion_option_seen {
+        return Err(
+            "scalar diffusion solve options require --solveScalarDiffusion <field>".to_string(),
+        );
     }
     Ok(SolverArgs {
         case_dir,
         plan_json,
         runner_dry_run,
         max_runner_steps,
+        scalar_diffusion_solve,
     })
+}
+
+fn parse_scalar_diffusion_linear_solver(
+    value: &str,
+) -> Result<ScalarDiffusionLinearSolver, String> {
+    match value {
+        "cg" | "CG" | "pcg" | "PCG" => Ok(ScalarDiffusionLinearSolver::Cg),
+        "jacobi" | "Jacobi" => Ok(ScalarDiffusionLinearSolver::Jacobi),
+        other => Err(format!(
+            "invalid --linearSolver value '{other}'; expected 'cg' or 'jacobi'"
+        )),
+    }
+}
+
+fn parse_positive_usize_arg(label: &str, value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid {label} value '{value}'; expected a positive integer"))?;
+    if parsed == 0 {
+        return Err(format!("{label} must be greater than zero"));
+    }
+    Ok(parsed)
+}
+
+fn parse_finite_f64_arg(label: &str, value: &str) -> Result<f64, String> {
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|_| format!("invalid {label} value '{value}'; expected a finite number"))?;
+    if !parsed.is_finite() {
+        return Err(format!("{label} must be finite"));
+    }
+    Ok(parsed)
+}
+
+fn parse_positive_f64_arg(label: &str, value: &str) -> Result<f64, String> {
+    let parsed = parse_finite_f64_arg(label, value)?;
+    if parsed <= 0.0 {
+        return Err(format!("{label} must be greater than zero"));
+    }
+    Ok(parsed)
+}
+
+fn parse_non_negative_f64_arg(label: &str, value: &str) -> Result<f64, String> {
+    let parsed = parse_finite_f64_arg(label, value)?;
+    if parsed < 0.0 {
+        return Err(format!("{label} must be non-negative"));
+    }
+    Ok(parsed)
 }
 
 fn parse_init_case_args(args: &[String]) -> Result<InitCaseOptions, String> {
@@ -2207,7 +2514,7 @@ fn print_init_case_usage() {
 
 fn print_solver_usage() {
     println!(
-        "usage: ferrumSolver [-case <caseDir>] [--preflight] [--planJson <file>] [--runnerDryRun] [--maxRunnerSteps <n>]"
+        "usage: ferrumSolver [-case <caseDir>] [--preflight] [--planJson <file>] [--runnerDryRun] [--maxRunnerSteps <n>] [--solveScalarDiffusion <field>]"
     );
     println!();
     println!("reads a FerrumCFD/OpenFOAM-like case and prints the solver preflight plan:");
@@ -2224,6 +2531,16 @@ fn print_solver_usage() {
     println!("  --planJson <file>    also write the solver-neutral plan as JSON");
     println!("  --runnerDryRun       preview the future solver runner without solving equations");
     println!("  --maxRunnerSteps <n> limit runner dry-run preview steps (default: 3)");
+    println!("  --solveScalarDiffusion <field> assemble and solve one CPU scalar diffusion system");
+    println!(
+        "  --diffusivity <v>    scalar diffusion coefficient for --solveScalarDiffusion (default: 1)"
+    );
+    println!(
+        "  --source <v>         uniform volume source for --solveScalarDiffusion (default: 0)"
+    );
+    println!("  --linearSolver <s>   cg or jacobi for --solveScalarDiffusion (default: cg)");
+    println!("  --solveTolerance <v> absolute residual tolerance (default: 1e-10)");
+    println!("  --maxIterations <n>  linear solver iteration cap (default: 10000)");
     println!();
     println!(
         "CPU scalar diffusion assembly and CSR/Jacobi/CG kernels are available; full CFD equations are not executed yet"
@@ -2253,7 +2570,9 @@ fn normalize_case_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_solver_args, write_json_solver_state, write_json_string};
+    use super::{
+        ScalarDiffusionLinearSolver, parse_solver_args, write_json_solver_state, write_json_string,
+    };
     use ferrum_mesh::solver_state::{
         SolverStateCpuBufferPlan, SolverStateCpuBufferStatus, SolverStateFieldKind,
         SolverStateFieldPlan, SolverStateInternalFieldPlan, SolverStatePlan,
@@ -2292,6 +2611,48 @@ mod tests {
         let error = parse_solver_args(&args).expect_err("zero preview steps should fail");
 
         assert!(error.contains("greater than zero"));
+    }
+
+    #[test]
+    fn parses_scalar_diffusion_solve_options() {
+        let args = vec![
+            "-case".to_string(),
+            "examples/laminar_pipe".to_string(),
+            "--solveScalarDiffusion".to_string(),
+            "T".to_string(),
+            "--diffusivity".to_string(),
+            "0.598".to_string(),
+            "--source".to_string(),
+            "2.5".to_string(),
+            "--linearSolver".to_string(),
+            "jacobi".to_string(),
+            "--solveTolerance".to_string(),
+            "1e-8".to_string(),
+            "--maxIterations".to_string(),
+            "123".to_string(),
+        ];
+
+        let parsed = parse_solver_args(&args).expect("solver args should parse");
+        let solve = parsed
+            .scalar_diffusion_solve
+            .expect("scalar diffusion solve args");
+
+        assert_eq!(solve.field, "T");
+        assert_eq!(solve.diffusivity, 0.598);
+        assert_eq!(solve.source, 2.5);
+        assert_eq!(solve.linear_solver, ScalarDiffusionLinearSolver::Jacobi);
+        assert_eq!(solve.tolerance, 1e-8);
+        assert_eq!(solve.max_iterations, 123);
+    }
+
+    #[test]
+    fn rejects_scalar_diffusion_options_without_field() {
+        let args = vec!["--diffusivity".to_string(), "1.0".to_string()];
+
+        let error =
+            parse_solver_args(&args).expect_err("diffusivity without solve field should fail");
+
+        assert!(error.contains("--solveScalarDiffusion"));
     }
 
     #[test]

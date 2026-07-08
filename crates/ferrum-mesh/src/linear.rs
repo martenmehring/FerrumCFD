@@ -224,7 +224,7 @@ pub fn jacobi_solve(
 
     let diagonal = matrix.diagonal()?;
     for (row, value) in diagonal.iter().enumerate() {
-        if value.abs() <= f64::EPSILON {
+        if *value == 0.0 {
             return Err(invalid_input(format!(
                 "row {row} has a zero diagonal entry"
             )));
@@ -307,7 +307,7 @@ pub fn conjugate_gradient_solve(
     for iteration in 1..=options.max_iterations {
         let ap = matrix.matvec(&p)?;
         let denominator = dot(&p, &ap);
-        if !denominator.is_finite() || denominator.abs() <= f64::EPSILON {
+        if !denominator.is_finite() || denominator == 0.0 {
             return Err(invalid_input(
                 "conjugate-gradient denominator is zero; matrix is likely singular or not SPD"
                     .to_string(),

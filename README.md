@@ -26,6 +26,7 @@ cargo run -p ferrum-cli --bin checkFerrumMesh -- -case examples\membrane_reactor
 cargo run -p ferrum-cli --bin splitFerrumMeshRegions -- -case examples\membrane_reactor -cellZones
 cargo run -p ferrum-cli --bin ferrumSolver -- -case examples\membrane_reactor --preflight --planJson target\ferrumSolverPlan.json
 cargo run -p ferrum-cli --bin ferrumSolver -- -case examples\membrane_reactor --runnerDryRun --maxRunnerSteps 2
+cargo run -p ferrum-cli --bin ferrumSolver -- -case examples\laminar_pipe --solveScalarDiffusion T --diffusivity 1 --linearSolver cg
 ```
 
 ## 2D And Axisymmetric Meshes
@@ -82,9 +83,10 @@ The importer currently targets the membrane reactor test mesh shape:
 - CPU linear algebra now has a small executable CSR foundation with matrix-vector
   products, residuals, Jacobi, and conjugate-gradient solves for the first
   Poisson/diffusion equation assembly step
-- scalar diffusion/Poisson assembly can build a CPU CSR system from runtime
-  mesh geometry with internal-face diffusion, `fixedValue`, `zeroGradient`, and
-  volume source terms; this is not yet wired to full CFD field execution
+- scalar diffusion/Poisson assembly can build and solve an opt-in CPU CSR system
+  from runtime mesh geometry with internal-face diffusion, `fixedValue`,
+  `zeroGradient`, and volume source terms; it reports iterations, residual,
+  solution summary, and wall-clock time without writing field files
 - mesh geometry summaries compute face areas, boundary area, and cell volumes
 - special patch validation counts `empty`, `wedge`, and `symmetryPlane`
   patches and reports basic patch-range warnings
@@ -102,9 +104,9 @@ The importer currently targets the membrane reactor test mesh shape:
 - `ferrumSolver` currently performs a solver preflight and prints a
   solver-neutral case plan, including the estimated time/write schedule and
   resolved backend choice per built-in run stage; `--planJson <file>` also
-  writes the same plan as machine-readable JSON; CPU scalar diffusion assembly
-  and linear algebra kernels are available, but full CFD equation execution is
-  not implemented yet
+  writes the same plan as machine-readable JSON; `--solveScalarDiffusion
+  <field>` can execute one CPU scalar diffusion solve, but full CFD time-loop
+  execution is not implemented yet
 - `--runnerDryRun` previews the future solver runner for a capped number of
   steps and logs planned field state, CPU/GPU stage dispatch, runtime handles,
   and missing executable backend status without updating fields or solving

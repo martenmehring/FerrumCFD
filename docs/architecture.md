@@ -345,6 +345,10 @@ terms. Constraint patches such as `empty`, `wedge`, and `symmetryPlane` remain
 solver constraints rather than ordinary diffusive boundary faces. This assembly
 layer must stay separate from the linear solver implementation: equation code
 builds a system, while CPU/GPU backends decide how that system is solved.
+`ferrumSolver --solveScalarDiffusion <field>` is the first executable path
+through that stack: it reads one scalar field, assembles one CPU system, solves
+it with CG or Jacobi, reports residual and wall-clock time, and deliberately
+does not write fields or enter the full CFD time loop.
 
 Important design constraint:
 

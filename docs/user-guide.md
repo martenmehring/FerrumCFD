@@ -495,6 +495,7 @@ later CPU/GPU solver code should consume.
 ferrumSolver -case cases\my_case --preflight
 ferrumSolver -case cases\my_case --preflight --planJson target\ferrumSolverPlan.json
 ferrumSolver -case cases\my_case --runnerDryRun --maxRunnerSteps 2
+ferrumSolver -case examples\laminar_pipe --solveScalarDiffusion T --diffusivity 1 --linearSolver cg
 ```
 
 Equivalent combined command:
@@ -570,8 +571,23 @@ internal-face diffusion coupling, `fixedValue` Dirichlet boundaries,
 `zeroGradient` boundaries, and uniform volume source terms. Constraint patch
 types such as `empty`, `wedge`, and `symmetryPlane` are not treated as normal
 diffusive boundary faces. This is still an internal solver building block; it
-is not yet automatically driven by `fvSchemes`, `fvSolution`, or a selected
-field file.
+is not yet automatically driven by `fvSchemes`, `fvSolution`, or a full
+time-loop.
+
+`--solveScalarDiffusion <field>` is the first opt-in executable equation path.
+It reads the selected `volScalarField` from `0/`, converts supported
+`boundaryField` entries into diffusion boundary conditions, assembles a CPU CSR
+system, and solves it with `cg` or `jacobi`:
+
+```powershell
+ferrumSolver -case examples\laminar_pipe --solveScalarDiffusion T --diffusivity 1 --linearSolver cg --solveTolerance 1e-8 --maxIterations 20000
+```
+
+Supported field boundary types for this path are currently `fixedValue uniform
+<scalar>`, `zeroGradient`, and the constraint types `empty`, `wedge`, and
+`symmetryPlane`. The command reports matrix nonzeros, boundary-face counts,
+iteration count, convergence, residual norm, solution min/max/mean, and
+wall-clock seconds. It does not write updated field files back to the case.
 
 It also checks basic `controlDict` consistency: recognized `startFrom`,
 `stopAt`, and `writeControl` modes, positive finite `deltaT`, valid
@@ -786,7 +802,8 @@ consumed by built-in solver code.
 - Constant property dictionaries are parsed structurally; solver-specific
   required material models and coefficients are not enforced yet.
 - `ferrumSolver` is currently a preflight/run planner; `--runnerDryRun`
-  previews scheduling only. CPU scalar diffusion assembly and CSR/Jacobi/CG
-  kernels exist, but full CFD equation execution is not implemented yet.
+  previews scheduling only. `--solveScalarDiffusion <field>` can execute one
+  CPU scalar diffusion solve, but full CFD time-loop execution is not
+  implemented yet.
 - CPU/GPU backend selection is validated as configuration and not yet
   executable solver behavior.

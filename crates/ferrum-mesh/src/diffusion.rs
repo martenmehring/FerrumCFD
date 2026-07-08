@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use crate::fields::{FieldFile, FieldValueSummary};
 use crate::linear::CsrMatrix;
 use crate::runtime::SolverRuntimeMeshData;
 use crate::{MeshError, Point3, Result};
@@ -70,6 +71,73 @@ pub fn diffusion_assembly_capabilities() -> DiffusionAssemblyCapabilities {
         zero_gradient_boundary: true,
         gpu_assembly: false,
     }
+}
+
+pub fn scalar_diffusion_options_from_field(
+    field: &FieldFile,
+    diffusivity: f64,
+    source: f64,
+) -> Result<ScalarDiffusionOptions> {
+    if field.class_name.as_deref() != Some("volScalarField") {
+        return Err(invalid_input(format!(
+            "scalar diffusion requires a volScalarField, field '{}' has class '{}'",
+            field_label(field),
+            field.class_name.as_deref().unwrap_or("unknown")
+        )));
+    }
+
+    let mut patch_boundary_conditions = Vec::new();
+    for patch in &field.boundary_patches {
+        let Some(patch_type) = patch.patch_type.as_deref() else {
+            return Err(invalid_input(format!(
+                "field '{}' patch '{}' has no boundary type",
+                field_label(field),
+                patch.name
+            )));
+        };
+
+        match patch_type {
+            "fixedValue" => {
+                let value = patch.value.as_ref().ok_or_else(|| {
+                    invalid_input(format!(
+                        "field '{}' patch '{}' uses fixedValue without a value",
+                        field_label(field),
+                        patch.name
+                    ))
+                })?;
+                patch_boundary_conditions.push(ScalarPatchBoundaryCondition {
+                    patch: patch.name.clone(),
+                    condition: ScalarBoundaryCondition::FixedValue(parse_uniform_scalar_value(
+                        value,
+                        field,
+                        &patch.name,
+                    )?),
+                });
+            }
+            "zeroGradient" => {
+                patch_boundary_conditions.push(ScalarPatchBoundaryCondition {
+                    patch: patch.name.clone(),
+                    condition: ScalarBoundaryCondition::ZeroGradient,
+                });
+            }
+            "empty" | "wedge" | "symmetryPlane" => {}
+            other => {
+                return Err(invalid_input(format!(
+                    "field '{}' patch '{}' uses unsupported scalar diffusion boundary type '{}'",
+                    field_label(field),
+                    patch.name,
+                    other
+                )));
+            }
+        }
+    }
+
+    Ok(ScalarDiffusionOptions {
+        diffusivity,
+        source,
+        default_boundary: ScalarBoundaryCondition::ZeroGradient,
+        patch_boundary_conditions,
+    })
 }
 
 pub fn assemble_scalar_diffusion_system(
@@ -379,6 +447,52 @@ fn distance(left: Point3, right: Point3) -> f64 {
     (dx * dx + dy * dy + dz * dz).sqrt()
 }
 
+fn parse_uniform_scalar_value(
+    value: &FieldValueSummary,
+    field: &FieldFile,
+    patch: &str,
+) -> Result<f64> {
+    let FieldValueSummary::Uniform(value) = value else {
+        return Err(invalid_input(format!(
+            "field '{}' patch '{}' fixedValue must be uniform scalar for scalar diffusion",
+            field_label(field),
+            patch
+        )));
+    };
+
+    let values = value
+        .replace(['(', ')'], " ")
+        .split_whitespace()
+        .map(|token| {
+            token.parse::<f64>().map_err(|_| {
+                invalid_input(format!(
+                    "field '{}' patch '{}' fixedValue contains non-numeric token '{}'",
+                    field_label(field),
+                    patch,
+                    token
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if values.len() != 1 {
+        return Err(invalid_input(format!(
+            "field '{}' patch '{}' fixedValue must contain exactly one scalar, got {} values",
+            field_label(field),
+            patch,
+            values.len()
+        )));
+    }
+    Ok(values[0])
+}
+
+fn field_label(field: &FieldFile) -> String {
+    if let Some(region) = &field.region {
+        format!("{region}/{}", field.name)
+    } else {
+        field.name.clone()
+    }
+}
+
 fn invalid_input(message: String) -> MeshError {
     MeshError::InvalidInput(message)
 }
@@ -386,12 +500,13 @@ fn invalid_input(message: String) -> MeshError {
 #[cfg(test)]
 mod tests {
     use crate::Point3;
+    use crate::fields::{FieldBoundaryPatch, FieldFile, FieldValueSummary};
     use crate::linear::{ConjugateGradientOptions, conjugate_gradient_solve};
     use crate::runtime::{SolverRuntimeMeshData, SolverRuntimePatchRange};
 
     use super::{
         ScalarBoundaryCondition, ScalarDiffusionOptions, ScalarPatchBoundaryCondition,
-        assemble_scalar_diffusion_system,
+        assemble_scalar_diffusion_system, scalar_diffusion_options_from_field,
     };
 
     #[test]
@@ -512,6 +627,56 @@ mod tests {
         assert!(error.to_string().contains("constraint patch"));
     }
 
+    #[test]
+    fn builds_diffusion_options_from_scalar_field_boundaries() {
+        let field = scalar_field(vec![
+            FieldBoundaryPatch {
+                name: "inlet".to_string(),
+                patch_type: Some("fixedValue".to_string()),
+                value: Some(FieldValueSummary::Uniform("293.15".to_string())),
+            },
+            FieldBoundaryPatch {
+                name: "outlet".to_string(),
+                patch_type: Some("zeroGradient".to_string()),
+                value: None,
+            },
+            FieldBoundaryPatch {
+                name: "front".to_string(),
+                patch_type: Some("empty".to_string()),
+                value: None,
+            },
+        ]);
+
+        let options =
+            scalar_diffusion_options_from_field(&field, 0.5, 2.0).expect("diffusion options");
+
+        assert_eq!(options.diffusivity, 0.5);
+        assert_eq!(options.source, 2.0);
+        assert_eq!(options.patch_boundary_conditions.len(), 2);
+        assert_eq!(
+            options.patch_boundary_conditions[0].condition,
+            ScalarBoundaryCondition::FixedValue(293.15)
+        );
+        assert_eq!(
+            options.patch_boundary_conditions[1].condition,
+            ScalarBoundaryCondition::ZeroGradient
+        );
+    }
+
+    #[test]
+    fn rejects_non_scalar_fixed_value_field_boundary() {
+        let field = scalar_field(vec![FieldBoundaryPatch {
+            name: "wall".to_string(),
+            patch_type: Some("fixedValue".to_string()),
+            value: Some(FieldValueSummary::Uniform("( 1 0 0 )".to_string())),
+        }]);
+
+        let error = scalar_diffusion_options_from_field(&field, 1.0, 0.0)
+            .expect_err("vector fixedValue should fail");
+
+        assert!(error.to_string().contains("exactly one scalar"));
+    }
+
     fn two_cell_line_mesh() -> SolverRuntimeMeshData {
         SolverRuntimeMeshData {
             points: 0,
@@ -558,6 +723,18 @@ mod tests {
 
     fn point(x: f64, y: f64, z: f64) -> Point3 {
         Point3 { x, y, z }
+    }
+
+    fn scalar_field(boundary_patches: Vec<FieldBoundaryPatch>) -> FieldFile {
+        FieldFile {
+            path: "0/T".into(),
+            region: None,
+            name: "T".to_string(),
+            class_name: Some("volScalarField".to_string()),
+            dimensions: None,
+            internal_field: None,
+            boundary_patches,
+        }
     }
 
     fn assert_close(left: f64, right: f64, tolerance: f64) {
