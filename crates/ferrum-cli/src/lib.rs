@@ -700,7 +700,7 @@ fn resolve_laminar_simple_options(
     let max_field_change_per_step = solve
         .max_field_change_per_step
         .or_else(|| fv_solution_number(plan, "SIMPLE", "maxFieldChangePerStep"))
-        .unwrap_or(0.10);
+        .unwrap_or(0.02);
 
     Ok(LaminarSimpleOptions {
         density,
@@ -4217,7 +4217,7 @@ fn print_solver_usage() {
         "  --fieldChangeTolerance <v> relative U/p field-change tolerance for --solveLaminarSimple (default: 0.01)"
     );
     println!(
-        "  --maxFieldChangePerStep <v> bound one laminar SIMPLE U/p/phi update (default: 0.10)"
+        "  --maxFieldChangePerStep <v> bound one laminar SIMPLE U/p/phi update (default: 0.02)"
     );
     println!(
         "  --velocityRelaxation <v> override U relaxation for --solveLaminarSimple (default: fvSolution relaxationFactors.equations.U or 0.7)"

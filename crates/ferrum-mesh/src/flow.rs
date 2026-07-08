@@ -11,6 +11,7 @@ use crate::{MeshError, Point3, Result};
 
 const MAX_LAMINAR_SIMPLE_STEP_CONTINUITY_GROWTH: f64 = 2.0;
 const MAX_LAMINAR_SIMPLE_STEP_PRESSURE_ERROR_GROWTH: f64 = 10.0;
+const MIN_LAMINAR_SIMPLE_CONVERGED_UPDATE_SCALE: f64 = 0.999;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LaminarSimpleLinearSolver {
@@ -358,6 +359,8 @@ pub fn solve_laminar_simple(
                 relative_pressure_drop_error,
                 relative_velocity_change_l2,
                 relative_pressure_change_l2,
+                momentum_update_scale,
+                1.0,
                 options,
             ) {
                 converged = true;
@@ -576,6 +579,8 @@ pub fn solve_laminar_simple(
             relative_pressure_drop_error,
             relative_velocity_change_l2,
             relative_pressure_change_l2,
+            momentum_update_scale,
+            pressure_correction_update_scale,
             options,
         ) {
             converged = true;
@@ -797,6 +802,8 @@ fn laminar_simple_converged(
     relative_pressure_drop_error: f64,
     relative_velocity_change_l2: f64,
     relative_pressure_change_l2: f64,
+    momentum_update_scale: f64,
+    pressure_correction_update_scale: f64,
     options: &LaminarSimpleOptions,
 ) -> bool {
     iteration >= options.min_simple_iterations
@@ -807,6 +814,12 @@ fn laminar_simple_converged(
         && relative_velocity_change_l2 <= options.field_change_tolerance
         && relative_pressure_change_l2.is_finite()
         && relative_pressure_change_l2 <= options.field_change_tolerance
+        && update_limiter_inactive(momentum_update_scale)
+        && update_limiter_inactive(pressure_correction_update_scale)
+}
+
+fn update_limiter_inactive(scale: f64) -> bool {
+    scale.is_finite() && scale >= MIN_LAMINAR_SIMPLE_CONVERGED_UPDATE_SCALE
 }
 
 fn points_are_finite(values: &[Point3]) -> bool {
@@ -1211,7 +1224,7 @@ fn vector_convection_divergence(
     let mut divergence = vec![zero(); mesh.cells];
     for (face_index, phi) in flux.iter().copied().enumerate() {
         let owner = mesh.owner[face_index];
-        let face_velocity = face_vector_value(mesh, velocity, boundary, face_index);
+        let face_velocity = upwind_face_vector_value(mesh, velocity, boundary, face_index, phi);
         add_scaled(&mut divergence[owner], face_velocity, phi);
         if let Some(neighbour) = mesh.neighbour[face_index] {
             add_scaled(&mut divergence[neighbour], face_velocity, -phi);
@@ -1818,6 +1831,28 @@ fn face_vector_value(
     }
 }
 
+fn upwind_face_vector_value(
+    mesh: &SolverRuntimeMeshData,
+    velocity: &[Point3],
+    boundary: &[VectorFaceTreatment],
+    face_index: usize,
+    flux: f64,
+) -> Point3 {
+    let owner = mesh.owner[face_index];
+    if let Some(neighbour) = mesh.neighbour[face_index] {
+        return if flux >= 0.0 {
+            velocity[owner]
+        } else {
+            velocity[neighbour]
+        };
+    }
+    match boundary[face_index] {
+        VectorFaceTreatment::FixedValue(value) if flux < 0.0 => value,
+        VectorFaceTreatment::FixedValue(_) => velocity[owner],
+        VectorFaceTreatment::ZeroGradient | VectorFaceTreatment::Constraint => velocity[owner],
+    }
+}
+
 fn face_scalar_value(
     mesh: &SolverRuntimeMeshData,
     values: &[f64],
@@ -2193,7 +2228,7 @@ mod tests {
         LaminarSimpleLinearSolver, LaminarSimpleOptions, LaminarSimplePreconditioner,
         ScalarFaceTreatment, assemble_variable_scalar_component_system, compute_face_flux,
         net_cell_flux, pressure_correction_flux, reciprocal_momentum_diagonal,
-        solve_laminar_simple, vector_face_treatments,
+        solve_laminar_simple, upwind_face_vector_value, vector_face_treatments,
     };
     use crate::Point3;
 
@@ -2226,6 +2261,31 @@ mod tests {
         assert_close(flux[0], 2.0);
         assert_close(flux[1], -1.0);
         assert_close(flux[2], 3.0);
+    }
+
+    #[test]
+    fn selects_upwind_momentum_face_value_from_flux_direction() {
+        let runtime = two_cell_runtime();
+        let fields = two_cell_fields();
+        let u_field = fields
+            .fields
+            .iter()
+            .find(|field| field.name == "U")
+            .expect("U field");
+        let boundary = vector_face_treatments(&runtime.mesh, u_field).expect("U boundary");
+        let velocity = vec![point(5.0, 0.0, 0.0), point(3.0, 0.0, 0.0)];
+
+        let owner_to_neighbour =
+            upwind_face_vector_value(&runtime.mesh, &velocity, &boundary, 0, 1.0);
+        let neighbour_to_owner =
+            upwind_face_vector_value(&runtime.mesh, &velocity, &boundary, 0, -1.0);
+        let inlet_inflow = upwind_face_vector_value(&runtime.mesh, &velocity, &boundary, 1, -1.0);
+        let outlet_outflow = upwind_face_vector_value(&runtime.mesh, &velocity, &boundary, 2, 1.0);
+
+        assert_close(owner_to_neighbour.x, 5.0);
+        assert_close(neighbour_to_owner.x, 3.0);
+        assert_close(inlet_inflow.x, 1.0);
+        assert_close(outlet_outflow.x, 3.0);
     }
 
     #[test]
