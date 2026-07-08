@@ -5,7 +5,10 @@ use crate::backends::{BackendChoice, read_backend_config, validate_backend_resou
 use crate::control::{ControlDict, read_control_dict};
 use crate::fields::{read_initial_fields, validate_initial_field_boundaries};
 use crate::interfaces::{read_interface_config, validate_interface_config};
-use crate::numerics::{NumericsSection, format_numerics_value, read_fv_schemes, read_fv_solution};
+use crate::numerics::{
+    NumericsSection, format_numerics_value, read_fv_schemes, read_fv_solution, validate_fv_schemes,
+    validate_fv_solution,
+};
 use crate::patches::{PatchValidationSummary, validate_poly_mesh_patches};
 use crate::poly_mesh::PolyMesh;
 use crate::regions::{build_interface_registry, read_region_mesh_summaries};
@@ -183,7 +186,8 @@ pub fn build_solver_case_plan(case_dir: &Path) -> Result<SolverCasePlan> {
             .map(|warning| format!("field boundary: {warning}")),
     );
 
-    let numerics = build_numerics_plan(case_dir, &mut warnings)?;
+    let field_names = unique_field_names(&fields);
+    let numerics = build_numerics_plan(case_dir, &field_names, &mut warnings)?;
 
     let interface_config = read_interface_config(case_dir)?;
     let config_present = interface_config.is_some();
@@ -286,9 +290,33 @@ fn classify_dimensionality(patch_validation: &PatchValidationSummary) -> SolverD
     }
 }
 
-fn build_numerics_plan(case_dir: &Path, warnings: &mut Vec<String>) -> Result<SolverNumericsPlan> {
+fn unique_field_names(fields: &crate::fields::InitialFieldSet) -> Vec<String> {
+    let mut names = fields
+        .fields
+        .iter()
+        .map(|field| field.name.clone())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn build_numerics_plan(
+    case_dir: &Path,
+    field_names: &[String],
+    warnings: &mut Vec<String>,
+) -> Result<SolverNumericsPlan> {
     let fv_schemes = match read_fv_schemes(case_dir)? {
-        Some(schemes) => build_numerics_dictionary_plan(true, &schemes.sections),
+        Some(schemes) => {
+            let validation = validate_fv_schemes(&schemes);
+            warnings.extend(
+                validation
+                    .warnings
+                    .iter()
+                    .map(|warning| format!("fvSchemes: {warning}")),
+            );
+            build_numerics_dictionary_plan(true, &schemes.sections)
+        }
         None => {
             warnings.push("no system/fvSchemes found; discretisation plan is empty".to_string());
             build_numerics_dictionary_plan(false, &[])
@@ -296,7 +324,16 @@ fn build_numerics_plan(case_dir: &Path, warnings: &mut Vec<String>) -> Result<So
     };
 
     let fv_solution = match read_fv_solution(case_dir)? {
-        Some(solution) => build_numerics_dictionary_plan(true, &solution.sections),
+        Some(solution) => {
+            let validation = validate_fv_solution(&solution, field_names);
+            warnings.extend(
+                validation
+                    .warnings
+                    .iter()
+                    .map(|warning| format!("fvSolution: {warning}")),
+            );
+            build_numerics_dictionary_plan(true, &solution.sections)
+        }
         None => {
             warnings.push("no system/fvSolution found; solver settings plan is empty".to_string());
             build_numerics_dictionary_plan(false, &[])

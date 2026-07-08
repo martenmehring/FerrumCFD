@@ -29,6 +29,11 @@ pub struct NumericsEntry {
     pub value: Vec<String>,
 }
 
+#[derive(Debug)]
+pub struct NumericsValidation {
+    pub warnings: Vec<String>,
+}
+
 pub fn read_fv_schemes(case_dir: &Path) -> Result<Option<FvSchemes>> {
     let path = case_dir.join("system").join("fvSchemes");
     if !path.exists() {
@@ -64,6 +69,102 @@ pub fn format_numerics_value(value: &[String]) -> String {
         return "empty".to_string();
     }
     value.join(" ")
+}
+
+pub fn validate_fv_schemes(schemes: &FvSchemes) -> NumericsValidation {
+    const REQUIRED_DEFAULT_SECTIONS: &[&str] = &[
+        "ddtSchemes",
+        "gradSchemes",
+        "divSchemes",
+        "laplacianSchemes",
+        "interpolationSchemes",
+        "snGradSchemes",
+    ];
+
+    let mut warnings = Vec::new();
+    for section_name in REQUIRED_DEFAULT_SECTIONS {
+        let Some(section) = top_level_section(&schemes.sections, section_name) else {
+            warnings.push(format!("missing section '{section_name}'"));
+            continue;
+        };
+
+        if !section.entries.iter().any(|entry| entry.key == "default") {
+            warnings.push(format!("section '{section_name}' has no default entry"));
+        }
+    }
+
+    NumericsValidation { warnings }
+}
+
+pub fn validate_fv_solution(solution: &FvSolution, field_names: &[String]) -> NumericsValidation {
+    let mut warnings = Vec::new();
+    let Some(solvers) = top_level_section(&solution.sections, "solvers") else {
+        if !field_names.is_empty() {
+            warnings.push(format!(
+                "missing 'solvers' section for {} initial field(s)",
+                field_names.len()
+            ));
+        }
+        return NumericsValidation { warnings };
+    };
+
+    for solver_section in &solvers.sections {
+        if !solver_section
+            .entries
+            .iter()
+            .any(|entry| entry.key == "solver")
+        {
+            warnings.push(format!(
+                "solvers.{} has no solver entry",
+                solver_section.name
+            ));
+        }
+    }
+
+    let has_default_solver = solvers
+        .sections
+        .iter()
+        .any(|section| section.name == "default");
+    if !has_default_solver {
+        for field_name in field_names {
+            if !solvers
+                .sections
+                .iter()
+                .any(|section| solver_section_matches_field(&section.name, field_name))
+            {
+                warnings.push(format!(
+                    "initial field '{field_name}' has no fvSolution solver entry"
+                ));
+            }
+        }
+    }
+
+    NumericsValidation { warnings }
+}
+
+fn top_level_section<'a>(
+    sections: &'a [NumericsSection],
+    name: &str,
+) -> Option<&'a NumericsSection> {
+    sections.iter().find(|section| section.name == name)
+}
+
+fn solver_section_matches_field(section_name: &str, field_name: &str) -> bool {
+    if section_name == field_name {
+        return true;
+    }
+
+    let Some(pattern) = section_name
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+    else {
+        return false;
+    };
+
+    pattern
+        .split('|')
+        .map(str::trim)
+        .any(|candidate| candidate == field_name || candidate == ".*")
 }
 
 fn parse_numerics_dictionary_str(content: &str, path: &Path) -> Result<Vec<NumericsSection>> {
@@ -129,7 +230,10 @@ fn parse_section(cursor: &mut TokenCursor, name: String) -> Result<NumericsSecti
 mod tests {
     use std::path::Path;
 
-    use super::{format_numerics_value, parse_numerics_dictionary_str};
+    use super::{
+        FvSchemes, FvSolution, format_numerics_value, parse_numerics_dictionary_str,
+        validate_fv_schemes, validate_fv_solution,
+    };
 
     #[test]
     fn parses_fv_schemes_sections() {
@@ -201,5 +305,129 @@ mod tests {
         assert_eq!(sections.len(), 1);
         assert!(sections[0].entries.is_empty());
         assert!(sections[0].sections.is_empty());
+    }
+
+    #[test]
+    fn warns_for_missing_scheme_defaults() {
+        let sections = parse_numerics_dictionary_str(
+            r#"
+            ddtSchemes { Euler; }
+            gradSchemes { default Gauss linear; }
+            "#,
+            Path::new("fvSchemes"),
+        )
+        .unwrap();
+        let schemes = FvSchemes {
+            path: Path::new("fvSchemes").to_path_buf(),
+            sections,
+        };
+
+        let validation = validate_fv_schemes(&schemes);
+
+        assert!(
+            validation
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("ddtSchemes"))
+        );
+        assert!(
+            validation
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("divSchemes"))
+        );
+    }
+
+    #[test]
+    fn validates_fv_solution_field_solver_entries() {
+        let sections = parse_numerics_dictionary_str(
+            r#"
+            solvers
+            {
+                p
+                {
+                    solver PCG;
+                }
+                U
+                {
+                    tolerance 1e-08;
+                }
+            }
+            "#,
+            Path::new("fvSolution"),
+        )
+        .unwrap();
+        let solution = FvSolution {
+            path: Path::new("fvSolution").to_path_buf(),
+            sections,
+        };
+
+        let validation = validate_fv_solution(
+            &solution,
+            &["p".to_string(), "U".to_string(), "T".to_string()],
+        );
+
+        assert!(
+            validation
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("solvers.U has no solver entry"))
+        );
+        assert!(
+            validation
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("initial field 'T'"))
+        );
+    }
+
+    #[test]
+    fn accepts_default_fv_solution_solver_for_fields() {
+        let sections = parse_numerics_dictionary_str(
+            r#"
+            solvers
+            {
+                default
+                {
+                    solver smoothSolver;
+                }
+            }
+            "#,
+            Path::new("fvSolution"),
+        )
+        .unwrap();
+        let solution = FvSolution {
+            path: Path::new("fvSolution").to_path_buf(),
+            sections,
+        };
+
+        let validation = validate_fv_solution(&solution, &["p".to_string(), "U".to_string()]);
+
+        assert!(validation.warnings.is_empty());
+    }
+
+    #[test]
+    fn accepts_parenthesized_field_group_solver() {
+        let sections = parse_numerics_dictionary_str(
+            r#"
+            solvers
+            {
+                "(p|U)"
+                {
+                    solver smoothSolver;
+                }
+            }
+            "#,
+            Path::new("fvSolution"),
+        )
+        .unwrap();
+        let solution = FvSolution {
+            path: Path::new("fvSolution").to_path_buf(),
+            sections,
+        };
+
+        let validation = validate_fv_solution(&solution, &["p".to_string(), "U".to_string()]);
+
+        assert!(validation.warnings.is_empty());
     }
 }

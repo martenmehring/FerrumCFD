@@ -214,6 +214,12 @@ report entries such as `ddtSchemes.default=Euler` or
 decide which schemes and linear/nonlinear solver settings are valid for each
 equation system.
 
+Basic structural validation belongs in the preflight. Examples include missing
+standard `fvSchemes` sections, missing `default` entries, missing
+`fvSolution.solvers`, or initial fields that have no matching solver entry.
+Equation-specific validation, such as whether a convection scheme is valid for
+a particular transport equation, stays with the future solver modules.
+
 ## Mesh Geometry Direction
 
 The first geometry pass derives face centres, oriented face area vectors,

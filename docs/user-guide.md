@@ -423,6 +423,10 @@ backend/devices, and per-stage choices such as `flow.residual=gpu` or
 `chemistry.odeSolve=cpu`. This is metadata only for now, but it is the intended
 boundary between OpenFOAM-like case input and the future Rust/GPU solver stack.
 
+The preflight warns about basic numerical setup gaps, such as missing standard
+`fvSchemes` sections, missing `default` scheme entries, or initial fields that
+do not have a matching `fvSolution.solvers` entry.
+
 ## Interface Model Setup
 
 Users should normally not edit `flipMap` by hand. `flipMap` belongs to the
@@ -579,9 +583,9 @@ accept `auto` or a positive integer.
 - Initial field parsing currently summarizes fields and boundary entries; it
   validates boundary patch names and special patch boundary types, but it does
   not yet validate dimensions against solver equations.
-- `fvSchemes` and `fvSolution` are parsed structurally for the solver preflight;
-  their entries are not yet consumed by executable discretisation or linear
-  solver kernels.
+- `fvSchemes` and `fvSolution` are parsed and checked structurally for the
+  solver preflight; their entries are not yet consumed by executable
+  discretisation or linear solver kernels.
 - `ferrumSolver` is currently a preflight planner; CFD solver kernels are not
   implemented yet.
 - CPU/GPU backend selection is validated as configuration and not yet
