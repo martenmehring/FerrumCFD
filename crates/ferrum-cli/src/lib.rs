@@ -485,7 +485,7 @@ fn print_solver_state_plan(plan: &SolverStatePlan) {
             field.name.clone()
         };
         println!(
-            "  {}: class={} kind={} meshCells={} internal={} values={} expected={} valid={} components={} scalarSlots={} bytesF64={} uniform={} boundaryPatches={}/{} cpu={} gpu={} storage={} cpuBuffer={} cpuBufferStatus={}",
+            "  {}: class={} kind={} meshCells={} internal={} values={} expected={} valid={} components={} scalarSlots={} bytesF64={} uniform={} loadedScalars={} boundaryPatches={}/{} cpu={} gpu={} storage={} cpuBuffer={} cpuBufferStatus={}",
             name,
             field.class_name.as_deref().unwrap_or("unknown"),
             field.kind,
@@ -498,6 +498,13 @@ fn print_solver_state_plan(plan: &SolverStatePlan) {
             format_optional_usize(field.storage.scalar_slots),
             format_optional_usize(field.storage.bytes_f64),
             format_optional_f64_list(field.internal_field.uniform_components.as_deref()),
+            format_optional_usize(
+                field
+                    .internal_field
+                    .nonuniform_values
+                    .as_ref()
+                    .map(Vec::len)
+            ),
             field.boundary_patches,
             format_optional_usize(field.mesh_boundary_patches),
             yes_no(field.storage.cpu_capable),
@@ -684,7 +691,7 @@ fn print_solver_runner_state(plan: &SolverStatePlan) {
             field.name.clone()
         };
         println!(
-            "  field {}: kind={} internal={} values={} expected={} components={} scalarSlots={} bytesF64={} uniform={} cpu={} gpu={} storage={} cpuBuffer={} cpuBufferStatus={}",
+            "  field {}: kind={} internal={} values={} expected={} components={} scalarSlots={} bytesF64={} uniform={} loadedScalars={} cpu={} gpu={} storage={} cpuBuffer={} cpuBufferStatus={}",
             name,
             field.kind,
             field.internal_field.kind,
@@ -694,6 +701,13 @@ fn print_solver_runner_state(plan: &SolverStatePlan) {
             format_optional_usize(field.storage.scalar_slots),
             format_optional_usize(field.storage.bytes_f64),
             format_optional_f64_list(field.internal_field.uniform_components.as_deref()),
+            format_optional_usize(
+                field
+                    .internal_field
+                    .nonuniform_values
+                    .as_ref()
+                    .map(Vec::len)
+            ),
             yes_no(field.storage.cpu_capable),
             yes_no(field.storage.gpu_capable),
             field.storage.status,
@@ -897,6 +911,16 @@ fn write_json_solver_state(writer: &mut impl Write, plan: &SolverStatePlan) -> s
         writeln!(writer, ",")?;
         write_json_key(writer, 10, "uniformComponents")?;
         write_json_optional_f64_array(writer, field.internal_field.uniform_components.as_deref())?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 10, "loadedScalars")?;
+        write_json_optional_usize(
+            writer,
+            field
+                .internal_field
+                .nonuniform_values
+                .as_ref()
+                .map(Vec::len),
+        )?;
         writeln!(writer)?;
         write_indent(writer, 8)?;
         writeln!(writer, "}},")?;
@@ -2064,6 +2088,7 @@ mod tests {
                     expected_count: Some(4),
                     valid_count: Some(true),
                     uniform_components: Some(vec![0.0]),
+                    nonuniform_values: None,
                 },
                 boundary_patches: 1,
                 mesh_boundary_patches: Some(1),

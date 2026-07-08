@@ -29,6 +29,7 @@ pub enum FieldValueSummary {
     NonUniform {
         value_type: Option<String>,
         count: Option<usize>,
+        values: Option<Vec<f64>>,
     },
     Other(String),
 }
@@ -50,13 +51,21 @@ impl std::fmt::Display for FieldValueSummary {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Uniform(value) => write!(formatter, "uniform {value}"),
-            Self::NonUniform { value_type, count } => {
+            Self::NonUniform {
+                value_type,
+                count,
+                values,
+            } => {
                 write!(
                     formatter,
-                    "nonuniform {} count={}",
+                    "nonuniform {} count={} loadedScalars={}",
                     value_type.as_deref().unwrap_or("unknown"),
                     count
                         .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    values
+                        .as_ref()
+                        .map(|values| values.len().to_string())
                         .unwrap_or_else(|| "unknown".to_string())
                 )
             }
@@ -278,11 +287,57 @@ fn parse_field_value_tokens(tokens: Vec<String>) -> FieldValueSummary {
 
     match kind.as_str() {
         "uniform" => FieldValueSummary::Uniform(join_tokens(&tokens[1..])),
-        "nonuniform" => FieldValueSummary::NonUniform {
-            value_type: tokens.get(1).cloned(),
-            count: tokens.iter().find_map(|token| token.parse::<usize>().ok()),
-        },
+        "nonuniform" => parse_nonuniform_field_value(&tokens),
         _ => FieldValueSummary::Other(join_tokens(&tokens)),
+    }
+}
+
+fn parse_nonuniform_field_value(tokens: &[String]) -> FieldValueSummary {
+    let value_type = tokens.get(1).cloned();
+    let count_index = tokens
+        .iter()
+        .enumerate()
+        .skip(2)
+        .find_map(|(index, token)| token.parse::<usize>().ok().map(|count| (index, count)));
+    let count = count_index.map(|(_, count)| count);
+    let values = count_index.and_then(|(index, count)| {
+        parse_nonuniform_numeric_values(tokens, index + 1, &value_type, count)
+    });
+
+    FieldValueSummary::NonUniform {
+        value_type,
+        count,
+        values,
+    }
+}
+
+fn parse_nonuniform_numeric_values(
+    tokens: &[String],
+    start_index: usize,
+    value_type: &Option<String>,
+    count: usize,
+) -> Option<Vec<f64>> {
+    let components = nonuniform_components_for_type(value_type.as_deref())?;
+    let expected_values = count.checked_mul(components)?;
+    let mut values = Vec::new();
+    for token in &tokens[start_index..] {
+        if matches!(token.as_str(), "(" | ")" | "[" | "]") {
+            continue;
+        }
+        values.push(token.parse::<f64>().ok()?);
+    }
+    if values.len() == expected_values {
+        Some(values)
+    } else {
+        None
+    }
+}
+
+fn nonuniform_components_for_type(value_type: Option<&str>) -> Option<usize> {
+    match value_type {
+        Some("List<scalar>") | Some("scalarField") | Some("Field<scalar>") => Some(1),
+        Some("List<vector>") | Some("vectorField") | Some("Field<vector>") => Some(3),
+        _ => None,
     }
 }
 
@@ -534,9 +589,48 @@ mod tests {
             parse_field_file_str(content, Path::new("0/T"), Some("fluid".to_string())).unwrap();
         assert_eq!(field.region.as_deref(), Some("fluid"));
         match field.internal_field.unwrap() {
-            FieldValueSummary::NonUniform { value_type, count } => {
+            FieldValueSummary::NonUniform {
+                value_type,
+                count,
+                values,
+            } => {
                 assert_eq!(value_type.as_deref(), Some("List<scalar>"));
                 assert_eq!(count, Some(3));
+                assert_eq!(values, Some(vec![300.0, 310.0, 320.0]));
+            }
+            other => panic!("unexpected field value: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_nonuniform_vector_values() {
+        let content = r#"
+        FoamFile
+        {
+            class volVectorField;
+            object U;
+        }
+
+        dimensions [0 1 -1 0 0 0 0];
+        internalField nonuniform List<vector>
+        2
+        (
+            (1 0 0)
+            (0 1 0)
+        );
+        boundaryField {}
+        "#;
+
+        let field = parse_field_file_str(content, Path::new("0/U"), None).unwrap();
+        match field.internal_field.unwrap() {
+            FieldValueSummary::NonUniform {
+                value_type,
+                count,
+                values,
+            } => {
+                assert_eq!(value_type.as_deref(), Some("List<vector>"));
+                assert_eq!(count, Some(2));
+                assert_eq!(values, Some(vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0]));
             }
             other => panic!("unexpected field value: {other:?}"),
         }

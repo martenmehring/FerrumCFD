@@ -135,7 +135,9 @@ Supported field entries for the current parser:
 - `FoamFile` metadata, especially `class` and `object`
 - `dimensions [ ... ];`
 - `internalField uniform ...;`
-- `internalField nonuniform List<...> ...;` as a summary
+- `internalField nonuniform List<scalar> ...;` with numeric values
+- `internalField nonuniform List<vector> ...;` with flattened numeric values
+- other `internalField nonuniform List<...> ...;` forms as a summary
 - `boundaryField { patch { type ...; value ...; } }`
 
 Example:
@@ -441,10 +443,12 @@ surface fields are checked against mesh face counts. The report shows the
 field region, class, internal value count, expected count, components, f64 slot
 count, byte estimate, boundary patch counts, and whether the field storage is
 CPU/GPU-capable. Uniform scalar/vector values are parsed into numeric
-components when possible. Correctly shaped uniform fields are also marked as
-materializable CPU f64 buffers. Nonuniform fields are count-checked, but their
-full value lists are not loaded into buffers yet. This still does not solve
-equations or change field values.
+components when possible. Correctly shaped uniform fields are marked as
+materializable CPU f64 buffers. Nonuniform `List<scalar>` and `List<vector>`
+fields are count-checked and loaded into flattened f64 buffers when their value
+count matches the mesh. Other nonuniform value types remain summary-only until
+their type-specific loader exists. This still does not solve equations or
+change field values.
 
 It also checks basic `controlDict` consistency: recognized `startFrom`,
 `stopAt`, and `writeControl` modes, positive finite `deltaT`, valid
@@ -468,8 +472,8 @@ events. It also prints runtime handles derived from `system/ferrumBackends`,
 including CPU thread policy and GPU backend/device metadata. GPU stages are
 reported as planned dispatch only until executable GPU solver kernels exist.
 The same dry-run output also lists the solver-state fields that would be
-available to the future runner, including whether a uniform initial field can
-already be materialized into a CPU buffer.
+available to the future runner, including whether an initial field can already
+be materialized into a CPU buffer.
 `--maxRunnerSteps <n>` limits the preview length. This does not update fields,
 advance physics, or solve equations.
 

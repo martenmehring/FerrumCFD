@@ -70,8 +70,9 @@ The importer currently targets the membrane reactor test mesh shape:
 - solver-state preflight recognizes `volScalarField`, `volVectorField`, and
   `surfaceScalarField`, checks internal field counts against mesh cells/faces,
   estimates components, f64 slots, byte counts, and reports CPU/GPU
-  field-storage capability; valid uniform fields can be materialized as
-  initial CPU f64 buffers without solving equations
+  field-storage capability; valid `uniform`, `List<scalar>`, and
+  `List<vector>` initial fields can be materialized as CPU f64 buffers without
+  solving equations
 - mesh geometry summaries compute face areas, boundary area, and cell volumes
 - special patch validation counts `empty`, `wedge`, and `symmetryPlane`
   patches and reports basic patch-range warnings
