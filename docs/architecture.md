@@ -361,22 +361,25 @@ SIMPLE, PISO, or full Navier-Stokes implementation.
 `transportProperties`, `fvSchemes`, and `fvSolution`, constructs the first flow
 operators on the same runtime `polyMesh` geometry, and writes solver reports as
 JSON/Markdown. The current implementation is deliberately guarded: one damped
-Jacobi CPU SIMPLE step is the stable default for the pipe benchmark, while
-multi-step pressure correction remains an active solver-development target.
-Momentum and pressure-correction linear solvers can be selected separately, so
-experiments can run CG for momentum and Jacobi for pressure correction without
+CPU SIMPLE step remains the stable default, while multi-step pressure
+correction is allowed only when continuity, Hagen-Poiseuille pressure-drop
+error, and relative `U`/`p` field changes satisfy their tolerances. Momentum
+and pressure-correction linear solvers can be selected separately, so
+experiments can run CG/PCG for one equation and Jacobi for another without
 changing the case files. OpenFOAM-style `fvSolution` entries are the default
 source for pressure and velocity under-relaxation and for per-equation linear
 tolerances: `relaxationFactors.equations.U`, `relaxationFactors.fields.p`,
 `solvers.U.tolerance`, `solvers.p.tolerance`, `solvers.p.solver PCG`,
-`solvers.p.preconditioner DIC`, and optional `maxIter` values. `PCG` dispatches
-to Ferrum's CPU preconditioned-CG path. OpenFOAM `DIC`/`FDIC` currently maps to
-a diagonal PCG preconditioner, while true incomplete-Cholesky is tracked as a
+`solvers.p.preconditioner DIC`, and optional `maxIter` values. Ferrum-specific
+SIMPLE entries can additionally set `minSimpleIterations`,
+`pressureDropTolerance`, and `fieldChangeTolerance`. `PCG` dispatches to
+Ferrum's CPU preconditioned-CG path. OpenFOAM `DIC`/`FDIC` currently maps to a
+diagonal PCG preconditioner, while true incomplete-Cholesky is tracked as a
 later numerical upgrade. CLI flags remain explicit experiment overrides.
 The pressure-correction bridge now follows the OpenFOAM shape more closely:
 it builds cell-wise `rAU = V/A(U)`, assembles a variable-coefficient pressure
-correction equation, and corrects `phi` with the pressure-equation flux instead
-of recomputing the surface flux only from corrected cell velocity. The operator
+correction equation, corrects `phi` with the pressure-equation flux, and
+carries the corrected surface flux into the next SIMPLE iteration. The operator
 and report boundaries are kept backend-neutral so the same assembly path can
 later dispatch linear and nonlinear solves to CPU, GPU, or mixed CPU/GPU
 resources.

@@ -10,6 +10,7 @@ use crate::runtime::{SolverRuntimeData, SolverRuntimeMeshData};
 use crate::{MeshError, Point3, Result};
 
 const MAX_LAMINAR_SIMPLE_STEP_CONTINUITY_GROWTH: f64 = 2.0;
+const MAX_LAMINAR_SIMPLE_STEP_PRESSURE_ERROR_GROWTH: f64 = 10.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LaminarSimpleLinearSolver {
@@ -45,7 +46,10 @@ pub struct LaminarSimpleOptions {
     pub momentum_max_linear_iterations: usize,
     pub pressure_max_linear_iterations: usize,
     pub max_simple_iterations: usize,
+    pub min_simple_iterations: usize,
     pub simple_tolerance: f64,
+    pub pressure_drop_tolerance: f64,
+    pub field_change_tolerance: f64,
     pub velocity_relaxation: f64,
     pub pressure_relaxation: f64,
 }
@@ -121,6 +125,9 @@ pub struct LaminarSimpleIterationSummary {
     pub pressure_linear_iterations: usize,
     pub momentum_residual_norm: f64,
     pub pressure_correction_residual_norm: f64,
+    pub relative_pressure_drop_error: f64,
+    pub relative_velocity_change_l2: f64,
+    pub relative_pressure_change_l2: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -190,14 +197,18 @@ pub fn solve_laminar_simple(
     let mut final_pressure_correction_residual_norm = 0.0;
     let mut total_momentum_linear_iterations = 0;
     let mut total_pressure_linear_iterations = 0;
-    let mut final_phi = initial_phi;
+    let mut surface_flux = initial_phi;
+    let mut final_phi = surface_flux.clone();
     let mut final_grad_p = vec![zero(); runtime.mesh.cells];
     let mut final_convection = vec![zero(); runtime.mesh.cells];
 
     for iteration in 1..=options.max_simple_iterations {
         let previous_velocity = velocity.clone();
         let previous_pressure = pressure.clone();
-        let phi = compute_face_flux(&runtime.mesh, &velocity, &velocity_boundary)?;
+        let previous_phi = surface_flux.clone();
+        let phi = previous_phi.clone();
+        let previous_relative_pressure_drop_error =
+            relative_pressure_drop_error_from_velocity(&runtime.mesh, &previous_velocity, options)?;
         let continuity_before = summarize_continuity(&net_cell_flux(&runtime.mesh, &phi)?);
         let grad_p = scalar_gradient(&runtime.mesh, &pressure, &pressure_boundary)?;
         let convection =
@@ -224,6 +235,13 @@ pub fn solve_laminar_simple(
                 pressure_linear_iterations: 0,
                 momentum_residual_norm: momentum.residual_norm,
                 pressure_correction_residual_norm: 0.0,
+                relative_pressure_drop_error: relative_pressure_drop_error_from_velocity(
+                    &runtime.mesh,
+                    &velocity,
+                    options,
+                )?,
+                relative_velocity_change_l2: 0.0,
+                relative_pressure_change_l2: 0.0,
             });
             break;
         }
@@ -250,6 +268,13 @@ pub fn solve_laminar_simple(
                 pressure_linear_iterations: 0,
                 momentum_residual_norm: momentum.residual_norm,
                 pressure_correction_residual_norm: 0.0,
+                relative_pressure_drop_error: relative_pressure_drop_error_from_velocity(
+                    &runtime.mesh,
+                    &velocity,
+                    options,
+                )?,
+                relative_velocity_change_l2: 0.0,
+                relative_pressure_change_l2: 0.0,
             });
             break;
         }
@@ -271,12 +296,20 @@ pub fn solve_laminar_simple(
                 pressure_linear_iterations: 0,
                 momentum_residual_norm: momentum.residual_norm,
                 pressure_correction_residual_norm: 0.0,
+                relative_pressure_drop_error: relative_pressure_drop_error_from_velocity(
+                    &runtime.mesh,
+                    &velocity,
+                    options,
+                )?,
+                relative_velocity_change_l2: 0.0,
+                relative_pressure_change_l2: 0.0,
             });
             break;
         }
         if continuity_star.l2_norm <= options.simple_tolerance {
             velocity = predicted_velocity;
             final_phi = phi_star;
+            surface_flux = final_phi.clone();
             final_continuity = continuity_star;
             final_grad_p = scalar_gradient(&runtime.mesh, &pressure, &pressure_boundary)?;
             final_convection = vector_convection_divergence(
@@ -285,6 +318,11 @@ pub fn solve_laminar_simple(
                 &velocity_boundary,
                 &final_phi,
             )?;
+            let relative_pressure_drop_error =
+                relative_pressure_drop_error_from_velocity(&runtime.mesh, &velocity, options)?;
+            let relative_velocity_change_l2 =
+                relative_vector_field_change_l2(&previous_velocity, &velocity);
+            let relative_pressure_change_l2 = 0.0;
             history.push(LaminarSimpleIterationSummary {
                 iteration,
                 continuity_before,
@@ -294,9 +332,22 @@ pub fn solve_laminar_simple(
                 pressure_linear_iterations: 0,
                 momentum_residual_norm: momentum.residual_norm,
                 pressure_correction_residual_norm: 0.0,
+                relative_pressure_drop_error,
+                relative_velocity_change_l2,
+                relative_pressure_change_l2,
             });
-            converged = true;
-            break;
+            if laminar_simple_converged(
+                iteration,
+                final_continuity,
+                relative_pressure_drop_error,
+                relative_velocity_change_l2,
+                relative_pressure_change_l2,
+                options,
+            ) {
+                converged = true;
+                break;
+            }
+            continue;
         }
         let pressure_source = pressure_correction_source(&runtime.mesh, &net_flux_star)?;
         let r_au = reciprocal_momentum_diagonal(&runtime.mesh, &momentum.diagonal)?;
@@ -337,6 +388,16 @@ pub fn solve_laminar_simple(
                     pressure_linear_iterations: 0,
                     momentum_residual_norm: momentum.residual_norm,
                     pressure_correction_residual_norm: final_pressure_correction_residual_norm,
+                    relative_pressure_drop_error: relative_pressure_drop_error_from_velocity(
+                        &runtime.mesh,
+                        &velocity,
+                        options,
+                    )?,
+                    relative_velocity_change_l2: relative_vector_field_change_l2(
+                        &previous_velocity,
+                        &velocity,
+                    ),
+                    relative_pressure_change_l2: 0.0,
                 });
                 break;
             }
@@ -382,10 +443,12 @@ pub fn solve_laminar_simple(
             velocity = corrected_velocity;
             pressure = corrected_pressure;
             final_phi = corrected_phi;
+            surface_flux = final_phi.clone();
             final_continuity = corrected_continuity;
         } else {
             velocity = predicted_velocity;
             final_phi = phi_star;
+            surface_flux = final_phi.clone();
             final_continuity = continuity_star;
         }
 
@@ -395,13 +458,41 @@ pub fn solve_laminar_simple(
 
         let continuity_growth_exceeded = iteration > 1
             && simple_step_continuity_growth_exceeded(final_continuity, continuity_before);
-        let reported_continuity_after = if continuity_growth_exceeded {
+        let relative_pressure_drop_error =
+            relative_pressure_drop_error_from_velocity(&runtime.mesh, &velocity, options)?;
+        let reference_error_growth_exceeded = iteration > 1
+            && simple_step_pressure_error_growth_exceeded(
+                relative_pressure_drop_error,
+                previous_relative_pressure_drop_error,
+                options,
+            );
+        let step_guard_exceeded = continuity_growth_exceeded || reference_error_growth_exceeded;
+        let reported_continuity_after = if step_guard_exceeded {
             continuity_before
         } else {
             final_continuity
         };
         let reported_pressure_correction_accepted =
-            pressure_correction_accepted && !continuity_growth_exceeded;
+            pressure_correction_accepted && !step_guard_exceeded;
+        let reported_relative_pressure_drop_error = if step_guard_exceeded {
+            previous_relative_pressure_drop_error
+        } else {
+            relative_pressure_drop_error
+        };
+        let relative_velocity_change_l2 =
+            relative_vector_field_change_l2(&previous_velocity, &velocity);
+        let relative_pressure_change_l2 =
+            relative_scalar_field_change_l2(&previous_pressure, &pressure);
+        let reported_relative_velocity_change_l2 = if step_guard_exceeded {
+            0.0
+        } else {
+            relative_velocity_change_l2
+        };
+        let reported_relative_pressure_change_l2 = if step_guard_exceeded {
+            0.0
+        } else {
+            relative_pressure_change_l2
+        };
 
         history.push(LaminarSimpleIterationSummary {
             iteration,
@@ -412,18 +503,28 @@ pub fn solve_laminar_simple(
             pressure_linear_iterations: pressure_report.iterations,
             momentum_residual_norm: momentum.residual_norm,
             pressure_correction_residual_norm: pressure_report.residual_norm,
+            relative_pressure_drop_error: reported_relative_pressure_drop_error,
+            relative_velocity_change_l2: reported_relative_velocity_change_l2,
+            relative_pressure_change_l2: reported_relative_pressure_change_l2,
         });
 
-        if continuity_growth_exceeded {
+        if step_guard_exceeded {
             velocity = previous_velocity;
             pressure = previous_pressure;
-            final_phi = phi;
+            final_phi = previous_phi;
             final_continuity = continuity_before;
             final_grad_p = grad_p;
             final_convection = convection;
             break;
         }
-        if final_continuity.l2_norm <= options.simple_tolerance {
+        if laminar_simple_converged(
+            iteration,
+            final_continuity,
+            relative_pressure_drop_error,
+            relative_velocity_change_l2,
+            relative_pressure_change_l2,
+            options,
+        ) {
             converged = true;
             break;
         }
@@ -621,10 +722,78 @@ fn simple_step_continuity_growth_exceeded(
         && after.l2_norm > before.l2_norm * MAX_LAMINAR_SIMPLE_STEP_CONTINUITY_GROWTH
 }
 
+fn simple_step_pressure_error_growth_exceeded(
+    after_error: f64,
+    before_error: f64,
+    options: &LaminarSimpleOptions,
+) -> bool {
+    let after_abs = after_error.abs();
+    let before_abs = before_error.abs();
+    after_abs.is_finite()
+        && before_abs.is_finite()
+        && after_abs > options.pressure_drop_tolerance
+        && (before_abs <= options.pressure_drop_tolerance
+            || after_abs
+                > before_abs.max(options.pressure_drop_tolerance)
+                    * MAX_LAMINAR_SIMPLE_STEP_PRESSURE_ERROR_GROWTH)
+}
+
+fn laminar_simple_converged(
+    iteration: usize,
+    continuity: ContinuitySummary,
+    relative_pressure_drop_error: f64,
+    relative_velocity_change_l2: f64,
+    relative_pressure_change_l2: f64,
+    options: &LaminarSimpleOptions,
+) -> bool {
+    iteration >= options.min_simple_iterations
+        && continuity.l2_norm <= options.simple_tolerance
+        && relative_pressure_drop_error.is_finite()
+        && relative_pressure_drop_error.abs() <= options.pressure_drop_tolerance
+        && relative_velocity_change_l2.is_finite()
+        && relative_velocity_change_l2 <= options.field_change_tolerance
+        && relative_pressure_change_l2.is_finite()
+        && relative_pressure_change_l2 <= options.field_change_tolerance
+}
+
 fn points_are_finite(values: &[Point3]) -> bool {
     values
         .iter()
         .all(|value| value.x.is_finite() && value.y.is_finite() && value.z.is_finite())
+}
+
+fn relative_vector_field_change_l2(before: &[Point3], after: &[Point3]) -> f64 {
+    let mut delta_squared_sum = 0.0;
+    let mut value_squared_sum = 0.0;
+    for (before, after) in before.iter().zip(after) {
+        let dx = after.x - before.x;
+        let dy = after.y - before.y;
+        let dz = after.z - before.z;
+        delta_squared_sum += dx * dx + dy * dy + dz * dz;
+        value_squared_sum += after.x * after.x + after.y * after.y + after.z * after.z;
+    }
+    let value_norm = value_squared_sum.sqrt();
+    if value_norm <= f64::EPSILON {
+        delta_squared_sum.sqrt()
+    } else {
+        delta_squared_sum.sqrt() / value_norm
+    }
+}
+
+fn relative_scalar_field_change_l2(before: &[f64], after: &[f64]) -> f64 {
+    let mut delta_squared_sum = 0.0;
+    let mut value_squared_sum = 0.0;
+    for (before, after) in before.iter().zip(after) {
+        let delta = *after - *before;
+        delta_squared_sum += delta * delta;
+        value_squared_sum += *after * *after;
+    }
+    let value_norm = value_squared_sum.sqrt();
+    if value_norm <= f64::EPSILON {
+        delta_squared_sum.sqrt()
+    } else {
+        delta_squared_sum.sqrt() / value_norm
+    }
 }
 
 fn component_name(component: usize) -> &'static str {
@@ -1051,22 +1220,8 @@ fn summarize_laminar_simple_solution(
     let analytic_mean_velocity = options.pressure_drop * options.diameter * options.diameter
         / (32.0 * options.dynamic_viscosity * options.length);
     let analytic_flow_rate = analytic_mean_velocity * cross_section_area;
-    let mut weighted_sum = 0.0;
-    let mut total_volume = 0.0;
-    let mut min_axial_velocity = f64::INFINITY;
-    let mut max_axial_velocity = f64::NEG_INFINITY;
-    for (value, volume) in velocity.iter().zip(&mesh.cell_volumes) {
-        weighted_sum += value.x * volume;
-        total_volume += volume;
-        min_axial_velocity = min_axial_velocity.min(value.x);
-        max_axial_velocity = max_axial_velocity.max(value.x);
-    }
-    if total_volume <= f64::EPSILON {
-        return Err(invalid_input(
-            "laminar SIMPLE summary requires positive total cell volume".to_string(),
-        ));
-    }
-    let mean_velocity = weighted_sum / total_volume;
+    let (mean_velocity, min_axial_velocity, max_axial_velocity) =
+        axial_velocity_summary(mesh, velocity)?;
     let flow_rate = mean_velocity * cross_section_area;
     let pressure_drop_from_mean = 32.0 * options.dynamic_viscosity * options.length * mean_velocity
         / (options.diameter * options.diameter);
@@ -1102,6 +1257,47 @@ fn summarize_laminar_simple_solution(
         min_axial_velocity,
         max_axial_velocity,
     })
+}
+
+fn relative_pressure_drop_error_from_velocity(
+    mesh: &SolverRuntimeMeshData,
+    velocity: &[Point3],
+    options: &LaminarSimpleOptions,
+) -> Result<f64> {
+    let (mean_velocity, _, _) = axial_velocity_summary(mesh, velocity)?;
+    let pressure_drop_from_mean = 32.0 * options.dynamic_viscosity * options.length * mean_velocity
+        / (options.diameter * options.diameter);
+    if options.pressure_drop.abs() > f64::EPSILON {
+        Ok((pressure_drop_from_mean - options.pressure_drop) / options.pressure_drop)
+    } else {
+        Ok(0.0)
+    }
+}
+
+fn axial_velocity_summary(
+    mesh: &SolverRuntimeMeshData,
+    velocity: &[Point3],
+) -> Result<(f64, f64, f64)> {
+    let mut weighted_sum = 0.0;
+    let mut total_volume = 0.0;
+    let mut min_axial_velocity = f64::INFINITY;
+    let mut max_axial_velocity = f64::NEG_INFINITY;
+    for (value, volume) in velocity.iter().zip(&mesh.cell_volumes) {
+        weighted_sum += value.x * volume;
+        total_volume += volume;
+        min_axial_velocity = min_axial_velocity.min(value.x);
+        max_axial_velocity = max_axial_velocity.max(value.x);
+    }
+    if total_volume <= f64::EPSILON {
+        return Err(invalid_input(
+            "laminar SIMPLE summary requires positive total cell volume".to_string(),
+        ));
+    }
+    Ok((
+        weighted_sum / total_volume,
+        min_axial_velocity,
+        max_axial_velocity,
+    ))
 }
 
 fn patch_owner_average_scalar(
@@ -1611,10 +1807,17 @@ fn validate_laminar_simple_options(options: &LaminarSimpleOptions) -> Result<()>
         || options.momentum_max_linear_iterations == 0
         || options.pressure_max_linear_iterations == 0
         || options.max_simple_iterations == 0
+        || options.min_simple_iterations == 0
     {
         return Err(invalid_input(
             "laminar SIMPLE iteration limits must be greater than zero".to_string(),
         ));
+    }
+    if options.min_simple_iterations > options.max_simple_iterations {
+        return Err(invalid_input(format!(
+            "laminar SIMPLE minSimpleIterations must not exceed maxSimpleIterations, got {} > {}",
+            options.min_simple_iterations, options.max_simple_iterations
+        )));
     }
     if !options.linear_tolerance.is_finite() || options.linear_tolerance < 0.0 {
         return Err(invalid_input(format!(
@@ -1638,6 +1841,18 @@ fn validate_laminar_simple_options(options: &LaminarSimpleOptions) -> Result<()>
         return Err(invalid_input(format!(
             "laminar SIMPLE tolerance must be non-negative and finite, got {}",
             options.simple_tolerance
+        )));
+    }
+    if !options.pressure_drop_tolerance.is_finite() || options.pressure_drop_tolerance < 0.0 {
+        return Err(invalid_input(format!(
+            "laminar SIMPLE pressure-drop tolerance must be non-negative and finite, got {}",
+            options.pressure_drop_tolerance
+        )));
+    }
+    if !options.field_change_tolerance.is_finite() || options.field_change_tolerance < 0.0 {
+        return Err(invalid_input(format!(
+            "laminar SIMPLE field-change tolerance must be non-negative and finite, got {}",
+            options.field_change_tolerance
         )));
     }
     validate_relaxation("velocity", options.velocity_relaxation)?;
@@ -1958,7 +2173,10 @@ mod tests {
             momentum_max_linear_iterations: 100,
             pressure_max_linear_iterations: 100,
             max_simple_iterations: 3,
+            min_simple_iterations: 1,
             simple_tolerance: 1.0e-12,
+            pressure_drop_tolerance: 1.0,
+            field_change_tolerance: 1.0,
             velocity_relaxation: 0.7,
             pressure_relaxation: 0.3,
         };

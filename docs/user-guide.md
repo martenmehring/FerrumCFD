@@ -670,17 +670,24 @@ preconditioner; a full incomplete-Cholesky factorization is still future
 solver work. The generic `--solveTolerance` and `--maxIterations` flags remain
 broad overrides for both equations.
 
-The current default for this path is one damped Jacobi CPU SIMPLE step. The
-report records residuals, SIMPLE iterations, wall-clock time, finite-volume
-operator summaries, boundary counts, Hagen-Poiseuille error, and continuity.
-The pressure-correction bridge uses cell-wise `rAU = V/A(U)` and corrects
-`phi` from the pressure-equation flux, matching the broad OpenFOAM SIMPLE
-structure more closely than a plain recompute from corrected cell velocity.
-Multi-step SIMPLE runs now have a continuity-growth guard: when a step grows
-the continuity norm too aggressively, Ferrum rolls back to the previous finite
-state and stops the trial. This prevents runaway reports, but multiple
-correction steps and fully OpenFOAM-grade pressure preconditioning are still
-solver-development work.
+The current default for this path remains one damped CPU SIMPLE step. When
+`--maxSimpleIterations` is greater than one, Ferrum defaults to at least two
+SIMPLE iterations before convergence can be accepted. Multi-step convergence
+requires all active checks to pass: continuity L2 below `--simpleTolerance`,
+Hagen-Poiseuille pressure-drop error below `--pressureDropTolerance`, and
+relative `U`/`p` field changes below `--fieldChangeTolerance`. These can also
+be set as Ferrum-specific entries under `SIMPLE` in `system/fvSolution`:
+`minSimpleIterations`, `pressureDropTolerance`, and `fieldChangeTolerance`.
+
+The report records residuals, SIMPLE iterations, wall-clock time,
+finite-volume operator summaries, boundary counts, Hagen-Poiseuille error,
+continuity, and per-iteration field changes. The pressure-correction bridge
+uses cell-wise `rAU = V/A(U)`, corrects `phi` from the pressure-equation flux,
+and carries that corrected surface flux into the next SIMPLE iteration. Guards
+roll back to the previous finite state when continuity or the benchmark
+pressure-drop reference jumps aggressively. This prevents runaway reports, but
+fully OpenFOAM-grade momentum-pressure coupling and true incomplete-Cholesky
+pressure preconditioning are still solver-development work.
 
 For the standard pipe benchmark, the automated comparison command is:
 
