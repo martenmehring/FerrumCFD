@@ -560,9 +560,18 @@ are the handoff point for the future CPU/GPU equation kernels.
 FerrumCFD also contains the first executable CPU linear algebra foundation:
 CSR matrices, matrix-vector products, residual calculation, Jacobi, and
 conjugate gradient. The preflight reports these as CPU linear-solver
-capabilities. They are not yet connected to an assembled CFD equation; the next
-solver step is to assemble a Poisson/diffusion matrix from the runtime mesh and
-solve it through this interface.
+capabilities. They are the solve-side substrate for the scalar diffusion
+assembly described below, but they are not yet driven by a complete CFD
+time-loop or field equation.
+
+The first equation assembly foundation is now present as well. It can assemble
+a scalar diffusion/Poisson CSR system on CPU from runtime mesh geometry with
+internal-face diffusion coupling, `fixedValue` Dirichlet boundaries,
+`zeroGradient` boundaries, and uniform volume source terms. Constraint patch
+types such as `empty`, `wedge`, and `symmetryPlane` are not treated as normal
+diffusive boundary faces. This is still an internal solver building block; it
+is not yet automatically driven by `fvSchemes`, `fvSolution`, or a selected
+field file.
 
 It also checks basic `controlDict` consistency: recognized `startFrom`,
 `stopAt`, and `writeControl` modes, positive finite `deltaT`, valid
@@ -777,7 +786,7 @@ consumed by built-in solver code.
 - Constant property dictionaries are parsed structurally; solver-specific
   required material models and coefficients are not enforced yet.
 - `ferrumSolver` is currently a preflight/run planner; `--runnerDryRun`
-  previews scheduling only. CPU CSR/Jacobi/CG kernels exist, but CFD equation
-  kernels are not implemented yet.
+  previews scheduling only. CPU scalar diffusion assembly and CSR/Jacobi/CG
+  kernels exist, but full CFD equation execution is not implemented yet.
 - CPU/GPU backend selection is validated as configuration and not yet
   executable solver behavior.

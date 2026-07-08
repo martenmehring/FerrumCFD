@@ -333,10 +333,18 @@ operations run.
 
 The first executable solver foundation is CPU linear algebra: CSR matrices,
 matrix-vector products, residuals, Jacobi, and conjugate gradient. This is the
-minimal substrate needed before assembling the first Poisson or diffusion
-equation from runtime mesh geometry. It should remain a small backend-neutral
-contract so later GPU implementations can provide the same operations without
-changing the equation assembly layer.
+minimal substrate used by the first scalar Poisson/diffusion assembly from
+runtime mesh geometry. It should remain a small backend-neutral contract so
+later GPU implementations can provide the same operations without changing the
+equation assembly layer.
+
+The first equation assembly layer is scalar diffusion/Poisson on CPU. It
+converts runtime mesh geometry into a CSR system with internal face coupling,
+`fixedValue` and `zeroGradient` boundary contributions, and volume source
+terms. Constraint patches such as `empty`, `wedge`, and `symmetryPlane` remain
+solver constraints rather than ordinary diffusive boundary faces. This assembly
+layer must stay separate from the linear solver implementation: equation code
+builds a system, while CPU/GPU backends decide how that system is solved.
 
 Important design constraint:
 

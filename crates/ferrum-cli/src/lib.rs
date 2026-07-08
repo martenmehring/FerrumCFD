@@ -10,6 +10,7 @@ use ferrum_mesh::backends::{
     read_backend_config, validate_backend_policy, validate_backend_resources,
 };
 use ferrum_mesh::check::read_case_summary;
+use ferrum_mesh::diffusion::diffusion_assembly_capabilities;
 use ferrum_mesh::fields::{
     FieldBoundaryValidationSummary, FieldFile, InitialFieldSet, read_initial_fields,
     validate_initial_field_boundaries,
@@ -401,6 +402,7 @@ fn print_solver_case_plan(plan: &SolverCasePlan) {
     }
     print_solver_state_plan(&plan.state);
     print_solver_runtime_data(&plan.runtime_data);
+    print_diffusion_assembly_capabilities();
     print_linear_solver_capabilities();
     print_solver_properties(&plan.properties);
     print_solver_numerics_dictionary("fvSchemes", &plan.numerics.fv_schemes);
@@ -424,7 +426,7 @@ fn print_solver_case_plan(plan: &SolverCasePlan) {
         }
     }
     println!(
-        "solver execution: CPU linear algebra kernels are available; CFD equation kernels are not executed yet"
+        "solver execution: CPU scalar diffusion assembly and linear algebra kernels are available; full CFD equations are not executed yet"
     );
 }
 
@@ -436,6 +438,18 @@ fn print_linear_solver_capabilities() {
         yes_no(capabilities.cpu_jacobi),
         yes_no(capabilities.cpu_conjugate_gradient),
         yes_no(capabilities.gpu_linear_solvers)
+    );
+}
+
+fn print_diffusion_assembly_capabilities() {
+    let capabilities = diffusion_assembly_capabilities();
+    println!(
+        "equation assembly: cpuScalarDiffusion={} cpuPoisson={} fixedValue={} zeroGradient={} gpuAssembly={}",
+        yes_no(capabilities.cpu_scalar_diffusion),
+        yes_no(capabilities.cpu_poisson),
+        yes_no(capabilities.fixed_value_boundary),
+        yes_no(capabilities.zero_gradient_boundary),
+        yes_no(capabilities.gpu_assembly)
     );
 }
 
@@ -2211,7 +2225,9 @@ fn print_solver_usage() {
     println!("  --runnerDryRun       preview the future solver runner without solving equations");
     println!("  --maxRunnerSteps <n> limit runner dry-run preview steps (default: 3)");
     println!();
-    println!("CPU CSR/Jacobi/CG kernels are available; CFD equation kernels are not executed yet");
+    println!(
+        "CPU scalar diffusion assembly and CSR/Jacobi/CG kernels are available; full CFD equations are not executed yet"
+    );
 }
 
 fn print_gmsh_to_foam_usage() {

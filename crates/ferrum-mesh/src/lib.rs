@@ -2,6 +2,7 @@ pub mod backends;
 pub mod check;
 pub mod control;
 pub mod dictionary;
+pub mod diffusion;
 pub mod fields;
 pub mod foam;
 pub mod geometry;
