@@ -357,6 +357,16 @@ average against Hagen-Poiseuille, and reports timing and residuals. This is a
 controlled bridge toward the later momentum-pressure solver; it is not yet a
 SIMPLE, PISO, or full Navier-Stokes implementation.
 
+`ferrumSolver --solveLaminarSimple` is the next bridge: it reads `U`, `p`,
+`transportProperties`, `fvSchemes`, and `fvSolution`, constructs the first flow
+operators on the same runtime `polyMesh` geometry, and writes solver reports as
+JSON/Markdown. The current implementation is deliberately guarded: one damped
+Jacobi CPU SIMPLE step is the stable default for the pipe benchmark, while
+multi-step pressure correction and CG/PCG momentum solves remain active solver
+development targets. The operator and report boundaries are kept
+backend-neutral so the same assembly path can later dispatch linear and
+nonlinear solves to CPU, GPU, or mixed CPU/GPU resources.
+
 Important design constraint:
 
 ```text

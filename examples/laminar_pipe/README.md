@@ -30,6 +30,7 @@ OpenFOAM comparison:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_poiseuille_benchmark.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_simple_benchmark.ps1 -SkipOpenFoam -UseExistingOpenFoamJson
 ```
 
 The OpenFOAM reference case is generated under `target/openfoam/laminar_pipe`.
@@ -45,6 +46,10 @@ Generated benchmark files:
 - `target/benchmarks/laminar_pipe_compare.json`
 - `target/benchmarks/laminar_pipe_compare.md`
 - `target/benchmarks/laminar_pipe_compare.ferrum_poiseuille.log`
+- `target/benchmarks/laminar_pipe_laminar_simple.json`
+- `target/benchmarks/laminar_pipe_laminar_simple.md`
+- `target/benchmarks/laminar_pipe_laminar_simple_compare.json`
+- `target/benchmarks/laminar_pipe_laminar_simple_compare.md`
 
 Mesh convergence:
 
@@ -68,8 +73,9 @@ Useful checks:
 checkFerrumMesh -case examples\laminar_pipe
 ferrumSolver -case examples\laminar_pipe --runnerDryRun --maxRunnerSteps 2 --planJson target\laminar_pipe_plan.json
 ferrumSolver -case examples\laminar_pipe --solvePoiseuille --linearSolver cg
+ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --solveTolerance 1e-6 --maxIterations 100 --solveReportJson target\benchmarks\laminar_pipe_laminar_simple.json --solveReportMarkdown target\benchmarks\laminar_pipe_laminar_simple.md
 ```
 
 The full CFD time loop is not implemented yet. This case already executes the
-source-driven CPU Poiseuille benchmark and remains the contract for the later
-flow and heat-transfer solvers.
+source-driven CPU Poiseuille benchmark and the first guarded laminar SIMPLE
+path, and remains the contract for the later flow and heat-transfer solvers.

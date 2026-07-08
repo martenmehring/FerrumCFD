@@ -4,6 +4,7 @@ pub mod control;
 pub mod dictionary;
 pub mod diffusion;
 pub mod fields;
+pub mod flow;
 pub mod foam;
 pub mod geometry;
 pub mod gmsh;

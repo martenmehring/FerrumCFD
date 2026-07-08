@@ -625,15 +625,48 @@ relative error, flow rate, reconstructed pressure drop, solver iterations,
 residual, and wall-clock seconds. It does not write velocity or pressure fields
 back to the case.
 
+`--solveLaminarSimple` is the first guarded laminar incompressible
+pressure-velocity path. It reads the OpenFOAM-like case dictionaries and fields
+that a `simpleFoam` user expects:
+
+- `0/U`
+- `0/p`
+- `constant/transportProperties`
+- `system/fvSchemes`
+- `system/fvSolution`
+- `constant/polyMesh`
+
+It builds the first finite-volume flow operators on the runtime mesh:
+`phi = U_f . S_f`, `grad(p)`, `div(phi,U)`, and `laplacian(nu,U)`. For the
+pipe benchmark the supported boundary-condition contract is:
+
+- `U`: inlet `fixedValue` including nonuniform/parabolic values, wall `noSlip`,
+  outlet `zeroGradient`
+- `p`: inlet `zeroGradient`, outlet `fixedValue`
+- constraint patches: `empty`, `wedge`, and `symmetryPlane`
+
+Current practical command:
+
+```powershell
+ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --solveTolerance 1e-6 --maxIterations 100 --solveReportJson target\benchmarks\laminar_pipe_laminar_simple.json --solveReportMarkdown target\benchmarks\laminar_pipe_laminar_simple.md
+```
+
+The current default for this path is one damped Jacobi CPU SIMPLE step. The
+report records residuals, SIMPLE iterations, wall-clock time, finite-volume
+operator summaries, boundary counts, Hagen-Poiseuille error, and continuity.
+Multiple SIMPLE correction steps and the CG/PCG momentum path are intentionally
+still treated as solver-development work.
+
 For the standard pipe benchmark, the automated comparison command is:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_poiseuille_benchmark.ps1 -OpenFoamSteps 200
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_simple_benchmark.ps1 -SkipOpenFoam -UseExistingOpenFoamJson
 ```
 
-The resulting Markdown table records Ferrum pressure-loss error, OpenFOAM
+The resulting Markdown tables record Ferrum pressure-loss error, OpenFOAM
 pressure-loss error, Ferrum solve time, OpenFOAM wall time, and the shared SI
-inputs `deltaP`, `mu`, `L`, and `D`.
+inputs such as `deltaP`, `rho`, `mu`, `L`, and `D`.
 
 It also checks basic `controlDict` consistency: recognized `startFrom`,
 `stopAt`, and `writeControl` modes, positive finite `deltaT`, valid

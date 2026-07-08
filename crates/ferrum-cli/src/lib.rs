@@ -19,6 +19,11 @@ use ferrum_mesh::fields::{
     FieldBoundaryValidationSummary, FieldFile, InitialFieldSet, read_initial_fields,
     validate_initial_field_boundaries,
 };
+use ferrum_mesh::flow::{
+    ContinuitySummary, FlowBoundarySummary, FlowOperatorSummary, LaminarSimpleIterationSummary,
+    LaminarSimpleLinearSolver, LaminarSimpleOptions, LaminarSimpleReport,
+    LaminarSimpleSolutionSummary, solve_laminar_simple,
+};
 use ferrum_mesh::foam::{FoamWriteOptions, write_openfoam_case_with_options};
 use ferrum_mesh::geometry::{GeometrySummary, summarize_case_geometry};
 use ferrum_mesh::gmsh::read_msh22_ascii;
@@ -348,6 +353,9 @@ fn solve_case(args: Vec<String>) -> Result<(), String> {
     if let Some(solve) = &options.poiseuille_solve {
         run_poiseuille_solve(&plan, solve)?;
     }
+    if let Some(solve) = &options.laminar_simple_solve {
+        run_laminar_simple_solve(&plan, solve)?;
+    }
     if let Some(path) = options.plan_json {
         write_solver_plan_json(&plan, &path).map_err(|error| {
             format!(
@@ -478,6 +486,150 @@ fn resolve_poiseuille_options(
         length,
         diameter,
         wall_patches,
+    })
+}
+
+fn run_laminar_simple_solve(
+    plan: &SolverCasePlan,
+    solve: &LaminarSimpleSolveArgs,
+) -> Result<(), String> {
+    let fields = read_initial_fields(&plan.case_dir).map_err(|error| error.to_string())?;
+    let options = resolve_laminar_simple_options(plan, solve)?;
+
+    let started = Instant::now();
+    let report = solve_laminar_simple(&plan.runtime_data, &fields, &options)
+        .map_err(|error| error.to_string())?;
+    let wall_clock_seconds = started.elapsed().as_secs_f64();
+
+    println!(
+        "laminarSimple solve: backend=cpu linearSolver={} cells={} faces={} simpleIterations={} converged={} initialContinuityL2={} finalContinuityL2={} momentumResidualNorm={} pressureCorrectionResidualNorm={} momentumLinearIterations={} pressureLinearIterations={} wallClockSeconds={:.6}",
+        options.linear_solver,
+        report.cells,
+        report.faces,
+        report.simple_iterations,
+        yes_no(report.converged),
+        format_scientific(report.initial_continuity.l2_norm),
+        format_scientific(report.final_continuity.l2_norm),
+        format_scientific(report.final_momentum_residual_norm),
+        format_scientific(report.final_pressure_correction_residual_norm),
+        report.total_momentum_linear_iterations,
+        report.total_pressure_linear_iterations,
+        wall_clock_seconds
+    );
+    println!(
+        "laminarSimple result: meanVelocity={} analyticMeanVelocity={} relativeMeanVelocityError={} flowRate={} analyticFlowRate={} pressureDropFromMean={} relativePressureDropError={} pressureDropFromField={} minAxialVelocity={} maxAxialVelocity={}",
+        format_scientific(report.solution.mean_velocity),
+        format_scientific(report.solution.analytic_mean_velocity),
+        format_scientific(report.solution.relative_mean_velocity_error),
+        format_scientific(report.solution.flow_rate),
+        format_scientific(report.solution.analytic_flow_rate),
+        format_scientific(report.solution.pressure_drop_from_mean),
+        format_scientific(report.solution.relative_pressure_drop_error),
+        format_optional_scientific(report.solution.pressure_drop_from_field),
+        format_scientific(report.solution.min_axial_velocity),
+        format_scientific(report.solution.max_axial_velocity)
+    );
+    println!(
+        "laminarSimple operators: phiMin={} phiMax={} phiSumAbs={} gradPL2={} divPhiUL2={} velocityFixedValueFaces={} velocityZeroGradientFaces={} pressureFixedValueFaces={} pressureZeroGradientFaces={}",
+        format_scientific(report.operator_summary.phi_min),
+        format_scientific(report.operator_summary.phi_max),
+        format_scientific(report.operator_summary.phi_sum_abs),
+        format_scientific(report.operator_summary.grad_p_l2_norm),
+        format_scientific(report.operator_summary.div_phi_u_l2_norm),
+        report.boundary_summary.velocity_fixed_value_faces,
+        report.boundary_summary.velocity_zero_gradient_faces,
+        report.boundary_summary.pressure_fixed_value_faces,
+        report.boundary_summary.pressure_zero_gradient_faces
+    );
+    println!("laminarSimple status: no field files written");
+
+    if let Some(path) = &solve.report_json {
+        write_laminar_simple_report_json(plan, &options, &report, wall_clock_seconds, path)
+            .map_err(|error| {
+                format!(
+                    "could not write laminar SIMPLE report JSON to {} ({error})",
+                    path.display()
+                )
+            })?;
+        println!("wrote laminar SIMPLE report json: {}", path.display());
+    }
+    if let Some(path) = &solve.report_markdown {
+        write_laminar_simple_report_markdown(plan, &options, &report, wall_clock_seconds, path)
+            .map_err(|error| {
+                format!(
+                    "could not write laminar SIMPLE report Markdown to {} ({error})",
+                    path.display()
+                )
+            })?;
+        println!("wrote laminar SIMPLE report markdown: {}", path.display());
+    }
+
+    Ok(())
+}
+
+fn resolve_laminar_simple_options(
+    plan: &SolverCasePlan,
+    solve: &LaminarSimpleSolveArgs,
+) -> Result<LaminarSimpleOptions, String> {
+    let density = solve
+        .density
+        .or_else(|| property_number(plan, "transportProperties", None, "rho"))
+        .or_else(|| property_number(plan, "pipeBenchmark", Some("water"), "rho"))
+        .ok_or_else(|| {
+            "Laminar SIMPLE solve requires --rho or transportProperties.rho/pipeBenchmark.water.rho"
+                .to_string()
+        })?;
+    let dynamic_viscosity = solve
+        .dynamic_viscosity
+        .or_else(|| property_number(plan, "transportProperties", None, "mu"))
+        .or_else(|| property_number(plan, "pipeBenchmark", Some("water"), "mu"))
+        .ok_or_else(|| {
+            "Laminar SIMPLE solve requires --mu or transportProperties.mu/pipeBenchmark.water.mu"
+                .to_string()
+        })?;
+    let pressure_drop = solve
+        .pressure_drop
+        .or_else(|| {
+            property_number(
+                plan,
+                "pipeBenchmark",
+                Some("flowReference"),
+                "expectedDeltaP",
+            )
+        })
+        .ok_or_else(|| {
+            "Laminar SIMPLE solve requires --pressureDrop or pipeBenchmark.flowReference.expectedDeltaP"
+                .to_string()
+        })?;
+    let length = solve
+        .length
+        .or_else(|| property_number(plan, "pipeBenchmark", Some("geometry"), "length"))
+        .ok_or_else(|| {
+            "Laminar SIMPLE solve requires --length or pipeBenchmark.geometry.length".to_string()
+        })?;
+    let diameter = solve
+        .diameter
+        .or_else(|| property_number(plan, "pipeBenchmark", Some("geometry"), "diameter"))
+        .ok_or_else(|| {
+            "Laminar SIMPLE solve requires --diameter or pipeBenchmark.geometry.diameter"
+                .to_string()
+        })?;
+
+    Ok(LaminarSimpleOptions {
+        density,
+        dynamic_viscosity,
+        pressure_drop,
+        length,
+        diameter,
+        inlet_patch: solve.inlet_patch.clone(),
+        outlet_patch: solve.outlet_patch.clone(),
+        linear_solver: solve.linear_solver,
+        linear_tolerance: solve.linear_tolerance,
+        max_linear_iterations: solve.max_linear_iterations,
+        max_simple_iterations: solve.max_simple_iterations,
+        simple_tolerance: solve.simple_tolerance,
+        velocity_relaxation: solve.velocity_relaxation,
+        pressure_relaxation: solve.pressure_relaxation,
     })
 }
 
@@ -732,7 +884,7 @@ fn print_solver_case_plan(plan: &SolverCasePlan) {
         }
     }
     println!(
-        "solver execution: CPU scalar diffusion assembly and linear algebra kernels are available; full CFD equations are not executed yet"
+        "solver execution: CPU scalar diffusion, Poiseuille, and guarded laminar SIMPLE kernels are available; GPU equation kernels are planned"
     );
 }
 
@@ -1173,6 +1325,496 @@ fn write_solver_plan_json(plan: &SolverCasePlan, path: &Path) -> std::io::Result
     writeln!(writer, "}}")?;
 
     writer.flush()
+}
+
+fn write_laminar_simple_report_json(
+    plan: &SolverCasePlan,
+    options: &LaminarSimpleOptions,
+    report: &LaminarSimpleReport,
+    wall_clock_seconds: f64,
+    path: &Path,
+) -> std::io::Result<()> {
+    ensure_parent_dir(path)?;
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+
+    writeln!(writer, "{{")?;
+    write_json_key(&mut writer, 2, "caseDir")?;
+    write_json_string(&mut writer, &plan.case_dir.display().to_string())?;
+    writeln!(writer, ",")?;
+    write_json_key(&mut writer, 2, "solver")?;
+    write_json_string(&mut writer, "laminarSimple")?;
+    writeln!(writer, ",")?;
+    write_json_key(&mut writer, 2, "backend")?;
+    write_json_string(&mut writer, "cpu")?;
+    writeln!(writer, ",")?;
+    write_json_laminar_simple_options(&mut writer, options)?;
+    writeln!(writer, ",")?;
+    write_json_key(&mut writer, 2, "mesh")?;
+    writeln!(writer, "{{")?;
+    write_json_number_field(&mut writer, 4, "cells", report.cells)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(&mut writer, 4, "faces", report.faces)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(&mut writer, 4, "internalFaces", report.internal_faces)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(&mut writer, 4, "boundaryFaces", report.boundary_faces)?;
+    writeln!(writer)?;
+    write_indent(&mut writer, 2)?;
+    writeln!(writer, "}},")?;
+    write_json_key(&mut writer, 2, "solve")?;
+    writeln!(writer, "{{")?;
+    write_json_number_field(&mut writer, 4, "simpleIterations", report.simple_iterations)?;
+    writeln!(writer, ",")?;
+    write_json_bool_field(&mut writer, 4, "converged", report.converged)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(
+        &mut writer,
+        4,
+        "momentumLinearIterations",
+        report.total_momentum_linear_iterations,
+    )?;
+    writeln!(writer, ",")?;
+    write_json_number_field(
+        &mut writer,
+        4,
+        "pressureLinearIterations",
+        report.total_pressure_linear_iterations,
+    )?;
+    writeln!(writer, ",")?;
+    write_json_key(&mut writer, 4, "wallClockSeconds")?;
+    write_json_optional_number(&mut writer, Some(wall_clock_seconds))?;
+    writeln!(writer, ",")?;
+    write_json_key(&mut writer, 4, "finalMomentumResidualNorm")?;
+    write_json_optional_number(&mut writer, Some(report.final_momentum_residual_norm))?;
+    writeln!(writer, ",")?;
+    write_json_key(&mut writer, 4, "finalPressureCorrectionResidualNorm")?;
+    write_json_optional_number(
+        &mut writer,
+        Some(report.final_pressure_correction_residual_norm),
+    )?;
+    writeln!(writer)?;
+    write_indent(&mut writer, 2)?;
+    writeln!(writer, "}},")?;
+    write_json_key(&mut writer, 2, "continuity")?;
+    writeln!(writer, "{{")?;
+    write_json_key(&mut writer, 4, "initial")?;
+    write_json_continuity_summary(&mut writer, 4, &report.initial_continuity)?;
+    writeln!(writer, ",")?;
+    write_json_key(&mut writer, 4, "final")?;
+    write_json_continuity_summary(&mut writer, 4, &report.final_continuity)?;
+    writeln!(writer)?;
+    write_indent(&mut writer, 2)?;
+    writeln!(writer, "}},")?;
+    write_json_operator_summary(&mut writer, &report.operator_summary)?;
+    writeln!(writer, ",")?;
+    write_json_boundary_summary(&mut writer, &report.boundary_summary)?;
+    writeln!(writer, ",")?;
+    write_json_solution_summary(&mut writer, &report.solution)?;
+    writeln!(writer, ",")?;
+    write_json_laminar_simple_history(&mut writer, &report.history)?;
+    writeln!(writer)?;
+    writeln!(writer, "}}")?;
+
+    writer.flush()
+}
+
+fn write_json_laminar_simple_options(
+    writer: &mut impl Write,
+    options: &LaminarSimpleOptions,
+) -> std::io::Result<()> {
+    write_json_key(writer, 2, "options")?;
+    writeln!(writer, "{{")?;
+    write_json_string_field(
+        writer,
+        4,
+        "linearSolver",
+        &options.linear_solver.to_string(),
+    )?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "density")?;
+    write_json_optional_number(writer, Some(options.density))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "dynamicViscosity")?;
+    write_json_optional_number(writer, Some(options.dynamic_viscosity))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "pressureDrop")?;
+    write_json_optional_number(writer, Some(options.pressure_drop))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "length")?;
+    write_json_optional_number(writer, Some(options.length))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "diameter")?;
+    write_json_optional_number(writer, Some(options.diameter))?;
+    writeln!(writer, ",")?;
+    write_json_string_field(writer, 4, "inletPatch", &options.inlet_patch)?;
+    writeln!(writer, ",")?;
+    write_json_string_field(writer, 4, "outletPatch", &options.outlet_patch)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(
+        writer,
+        4,
+        "maxSimpleIterations",
+        options.max_simple_iterations,
+    )?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "simpleTolerance")?;
+    write_json_optional_number(writer, Some(options.simple_tolerance))?;
+    writeln!(writer, ",")?;
+    write_json_number_field(
+        writer,
+        4,
+        "maxLinearIterations",
+        options.max_linear_iterations,
+    )?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "linearTolerance")?;
+    write_json_optional_number(writer, Some(options.linear_tolerance))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "velocityRelaxation")?;
+    write_json_optional_number(writer, Some(options.velocity_relaxation))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "pressureRelaxation")?;
+    write_json_optional_number(writer, Some(options.pressure_relaxation))?;
+    writeln!(writer)?;
+    write_indent(writer, 2)?;
+    write!(writer, "}}")
+}
+
+fn write_json_continuity_summary(
+    writer: &mut impl Write,
+    indent: usize,
+    summary: &ContinuitySummary,
+) -> std::io::Result<()> {
+    writeln!(writer, "{{")?;
+    write_json_key(writer, indent + 2, "l2Norm")?;
+    write_json_optional_number(writer, Some(summary.l2_norm))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "maxAbs")?;
+    write_json_optional_number(writer, Some(summary.max_abs))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "sumAbs")?;
+    write_json_optional_number(writer, Some(summary.sum_abs))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "globalSum")?;
+    write_json_optional_number(writer, Some(summary.global_sum))?;
+    writeln!(writer)?;
+    write_indent(writer, indent)?;
+    write!(writer, "}}")
+}
+
+fn write_json_operator_summary(
+    writer: &mut impl Write,
+    summary: &FlowOperatorSummary,
+) -> std::io::Result<()> {
+    write_json_key(writer, 2, "operators")?;
+    writeln!(writer, "{{")?;
+    write_json_key(writer, 4, "phiMin")?;
+    write_json_optional_number(writer, Some(summary.phi_min))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "phiMax")?;
+    write_json_optional_number(writer, Some(summary.phi_max))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "phiSumAbs")?;
+    write_json_optional_number(writer, Some(summary.phi_sum_abs))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "gradPL2Norm")?;
+    write_json_optional_number(writer, Some(summary.grad_p_l2_norm))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "divPhiUL2Norm")?;
+    write_json_optional_number(writer, Some(summary.div_phi_u_l2_norm))?;
+    writeln!(writer)?;
+    write_indent(writer, 2)?;
+    write!(writer, "}}")
+}
+
+fn write_json_boundary_summary(
+    writer: &mut impl Write,
+    summary: &FlowBoundarySummary,
+) -> std::io::Result<()> {
+    write_json_key(writer, 2, "boundaries")?;
+    writeln!(writer, "{{")?;
+    write_json_number_field(
+        writer,
+        4,
+        "velocityFixedValueFaces",
+        summary.velocity_fixed_value_faces,
+    )?;
+    writeln!(writer, ",")?;
+    write_json_number_field(
+        writer,
+        4,
+        "velocityZeroGradientFaces",
+        summary.velocity_zero_gradient_faces,
+    )?;
+    writeln!(writer, ",")?;
+    write_json_number_field(
+        writer,
+        4,
+        "velocityConstraintFaces",
+        summary.velocity_constraint_faces,
+    )?;
+    writeln!(writer, ",")?;
+    write_json_number_field(
+        writer,
+        4,
+        "pressureFixedValueFaces",
+        summary.pressure_fixed_value_faces,
+    )?;
+    writeln!(writer, ",")?;
+    write_json_number_field(
+        writer,
+        4,
+        "pressureZeroGradientFaces",
+        summary.pressure_zero_gradient_faces,
+    )?;
+    writeln!(writer, ",")?;
+    write_json_number_field(
+        writer,
+        4,
+        "pressureConstraintFaces",
+        summary.pressure_constraint_faces,
+    )?;
+    writeln!(writer)?;
+    write_indent(writer, 2)?;
+    write!(writer, "}}")
+}
+
+fn write_json_solution_summary(
+    writer: &mut impl Write,
+    summary: &LaminarSimpleSolutionSummary,
+) -> std::io::Result<()> {
+    write_json_key(writer, 2, "solution")?;
+    writeln!(writer, "{{")?;
+    write_json_key(writer, 4, "meanVelocity")?;
+    write_json_optional_number(writer, Some(summary.mean_velocity))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "analyticMeanVelocity")?;
+    write_json_optional_number(writer, Some(summary.analytic_mean_velocity))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "relativeMeanVelocityError")?;
+    write_json_optional_number(writer, Some(summary.relative_mean_velocity_error))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "flowRate")?;
+    write_json_optional_number(writer, Some(summary.flow_rate))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "analyticFlowRate")?;
+    write_json_optional_number(writer, Some(summary.analytic_flow_rate))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "pressureDropFromMean")?;
+    write_json_optional_number(writer, Some(summary.pressure_drop_from_mean))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "relativePressureDropError")?;
+    write_json_optional_number(writer, Some(summary.relative_pressure_drop_error))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "pressureDropFromField")?;
+    write_json_optional_number(writer, summary.pressure_drop_from_field)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "minAxialVelocity")?;
+    write_json_optional_number(writer, Some(summary.min_axial_velocity))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "maxAxialVelocity")?;
+    write_json_optional_number(writer, Some(summary.max_axial_velocity))?;
+    writeln!(writer)?;
+    write_indent(writer, 2)?;
+    write!(writer, "}}")
+}
+
+fn write_json_laminar_simple_history(
+    writer: &mut impl Write,
+    history: &[LaminarSimpleIterationSummary],
+) -> std::io::Result<()> {
+    write_json_key(writer, 2, "history")?;
+    writeln!(writer, "[")?;
+    for (index, item) in history.iter().enumerate() {
+        write_indent(writer, 4)?;
+        writeln!(writer, "{{")?;
+        write_json_number_field(writer, 6, "iteration", item.iteration)?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 6, "continuityBefore")?;
+        write_json_continuity_summary(writer, 6, &item.continuity_before)?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 6, "continuityAfter")?;
+        write_json_continuity_summary(writer, 6, &item.continuity_after)?;
+        writeln!(writer, ",")?;
+        write_json_bool_field(
+            writer,
+            6,
+            "pressureCorrectionAccepted",
+            item.pressure_correction_accepted,
+        )?;
+        writeln!(writer, ",")?;
+        write_json_number_field(
+            writer,
+            6,
+            "momentumLinearIterations",
+            item.momentum_linear_iterations,
+        )?;
+        writeln!(writer, ",")?;
+        write_json_number_field(
+            writer,
+            6,
+            "pressureLinearIterations",
+            item.pressure_linear_iterations,
+        )?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 6, "momentumResidualNorm")?;
+        write_json_optional_number(writer, Some(item.momentum_residual_norm))?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 6, "pressureCorrectionResidualNorm")?;
+        write_json_optional_number(writer, Some(item.pressure_correction_residual_norm))?;
+        writeln!(writer)?;
+        write_indent(writer, 4)?;
+        if index + 1 == history.len() {
+            writeln!(writer, "}}")?;
+        } else {
+            writeln!(writer, "}},")?;
+        }
+    }
+    write_indent(writer, 2)?;
+    write!(writer, "]")
+}
+
+fn write_laminar_simple_report_markdown(
+    plan: &SolverCasePlan,
+    options: &LaminarSimpleOptions,
+    report: &LaminarSimpleReport,
+    wall_clock_seconds: f64,
+    path: &Path,
+) -> std::io::Result<()> {
+    ensure_parent_dir(path)?;
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+
+    writeln!(writer, "# Laminar SIMPLE Benchmark")?;
+    writeln!(writer)?;
+    writeln!(writer, "Case: `{}`", plan.case_dir.display())?;
+    writeln!(writer)?;
+    writeln!(writer, "## Inputs")?;
+    writeln!(writer)?;
+    writeln!(writer, "| Quantity | Value |")?;
+    writeln!(writer, "| --- | ---: |")?;
+    writeln!(
+        writer,
+        "| Density [kg/m3] | {} |",
+        format_scientific(options.density)
+    )?;
+    writeln!(
+        writer,
+        "| Dynamic viscosity [Pa s] | {} |",
+        format_scientific(options.dynamic_viscosity)
+    )?;
+    writeln!(
+        writer,
+        "| Length [m] | {} |",
+        format_scientific(options.length)
+    )?;
+    writeln!(
+        writer,
+        "| Diameter [m] | {} |",
+        format_scientific(options.diameter)
+    )?;
+    writeln!(
+        writer,
+        "| Analytic deltaP [Pa] | {} |",
+        format_scientific(options.pressure_drop)
+    )?;
+    writeln!(writer)?;
+    writeln!(writer, "## Result")?;
+    writeln!(writer)?;
+    writeln!(writer, "| Quantity | Value |")?;
+    writeln!(writer, "| --- | ---: |")?;
+    writeln!(
+        writer,
+        "| SIMPLE iterations | {} |",
+        report.simple_iterations
+    )?;
+    writeln!(writer, "| Converged | {} |", yes_no(report.converged))?;
+    writeln!(
+        writer,
+        "| Final continuity L2 | {} |",
+        format_scientific(report.final_continuity.l2_norm)
+    )?;
+    writeln!(
+        writer,
+        "| Momentum residual norm | {} |",
+        format_scientific(report.final_momentum_residual_norm)
+    )?;
+    writeln!(
+        writer,
+        "| Pressure-correction residual norm | {} |",
+        format_scientific(report.final_pressure_correction_residual_norm)
+    )?;
+    writeln!(
+        writer,
+        "| Wall clock [s] | {} |",
+        format_scientific(wall_clock_seconds)
+    )?;
+    writeln!(
+        writer,
+        "| Mean velocity [m/s] | {} |",
+        format_scientific(report.solution.mean_velocity)
+    )?;
+    writeln!(
+        writer,
+        "| Analytic mean velocity [m/s] | {} |",
+        format_scientific(report.solution.analytic_mean_velocity)
+    )?;
+    writeln!(
+        writer,
+        "| Relative mean-velocity error | {} |",
+        format_percent(report.solution.relative_mean_velocity_error)
+    )?;
+    writeln!(
+        writer,
+        "| DeltaP from mean [Pa] | {} |",
+        format_scientific(report.solution.pressure_drop_from_mean)
+    )?;
+    writeln!(
+        writer,
+        "| Relative pressure-drop error | {} |",
+        format_percent(report.solution.relative_pressure_drop_error)
+    )?;
+    writeln!(
+        writer,
+        "| DeltaP from pressure field [Pa] | {} |",
+        format_optional_scientific(report.solution.pressure_drop_from_field)
+    )?;
+    writeln!(writer)?;
+    writeln!(writer, "## Iterations")?;
+    writeln!(writer)?;
+    writeln!(
+        writer,
+        "| Iteration | Continuity before | Continuity after | Pressure correction | Momentum residual | Pressure residual |"
+    )?;
+    writeln!(writer, "| ---: | ---: | ---: | --- | ---: | ---: |")?;
+    for item in &report.history {
+        writeln!(
+            writer,
+            "| {} | {} | {} | {} | {} | {} |",
+            item.iteration,
+            format_scientific(item.continuity_before.l2_norm),
+            format_scientific(item.continuity_after.l2_norm),
+            if item.pressure_correction_accepted {
+                "accepted"
+            } else {
+                "guarded"
+            },
+            format_scientific(item.momentum_residual_norm),
+            format_scientific(item.pressure_correction_residual_norm)
+        )?;
+    }
+
+    writer.flush()
+}
+
+fn ensure_parent_dir(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(())
 }
 
 fn write_json_control(writer: &mut impl Write, plan: &SolverCasePlan) -> std::io::Result<()> {
@@ -2225,6 +2867,16 @@ fn format_scientific(value: f64) -> String {
     format!("{value:.6e}")
 }
 
+fn format_optional_scientific(value: Option<f64>) -> String {
+    value
+        .map(format_scientific)
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn format_percent(value: f64) -> String {
+    format!("{:.3}%", value * 100.0)
+}
+
 fn print_region_patch(patch: &ferrum_mesh::regions::RegionPatchSummary) {
     if patch.source_flipped_faces > 0 {
         println!(
@@ -2263,6 +2915,7 @@ struct SolverArgs {
     max_runner_steps: usize,
     scalar_diffusion_solve: Option<ScalarDiffusionSolveArgs>,
     poiseuille_solve: Option<PoiseuilleSolveArgs>,
+    laminar_simple_solve: Option<LaminarSimpleSolveArgs>,
 }
 
 #[derive(Debug)]
@@ -2285,6 +2938,26 @@ struct PoiseuilleSolveArgs {
     linear_solver: ScalarDiffusionLinearSolver,
     tolerance: f64,
     max_iterations: usize,
+}
+
+#[derive(Debug)]
+struct LaminarSimpleSolveArgs {
+    density: Option<f64>,
+    dynamic_viscosity: Option<f64>,
+    pressure_drop: Option<f64>,
+    length: Option<f64>,
+    diameter: Option<f64>,
+    inlet_patch: String,
+    outlet_patch: String,
+    linear_solver: LaminarSimpleLinearSolver,
+    linear_tolerance: f64,
+    max_linear_iterations: usize,
+    max_simple_iterations: usize,
+    simple_tolerance: f64,
+    velocity_relaxation: f64,
+    pressure_relaxation: f64,
+    report_json: Option<PathBuf>,
+    report_markdown: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2317,17 +2990,29 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
     let mut scalar_diffusion_option_seen = false;
     let mut poiseuille_solve = false;
     let mut poiseuille_option_seen = false;
+    let mut laminar_simple_solve = false;
+    let mut laminar_simple_option_seen = false;
+    let mut density = None;
     let mut pressure_drop = None;
     let mut dynamic_viscosity = None;
     let mut length = None;
     let mut diameter = None;
+    let mut inlet_patch = "inlet".to_string();
+    let mut outlet_patch = "outlet".to_string();
     let mut wall_patches = Vec::new();
     let mut linear_solve_option_seen = false;
+    let mut linear_solver_name_seen = false;
     let mut scalar_diffusion_diffusivity = 1.0;
     let mut scalar_diffusion_source = 0.0;
     let mut scalar_diffusion_linear_solver = ScalarDiffusionLinearSolver::Cg;
     let mut scalar_diffusion_tolerance = 1.0e-10;
     let mut scalar_diffusion_max_iterations = 10_000;
+    let mut max_simple_iterations = 1;
+    let mut simple_tolerance = 1.0e-8;
+    let mut velocity_relaxation = 0.7;
+    let mut pressure_relaxation = 0.3;
+    let mut solve_report_json = None;
+    let mut solve_report_markdown = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -2382,6 +3067,13 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
                 poiseuille_solve = true;
                 index += 1;
             }
+            "-solveLaminarSimple"
+            | "--solveLaminarSimple"
+            | "-solve-laminar-simple"
+            | "--solve-laminar-simple" => {
+                laminar_simple_solve = true;
+                index += 1;
+            }
             "-diffusivity" | "--diffusivity" => {
                 let value = args
                     .get(index + 1)
@@ -2404,6 +3096,14 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
                 })?;
                 pressure_drop = Some(parse_positive_f64_arg("--pressureDrop", value)?);
                 poiseuille_option_seen = true;
+                index += 2;
+            }
+            "-rho" | "--rho" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--rho requires a positive density in kg/m3".to_string())?;
+                density = Some(parse_positive_f64_arg("--rho", value)?);
+                laminar_simple_option_seen = true;
                 index += 2;
             }
             "-mu" | "--mu" => {
@@ -2430,6 +3130,28 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
                 poiseuille_option_seen = true;
                 index += 2;
             }
+            "-inletPatch" | "--inletPatch" | "-inlet-patch" | "--inlet-patch" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--inletPatch requires a patch name".to_string())?;
+                if value.trim().is_empty() {
+                    return Err("--inletPatch patch name must not be empty".to_string());
+                }
+                inlet_patch = value.to_string();
+                laminar_simple_option_seen = true;
+                index += 2;
+            }
+            "-outletPatch" | "--outletPatch" | "-outlet-patch" | "--outlet-patch" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--outletPatch requires a patch name".to_string())?;
+                if value.trim().is_empty() {
+                    return Err("--outletPatch patch name must not be empty".to_string());
+                }
+                outlet_patch = value.to_string();
+                laminar_simple_option_seen = true;
+                index += 2;
+            }
             "-wallPatch" | "--wallPatch" | "-wall-patch" | "--wall-patch" => {
                 let value = args
                     .get(index + 1)
@@ -2446,6 +3168,7 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
                     .get(index + 1)
                     .ok_or_else(|| "--linearSolver requires 'cg' or 'jacobi'".to_string())?;
                 scalar_diffusion_linear_solver = parse_scalar_diffusion_linear_solver(value)?;
+                linear_solver_name_seen = true;
                 linear_solve_option_seen = true;
                 index += 2;
             }
@@ -2464,6 +3187,70 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
                 scalar_diffusion_max_iterations =
                     parse_positive_usize_arg("--maxIterations", value)?;
                 linear_solve_option_seen = true;
+                index += 2;
+            }
+            "-maxSimpleIterations"
+            | "--maxSimpleIterations"
+            | "-max-simple-iterations"
+            | "--max-simple-iterations" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--maxSimpleIterations requires a positive integer".to_string()
+                })?;
+                max_simple_iterations = parse_positive_usize_arg("--maxSimpleIterations", value)?;
+                laminar_simple_option_seen = true;
+                index += 2;
+            }
+            "-simpleTolerance" | "--simpleTolerance" | "-simple-tolerance"
+            | "--simple-tolerance" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--simpleTolerance requires a non-negative number".to_string()
+                })?;
+                simple_tolerance = parse_non_negative_f64_arg("--simpleTolerance", value)?;
+                laminar_simple_option_seen = true;
+                index += 2;
+            }
+            "-velocityRelaxation"
+            | "--velocityRelaxation"
+            | "-velocity-relaxation"
+            | "--velocity-relaxation" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--velocityRelaxation requires a number in (0, 1]".to_string()
+                })?;
+                velocity_relaxation = parse_relaxation_arg("--velocityRelaxation", value)?;
+                laminar_simple_option_seen = true;
+                index += 2;
+            }
+            "-pressureRelaxation"
+            | "--pressureRelaxation"
+            | "-pressure-relaxation"
+            | "--pressure-relaxation" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--pressureRelaxation requires a number in (0, 1]".to_string()
+                })?;
+                pressure_relaxation = parse_relaxation_arg("--pressureRelaxation", value)?;
+                laminar_simple_option_seen = true;
+                index += 2;
+            }
+            "-solveReportJson"
+            | "--solveReportJson"
+            | "-solve-report-json"
+            | "--solve-report-json" => {
+                let path = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--solveReportJson requires a file path".to_string())?;
+                solve_report_json = Some(PathBuf::from(path));
+                laminar_simple_option_seen = true;
+                index += 2;
+            }
+            "-solveReportMarkdown"
+            | "--solveReportMarkdown"
+            | "-solve-report-markdown"
+            | "--solve-report-markdown" => {
+                let path = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--solveReportMarkdown requires a file path".to_string())?;
+                solve_report_markdown = Some(PathBuf::from(path));
+                laminar_simple_option_seen = true;
                 index += 2;
             }
             other => return Err(format!("unknown ferrumSolver option '{other}'")),
@@ -2496,18 +3283,55 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
     } else {
         None
     };
-    if poiseuille_solve.is_none() && poiseuille_option_seen {
+    let laminar_simple_solve = if laminar_simple_solve {
+        let laminar_simple_linear_solver = if linear_solver_name_seen {
+            map_laminar_simple_linear_solver(scalar_diffusion_linear_solver)
+        } else {
+            LaminarSimpleLinearSolver::Jacobi
+        };
+        Some(LaminarSimpleSolveArgs {
+            density,
+            dynamic_viscosity,
+            pressure_drop,
+            length,
+            diameter,
+            inlet_patch,
+            outlet_patch,
+            linear_solver: laminar_simple_linear_solver,
+            linear_tolerance: scalar_diffusion_tolerance,
+            max_linear_iterations: scalar_diffusion_max_iterations,
+            max_simple_iterations,
+            simple_tolerance,
+            velocity_relaxation,
+            pressure_relaxation,
+            report_json: solve_report_json,
+            report_markdown: solve_report_markdown,
+        })
+    } else {
+        None
+    };
+    if poiseuille_solve.is_none() && laminar_simple_solve.is_none() && poiseuille_option_seen {
         return Err("Poiseuille solve options require --solvePoiseuille".to_string());
     }
-    if scalar_diffusion_solve.is_none() && poiseuille_solve.is_none() && linear_solve_option_seen {
+    if laminar_simple_solve.is_none() && laminar_simple_option_seen {
+        return Err("Laminar SIMPLE solve options require --solveLaminarSimple".to_string());
+    }
+    if scalar_diffusion_solve.is_none()
+        && poiseuille_solve.is_none()
+        && laminar_simple_solve.is_none()
+        && linear_solve_option_seen
+    {
         return Err(
-            "linear solve options require --solveScalarDiffusion <field> or --solvePoiseuille"
+            "linear solve options require --solveScalarDiffusion <field>, --solvePoiseuille, or --solveLaminarSimple"
                 .to_string(),
         );
     }
-    if scalar_diffusion_solve.is_some() && poiseuille_solve.is_some() {
+    let executable_solve_count = scalar_diffusion_solve.is_some() as usize
+        + poiseuille_solve.is_some() as usize
+        + laminar_simple_solve.is_some() as usize;
+    if executable_solve_count > 1 {
         return Err(
-            "--solveScalarDiffusion and --solvePoiseuille cannot be used in the same command yet"
+            "--solveScalarDiffusion, --solvePoiseuille, and --solveLaminarSimple cannot be combined in one command yet"
                 .to_string(),
         );
     }
@@ -2518,7 +3342,17 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
         max_runner_steps,
         scalar_diffusion_solve,
         poiseuille_solve,
+        laminar_simple_solve,
     })
+}
+
+fn map_laminar_simple_linear_solver(
+    solver: ScalarDiffusionLinearSolver,
+) -> LaminarSimpleLinearSolver {
+    match solver {
+        ScalarDiffusionLinearSolver::Cg => LaminarSimpleLinearSolver::Cg,
+        ScalarDiffusionLinearSolver::Jacobi => LaminarSimpleLinearSolver::Jacobi,
+    }
 }
 
 fn parse_scalar_diffusion_linear_solver(
@@ -2565,6 +3399,14 @@ fn parse_non_negative_f64_arg(label: &str, value: &str) -> Result<f64, String> {
     let parsed = parse_finite_f64_arg(label, value)?;
     if parsed < 0.0 {
         return Err(format!("{label} must be non-negative"));
+    }
+    Ok(parsed)
+}
+
+fn parse_relaxation_arg(label: &str, value: &str) -> Result<f64, String> {
+    let parsed = parse_finite_f64_arg(label, value)?;
+    if parsed <= 0.0 || parsed > 1.0 {
+        return Err(format!("{label} must be in (0, 1]"));
     }
     Ok(parsed)
 }
@@ -2767,7 +3609,7 @@ fn print_init_case_usage() {
 
 fn print_solver_usage() {
     println!(
-        "usage: ferrumSolver [-case <caseDir>] [--preflight] [--planJson <file>] [--runnerDryRun] [--maxRunnerSteps <n>] [--solveScalarDiffusion <field>|--solvePoiseuille]"
+        "usage: ferrumSolver [-case <caseDir>] [--preflight] [--planJson <file>] [--runnerDryRun] [--maxRunnerSteps <n>] [--solveScalarDiffusion <field>|--solvePoiseuille|--solveLaminarSimple]"
     );
     println!();
     println!("reads a FerrumCFD/OpenFOAM-like case and prints the solver preflight plan:");
@@ -2786,23 +3628,43 @@ fn print_solver_usage() {
     println!("  --maxRunnerSteps <n> limit runner dry-run preview steps (default: 3)");
     println!("  --solveScalarDiffusion <field> assemble and solve one CPU scalar diffusion system");
     println!("  --solvePoiseuille    solve a source-driven axial Stokes/Poiseuille benchmark");
+    println!("  --solveLaminarSimple solve the first guarded laminar incompressible SIMPLE path");
     println!(
         "  --diffusivity <v>    scalar diffusion coefficient for --solveScalarDiffusion (default: 1)"
     );
     println!(
         "  --source <v>         uniform volume source for --solveScalarDiffusion (default: 0)"
     );
-    println!("  --linearSolver <s>   cg or jacobi for executable solves (default: cg)");
-    println!("  --pressureDrop <Pa>  pressure drop for --solvePoiseuille");
-    println!("  --mu <Pa.s>          dynamic viscosity for --solvePoiseuille");
-    println!("  --length <m>         pipe length for --solvePoiseuille");
-    println!("  --diameter <m>       pipe diameter for --solvePoiseuille");
+    println!(
+        "  --linearSolver <s>   cg or jacobi for executable solves (default: cg; laminar SIMPLE default: jacobi)"
+    );
+    println!("  --pressureDrop <Pa>  pressure drop for --solvePoiseuille/--solveLaminarSimple");
+    println!("  --rho <kg/m3>        density for --solveLaminarSimple");
+    println!("  --mu <Pa.s>          dynamic viscosity for --solvePoiseuille/--solveLaminarSimple");
+    println!("  --length <m>         pipe length for --solvePoiseuille/--solveLaminarSimple");
+    println!("  --diameter <m>       pipe diameter for --solvePoiseuille/--solveLaminarSimple");
     println!("  --wallPatch <name>   wall patch for --solvePoiseuille (default: wall)");
+    println!("  --inletPatch <name>  inlet patch for --solveLaminarSimple (default: inlet)");
+    println!("  --outletPatch <name> outlet patch for --solveLaminarSimple (default: outlet)");
+    println!(
+        "  --maxSimpleIterations <n> SIMPLE iteration cap for --solveLaminarSimple (default: 1)"
+    );
+    println!(
+        "  --simpleTolerance <v> SIMPLE continuity tolerance for --solveLaminarSimple (default: 1e-8)"
+    );
+    println!(
+        "  --velocityRelaxation <v> velocity relaxation for --solveLaminarSimple (default: 0.7)"
+    );
+    println!(
+        "  --pressureRelaxation <v> pressure relaxation for --solveLaminarSimple (default: 0.3)"
+    );
+    println!("  --solveReportJson <file> write --solveLaminarSimple JSON report");
+    println!("  --solveReportMarkdown <file> write --solveLaminarSimple Markdown report");
     println!("  --solveTolerance <v> absolute residual tolerance (default: 1e-10)");
     println!("  --maxIterations <n>  linear solver iteration cap (default: 10000)");
     println!();
     println!(
-        "CPU scalar diffusion assembly and CSR/Jacobi/CG kernels are available; full CFD equations are not executed yet"
+        "CPU scalar diffusion, Poiseuille, and a guarded first laminar SIMPLE path are available; GPU equation kernels are planned"
     );
 }
 
@@ -2832,6 +3694,7 @@ mod tests {
     use super::{
         ScalarDiffusionLinearSolver, parse_solver_args, write_json_solver_state, write_json_string,
     };
+    use ferrum_mesh::flow::LaminarSimpleLinearSolver;
     use ferrum_mesh::solver_state::{
         SolverStateCpuBufferPlan, SolverStateCpuBufferStatus, SolverStateFieldKind,
         SolverStateFieldPlan, SolverStateInternalFieldPlan, SolverStatePlan,
@@ -2944,6 +3807,56 @@ mod tests {
     }
 
     #[test]
+    fn parses_laminar_simple_solve_options() {
+        let args = vec![
+            "--solveLaminarSimple".to_string(),
+            "--rho".to_string(),
+            "998.2".to_string(),
+            "--mu".to_string(),
+            "0.001002".to_string(),
+            "--pressureDrop".to_string(),
+            "1.6032".to_string(),
+            "--length".to_string(),
+            "1.0".to_string(),
+            "--diameter".to_string(),
+            "0.02".to_string(),
+            "--maxSimpleIterations".to_string(),
+            "7".to_string(),
+            "--simpleTolerance".to_string(),
+            "1e-7".to_string(),
+            "--velocityRelaxation".to_string(),
+            "0.6".to_string(),
+            "--pressureRelaxation".to_string(),
+            "0.2".to_string(),
+            "--solveReportJson".to_string(),
+            "target/simple.json".to_string(),
+            "--solveReportMarkdown".to_string(),
+            "target/simple.md".to_string(),
+        ];
+
+        let parsed = parse_solver_args(&args).expect("solver args should parse");
+        let solve = parsed
+            .laminar_simple_solve
+            .expect("laminar SIMPLE solve args");
+
+        assert_eq!(solve.density, Some(998.2));
+        assert_eq!(solve.dynamic_viscosity, Some(0.001002));
+        assert_eq!(solve.pressure_drop, Some(1.6032));
+        assert_eq!(solve.length, Some(1.0));
+        assert_eq!(solve.diameter, Some(0.02));
+        assert_eq!(solve.linear_solver, LaminarSimpleLinearSolver::Jacobi);
+        assert_eq!(solve.max_simple_iterations, 7);
+        assert_eq!(solve.simple_tolerance, 1e-7);
+        assert_eq!(solve.velocity_relaxation, 0.6);
+        assert_eq!(solve.pressure_relaxation, 0.2);
+        assert_eq!(solve.report_json, Some(PathBuf::from("target/simple.json")));
+        assert_eq!(
+            solve.report_markdown,
+            Some(PathBuf::from("target/simple.md"))
+        );
+    }
+
+    #[test]
     fn rejects_mixed_executable_solves() {
         let args = vec![
             "--solveScalarDiffusion".to_string(),
@@ -2953,7 +3866,7 @@ mod tests {
 
         let error = parse_solver_args(&args).expect_err("mixed executable solves should fail");
 
-        assert!(error.contains("cannot be used in the same command"));
+        assert!(error.contains("cannot be combined"));
     }
 
     #[test]

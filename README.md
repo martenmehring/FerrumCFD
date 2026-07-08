@@ -28,12 +28,14 @@ cargo run -p ferrum-cli --bin ferrumSolver -- -case examples\membrane_reactor --
 cargo run -p ferrum-cli --bin ferrumSolver -- -case examples\membrane_reactor --runnerDryRun --maxRunnerSteps 2
 cargo run -p ferrum-cli --bin ferrumSolver -- -case examples\laminar_pipe --solveScalarDiffusion T --diffusivity 1 --linearSolver cg
 cargo run -p ferrum-cli --bin ferrumSolver -- -case examples\laminar_pipe --solvePoiseuille --linearSolver cg
+cargo run -p ferrum-cli --bin ferrumSolver -- -case examples\laminar_pipe --solveLaminarSimple --solveTolerance 1e-6 --maxIterations 100 --solveReportJson target\benchmarks\laminar_pipe_laminar_simple.json --solveReportMarkdown target\benchmarks\laminar_pipe_laminar_simple.md
 ```
 
-Run the first Ferrum/OpenFOAM/analytic Poiseuille benchmark with:
+Run the first Ferrum/OpenFOAM/analytic pipe benchmarks with:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_poiseuille_benchmark.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_simple_benchmark.ps1 -SkipOpenFoam -UseExistingOpenFoamJson
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_pipe_convergence.ps1 -OpenFoamSteps 200
 ```
 
@@ -100,6 +102,12 @@ The importer currently targets the membrane reactor test mesh shape:
   benchmark dictionaries when present, and reports mean velocity, flow rate,
   Hagen-Poiseuille reference values, relative error, residual, and wall-clock
   time without writing field files
+- `--solveLaminarSimple` is the first guarded laminar incompressible SIMPLE
+  path. It reads `U`, `p`, `transportProperties`, `fvSchemes`, and
+  `fvSolution`, builds finite-volume `phi`, `grad(p)`, `div(phi,U)`, and
+  `laplacian(nu,U)` operators on the runtime `constant/polyMesh` geometry,
+  writes JSON/Markdown reports, and currently defaults to one damped Jacobi
+  CPU predictor/correction step for the pipe benchmark
 - mesh geometry summaries compute face areas, boundary area, and cell volumes
 - special patch validation counts `empty`, `wedge`, and `symmetryPlane`
   patches and reports basic patch-range warnings
@@ -118,16 +126,16 @@ The importer currently targets the membrane reactor test mesh shape:
   solver-neutral case plan, including the estimated time/write schedule and
   resolved backend choice per built-in run stage; `--planJson <file>` also
   writes the same plan as machine-readable JSON; `--solveScalarDiffusion
-  <field>` and `--solvePoiseuille` can execute one CPU equation solve, but full
-  CFD time-loop execution is not implemented yet
+  <field>`, `--solvePoiseuille`, and `--solveLaminarSimple` can execute current
+  CPU equation paths, but full CFD time-loop execution is not implemented yet
 - `--runnerDryRun` previews the future solver runner for a capped number of
   steps and logs planned field state, CPU/GPU stage dispatch, runtime handles,
   and missing executable backend status without updating fields or solving
   equations
 - `examples/laminar_pipe` provides a generated circular-pipe SI benchmark with
   a flow-normalized parabolic inlet, analytical Hagen-Poiseuille data,
-  executable Ferrum Poiseuille solves, and OpenFOAM comparison/convergence
-  scripts that record wall-clock runtime
+  executable Ferrum Poiseuille and guarded laminar SIMPLE solves, and OpenFOAM
+  comparison/convergence scripts that record wall-clock runtime
 - `examples/gmsh_pipe/pipe_prism2.geo` provides a parametric Gmsh pipe with two
   near-wall prism layers; `scripts/run_gmsh_pipe_mesh_study.ps1` creates
   coarse/medium/fine Gmsh meshes for OpenFOAM convergence and FerrumCFD

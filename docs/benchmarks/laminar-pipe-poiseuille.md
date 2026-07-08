@@ -8,6 +8,7 @@ Commands:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_poiseuille_benchmark.ps1 -OpenFoamSteps 200
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_simple_benchmark.ps1 -SkipOpenFoam -UseExistingOpenFoamJson
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_pipe_convergence.ps1 -OpenFoamSteps 200
 ```
 
@@ -28,6 +29,23 @@ Reference input:
 Ferrum currently solves the source-driven axial Stokes/Poiseuille benchmark on
 CPU and reconstructs pressure loss from mean velocity. This is not yet the full
 SIMPLE-like pressure-velocity solver.
+
+## Guarded Laminar SIMPLE Path
+
+The first `--solveLaminarSimple` benchmark uses the same medium pipe case,
+OpenFOAM-like field files, and SI inputs. Current default settings are one
+damped Jacobi CPU SIMPLE step with `--solveTolerance 1e-6` and
+`--maxIterations 100`.
+
+| Source | Mean velocity [m/s] | DeltaP from mean [Pa] | Error to analytic | Solve/wall time [s] |
+| --- | ---: | ---: | ---: | ---: |
+| FerrumCFD laminarSimple | 0.0191079 | 1.531687 | -4.461% | 0.468459 solve |
+| OpenFOAM simpleFoam | n/a | 1.6401231 | 2.303% | 12.7306 wall |
+
+This path is a real finite-volume pressure-velocity assembly bridge, but it is
+still guarded. Multi-step SIMPLE correction and CG/PCG momentum solves are the
+next numerical-stability targets before treating it as a `simpleFoam`
+equivalent.
 
 ## Mesh Study
 
