@@ -172,10 +172,7 @@ fn check_mesh(args: Vec<String>) -> Result<(), String> {
                 region.path.display()
             );
             for patch in &region.patches {
-                println!(
-                    "    patch {} type={} faces={} startFace={}",
-                    patch.name, patch.patch_type, patch.faces, patch.start_face
-                );
+                print_region_patch(patch);
             }
         }
     }
@@ -228,13 +225,24 @@ fn split_mesh_regions(args: Vec<String>) -> Result<(), String> {
             region.path.display()
         );
         for patch in &region.patches {
-            println!(
-                "    patch {} type={} faces={} startFace={}",
-                patch.name, patch.patch_type, patch.faces, patch.start_face
-            );
+            print_region_patch(patch);
         }
     }
     Ok(())
+}
+
+fn print_region_patch(patch: &ferrum_mesh::regions::RegionPatchSummary) {
+    if patch.source_flipped_faces > 0 {
+        println!(
+            "    patch {} type={} faces={} startFace={} sourceFlippedFaces={}",
+            patch.name, patch.patch_type, patch.faces, patch.start_face, patch.source_flipped_faces
+        );
+    } else {
+        println!(
+            "    patch {} type={} faces={} startFace={}",
+            patch.name, patch.patch_type, patch.faces, patch.start_face
+        );
+    }
 }
 
 fn parse_case_dir(args: &[String], default: PathBuf) -> Result<PathBuf, String> {

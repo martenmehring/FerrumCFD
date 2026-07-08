@@ -125,11 +125,20 @@ For region interface patches:
 - existing external boundary patch names and types are preserved
 - internal interface names are taken from `faceZones` where available
 - interface patch type is currently written as `patch`
+- `sourceFlippedFaces` is reported when source `faceZone` entries use
+  `flipMap true`
 
 OpenFOAM-style `faceZones` contain `faceLabels` and a `flipMap`. FerrumCFD
-currently uses the `faceLabels` to identify interface faces and skips `flipMap`
-during region splitting. The splitter determines local face orientation from
-`owner` and `neighbour` instead.
+reads both. `faceLabels` identify interface faces. `flipMap` records whether a
+face orientation is flipped relative to the zone orientation. The current
+region splitter still determines each region boundary orientation from
+`owner` and `neighbour`, but the `flipMap` data is retained in memory for later
+interface and flux models.
+
+For membrane and conjugate-transfer models, the positive flux direction should
+be defined by interface metadata, not hidden inside each differential equation.
+The equations should consume an oriented interface normal and then apply their
+physical law, for example heat flux or species flux through a membrane.
 
 ## 2D Meshes
 

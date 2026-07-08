@@ -29,6 +29,7 @@ pub struct RegionPatchSummary {
     pub patch_type: String,
     pub faces: usize,
     pub start_face: usize,
+    pub source_flipped_faces: usize,
 }
 
 pub fn split_regions_by_cell_zones(case_dir: &Path) -> Result<RegionSplitSummary> {
@@ -80,6 +81,7 @@ pub fn split_regions_by_cell_zones(case_dir: &Path) -> Result<RegionSplitSummary
                     patch_type: patch.patch_type.clone(),
                     faces: patch.faces.len(),
                     start_face: patch.start_face,
+                    source_flipped_faces: patch.source_flipped_faces,
                 })
                 .collect(),
         });
@@ -140,6 +142,7 @@ fn summarize_poly_mesh(name: String, path: PathBuf, mesh: &PolyMesh) -> RegionSu
                 patch_type: patch.patch_type.clone(),
                 faces: patch.faces,
                 start_face: patch.start_face,
+                source_flipped_faces: 0,
             })
             .collect(),
     }
@@ -167,11 +170,14 @@ fn build_cell_to_zone(cell_zones: &[CellZone], cell_count: usize) -> Result<Vec<
     Ok(cell_to_zone)
 }
 
-fn build_face_zone_index(face_zones: &[FaceZone]) -> HashMap<usize, String> {
+fn build_face_zone_index(face_zones: &[FaceZone]) -> HashMap<usize, FaceZoneRef> {
     let mut by_face = HashMap::new();
     for zone in face_zones {
-        for &face in &zone.faces {
-            by_face.entry(face).or_insert_with(|| zone.name.clone());
+        for entry in &zone.faces {
+            by_face.entry(entry.face).or_insert_with(|| FaceZoneRef {
+                name: zone.name.clone(),
+                flip: entry.flip,
+            });
         }
     }
     by_face
@@ -186,6 +192,7 @@ fn build_boundary_index(patches: &[BoundaryPatch]) -> HashMap<usize, BoundaryPat
                 BoundaryPatchRef {
                     name: patch.name.clone(),
                     patch_type: patch.patch_type.clone(),
+                    face_zone_flip: None,
                 },
             );
         }
@@ -198,7 +205,7 @@ fn build_region_mesh(
     zone_index: usize,
     zone: &CellZone,
     cell_to_zone: &[Option<usize>],
-    face_zone_by_face: &HashMap<usize, String>,
+    face_zone_by_face: &HashMap<usize, FaceZoneRef>,
     boundary_by_face: &HashMap<usize, BoundaryPatchRef>,
 ) -> Result<RegionMesh> {
     let cell_map = zone
@@ -301,17 +308,22 @@ fn region_patch_for_face(
     zone_index: usize,
     other_zone: Option<usize>,
     face_index: usize,
-    face_zone_by_face: &HashMap<usize, String>,
+    face_zone_by_face: &HashMap<usize, FaceZoneRef>,
     boundary_by_face: &HashMap<usize, BoundaryPatchRef>,
 ) -> BoundaryPatchRef {
     if let Some(patch) = boundary_by_face.get(&face_index) {
-        return patch.clone();
+        let mut patch = patch.clone();
+        if patch.face_zone_flip.is_none() {
+            patch.face_zone_flip = face_zone_by_face.get(&face_index).map(|zone| zone.flip);
+        }
+        return patch;
     }
 
     if let Some(face_zone) = face_zone_by_face.get(&face_index) {
         return BoundaryPatchRef {
-            name: face_zone.clone(),
+            name: face_zone.name.clone(),
             patch_type: "patch".to_string(),
+            face_zone_flip: Some(face_zone.flip),
         };
     }
 
@@ -323,6 +335,7 @@ fn region_patch_for_face(
     BoundaryPatchRef {
         name: format!("interface_{zone_name}_to_{other_name}"),
         patch_type: "patch".to_string(),
+        face_zone_flip: None,
     }
 }
 
@@ -472,11 +485,15 @@ impl BoundaryAccumulator {
                 name: patch_ref.name.clone(),
                 patch_type: patch_ref.patch_type,
                 start_face: 0,
+                source_flipped_faces: 0,
                 faces: Vec::new(),
             });
             self.by_name.insert(key, index);
             index
         };
+        if patch_ref.face_zone_flip.unwrap_or(false) {
+            self.patches[index].source_flipped_faces += 1;
+        }
         self.patches[index].faces.push(face);
     }
 
@@ -515,6 +532,7 @@ struct RegionPatch {
     name: String,
     patch_type: String,
     start_face: usize,
+    source_flipped_faces: usize,
     faces: Vec<RegionFace>,
 }
 
@@ -522,6 +540,13 @@ struct RegionPatch {
 struct BoundaryPatchRef {
     name: String,
     patch_type: String,
+    face_zone_flip: Option<bool>,
+}
+
+#[derive(Clone)]
+struct FaceZoneRef {
+    name: String,
+    flip: bool,
 }
 
 struct PolyMesh {
@@ -593,7 +618,12 @@ struct CellZone {
 
 struct FaceZone {
     name: String,
-    faces: Vec<usize>,
+    faces: Vec<FaceZoneEntry>,
+}
+
+struct FaceZoneEntry {
+    face: usize,
+    flip: bool,
 }
 
 fn read_points(path: &Path) -> Result<Vec<Point3>> {
@@ -704,18 +734,34 @@ fn read_face_zones(path: &Path) -> Result<Vec<FaceZone>> {
     while let Some(name) = cursor.next_entry_name()? {
         cursor.expect("{")?;
         let mut faces = None;
+        let mut flip_map = None;
         while !cursor.peek_is("}")? {
             let line = cursor.next_required()?;
             if line.starts_with("faceLabels ") {
                 faces = Some(cursor.read_label_block()?);
             } else if line.starts_with("flipMap ") {
-                cursor.skip_block()?;
+                flip_map = Some(cursor.read_bool_block()?);
             }
         }
         cursor.expect("}")?;
+        let faces = faces.ok_or_else(|| missing_key(path, "faceLabels"))?;
+        let flip_map = flip_map.unwrap_or_else(|| vec![false; faces.len()]);
+        if flip_map.len() != faces.len() {
+            return Err(MeshError::InvalidInput(format!(
+                "faceZone '{}' has {} faceLabels but {} flipMap entries in {}",
+                name,
+                faces.len(),
+                flip_map.len(),
+                path.display()
+            )));
+        }
         zones.push(FaceZone {
             name,
-            faces: faces.ok_or_else(|| missing_key(path, "faceLabels"))?,
+            faces: faces
+                .into_iter()
+                .zip(flip_map)
+                .map(|(face, flip)| FaceZoneEntry { face, flip })
+                .collect(),
         });
     }
 
@@ -900,16 +946,29 @@ impl DictCursor {
         Ok(labels)
     }
 
-    fn skip_block(&mut self) -> Result<()> {
+    fn read_bool_block(&mut self) -> Result<Vec<bool>> {
         while !self.peek_is("(")? {
             self.index += 1;
         }
         self.expect("(")?;
+        let mut values = Vec::new();
         while !self.peek_is(")")? && !self.peek_is(");")? {
-            self.index += 1;
+            let line = self.next_required()?;
+            let value = match line.as_str() {
+                "true" => true,
+                "false" => false,
+                _ => {
+                    return Err(MeshError::InvalidInput(format!(
+                        "invalid bool '{}' in {}",
+                        line,
+                        self.path.display()
+                    )));
+                }
+            };
+            values.push(value);
         }
         self.index += 1;
-        Ok(())
+        Ok(values)
     }
 }
 

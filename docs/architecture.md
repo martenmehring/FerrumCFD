@@ -154,6 +154,25 @@ Rust/GPU-first architecture inside.
 That means FerrumCFD can remain comfortable for CFD users while still avoiding
 OpenFOAM's CPU-centered internal data layout.
 
+## Interface Orientation
+
+Interface orientation is mesh metadata. It should not be redefined separately
+inside every physics equation.
+
+For a named interface such as `mantle_inner_membrane_complete`, FerrumCFD should
+track:
+
+- the patch or faceZone name
+- the two adjacent regions
+- the oriented face normal
+- the source `flipMap` value where the interface comes from a faceZone
+- the sign convention used by models that consume fluxes across the interface
+
+Physics modules should then use that oriented interface normal. For example, a
+membrane model can define positive species flux from `inner_zone` into
+`membrane`, while the discretisation backend maps that sign convention onto the
+actual face owner/neighbour orientation.
+
 ## Reference Points
 
 - [OpenFOAM User Guide](https://www.openfoam.com/documentation/user-guide):
