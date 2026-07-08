@@ -4,6 +4,8 @@ FerrumCFD is an early Rust CFD platform prototype. The first milestone is
 `ferrum-mesh`: import existing Gmsh meshes into an OpenFOAM-like case layout
 without forcing users to change their usual workflow.
 
+Longer-term design notes are tracked in [docs/architecture.md](docs/architecture.md).
+
 ## First Commands
 
 ```powershell
