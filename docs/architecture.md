@@ -136,6 +136,13 @@ ferrumBackends
         pressureCorrection gpu;
     }
 
+    interfaces
+    {
+        flux auto;
+        coupling auto;
+        sourceTerms auto;
+    }
+
     chemistry
     {
         nonlinearSolve gpu;
@@ -187,10 +194,10 @@ each major stage is intended to run.
 
 Backend policy validation should catch obvious configuration mistakes without
 blocking future physics modules. Known built-in sections such as `mesh`,
-`flow`, `chemistry`, `heat`, and `species` can warn about misspelled stages or
-duplicate entries. Unknown sections remain allowed as forward-compatible custom
-policy, but the preflight should report that current built-in solvers do not
-consume them yet.
+`interfaces`, `flow`, `chemistry`, `heat`, and `species` can warn about
+misspelled stages or duplicate entries. Unknown sections remain allowed as
+forward-compatible custom policy, but the preflight should report that current
+built-in solvers do not consume them yet.
 
 ## Solver Preflight Boundary
 
@@ -220,6 +227,20 @@ The plan classifies the case as `3d`, `2d-empty`, `axisymmetric-wedge`, or
 `mixed-special-patches`. Later solver modules should consume this explicit
 classification rather than rediscovering reduced-dimensional behavior from
 raw patch strings in scattered equation code.
+
+The plan also derives a run schedule from `controlDict` when the time controls
+are fixed enough to do so. `startTime`, `endTime`, and positive `deltaT` allow
+an estimated step count. `writeControl timeStep` with an integer
+`writeInterval` allows an estimated write-event count. Other OpenFOAM-style
+stop/write modes remain valid, but the current preflight keeps their schedule
+open until a runtime exists.
+
+Backend policy resolution belongs in the run plan. Built-in stages are
+expanded into concrete `section.step=choice` entries, with a source marker
+showing whether the choice came from an explicit `ferrumBackends` stage or the
+default backend. This includes nonlinear solver stages, chemistry ODE solves,
+and interface stages such as `interfaces.flux`,
+`interfaces.coupling`, and `interfaces.sourceTerms`.
 
 `fvSchemes` and `fvSolution` parsing is currently structural. The preflight can
 report entries such as `ddtSchemes.default=Euler` or

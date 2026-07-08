@@ -76,12 +76,15 @@ The importer currently targets the membrane reactor test mesh shape:
 - `system/controlDict` is checked for basic run-control consistency such as
   positive `deltaT`, valid time controls, and write intervals
 - backend policy can select CPU/GPU/auto per solver stage, including nonlinear
-  solver steps, with multi-CPU, core-count, thread, and GPU device metadata
+  solver steps and interface flux/coupling/source-term stages, with multi-CPU,
+  core-count, thread, and GPU device metadata
 - backend policy validation warns about duplicate stages, likely misspelled
   built-in stage names, and inconsistent CPU/GPU resource declarations
 - `ferrumSolver` currently performs a solver preflight and prints a
-  solver-neutral case plan; `--planJson <file>` also writes the same plan as
-  machine-readable JSON; executable solver kernels are not implemented yet
+  solver-neutral case plan, including the estimated time/write schedule and
+  resolved backend choice per built-in run stage; `--planJson <file>` also
+  writes the same plan as machine-readable JSON; executable solver kernels are
+  not implemented yet
 
 `splitFerrumMeshRegions` can write one region mesh per imported cell zone under
 `constant/<region>/polyMesh`.

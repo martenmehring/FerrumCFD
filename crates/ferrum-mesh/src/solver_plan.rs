@@ -29,6 +29,7 @@ pub struct SolverCasePlan {
     pub numerics: SolverNumericsPlan,
     pub interfaces: SolverInterfacePlan,
     pub backends: SolverBackendPlan,
+    pub run: SolverRunPlan,
     pub warnings: Vec<String>,
 }
 
@@ -168,6 +169,33 @@ pub struct SolverBackendStagePlan {
     pub choice: BackendChoice,
 }
 
+#[derive(Debug)]
+pub struct SolverRunPlan {
+    pub stop_at: String,
+    pub start_time: Option<f64>,
+    pub end_time: Option<f64>,
+    pub delta_t: Option<f64>,
+    pub estimated_steps: Option<usize>,
+    pub write_control: String,
+    pub write_interval: Option<f64>,
+    pub estimated_write_events: Option<usize>,
+    pub stages: Vec<SolverRunStagePlan>,
+}
+
+#[derive(Debug)]
+pub struct SolverRunStagePlan {
+    pub section: String,
+    pub step: String,
+    pub choice: BackendChoice,
+    pub source: SolverRunStageSource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SolverRunStageSource {
+    Default,
+    Configured,
+}
+
 impl std::fmt::Display for SolverDimensionality {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -178,6 +206,39 @@ impl std::fmt::Display for SolverDimensionality {
         }
     }
 }
+
+impl std::fmt::Display for SolverRunStageSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Default => formatter.write_str("default"),
+            Self::Configured => formatter.write_str("configured"),
+        }
+    }
+}
+
+const BUILT_IN_RUN_STAGES: &[(&str, &str)] = &[
+    ("mesh", "checks"),
+    ("interfaces", "flux"),
+    ("interfaces", "coupling"),
+    ("interfaces", "sourceTerms"),
+    ("flow", "residual"),
+    ("flow", "jacobian"),
+    ("flow", "linearSolve"),
+    ("flow", "pressureCorrection"),
+    ("flow", "nonlinearSolve"),
+    ("heat", "residual"),
+    ("heat", "jacobian"),
+    ("heat", "linearSolve"),
+    ("heat", "nonlinearSolve"),
+    ("species", "residual"),
+    ("species", "jacobian"),
+    ("species", "linearSolve"),
+    ("species", "nonlinearSolve"),
+    ("chemistry", "residual"),
+    ("chemistry", "jacobian"),
+    ("chemistry", "odeSolve"),
+    ("chemistry", "nonlinearSolve"),
+];
 
 pub fn build_solver_case_plan(case_dir: &Path) -> Result<SolverCasePlan> {
     let control = read_control_dict(case_dir)?;
@@ -266,6 +327,7 @@ pub fn build_solver_case_plan(case_dir: &Path) -> Result<SolverCasePlan> {
     };
 
     let backends = build_backend_plan(case_dir, &mut warnings)?;
+    let run = build_run_plan(&control, &backends, &mut warnings);
 
     if patch_validation.empty_patches > 0 && patch_validation.wedge_patches > 0 {
         warnings.push(
@@ -293,6 +355,7 @@ pub fn build_solver_case_plan(case_dir: &Path) -> Result<SolverCasePlan> {
         numerics,
         interfaces,
         backends,
+        run,
         warnings,
     })
 }
@@ -603,13 +666,155 @@ fn build_backend_plan(case_dir: &Path, warnings: &mut Vec<String>) -> Result<Sol
     })
 }
 
+fn build_run_plan(
+    control: &ControlDict,
+    backends: &SolverBackendPlan,
+    warnings: &mut Vec<String>,
+) -> SolverRunPlan {
+    let end_time = if control.stop_at == "endTime" {
+        control.end_time
+    } else {
+        None
+    };
+    let estimated_steps = estimate_time_steps(control.start_time, end_time, control.delta_t);
+    let estimated_write_events = estimate_write_events(
+        control.write_control.as_str(),
+        control.write_interval,
+        control.start_time,
+        end_time,
+        estimated_steps,
+        warnings,
+    );
+
+    SolverRunPlan {
+        stop_at: control.stop_at.clone(),
+        start_time: control.start_time,
+        end_time,
+        delta_t: control.delta_t,
+        estimated_steps,
+        write_control: control.write_control.clone(),
+        write_interval: control.write_interval,
+        estimated_write_events,
+        stages: build_run_stages(backends),
+    }
+}
+
+fn estimate_time_steps(
+    start_time: Option<f64>,
+    end_time: Option<f64>,
+    delta_t: Option<f64>,
+) -> Option<usize> {
+    let start_time = start_time?;
+    let end_time = end_time?;
+    let delta_t = delta_t?;
+
+    if !start_time.is_finite()
+        || !end_time.is_finite()
+        || !delta_t.is_finite()
+        || delta_t <= 0.0
+        || end_time < start_time
+    {
+        return None;
+    }
+
+    let duration = end_time - start_time;
+    if duration <= f64::EPSILON {
+        return Some(0);
+    }
+
+    let steps = (duration / delta_t).ceil();
+    if !steps.is_finite() || steps > usize::MAX as f64 {
+        return None;
+    }
+
+    Some(steps as usize)
+}
+
+fn estimate_write_events(
+    write_control: &str,
+    write_interval: Option<f64>,
+    start_time: Option<f64>,
+    end_time: Option<f64>,
+    estimated_steps: Option<usize>,
+    warnings: &mut Vec<String>,
+) -> Option<usize> {
+    if write_control == "none" {
+        return Some(0);
+    }
+
+    let write_interval = write_interval?;
+    if !write_interval.is_finite() || write_interval <= 0.0 {
+        return None;
+    }
+
+    match write_control {
+        "timeStep" => {
+            let rounded = write_interval.round();
+            if (write_interval - rounded).abs() > f64::EPSILON {
+                warnings.push(format!(
+                    "run plan: writeControl timeStep expects an integer writeInterval, found {write_interval}"
+                ));
+                return None;
+            }
+            let every_steps = rounded as usize;
+            if every_steps == 0 {
+                return None;
+            }
+            estimated_steps.map(|steps| steps / every_steps)
+        }
+        "runTime" | "adjustableRunTime" => {
+            let start_time = start_time?;
+            let end_time = end_time?;
+            if !start_time.is_finite() || !end_time.is_finite() || end_time < start_time {
+                return None;
+            }
+            Some(((end_time - start_time) / write_interval).floor() as usize)
+        }
+        _ => None,
+    }
+}
+
+fn build_run_stages(backends: &SolverBackendPlan) -> Vec<SolverRunStagePlan> {
+    BUILT_IN_RUN_STAGES
+        .iter()
+        .map(|(section, step)| {
+            let (choice, source) = resolve_stage_backend(backends, section, step);
+            SolverRunStagePlan {
+                section: (*section).to_string(),
+                step: (*step).to_string(),
+                choice,
+                source,
+            }
+        })
+        .collect()
+}
+
+fn resolve_stage_backend(
+    backends: &SolverBackendPlan,
+    section: &str,
+    step: &str,
+) -> (BackendChoice, SolverRunStageSource) {
+    for stage in backends.stages.iter().rev() {
+        if stage.section == section && stage.step == step {
+            return (stage.choice, SolverRunStageSource::Configured);
+        }
+    }
+
+    (backends.default, SolverRunStageSource::Default)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
+    use crate::backends::BackendChoice;
+    use crate::control::ControlDict;
     use crate::patches::PatchValidationSummary;
 
-    use super::{SolverDimensionality, classify_dimensionality};
+    use super::{
+        SolverBackendPlan, SolverBackendStagePlan, SolverCpuResourcePlan, SolverDimensionality,
+        SolverGpuResourcePlan, SolverRunStageSource, build_run_plan, classify_dimensionality,
+    };
 
     #[test]
     fn classifies_plain_3d_meshes() {
@@ -647,6 +852,63 @@ mod tests {
         );
     }
 
+    #[test]
+    fn builds_time_step_run_plan() {
+        let control = control_dict(0.0, 1.0, 0.25, "timeStep", 2.0);
+        let backends = backend_plan(
+            BackendChoice::Cpu,
+            vec![
+                ("flow", "residual", BackendChoice::Gpu),
+                ("chemistry", "odeSolve", BackendChoice::Gpu),
+                ("interfaces", "flux", BackendChoice::Auto),
+            ],
+        );
+        let mut warnings = Vec::new();
+
+        let run = build_run_plan(&control, &backends, &mut warnings);
+
+        assert_eq!(run.estimated_steps, Some(4));
+        assert_eq!(run.estimated_write_events, Some(2));
+        let flow_residual = run
+            .stages
+            .iter()
+            .find(|stage| stage.section == "flow" && stage.step == "residual")
+            .expect("flow residual stage");
+        assert_eq!(flow_residual.choice, BackendChoice::Gpu);
+        assert_eq!(flow_residual.source, SolverRunStageSource::Configured);
+        let flow_linear = run
+            .stages
+            .iter()
+            .find(|stage| stage.section == "flow" && stage.step == "linearSolve")
+            .expect("flow linear solve stage");
+        assert_eq!(flow_linear.choice, BackendChoice::Cpu);
+        assert_eq!(flow_linear.source, SolverRunStageSource::Default);
+        let interface_flux = run
+            .stages
+            .iter()
+            .find(|stage| stage.section == "interfaces" && stage.step == "flux")
+            .expect("interface flux stage");
+        assert_eq!(interface_flux.choice, BackendChoice::Auto);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn warns_for_fractional_time_step_write_interval() {
+        let control = control_dict(0.0, 1.0, 0.25, "timeStep", 2.5);
+        let backends = backend_plan(BackendChoice::Cpu, Vec::new());
+        let mut warnings = Vec::new();
+
+        let run = build_run_plan(&control, &backends, &mut warnings);
+
+        assert_eq!(run.estimated_steps, Some(4));
+        assert_eq!(run.estimated_write_events, None);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("integer writeInterval"))
+        );
+    }
+
     fn patch_summary(empty_patches: usize, wedge_patches: usize) -> PatchValidationSummary {
         PatchValidationSummary {
             case_dir: PathBuf::from("case"),
@@ -655,6 +917,62 @@ mod tests {
             wedge_patches,
             symmetry_patches: 0,
             warnings: Vec::new(),
+        }
+    }
+
+    fn control_dict(
+        start_time: f64,
+        end_time: f64,
+        delta_t: f64,
+        write_control: &str,
+        write_interval: f64,
+    ) -> ControlDict {
+        ControlDict {
+            path: PathBuf::from("controlDict"),
+            application: "ferrumSolver".to_string(),
+            start_from: "startTime".to_string(),
+            start_time: Some(start_time),
+            stop_at: "endTime".to_string(),
+            end_time: Some(end_time),
+            delta_t: Some(delta_t),
+            write_control: write_control.to_string(),
+            write_interval: Some(write_interval),
+        }
+    }
+
+    fn backend_plan(
+        default: BackendChoice,
+        stages: Vec<(&str, &str, BackendChoice)>,
+    ) -> SolverBackendPlan {
+        SolverBackendPlan {
+            config_present: true,
+            default,
+            uses_cpu: true,
+            uses_gpu: stages
+                .iter()
+                .any(|(_, _, choice)| matches!(choice, BackendChoice::Gpu | BackendChoice::Auto)),
+            mixed_execution: true,
+            cpu: SolverCpuResourcePlan {
+                cpus: "auto".to_string(),
+                cores_per_cpu: "auto".to_string(),
+                threads: "auto".to_string(),
+                thread_pinning: "off".to_string(),
+                numa: "auto".to_string(),
+            },
+            gpu: SolverGpuResourcePlan {
+                backend: "auto".to_string(),
+                devices: vec!["auto".to_string()],
+                multi_gpu: "auto".to_string(),
+                precision: "f64".to_string(),
+            },
+            stages: stages
+                .into_iter()
+                .map(|(section, step, choice)| SolverBackendStagePlan {
+                    section: section.to_string(),
+                    step: step.to_string(),
+                    choice,
+                })
+                .collect(),
         }
     }
 }

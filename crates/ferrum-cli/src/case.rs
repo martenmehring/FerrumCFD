@@ -214,6 +214,13 @@ fn write_ferrum_backends(writer: &mut BufWriter<File>) -> Result<(), std::io::Er
     writeln!(writer, "    pressureCorrection auto;")?;
     writeln!(writer, "}}")?;
     writeln!(writer)?;
+    writeln!(writer, "interfaces")?;
+    writeln!(writer, "{{")?;
+    writeln!(writer, "    flux auto;")?;
+    writeln!(writer, "    coupling auto;")?;
+    writeln!(writer, "    sourceTerms auto;")?;
+    writeln!(writer, "}}")?;
+    writeln!(writer)?;
     writeln!(writer, "chemistry")?;
     writeln!(writer, "{{")?;
     writeln!(writer, "    residual auto;")?;

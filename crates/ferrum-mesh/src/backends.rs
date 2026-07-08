@@ -252,6 +252,7 @@ fn warn_inconsistent_resource_policy(config: &BackendConfig, warnings: &mut Vec<
 fn known_backend_steps(section: &str) -> Option<HashSet<&'static str>> {
     let steps = match section {
         "mesh" => ["import", "checks"].as_slice(),
+        "interfaces" => ["flux", "coupling", "sourceTerms"].as_slice(),
         "flow" => [
             "nonlinearSolve",
             "residual",
@@ -777,6 +778,28 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("customModel"))
+        );
+    }
+
+    #[test]
+    fn accepts_interface_backend_stages_as_builtin() {
+        let content = r#"
+        interfaces
+        {
+            flux gpu;
+            coupling cpu;
+            sourceTerms auto;
+        }
+        "#;
+
+        let config = parse_backend_config_str(content, Path::new("ferrumBackends")).unwrap();
+        let validation = super::validate_backend_policy(&config);
+
+        assert!(
+            validation
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("interfaces"))
         );
     }
 

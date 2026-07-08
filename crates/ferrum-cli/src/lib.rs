@@ -25,7 +25,8 @@ use ferrum_mesh::regions::{
 };
 use ferrum_mesh::solver_plan::{
     SolverBackendPlan, SolverCasePlan, SolverFieldPlan, SolverInterfacePlan, SolverMeshPlan,
-    SolverNumericsDictionaryPlan, SolverNumericsPlan, SolverPropertiesPlan, build_solver_case_plan,
+    SolverNumericsDictionaryPlan, SolverNumericsPlan, SolverPropertiesPlan, SolverRunPlan,
+    build_solver_case_plan,
 };
 
 pub fn run_ferrum() -> i32 {
@@ -394,6 +395,7 @@ fn print_solver_case_plan(plan: &SolverCasePlan) {
         plan.interfaces.configured_interfaces
     );
     print_solver_backend_plan(&plan.backends);
+    print_solver_run_plan(&plan.run);
     if plan.warnings.is_empty() {
         println!("preflight warnings: none");
     } else {
@@ -480,6 +482,32 @@ fn print_solver_backend_plan(plan: &SolverBackendPlan) {
     }
 }
 
+fn print_solver_run_plan(plan: &SolverRunPlan) {
+    println!(
+        "run schedule: stopAt={} startTime={} endTime={} deltaT={} estimatedSteps={} writeControl={} writeInterval={} estimatedWrites={}",
+        plan.stop_at,
+        format_optional_number(plan.start_time),
+        format_optional_number(plan.end_time),
+        format_optional_number(plan.delta_t),
+        format_optional_usize(plan.estimated_steps),
+        plan.write_control,
+        format_optional_number(plan.write_interval),
+        format_optional_usize(plan.estimated_write_events)
+    );
+    if plan.stages.is_empty() {
+        println!("run stages: none");
+        return;
+    }
+
+    println!("run stages:");
+    for stage in &plan.stages {
+        println!(
+            "  {}.{}={} ({})",
+            stage.section, stage.step, stage.choice, stage.source
+        );
+    }
+}
+
 fn write_solver_plan_json(plan: &SolverCasePlan, path: &Path) -> std::io::Result<()> {
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
@@ -501,6 +529,8 @@ fn write_solver_plan_json(plan: &SolverCasePlan, path: &Path) -> std::io::Result
     write_json_interfaces(&mut writer, &plan.interfaces)?;
     writeln!(writer, ",")?;
     write_json_backends(&mut writer, &plan.backends)?;
+    writeln!(writer, ",")?;
+    write_json_run_plan(&mut writer, &plan.run)?;
     writeln!(writer, ",")?;
     write_json_key(&mut writer, 2, "warnings")?;
     write_json_string_array(&mut writer, &plan.warnings)?;
@@ -776,6 +806,63 @@ fn write_json_interfaces(
     write!(writer, "}}")
 }
 
+fn write_json_run_plan(writer: &mut impl Write, plan: &SolverRunPlan) -> std::io::Result<()> {
+    write_json_key(writer, 2, "run")?;
+    writeln!(writer, "{{")?;
+    write_json_key(writer, 4, "stopAt")?;
+    write_json_string(writer, &plan.stop_at)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "startTime")?;
+    write_json_optional_number(writer, plan.start_time)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "endTime")?;
+    write_json_optional_number(writer, plan.end_time)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "deltaT")?;
+    write_json_optional_number(writer, plan.delta_t)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "estimatedSteps")?;
+    write_json_optional_usize(writer, plan.estimated_steps)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "writeControl")?;
+    write_json_string(writer, &plan.write_control)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "writeInterval")?;
+    write_json_optional_number(writer, plan.write_interval)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "estimatedWriteEvents")?;
+    write_json_optional_usize(writer, plan.estimated_write_events)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "stages")?;
+    writeln!(writer, "[")?;
+    for (index, stage) in plan.stages.iter().enumerate() {
+        write_indent(writer, 6)?;
+        writeln!(writer, "{{")?;
+        write_json_key(writer, 8, "section")?;
+        write_json_string(writer, &stage.section)?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 8, "step")?;
+        write_json_string(writer, &stage.step)?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 8, "choice")?;
+        write_json_string(writer, &stage.choice.to_string())?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 8, "source")?;
+        write_json_string(writer, &stage.source.to_string())?;
+        writeln!(writer)?;
+        write_indent(writer, 6)?;
+        if index + 1 == plan.stages.len() {
+            writeln!(writer, "}}")?;
+        } else {
+            writeln!(writer, "}},")?;
+        }
+    }
+    write_indent(writer, 4)?;
+    writeln!(writer, "]")?;
+    write_indent(writer, 2)?;
+    write!(writer, "}}")
+}
+
 fn write_json_backends(writer: &mut impl Write, plan: &SolverBackendPlan) -> std::io::Result<()> {
     write_json_key(writer, 2, "backends")?;
     writeln!(writer, "{{")?;
@@ -884,6 +971,13 @@ fn write_json_optional_number(writer: &mut impl Write, value: Option<f64>) -> st
     match value {
         Some(value) if value.is_finite() => write!(writer, "{value}"),
         Some(value) => write_json_string(writer, &value.to_string()),
+        None => write!(writer, "null"),
+    }
+}
+
+fn write_json_optional_usize(writer: &mut impl Write, value: Option<usize>) -> std::io::Result<()> {
+    match value {
+        Some(value) => write!(writer, "{value}"),
         None => write!(writer, "null"),
     }
 }
@@ -1056,6 +1150,12 @@ fn format_devices(devices: &[String]) -> String {
 }
 
 fn format_optional_number(value: Option<f64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "missing".to_string())
+}
+
+fn format_optional_usize(value: Option<usize>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "missing".to_string())

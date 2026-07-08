@@ -420,10 +420,12 @@ The output reports the detected dimensionality:
 - `axisymmetric-wedge` when `wedge` patches are present
 - `mixed-special-patches` when both `empty` and `wedge` appear
 
-It also prints the parsed numerical setup from `fvSchemes` and `fvSolution`
-and the backend plan, including CPU sockets/cores/thread policy, GPU
-backend/devices, and per-stage choices such as `flow.residual=gpu` or
-`chemistry.odeSolve=cpu`. This is metadata only for now, but it is the intended
+It also prints the parsed numerical setup from `fvSchemes` and `fvSolution`,
+the backend plan, and a run schedule. The run schedule estimates time steps and
+write events when `controlDict` provides fixed `startTime`, `endTime`, and
+`deltaT` values. It also resolves built-in run stages to CPU/GPU/auto, including
+choices such as `flow.residual=gpu`, `chemistry.odeSolve=cpu`, and
+`interfaces.flux=auto`. This is metadata only for now, but it is the intended
 boundary between OpenFOAM-like case input and the future Rust/GPU solver stack.
 
 The preflight warns about basic numerical setup gaps, such as missing standard
@@ -520,6 +522,13 @@ ferrumBackends
         pressureCorrection gpu;
     }
 
+    interfaces
+    {
+        flux auto;
+        coupling auto;
+        sourceTerms auto;
+    }
+
     chemistry
     {
         nonlinearSolve gpu;
@@ -548,6 +557,13 @@ solve can select backend execution for `residual`, `jacobian`,
 also run on GPU as batched per-cell ODE solves. `odeSolve cpu` is still a
 valid choice when the GPU is busy, unavailable, memory-limited, or when a
 particular stiff chemistry setup performs better on CPU.
+
+Interface stages are also first-class backend candidates. `interfaces.flux`
+belongs to model flux evaluation, `interfaces.coupling` to region-to-region
+coupling work, and `interfaces.sourceTerms` to equation source-term assembly.
+For a membrane model, pressure or concentration differences should determine
+the physical flux sign; the backend choice only decides where the computation
+runs.
 
 CPU resource policy:
 
@@ -579,6 +595,7 @@ GPU resource policy:
 ```text
 backend config: default=cpu cpuCpus=auto cpuCoresPerCpu=auto cpuThreads=auto cpuPinning=off cpuNuma=auto gpuBackend=auto gpuDevices=auto multiGpu=auto precision=f64
   mesh: import=cpu, checks=cpu
+  interfaces: flux=auto, coupling=auto, sourceTerms=auto
   flow: nonlinearSolve=auto, residual=auto, jacobian=auto, linearSolve=auto, pressureCorrection=auto
   chemistry: residual=auto, jacobian=auto, nonlinearSolve=auto, odeSolve=auto
 backend resources: usesCpu=true usesGpu=true mixed=true
@@ -602,7 +619,7 @@ consumed by built-in solver code.
 - Region splitting currently reads Ferrum-generated ASCII `polyMesh` files.
 - `checkFerrumMesh` is currently a structural summary plus basic topology
   warning report, with field, interface, and backend configuration validation.
-- `controlDict` validation is structural run-control validation; adaptive time
+- `controlDict` validation and run scheduling are structural; adaptive time
   stepping and solver-specific time-loop behavior are not implemented yet.
 - Geometry computation currently reports summary values; full OpenFOAM-grade
   geometry quality checks are not implemented yet.
@@ -614,7 +631,7 @@ consumed by built-in solver code.
   discretisation or linear solver kernels.
 - Constant property dictionaries are parsed structurally; solver-specific
   required material models and coefficients are not enforced yet.
-- `ferrumSolver` is currently a preflight planner; CFD solver kernels are not
-  implemented yet.
+- `ferrumSolver` is currently a preflight/run planner; CFD solver kernels are
+  not implemented yet.
 - CPU/GPU backend selection is validated as configuration and not yet
   executable solver behavior.
