@@ -20,7 +20,8 @@ use ferrum_mesh::regions::{
     read_region_mesh_summaries, split_regions_by_cell_zones,
 };
 use ferrum_mesh::solver_plan::{
-    SolverBackendPlan, SolverCasePlan, SolverNumericsDictionaryPlan, build_solver_case_plan,
+    SolverBackendPlan, SolverCasePlan, SolverNumericsDictionaryPlan, SolverPropertiesPlan,
+    build_solver_case_plan,
 };
 
 pub fn run_ferrum() -> i32 {
@@ -368,6 +369,7 @@ fn print_solver_case_plan(plan: &SolverCasePlan) {
             );
         }
     }
+    print_solver_properties(&plan.properties);
     print_solver_numerics_dictionary("fvSchemes", &plan.numerics.fv_schemes);
     print_solver_numerics_dictionary("fvSolution", &plan.numerics.fv_solution);
     println!(
@@ -388,6 +390,33 @@ fn print_solver_case_plan(plan: &SolverCasePlan) {
         }
     }
     println!("solver execution: preflight only; solver kernels are not implemented yet");
+}
+
+fn print_solver_properties(plan: &SolverPropertiesPlan) {
+    println!(
+        "properties: dictionaries={} entries={}",
+        plan.dictionaries.len(),
+        plan.entries.len()
+    );
+    for dictionary in &plan.dictionaries {
+        let label = if let Some(region) = &dictionary.region {
+            format!("{region}/{}", dictionary.name)
+        } else {
+            dictionary.name.clone()
+        };
+        println!(
+            "  {}: sections={} entries={}",
+            label, dictionary.sections, dictionary.entries
+        );
+    }
+    for entry in &plan.entries {
+        let path = if let Some(section) = &entry.section {
+            format!("{}.{}.{}", entry.dictionary, section, entry.key)
+        } else {
+            format!("{}.{}", entry.dictionary, entry.key)
+        };
+        println!("    {path}={}", entry.value);
+    }
 }
 
 fn print_solver_numerics_dictionary(name: &str, plan: &SolverNumericsDictionaryPlan) {
@@ -949,6 +978,7 @@ fn print_solver_usage() {
     println!("  system/fvSolution");
     println!("  system/ferrumBackends");
     println!("  constant/polyMesh");
+    println!("  constant/<property dictionaries>");
     println!("  constant/interfaces");
     println!("  0/<fields>");
     println!();

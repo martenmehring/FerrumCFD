@@ -71,6 +71,8 @@ The importer currently targets the membrane reactor test mesh shape:
   patches and reports basic patch-range warnings
 - `system/fvSchemes` and `system/fvSolution` are parsed and checked
   structurally for the solver preflight
+- constant property dictionaries such as `transportProperties` and
+  region-local property files are parsed structurally for the solver preflight
 - backend policy can select CPU/GPU/auto per solver stage, including nonlinear
   solver steps, with multi-CPU, core-count, thread, and GPU device metadata
 - `ferrumSolver` currently performs a solver preflight and prints a

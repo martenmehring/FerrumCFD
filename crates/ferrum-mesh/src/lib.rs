@@ -10,6 +10,7 @@ pub mod interfaces;
 pub mod numerics;
 pub mod patches;
 pub mod poly_mesh;
+pub mod properties;
 pub mod regions;
 pub mod solver_plan;
 

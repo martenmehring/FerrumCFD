@@ -11,6 +11,10 @@ use crate::numerics::{
 };
 use crate::patches::{PatchValidationSummary, validate_poly_mesh_patches};
 use crate::poly_mesh::PolyMesh;
+use crate::properties::{
+    PropertyDictionary, PropertySection, format_property_value, read_case_properties,
+    validate_properties,
+};
 use crate::regions::{build_interface_registry, read_region_mesh_summaries};
 
 #[derive(Debug)]
@@ -19,6 +23,7 @@ pub struct SolverCasePlan {
     pub control: ControlDict,
     pub mesh: SolverMeshPlan,
     pub fields: SolverFieldPlan,
+    pub properties: SolverPropertiesPlan,
     pub numerics: SolverNumericsPlan,
     pub interfaces: SolverInterfacePlan,
     pub backends: SolverBackendPlan,
@@ -66,6 +71,28 @@ pub struct SolverFieldEntryPlan {
     pub name: String,
     pub class_name: Option<String>,
     pub boundary_patches: usize,
+}
+
+#[derive(Debug)]
+pub struct SolverPropertiesPlan {
+    pub dictionaries: Vec<SolverPropertyDictionaryPlan>,
+    pub entries: Vec<SolverPropertyEntryPlan>,
+}
+
+#[derive(Debug)]
+pub struct SolverPropertyDictionaryPlan {
+    pub name: String,
+    pub region: Option<String>,
+    pub sections: usize,
+    pub entries: usize,
+}
+
+#[derive(Debug)]
+pub struct SolverPropertyEntryPlan {
+    pub dictionary: String,
+    pub section: Option<String>,
+    pub key: String,
+    pub value: String,
 }
 
 #[derive(Debug)]
@@ -187,6 +214,7 @@ pub fn build_solver_case_plan(case_dir: &Path) -> Result<SolverCasePlan> {
     );
 
     let field_names = unique_field_names(&fields);
+    let properties = build_properties_plan(case_dir, &mut warnings)?;
     let numerics = build_numerics_plan(case_dir, &field_names, &mut warnings)?;
 
     let interface_config = read_interface_config(case_dir)?;
@@ -251,6 +279,7 @@ pub fn build_solver_case_plan(case_dir: &Path) -> Result<SolverCasePlan> {
                 })
                 .collect(),
         },
+        properties,
         numerics,
         interfaces,
         backends,
@@ -287,6 +316,102 @@ fn classify_dimensionality(patch_validation: &PatchValidationSummary) -> SolverD
         (true, false) => SolverDimensionality::TwoD,
         (false, true) => SolverDimensionality::Axisymmetric,
         (true, true) => SolverDimensionality::MixedSpecialPatches,
+    }
+}
+
+fn build_properties_plan(
+    case_dir: &Path,
+    warnings: &mut Vec<String>,
+) -> Result<SolverPropertiesPlan> {
+    let dictionaries = read_case_properties(case_dir)?;
+    let validation = validate_properties(&dictionaries);
+    warnings.extend(
+        validation
+            .warnings
+            .iter()
+            .map(|warning| format!("properties: {warning}")),
+    );
+
+    let mut dictionary_plans = Vec::new();
+    let mut entry_plans = Vec::new();
+    for dictionary in &dictionaries {
+        let label = property_dictionary_label(dictionary);
+        dictionary_plans.push(SolverPropertyDictionaryPlan {
+            name: dictionary.name.clone(),
+            region: dictionary.region.clone(),
+            sections: count_property_sections(&dictionary.sections),
+            entries: count_property_entries(dictionary),
+        });
+        append_property_entries(
+            &label,
+            None,
+            &dictionary.entries,
+            &dictionary.sections,
+            &mut entry_plans,
+        );
+    }
+
+    Ok(SolverPropertiesPlan {
+        dictionaries: dictionary_plans,
+        entries: entry_plans,
+    })
+}
+
+fn property_dictionary_label(dictionary: &PropertyDictionary) -> String {
+    if let Some(region) = &dictionary.region {
+        format!("{region}/{}", dictionary.name)
+    } else {
+        dictionary.name.clone()
+    }
+}
+
+fn count_property_sections(sections: &[PropertySection]) -> usize {
+    sections
+        .iter()
+        .map(|section| 1 + count_property_sections(&section.sections))
+        .sum()
+}
+
+fn count_property_entries(dictionary: &PropertyDictionary) -> usize {
+    dictionary.entries.len() + count_section_property_entries(&dictionary.sections)
+}
+
+fn count_section_property_entries(sections: &[PropertySection]) -> usize {
+    sections
+        .iter()
+        .map(|section| section.entries.len() + count_section_property_entries(&section.sections))
+        .sum()
+}
+
+fn append_property_entries(
+    dictionary: &str,
+    section: Option<&str>,
+    entries: &[crate::properties::PropertyEntry],
+    sections: &[PropertySection],
+    entry_plans: &mut Vec<SolverPropertyEntryPlan>,
+) {
+    for entry in entries {
+        entry_plans.push(SolverPropertyEntryPlan {
+            dictionary: dictionary.to_string(),
+            section: section.map(str::to_string),
+            key: entry.key.clone(),
+            value: format_property_value(&entry.value),
+        });
+    }
+
+    for nested in sections {
+        let nested_path = if let Some(section) = section {
+            format!("{section}.{}", nested.name)
+        } else {
+            nested.name.clone()
+        };
+        append_property_entries(
+            dictionary,
+            Some(&nested_path),
+            &nested.entries,
+            &nested.sections,
+            entry_plans,
+        );
     }
 }
 

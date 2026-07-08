@@ -406,6 +406,8 @@ The preflight reads:
 - `system/fvSolution`
 - `system/ferrumBackends`
 - `constant/polyMesh`
+- constant property dictionaries such as `transportProperties`
+- region-local property dictionaries below `constant/<region>/`
 - generated region meshes below `constant/<region>/polyMesh`
 - `constant/interfaces`
 - initial fields below `0/`
@@ -426,6 +428,11 @@ boundary between OpenFOAM-like case input and the future Rust/GPU solver stack.
 The preflight warns about basic numerical setup gaps, such as missing standard
 `fvSchemes` sections, missing `default` scheme entries, or initial fields that
 do not have a matching `fvSolution.solvers` entry.
+
+It also reads material and transport property dictionaries below `constant/`
+and `constant/<region>/`. At this stage FerrumCFD checks the structure and
+dimension-vector shape, but solver modules will later decide which properties
+are required for each physics model.
 
 ## Interface Model Setup
 
@@ -586,6 +593,8 @@ accept `auto` or a positive integer.
 - `fvSchemes` and `fvSolution` are parsed and checked structurally for the
   solver preflight; their entries are not yet consumed by executable
   discretisation or linear solver kernels.
+- Constant property dictionaries are parsed structurally; solver-specific
+  required material models and coefficients are not enforced yet.
 - `ferrumSolver` is currently a preflight planner; CFD solver kernels are not
   implemented yet.
 - CPU/GPU backend selection is validated as configuration and not yet

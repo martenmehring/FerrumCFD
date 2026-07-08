@@ -198,6 +198,9 @@ The preflight reads:
 - `system/fvSolution` for user-facing solver and algorithm settings
 - `constant/polyMesh` for topology, patches, and special reduced-dimension
   patch types
+- constant property dictionaries such as `transportProperties` and
+  `thermophysicalProperties`
+- region-local property dictionaries below `constant/<region>/`
 - generated region meshes below `constant/<region>/polyMesh`
 - initial fields below `0/`
 - `constant/interfaces` for model-facing interface sign conventions
@@ -219,6 +222,12 @@ standard `fvSchemes` sections, missing `default` entries, missing
 `fvSolution.solvers`, or initial fields that have no matching solver entry.
 Equation-specific validation, such as whether a convection scheme is valid for
 a particular transport equation, stays with the future solver modules.
+
+Property dictionary parsing follows the same rule. The preflight can report
+entries such as `transportProperties.nu=[0 2 -1 0 0 0 0] 1e-05` and warn about
+malformed dimension vectors, but physics modules decide later whether a
+particular model requires `nu`, `rho`, species diffusivity, thermal
+conductivity, membrane permeance, or another coefficient.
 
 ## Mesh Geometry Direction
 
