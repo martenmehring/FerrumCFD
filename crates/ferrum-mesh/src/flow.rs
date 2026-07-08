@@ -288,7 +288,15 @@ pub fn solve_laminar_simple(
         }
 
         let phi_star = compute_face_flux(&runtime.mesh, &predicted_velocity, &velocity_boundary)?;
-        let net_flux_star = net_cell_flux(&runtime.mesh, &phi_star)?;
+        let r_au = reciprocal_momentum_diagonal(
+            &runtime.mesh,
+            &momentum.diagonal,
+            options.velocity_relaxation,
+        )?;
+        let old_pressure_flux =
+            pressure_correction_flux(&runtime.mesh, &pressure, &r_au, &pressure_boundary)?;
+        let phi_hby_a = subtract_face_fluxes(&phi_star, &old_pressure_flux)?;
+        let net_flux_star = net_cell_flux(&runtime.mesh, &phi_hby_a)?;
         let continuity_star = summarize_continuity(&net_flux_star);
         if !is_finite_continuity(continuity_star) {
             final_phi = phi;
@@ -318,7 +326,7 @@ pub fn solve_laminar_simple(
         }
         if continuity_star.l2_norm <= options.simple_tolerance {
             velocity = predicted_velocity;
-            final_phi = phi_star;
+            final_phi = phi_hby_a;
             surface_flux = final_phi.clone();
             final_continuity = continuity_star;
             final_grad_p = scalar_gradient(&runtime.mesh, &pressure, &pressure_boundary)?;
@@ -371,21 +379,16 @@ pub fn solve_laminar_simple(
             continue;
         }
         let pressure_source = pressure_correction_source(&runtime.mesh, &net_flux_star)?;
-        let r_au = reciprocal_momentum_diagonal(
-            &runtime.mesh,
-            &momentum.diagonal,
-            options.velocity_relaxation,
-        )?;
         let pressure_system = assemble_variable_scalar_component_system(
             &runtime.mesh,
             &r_au,
             &pressure_source,
-            &pressure_correction_boundary,
+            &pressure_boundary,
         )?;
         let pressure_report = match solve_scalar_system(
             &pressure_system.matrix,
             &pressure_system.rhs,
-            None,
+            Some(&pressure),
             options.pressure_linear_solver,
             options.pressure_preconditioner,
             options.pressure_linear_tolerance,
@@ -395,7 +398,7 @@ pub fn solve_laminar_simple(
             Err(error) if is_pressure_correction_breakdown(&error) => {
                 velocity = predicted_velocity;
                 final_pressure_correction_residual_norm = l2_norm(&pressure_system.rhs);
-                final_phi = phi_star;
+                final_phi = phi_hby_a;
                 final_continuity = continuity_star;
                 final_grad_p = scalar_gradient(&runtime.mesh, &pressure, &pressure_boundary)?;
                 final_convection = vector_convection_divergence(
@@ -437,30 +440,36 @@ pub fn solve_laminar_simple(
         total_pressure_linear_iterations += pressure_report.iterations;
         final_pressure_correction_residual_norm = pressure_report.residual_norm;
 
+        let pressure_delta = pressure_report
+            .solution
+            .iter()
+            .zip(&pressure)
+            .map(|(after, before)| options.pressure_relaxation * (after - before))
+            .collect::<Vec<_>>();
         let pressure_correction_gradient = scalar_gradient(
             &runtime.mesh,
-            &pressure_report.solution,
+            &pressure_delta,
             &pressure_correction_boundary,
         )?;
         let mut corrected_velocity = predicted_velocity.clone();
-        let mut corrected_pressure = pressure.clone();
         correct_velocity(
             &mut corrected_velocity,
             &pressure_correction_gradient,
             &r_au,
-            options.pressure_relaxation,
+            1.0,
         );
-        for (value, correction) in corrected_pressure.iter_mut().zip(&pressure_report.solution) {
-            *value += options.pressure_relaxation * correction;
+        let mut corrected_pressure = pressure.clone();
+        for (value, delta) in corrected_pressure.iter_mut().zip(&pressure_delta) {
+            *value += delta;
         }
 
         let pressure_flux = pressure_correction_flux(
             &runtime.mesh,
             &pressure_report.solution,
             &r_au,
-            &pressure_correction_boundary,
+            &pressure_boundary,
         )?;
-        let corrected_phi = add_face_fluxes(&phi_star, &pressure_flux)?;
+        let corrected_phi = add_face_fluxes(&phi_hby_a, &pressure_flux)?;
         let corrected_continuity =
             summarize_continuity(&net_cell_flux(&runtime.mesh, &corrected_phi)?);
         let full_pressure_correction_accepted = continuity_accepted(
@@ -473,15 +482,14 @@ pub fn solve_laminar_simple(
         if full_pressure_correction_accepted {
             let mut limited_velocity = corrected_velocity;
             let mut limited_pressure = corrected_pressure;
-            let mut limited_phi = corrected_phi;
+            let limited_phi = corrected_phi;
             pressure_correction_update_scale = limit_coupled_simple_update(
                 &previous_velocity,
                 &previous_pressure,
-                &previous_phi,
                 &mut limited_velocity,
                 &mut limited_pressure,
-                &mut limited_phi,
                 options.max_field_change_per_step,
+                options.pressure_drop.abs(),
             );
             let limited_continuity =
                 summarize_continuity(&net_cell_flux(&runtime.mesh, &limited_phi)?);
@@ -498,14 +506,14 @@ pub fn solve_laminar_simple(
                 final_continuity = limited_continuity;
             } else {
                 velocity = predicted_velocity;
-                final_phi = phi_star;
+                final_phi = phi_hby_a;
                 surface_flux = final_phi.clone();
                 final_continuity = continuity_star;
             }
         } else {
             pressure_correction_accepted = false;
             velocity = predicted_velocity;
-            final_phi = phi_star;
+            final_phi = phi_hby_a;
             surface_flux = final_phi.clone();
             final_continuity = continuity_star;
         }
@@ -549,8 +557,11 @@ pub fn solve_laminar_simple(
         };
         let relative_velocity_change_l2 =
             relative_vector_field_change_l2(&previous_velocity, &velocity);
-        let relative_pressure_change_l2 =
-            relative_scalar_field_change_l2(&previous_pressure, &pressure);
+        let relative_pressure_change_l2 = relative_scalar_field_change_l2_with_reference(
+            &previous_pressure,
+            &pressure,
+            options.pressure_drop.abs(),
+        );
         let reported_relative_velocity_change_l2 = if step_guard_exceeded {
             0.0
         } else {
@@ -950,19 +961,21 @@ fn limit_vector_field_update(
 fn limit_coupled_simple_update(
     previous_velocity: &[Point3],
     previous_pressure: &[f64],
-    previous_flux: &[f64],
     velocity: &mut [Point3],
     pressure: &mut [f64],
-    flux: &mut [f64],
     max_relative_change: f64,
+    pressure_reference_value: f64,
 ) -> f64 {
     let velocity_change = relative_vector_field_change_l2(previous_velocity, velocity);
-    let pressure_change = relative_scalar_field_change_l2(previous_pressure, pressure);
+    let pressure_change = relative_scalar_field_change_l2_with_reference(
+        previous_pressure,
+        pressure,
+        pressure_reference_value,
+    );
     let scale = bounded_update_scale(velocity_change.max(pressure_change), max_relative_change);
     if scale < 1.0 {
         blend_vector_field(previous_velocity, velocity, scale);
         blend_scalar_field(previous_pressure, pressure, scale);
-        blend_scalar_field(previous_flux, flux, scale);
     }
     scale
 }
@@ -992,7 +1005,11 @@ fn blend_scalar_field(before: &[f64], after: &mut [f64], scale: f64) {
     }
 }
 
-fn relative_scalar_field_change_l2(before: &[f64], after: &[f64]) -> f64 {
+fn relative_scalar_field_change_l2_with_reference(
+    before: &[f64],
+    after: &[f64],
+    reference_value: f64,
+) -> f64 {
     let mut delta_squared_sum = 0.0;
     let mut value_squared_sum = 0.0;
     for (before, after) in before.iter().zip(after) {
@@ -1000,11 +1017,18 @@ fn relative_scalar_field_change_l2(before: &[f64], after: &[f64]) -> f64 {
         delta_squared_sum += delta * delta;
         value_squared_sum += *after * *after;
     }
+    let delta_norm = delta_squared_sum.sqrt();
     let value_norm = value_squared_sum.sqrt();
-    if value_norm <= f64::EPSILON {
-        delta_squared_sum.sqrt()
+    let reference_norm = if reference_value.is_finite() && reference_value > f64::EPSILON {
+        reference_value * (after.len() as f64).sqrt()
     } else {
-        delta_squared_sum.sqrt() / value_norm
+        0.0
+    };
+    let denominator = value_norm.max(reference_norm);
+    if denominator <= f64::EPSILON {
+        delta_norm
+    } else {
+        delta_norm / denominator
     }
 }
 
@@ -1305,6 +1329,21 @@ fn add_face_fluxes(left: &[f64], right: &[f64]) -> Result<Vec<f64>> {
         .collect())
 }
 
+fn subtract_face_fluxes(left: &[f64], right: &[f64]) -> Result<Vec<f64>> {
+    if left.len() != right.len() {
+        return Err(invalid_input(format!(
+            "face flux arrays have different lengths: {} and {}",
+            left.len(),
+            right.len()
+        )));
+    }
+    Ok(left
+        .iter()
+        .zip(right)
+        .map(|(left, right)| left - right)
+        .collect())
+}
+
 fn scalar_gradient(
     mesh: &SolverRuntimeMeshData,
     values: &[f64],
@@ -1479,14 +1518,7 @@ fn summarize_laminar_simple_solution(
         0.0
     };
     let pressure_drop_from_field =
-        patch_owner_average_scalar(mesh, pressure, pressure_boundary, &options.inlet_patch)?
-            .zip(patch_owner_average_scalar(
-                mesh,
-                pressure,
-                pressure_boundary,
-                &options.outlet_patch,
-            )?)
-            .map(|(inlet, outlet)| inlet - outlet);
+        pressure_drop_from_field(mesh, pressure, pressure_boundary, options)?;
 
     Ok(LaminarSimpleSolutionSummary {
         mean_velocity,
@@ -1507,9 +1539,7 @@ fn relative_pressure_drop_error_from_velocity(
     velocity: &[Point3],
     options: &LaminarSimpleOptions,
 ) -> Result<f64> {
-    let (mean_velocity, _, _) = axial_velocity_summary(mesh, velocity)?;
-    let pressure_drop_from_mean = 32.0 * options.dynamic_viscosity * options.length * mean_velocity
-        / (options.diameter * options.diameter);
+    let pressure_drop_from_mean = pressure_drop_from_mean_velocity(mesh, velocity, options)?;
     if options.pressure_drop.abs() > f64::EPSILON {
         Ok((pressure_drop_from_mean - options.pressure_drop) / options.pressure_drop)
     } else {
@@ -1523,17 +1553,47 @@ fn relative_pressure_drop_error_from_pressure(
     pressure_boundary: &[ScalarFaceTreatment],
     options: &LaminarSimpleOptions,
 ) -> Result<Option<f64>> {
-    let pressure_drop =
-        patch_owner_average_scalar(mesh, pressure, pressure_boundary, &options.inlet_patch)?.zip(
-            patch_owner_average_scalar(mesh, pressure, pressure_boundary, &options.outlet_patch)?,
-        );
-    Ok(pressure_drop.map(|(inlet, outlet)| {
-        if options.pressure_drop.abs() > f64::EPSILON {
-            (inlet - outlet - options.pressure_drop) / options.pressure_drop
-        } else {
-            0.0
-        }
-    }))
+    Ok(
+        pressure_drop_from_field(mesh, pressure, pressure_boundary, options)?.map(
+            |pressure_drop| {
+                if options.pressure_drop.abs() > f64::EPSILON {
+                    (pressure_drop - options.pressure_drop) / options.pressure_drop
+                } else {
+                    0.0
+                }
+            },
+        ),
+    )
+}
+
+fn pressure_drop_from_mean_velocity(
+    mesh: &SolverRuntimeMeshData,
+    velocity: &[Point3],
+    options: &LaminarSimpleOptions,
+) -> Result<f64> {
+    let (mean_velocity, _, _) = axial_velocity_summary(mesh, velocity)?;
+    Ok(
+        32.0 * options.dynamic_viscosity * options.length * mean_velocity
+            / (options.diameter * options.diameter),
+    )
+}
+
+fn pressure_drop_from_field(
+    mesh: &SolverRuntimeMeshData,
+    pressure: &[f64],
+    pressure_boundary: &[ScalarFaceTreatment],
+    options: &LaminarSimpleOptions,
+) -> Result<Option<f64>> {
+    Ok(
+        patch_owner_average_scalar(mesh, pressure, pressure_boundary, &options.inlet_patch)?
+            .zip(patch_owner_average_scalar(
+                mesh,
+                pressure,
+                pressure_boundary,
+                &options.outlet_patch,
+            )?)
+            .map(|(inlet, outlet)| inlet - outlet),
+    )
 }
 
 fn axial_velocity_summary(

@@ -379,12 +379,14 @@ values. Ferrum-specific SIMPLE entries can additionally set
 currently maps to a diagonal PCG preconditioner, while true incomplete-Cholesky
 is tracked as a later numerical upgrade. CLI flags remain explicit experiment
 overrides.
-The pressure-correction bridge now follows the OpenFOAM shape more closely:
-it applies equation relaxation to the momentum equation, builds cell-wise
-`rAU` from the original momentum diagonal, assembles a variable-coefficient
-pressure correction equation, corrects `phi` with the pressure-equation flux,
-carries the corrected surface flux into the next SIMPLE iteration, and bounds
-the coupled `U`/`p`/`phi` update before committing the SIMPLE step. The
+The pressure bridge now follows the OpenFOAM shape more closely: it applies
+equation relaxation to the momentum equation, builds cell-wise `rAU` from the
+original momentum diagonal, reconstructs `phiHbyA` by removing the old pressure
+flux from the momentum predictor flux, solves an absolute variable-coefficient
+pressure equation, corrects `phi` with the pressure-equation flux, and carries
+that corrected surface flux into the next SIMPLE iteration. The guarded
+development path still bounds the committed `U` and `p` field updates, but the
+mass flux correction itself is no longer damped by that field limiter. The
 momentum convection term uses an implicit upwind contribution in this guarded
 path, which moves the pipe benchmark away from the earlier central-convection
 oscillations while the full non-symmetric momentum linear-solver stack is still

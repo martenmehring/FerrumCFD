@@ -57,6 +57,7 @@ ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --linearSolver cg 
 ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --linearSolver jacobi --momentumLinearSolver cg --pressureLinearSolver jacobi --solveTolerance 1e-6 --maxIterations 100 --maxSimpleIterations 20 --velocityRelaxation 0.1 --pressureRelaxation 0.02
 ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --solveTolerance 1e-6 --maxIterations 100 --maxSimpleIterations 20
 ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --maxSimpleIterations 20
+ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --maxSimpleIterations 80
 ```
 
 | Momentum solver | Pressure solver | Linear controls | Relaxation source | SIMPLE tries | DeltaP from mean [Pa] | Error to analytic | Final continuity L2 | Solve time [s] | Notes |
@@ -68,20 +69,21 @@ ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --maxSimpleIterati
 | Jacobi | Jacobi | fvSolution 1e-10/default 10000 | fvSolution 0.7/0.3 | 3 | 1.416486 | -11.646% | 1.797e-5 | 78.180144 | per-equation tolerances are read from `solvers.U/p`; Jacobi pressure correction reaches the guard |
 | Jacobi | PCG + diagonal | fvSolution 1e-10/default 10000 | fvSolution 0.7/0.3 + upwind convection + bounded 2% U/p/phi update | 9 | 1.605975 | 0.173% | 6.062e-11 | 56.472017 | upwind momentum convection keeps local U positive and moves U changes from about 9.6% to about 1.9%; convergence stays `no` because the update limiter is still active |
 | Jacobi | PCG + diagonal | fvSolution 1e-10/default 10000 | fvSolution 0.7/0.3 + implicit upwind momentum + equation relaxation + pressure-field check | 80 | 1.607913 | 0.294% | 9.504e-9 | 92.977633 | U changes fall to about 1% and the momentum limiter becomes inactive, but convergence stays `no` because pressure-field deltaP is still 2.259878 Pa and pressure updates remain clipped |
+| Jacobi | PCG + diagonal | fvSolution 1e-10/default 10000 | fvSolution 0.7/0.3 + absolute `p` solve from `phiHbyA` + full corrected `phi` + bounded U/p update | 80 | 1.604076 | 0.055% | 8.515e-11 | 98.653404 | OpenFOAM-like absolute pressure step greatly improves continuity and mean pressure loss; convergence stays `no` because pressure-field deltaP is still 2.092740 Pa |
 
 The continuity-growth guard prevents the old runaway behavior where long
 multi-step trials produced infinite or astronomically large values. The
 multi-step guard now also refuses convergence when the Hagen-Poiseuille
 pressure-drop reference, the relative U/p field changes, or the coupled update
 limiter are not stable. It also refuses final convergence when the pressure
-field itself gives a bad inlet-outlet pressure drop. The implicit upwind
-momentum run now keeps the local axial velocity positive, gets the mean
-pressure loss close to analytic, and brings U changes to about the 1% target,
-but it still remains a guarded solver-development result rather than a
-`simpleFoam` equivalent because the pressure field and pressure-correction
-updates are not yet settled. The next numerical target is tighter
-pressure-field coupling, then a proper non-symmetric momentum solver and true
-incomplete-Cholesky-style pressure preconditioning.
+field itself gives a bad inlet-outlet pressure drop. The absolute `p`/`phiHbyA`
+run now keeps the local axial velocity positive, drives continuity to
+`8.515e-11`, and gets the mean pressure loss to `0.055%` error. It still
+remains a guarded solver-development result rather than a `simpleFoam`
+equivalent because the stored pressure field is still too high. The next
+numerical target is tighter pressure-field coupling, then a proper
+non-symmetric momentum solver and true incomplete-Cholesky-style pressure
+preconditioning.
 
 ## Mesh Study
 

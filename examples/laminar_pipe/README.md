@@ -84,7 +84,8 @@ Multi-step SIMPLE reports are intentionally conservative: continuity, pressure
 loss, and U/p field changes must all stabilize before Ferrum marks the run as
 converged. If inlet/outlet pressure-field averages are available, the pressure
 field deltaP must also match the benchmark tolerance, and the coupled update
-limiter must no longer be clipping the step. The default multi-step run also
-bounds each coupled U/p/phi update to 2% to keep the intermediate velocity
-field finite and physically inspectable while the pressure-velocity coupling is
-still under development.
+limiter must no longer be clipping the step. The current multi-step run solves
+an absolute pressure equation from `phiHbyA`, carries the corrected `phi` into
+the next SIMPLE iteration, and bounds the committed U/p field update to 2% to
+keep intermediate fields finite and physically inspectable while the
+pressure-velocity coupling is still under development.

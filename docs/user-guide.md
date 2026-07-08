@@ -690,12 +690,14 @@ controls can also be set as Ferrum-specific entries under `SIMPLE` in
 
 The report records residuals, SIMPLE iterations, wall-clock time,
 finite-volume operator summaries, boundary counts, Hagen-Poiseuille error,
-continuity, and per-iteration field changes. The pressure-correction bridge
-uses equation-relaxed momentum diagonals for cell-wise `rAU`, corrects `phi`
-from the pressure-equation flux, carries that corrected surface flux into the
-next SIMPLE iteration, and bounds each coupled `U`/`p`/`phi` update with
-`--maxFieldChangePerStep` (default `0.02`). Guards roll back to the previous
-finite state when continuity or the benchmark pressure-drop reference jumps
+continuity, and per-iteration field changes. The pressure bridge uses
+equation-relaxed momentum diagonals for cell-wise `rAU`, reconstructs
+`phiHbyA`, solves an absolute pressure equation, corrects `phi` from the
+pressure-equation flux, and carries that corrected surface flux into the next
+SIMPLE iteration. The committed `U`/`p` field update is bounded with
+`--maxFieldChangePerStep` (default `0.02`), but the corrected mass flux itself
+is not damped by that field limiter. Guards roll back to the previous finite
+state when continuity or the benchmark pressure-drop reference jumps
 aggressively. This prevents runaway reports, but fully OpenFOAM-grade
 momentum-pressure coupling and true incomplete-Cholesky pressure
 preconditioning are still solver-development work.
