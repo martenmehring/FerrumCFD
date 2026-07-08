@@ -221,8 +221,8 @@ pub fn solve_laminar_simple(
             &runtime.mesh,
             &velocity,
             &velocity_boundary,
+            &phi,
             &grad_p,
-            &convection,
             options,
         )?;
         if !momentum.residual_norm.is_finite() || !points_are_finite(&momentum.velocity) {
@@ -254,12 +254,7 @@ pub fn solve_laminar_simple(
 
         total_momentum_linear_iterations += momentum.iterations;
         final_momentum_residual_norm = momentum.residual_norm;
-        let mut predicted_velocity = velocity.clone();
-        under_relax_velocity(
-            &mut predicted_velocity,
-            &momentum.velocity,
-            options.velocity_relaxation,
-        );
+        let mut predicted_velocity = momentum.velocity.clone();
         let momentum_update_scale = limit_vector_field_update(
             &previous_velocity,
             &mut predicted_velocity,
@@ -335,6 +330,12 @@ pub fn solve_laminar_simple(
             )?;
             let relative_pressure_drop_error =
                 relative_pressure_drop_error_from_velocity(&runtime.mesh, &velocity, options)?;
+            let relative_pressure_field_drop_error = relative_pressure_drop_error_from_pressure(
+                &runtime.mesh,
+                &pressure,
+                &pressure_boundary,
+                options,
+            )?;
             let relative_velocity_change_l2 =
                 relative_vector_field_change_l2(&previous_velocity, &velocity);
             let relative_pressure_change_l2 = 0.0;
@@ -357,6 +358,7 @@ pub fn solve_laminar_simple(
                 iteration,
                 final_continuity,
                 relative_pressure_drop_error,
+                relative_pressure_field_drop_error,
                 relative_velocity_change_l2,
                 relative_pressure_change_l2,
                 momentum_update_scale,
@@ -461,8 +463,11 @@ pub fn solve_laminar_simple(
         let corrected_phi = add_face_fluxes(&phi_star, &pressure_flux)?;
         let corrected_continuity =
             summarize_continuity(&net_cell_flux(&runtime.mesh, &corrected_phi)?);
-        let full_pressure_correction_accepted = corrected_continuity.l2_norm.is_finite()
-            && corrected_continuity.l2_norm <= continuity_star.l2_norm;
+        let full_pressure_correction_accepted = continuity_accepted(
+            corrected_continuity,
+            continuity_star,
+            options.simple_tolerance,
+        );
         let mut pressure_correction_update_scale = 0.0;
         let pressure_correction_accepted;
         if full_pressure_correction_accepted {
@@ -480,8 +485,11 @@ pub fn solve_laminar_simple(
             );
             let limited_continuity =
                 summarize_continuity(&net_cell_flux(&runtime.mesh, &limited_phi)?);
-            pressure_correction_accepted = limited_continuity.l2_norm.is_finite()
-                && limited_continuity.l2_norm <= continuity_before.l2_norm;
+            pressure_correction_accepted = continuity_accepted(
+                limited_continuity,
+                continuity_before,
+                options.simple_tolerance,
+            );
             if pressure_correction_accepted {
                 velocity = limited_velocity;
                 pressure = limited_pressure;
@@ -507,9 +515,19 @@ pub fn solve_laminar_simple(
             vector_convection_divergence(&runtime.mesh, &velocity, &velocity_boundary, &final_phi)?;
 
         let continuity_growth_exceeded = iteration > 1
-            && simple_step_continuity_growth_exceeded(final_continuity, continuity_before);
+            && simple_step_continuity_growth_exceeded(
+                final_continuity,
+                continuity_before,
+                options.simple_tolerance,
+            );
         let relative_pressure_drop_error =
             relative_pressure_drop_error_from_velocity(&runtime.mesh, &velocity, options)?;
+        let relative_pressure_field_drop_error = relative_pressure_drop_error_from_pressure(
+            &runtime.mesh,
+            &pressure,
+            &pressure_boundary,
+            options,
+        )?;
         let reference_error_growth_exceeded = iteration > 1
             && simple_step_pressure_error_growth_exceeded(
                 relative_pressure_drop_error,
@@ -577,6 +595,7 @@ pub fn solve_laminar_simple(
             iteration,
             final_continuity,
             relative_pressure_drop_error,
+            relative_pressure_field_drop_error,
             relative_velocity_change_l2,
             relative_pressure_change_l2,
             momentum_update_scale,
@@ -637,8 +656,8 @@ fn solve_momentum_predictor(
     mesh: &SolverRuntimeMeshData,
     velocity: &[Point3],
     velocity_boundary: &[VectorFaceTreatment],
+    flux: &[f64],
     grad_p: &[Point3],
-    convection: &[Point3],
     options: &LaminarSimpleOptions,
 ) -> Result<MomentumPredictorReport> {
     let old_components = split_components(velocity);
@@ -652,20 +671,22 @@ fn solve_momentum_predictor(
             .iter()
             .map(|value| -component_value(*value, component))
             .collect::<Vec<_>>();
-        let explicit_force = convection
-            .iter()
-            .map(|value| -options.density * component_value(*value, component))
-            .collect::<Vec<_>>();
         let boundary = scalar_component_boundary(velocity_boundary, component);
-        let system = assemble_scalar_component_system(
+        let mut system = assemble_momentum_component_system(
             mesh,
             options.dynamic_viscosity,
+            options.density,
+            flux,
             &volumetric_source,
-            Some(&explicit_force),
             &boundary,
         )?;
+        let component_diagonal = relax_scalar_component_equation(
+            &mut system,
+            &old_components[component],
+            options.velocity_relaxation,
+        )?;
         if component == 0 {
-            diagonal = system.matrix.diagonal()?;
+            diagonal = component_diagonal;
         }
         let report = solve_scalar_system(
             &system.matrix,
@@ -748,6 +769,54 @@ fn solve_scalar_system(
     })
 }
 
+fn relax_scalar_component_equation(
+    system: &mut ScalarComponentSystem,
+    old_solution: &[f64],
+    relaxation: f64,
+) -> Result<Vec<f64>> {
+    if old_solution.len() != system.rhs.len() {
+        return Err(invalid_input(format!(
+            "equation relaxation expected old solution with {} entries, got {}",
+            system.rhs.len(),
+            old_solution.len()
+        )));
+    }
+    if !relaxation.is_finite() || relaxation <= 0.0 || relaxation > 1.0 {
+        return Err(invalid_input(format!(
+            "equation relaxation factor must be in (0, 1], got {relaxation}"
+        )));
+    }
+
+    let diagonal = system.matrix.diagonal()?;
+    if (relaxation - 1.0).abs() <= f64::EPSILON {
+        return Ok(diagonal);
+    }
+
+    let rhs_scale = (1.0 / relaxation) - 1.0;
+    for ((rhs, diagonal), old_value) in system.rhs.iter_mut().zip(&diagonal).zip(old_solution) {
+        *rhs += rhs_scale * diagonal * old_value;
+    }
+
+    let mut rows = Vec::with_capacity(system.matrix.rows());
+    for row in 0..system.matrix.rows() {
+        let start = system.matrix.row_offsets()[row];
+        let end = system.matrix.row_offsets()[row + 1];
+        let mut entries = Vec::with_capacity(end - start);
+        for entry in start..end {
+            let column = system.matrix.col_indices()[entry];
+            let mut value = system.matrix.values()[entry];
+            if column == row {
+                value /= relaxation;
+            }
+            entries.push((column, value));
+        }
+        rows.push(entries);
+    }
+    system.matrix = CsrMatrix::from_rows(rows, system.matrix.cols())?;
+
+    Ok(diagonal)
+}
+
 fn map_cg_preconditioner(preconditioner: LaminarSimplePreconditioner) -> CgPreconditioner {
     match preconditioner {
         LaminarSimplePreconditioner::None => CgPreconditioner::None,
@@ -773,11 +842,21 @@ fn is_finite_continuity(summary: ContinuitySummary) -> bool {
 fn simple_step_continuity_growth_exceeded(
     after: ContinuitySummary,
     before: ContinuitySummary,
+    tolerance: f64,
 ) -> bool {
     before.l2_norm.is_finite()
         && before.l2_norm > f64::EPSILON
         && after.l2_norm.is_finite()
-        && after.l2_norm > before.l2_norm * MAX_LAMINAR_SIMPLE_STEP_CONTINUITY_GROWTH
+        && after.l2_norm > tolerance
+        && after.l2_norm > before.l2_norm.max(tolerance) * MAX_LAMINAR_SIMPLE_STEP_CONTINUITY_GROWTH
+}
+
+fn continuity_accepted(
+    after: ContinuitySummary,
+    reference: ContinuitySummary,
+    tolerance: f64,
+) -> bool {
+    after.l2_norm.is_finite() && (after.l2_norm <= reference.l2_norm || after.l2_norm <= tolerance)
 }
 
 fn simple_step_pressure_error_growth_exceeded(
@@ -800,6 +879,7 @@ fn laminar_simple_converged(
     iteration: usize,
     continuity: ContinuitySummary,
     relative_pressure_drop_error: f64,
+    relative_pressure_field_drop_error: Option<f64>,
     relative_velocity_change_l2: f64,
     relative_pressure_change_l2: f64,
     momentum_update_scale: f64,
@@ -810,12 +890,20 @@ fn laminar_simple_converged(
         && continuity.l2_norm <= options.simple_tolerance
         && relative_pressure_drop_error.is_finite()
         && relative_pressure_drop_error.abs() <= options.pressure_drop_tolerance
+        && optional_relative_error_within_tolerance(
+            relative_pressure_field_drop_error,
+            options.pressure_drop_tolerance,
+        )
         && relative_velocity_change_l2.is_finite()
         && relative_velocity_change_l2 <= options.field_change_tolerance
         && relative_pressure_change_l2.is_finite()
         && relative_pressure_change_l2 <= options.field_change_tolerance
         && update_limiter_inactive(momentum_update_scale)
         && update_limiter_inactive(pressure_correction_update_scale)
+}
+
+fn optional_relative_error_within_tolerance(error: Option<f64>, tolerance: f64) -> bool {
+    error.is_none_or(|value| value.is_finite() && value.abs() <= tolerance)
 }
 
 fn update_limiter_inactive(scale: f64) -> bool {
@@ -929,28 +1017,31 @@ fn component_name(component: usize) -> &'static str {
     }
 }
 
-fn assemble_scalar_component_system(
+fn assemble_momentum_component_system(
     mesh: &SolverRuntimeMeshData,
     diffusivity: f64,
+    density: f64,
+    flux: &[f64],
     volumetric_source: &[f64],
-    explicit_force: Option<&[f64]>,
     boundary: &[ScalarFaceTreatment],
 ) -> Result<ScalarComponentSystem> {
+    if flux.len() != mesh.faces {
+        return Err(invalid_input(format!(
+            "momentum flux has {} values, expected {} mesh faces",
+            flux.len(),
+            mesh.faces
+        )));
+    }
     if volumetric_source.len() != mesh.cells {
         return Err(invalid_input(format!(
-            "scalar component source has {} values, expected {} mesh cells",
+            "momentum component source has {} values, expected {} mesh cells",
             volumetric_source.len(),
             mesh.cells
         )));
     }
-    if explicit_force.is_some_and(|values| values.len() != mesh.cells) {
-        return Err(invalid_input(
-            "scalar component explicit force length does not match mesh cells".to_string(),
-        ));
-    }
     if boundary.len() != mesh.faces {
         return Err(invalid_input(format!(
-            "scalar component boundary has {} values, expected {} mesh faces",
+            "momentum component boundary has {} values, expected {} mesh faces",
             boundary.len(),
             mesh.faces
         )));
@@ -962,13 +1053,16 @@ fn assemble_scalar_component_system(
         .zip(&mesh.cell_volumes)
         .map(|(source, volume)| source * volume)
         .collect::<Vec<_>>();
-    if let Some(explicit_force) = explicit_force {
-        for (target, value) in rhs.iter_mut().zip(explicit_force) {
-            *target += value;
-        }
-    }
+
     for (face_index, treatment) in boundary.iter().enumerate() {
         let owner = mesh.owner[face_index];
+        let mass_flux = density * flux[face_index];
+        if !mass_flux.is_finite() {
+            return Err(invalid_input(format!(
+                "momentum face {face_index} mass flux must be finite, got {mass_flux}"
+            )));
+        }
+
         if let Some(neighbour) = mesh.neighbour[face_index] {
             let coefficient = face_diffusion_coefficient(
                 diffusivity,
@@ -981,6 +1075,7 @@ fn assemble_scalar_component_system(
             add_entry(&mut rows[owner], neighbour, -coefficient);
             add_entry(&mut rows[neighbour], neighbour, coefficient);
             add_entry(&mut rows[neighbour], owner, -coefficient);
+            add_internal_upwind_convection(&mut rows, owner, neighbour, mass_flux);
             continue;
         }
 
@@ -995,8 +1090,11 @@ fn assemble_scalar_component_system(
                 )?;
                 add_entry(&mut rows[owner], owner, coefficient);
                 rhs[owner] += coefficient * value;
+                add_boundary_upwind_convection(&mut rows, &mut rhs, owner, value, mass_flux);
             }
-            ScalarFaceTreatment::ZeroGradient | ScalarFaceTreatment::Constraint => {}
+            ScalarFaceTreatment::ZeroGradient | ScalarFaceTreatment::Constraint => {
+                add_entry(&mut rows[owner], owner, mass_flux);
+            }
         }
     }
 
@@ -1007,6 +1105,35 @@ fn assemble_scalar_component_system(
     let matrix = CsrMatrix::from_rows(matrix_rows, mesh.cells)?;
 
     Ok(ScalarComponentSystem { matrix, rhs })
+}
+
+fn add_internal_upwind_convection(
+    rows: &mut [BTreeMap<usize, f64>],
+    owner: usize,
+    neighbour: usize,
+    mass_flux: f64,
+) {
+    if mass_flux >= 0.0 {
+        add_entry(&mut rows[owner], owner, mass_flux);
+        add_entry(&mut rows[neighbour], owner, -mass_flux);
+    } else {
+        add_entry(&mut rows[owner], neighbour, mass_flux);
+        add_entry(&mut rows[neighbour], neighbour, -mass_flux);
+    }
+}
+
+fn add_boundary_upwind_convection(
+    rows: &mut [BTreeMap<usize, f64>],
+    rhs: &mut [f64],
+    owner: usize,
+    value: f64,
+    mass_flux: f64,
+) {
+    if mass_flux < 0.0 {
+        rhs[owner] += -mass_flux * value;
+    } else {
+        add_entry(&mut rows[owner], owner, mass_flux);
+    }
 }
 
 fn assemble_variable_scalar_component_system(
@@ -1325,14 +1452,6 @@ fn correct_velocity(
     }
 }
 
-fn under_relax_velocity(velocity: &mut [Point3], target: &[Point3], relaxation: f64) {
-    for (value, target) in velocity.iter_mut().zip(target) {
-        value.x += relaxation * (target.x - value.x);
-        value.y += relaxation * (target.y - value.y);
-        value.z += relaxation * (target.z - value.z);
-    }
-}
-
 fn summarize_laminar_simple_solution(
     mesh: &SolverRuntimeMeshData,
     velocity: &[Point3],
@@ -1396,6 +1515,25 @@ fn relative_pressure_drop_error_from_velocity(
     } else {
         Ok(0.0)
     }
+}
+
+fn relative_pressure_drop_error_from_pressure(
+    mesh: &SolverRuntimeMeshData,
+    pressure: &[f64],
+    pressure_boundary: &[ScalarFaceTreatment],
+    options: &LaminarSimpleOptions,
+) -> Result<Option<f64>> {
+    let pressure_drop =
+        patch_owner_average_scalar(mesh, pressure, pressure_boundary, &options.inlet_patch)?.zip(
+            patch_owner_average_scalar(mesh, pressure, pressure_boundary, &options.outlet_patch)?,
+        );
+    Ok(pressure_drop.map(|(inlet, outlet)| {
+        if options.pressure_drop.abs() > f64::EPSILON {
+            (inlet - outlet - options.pressure_drop) / options.pressure_drop
+        } else {
+            0.0
+        }
+    }))
 }
 
 fn axial_velocity_summary(
@@ -2225,10 +2363,13 @@ mod tests {
     use crate::solver_state::SolverStateFieldKind;
 
     use super::{
-        LaminarSimpleLinearSolver, LaminarSimpleOptions, LaminarSimplePreconditioner,
-        ScalarFaceTreatment, assemble_variable_scalar_component_system, compute_face_flux,
-        net_cell_flux, pressure_correction_flux, reciprocal_momentum_diagonal,
-        solve_laminar_simple, upwind_face_vector_value, vector_face_treatments,
+        ContinuitySummary, LaminarSimpleLinearSolver, LaminarSimpleOptions,
+        LaminarSimplePreconditioner, ScalarFaceTreatment, assemble_momentum_component_system,
+        assemble_variable_scalar_component_system, compute_face_flux, continuity_accepted,
+        net_cell_flux, optional_relative_error_within_tolerance, pressure_correction_flux,
+        reciprocal_momentum_diagonal, relax_scalar_component_equation, scalar_component_boundary,
+        simple_step_continuity_growth_exceeded, solve_laminar_simple, upwind_face_vector_value,
+        vector_face_treatments,
     };
     use crate::Point3;
 
@@ -2292,8 +2433,8 @@ mod tests {
     fn builds_cell_reciprocal_momentum_diagonal() {
         let runtime = two_cell_runtime();
 
-        let r_au = reciprocal_momentum_diagonal(&runtime.mesh, &[2.0, 4.0], 1.0)
-            .expect("cell rAU values");
+        let r_au =
+            reciprocal_momentum_diagonal(&runtime.mesh, &[2.0, 4.0], 1.0).expect("cell rAU values");
 
         assert_eq!(r_au.len(), 2);
         assert_close(r_au[0], 0.25);
@@ -2303,6 +2444,106 @@ mod tests {
             .expect("relaxed cell rAU values");
         assert_close(relaxed_r_au[0], 0.125);
         assert_close(relaxed_r_au[1], 0.0625);
+    }
+
+    #[test]
+    fn continuity_guard_ignores_growth_below_tolerance() {
+        let before = continuity(1.0e-10);
+        let after_below_tolerance = continuity(3.0e-10);
+        let after_above_tolerance = continuity(3.0e-8);
+
+        assert!(!simple_step_continuity_growth_exceeded(
+            after_below_tolerance,
+            before,
+            1.0e-8
+        ));
+        assert!(simple_step_continuity_growth_exceeded(
+            after_above_tolerance,
+            before,
+            1.0e-8
+        ));
+    }
+
+    #[test]
+    fn pressure_correction_accepts_continuity_below_tolerance() {
+        let before = continuity(1.0e-10);
+        let worse_but_converged = continuity(3.0e-10);
+        let worse_and_unconverged = continuity(3.0e-8);
+
+        assert!(continuity_accepted(worse_but_converged, before, 1.0e-8));
+        assert!(!continuity_accepted(worse_and_unconverged, before, 1.0e-8));
+    }
+
+    #[test]
+    fn pressure_field_error_must_satisfy_optional_convergence_check() {
+        assert!(optional_relative_error_within_tolerance(None, 0.02));
+        assert!(optional_relative_error_within_tolerance(Some(0.01), 0.02));
+        assert!(!optional_relative_error_within_tolerance(Some(0.03), 0.02));
+        assert!(!optional_relative_error_within_tolerance(
+            Some(f64::NAN),
+            0.02
+        ));
+    }
+
+    #[test]
+    fn assembles_implicit_upwind_momentum_convection() {
+        let runtime = two_cell_runtime();
+        let fields = two_cell_fields();
+        let u_field = fields
+            .fields
+            .iter()
+            .find(|field| field.name == "U")
+            .expect("U field");
+        let vector_boundary = vector_face_treatments(&runtime.mesh, u_field).expect("U boundary");
+        let boundary = scalar_component_boundary(&vector_boundary, 0);
+        let flux = vec![1.0, -2.0, 3.0];
+        let source = vec![0.0, 0.0];
+
+        let system =
+            assemble_momentum_component_system(&runtime.mesh, 1.0, 2.0, &flux, &source, &boundary)
+                .expect("momentum system");
+
+        let diagonal = system.matrix.diagonal().expect("diagonal");
+        assert_close(diagonal[0], 8.0);
+        assert_close(diagonal[1], 8.0);
+        assert_close(system.rhs[0], 8.0);
+        assert_close(system.rhs[1], 0.0);
+
+        let owner_column = system.matrix.matvec(&[1.0, 0.0]).expect("owner column");
+        let neighbour_column = system.matrix.matvec(&[0.0, 1.0]).expect("neighbour column");
+        assert_close(owner_column[0], 8.0);
+        assert_close(owner_column[1], -4.0);
+        assert_close(neighbour_column[0], -2.0);
+        assert_close(neighbour_column[1], 8.0);
+    }
+
+    #[test]
+    fn equation_relaxation_preserves_original_diagonal_for_rau() {
+        let runtime = two_cell_runtime();
+        let fields = two_cell_fields();
+        let u_field = fields
+            .fields
+            .iter()
+            .find(|field| field.name == "U")
+            .expect("U field");
+        let vector_boundary = vector_face_treatments(&runtime.mesh, u_field).expect("U boundary");
+        let boundary = scalar_component_boundary(&vector_boundary, 0);
+        let flux = vec![1.0, -2.0, 3.0];
+        let source = vec![0.0, 0.0];
+        let mut system =
+            assemble_momentum_component_system(&runtime.mesh, 1.0, 2.0, &flux, &source, &boundary)
+                .expect("momentum system");
+
+        let original_diagonal =
+            relax_scalar_component_equation(&mut system, &[5.0, 3.0], 0.5).expect("relaxed system");
+
+        assert_close(original_diagonal[0], 8.0);
+        assert_close(original_diagonal[1], 8.0);
+        let relaxed_diagonal = system.matrix.diagonal().expect("relaxed diagonal");
+        assert_close(relaxed_diagonal[0], 16.0);
+        assert_close(relaxed_diagonal[1], 16.0);
+        assert_close(system.rhs[0], 48.0);
+        assert_close(system.rhs[1], 24.0);
     }
 
     #[test]
@@ -2489,6 +2730,15 @@ mod tests {
 
     fn point(x: f64, y: f64, z: f64) -> Point3 {
         Point3 { x, y, z }
+    }
+
+    fn continuity(l2_norm: f64) -> ContinuitySummary {
+        ContinuitySummary {
+            l2_norm,
+            max_abs: l2_norm,
+            sum_abs: l2_norm,
+            global_sum: 0.0,
+        }
     }
 
     fn assert_close(left: f64, right: f64) {

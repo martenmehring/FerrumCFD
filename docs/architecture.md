@@ -363,12 +363,13 @@ operators on the same runtime `polyMesh` geometry, and writes solver reports as
 JSON/Markdown. The current implementation is deliberately guarded: one damped
 CPU SIMPLE step remains the stable default, while multi-step pressure
 correction is allowed only when continuity, Hagen-Poiseuille pressure-drop
-error, relative `U`/`p` field changes, and inactive update limiters all satisfy
-their tolerances. Momentum and pressure-correction linear solvers can be
-selected separately, so experiments can run CG/PCG for one equation and Jacobi
-for another without changing the case files. OpenFOAM-style `fvSolution`
-entries are the default source for pressure and velocity under-relaxation and
-for per-equation linear tolerances: `relaxationFactors.equations.U`,
+error, pressure-field pressure-drop error when available, relative `U`/`p`
+field changes, and inactive update limiters all satisfy their tolerances.
+Momentum and pressure-correction linear solvers can be selected separately, so
+experiments can run CG/PCG for one equation and Jacobi for another without
+changing the case files. OpenFOAM-style `fvSolution` entries are the default
+source for pressure and velocity under-relaxation and for per-equation linear
+tolerances: `relaxationFactors.equations.U`,
 `relaxationFactors.fields.p`, `solvers.U.tolerance`, `solvers.p.tolerance`,
 `solvers.p.solver PCG`, `solvers.p.preconditioner DIC`, and optional `maxIter`
 values. Ferrum-specific SIMPLE entries can additionally set
@@ -379,13 +380,15 @@ currently maps to a diagonal PCG preconditioner, while true incomplete-Cholesky
 is tracked as a later numerical upgrade. CLI flags remain explicit experiment
 overrides.
 The pressure-correction bridge now follows the OpenFOAM shape more closely:
-it builds velocity-relaxed cell-wise `rAU`, assembles a variable-coefficient
+it applies equation relaxation to the momentum equation, builds cell-wise
+`rAU` from the original momentum diagonal, assembles a variable-coefficient
 pressure correction equation, corrects `phi` with the pressure-equation flux,
 carries the corrected surface flux into the next SIMPLE iteration, and bounds
 the coupled `U`/`p`/`phi` update before committing the SIMPLE step. The
-momentum convection term uses upwind face values in this guarded path, which
-moves the pipe benchmark away from the earlier central-convection oscillations
-while the full implicit momentum matrix is still being developed. The
+momentum convection term uses an implicit upwind contribution in this guarded
+path, which moves the pipe benchmark away from the earlier central-convection
+oscillations while the full non-symmetric momentum linear-solver stack is still
+being developed. The
 operator and report boundaries are kept backend-neutral so the same assembly
 path can later dispatch linear and nonlinear solves to CPU, GPU, or mixed
 CPU/GPU resources.

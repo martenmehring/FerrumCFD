@@ -638,10 +638,11 @@ that a `simpleFoam` user expects:
 
 It builds the first finite-volume flow operators on the runtime mesh:
 `phi = U_f . S_f`, `grad(p)`, `div(phi,U)`, and `laplacian(nu,U)`. The guarded
-momentum predictor currently uses upwind face velocities for `div(phi,U)` to
-avoid the central-convection oscillations seen in early multi-step SIMPLE
-experiments. For the pipe benchmark the supported boundary-condition contract
-is:
+momentum predictor currently assembles `rho * div(phi,U)` as an implicit
+upwind contribution and applies OpenFOAM-style equation relaxation to the
+velocity equation. This avoids the central-convection oscillations seen in
+early multi-step SIMPLE experiments. For the pipe benchmark the supported
+boundary-condition contract is:
 
 - `U`: inlet `fixedValue` including nonuniform/parabolic values, wall `noSlip`,
   outlet `zeroGradient`
@@ -678,19 +679,21 @@ The current default for this path remains one damped CPU SIMPLE step. When
 SIMPLE iterations before convergence can be accepted. Multi-step convergence
 requires all active checks to pass: continuity L2 below `--simpleTolerance`,
 Hagen-Poiseuille pressure-drop error below `--pressureDropTolerance`, and
-relative `U`/`p` field changes below `--fieldChangeTolerance`. Ferrum also
-requires the coupled update limiter to be inactive before reporting
-`converged=yes`, so an artificially clipped update cannot pass as a physical
-steady state. These controls can also be set as Ferrum-specific entries under
-`SIMPLE` in `system/fvSolution`: `minSimpleIterations`,
-`pressureDropTolerance`, `fieldChangeTolerance`, and `maxFieldChangePerStep`.
+relative `U`/`p` field changes below `--fieldChangeTolerance`. If inlet and
+outlet pressure-field averages are available, the pressure-field pressure drop
+must also satisfy `--pressureDropTolerance`. Ferrum also requires the coupled
+update limiter to be inactive before reporting `converged=yes`, so an
+artificially clipped update cannot pass as a physical steady state. These
+controls can also be set as Ferrum-specific entries under `SIMPLE` in
+`system/fvSolution`: `minSimpleIterations`, `pressureDropTolerance`,
+`fieldChangeTolerance`, and `maxFieldChangePerStep`.
 
 The report records residuals, SIMPLE iterations, wall-clock time,
 finite-volume operator summaries, boundary counts, Hagen-Poiseuille error,
 continuity, and per-iteration field changes. The pressure-correction bridge
-uses velocity-relaxed cell-wise `rAU`, corrects `phi` from the
-pressure-equation flux, carries that corrected surface flux into the next
-SIMPLE iteration, and bounds each coupled `U`/`p`/`phi` update with
+uses equation-relaxed momentum diagonals for cell-wise `rAU`, corrects `phi`
+from the pressure-equation flux, carries that corrected surface flux into the
+next SIMPLE iteration, and bounds each coupled `U`/`p`/`phi` update with
 `--maxFieldChangePerStep` (default `0.02`). Guards roll back to the previous
 finite state when continuity or the benchmark pressure-drop reference jumps
 aggressively. This prevents runaway reports, but fully OpenFOAM-grade
