@@ -70,6 +70,13 @@ FerrumCFD writes an OpenFOAM-like case structure:
 
 ```text
 case/
+  0/
+    p
+    U
+    T
+    <region>/
+      p
+      T
   constant/
     polyMesh/
       points
@@ -97,6 +104,74 @@ case/
     inner_zone/polyMesh/
     membrane/polyMesh/
     outer_zone/polyMesh/
+```
+
+## Initial Field Files
+
+FerrumCFD can read OpenFOAM-like initial field files from `0/`. This is the
+case-input side for later solvers; it does not solve equations yet.
+
+Single-region examples:
+
+```text
+0/p
+0/U
+0/T
+0/YH2O
+```
+
+Multi-region examples:
+
+```text
+0/fluid/p
+0/fluid/U
+0/membrane/T
+0/solid/T
+```
+
+Supported field entries for the current parser:
+
+- `FoamFile` metadata, especially `class` and `object`
+- `dimensions [ ... ];`
+- `internalField uniform ...;`
+- `internalField nonuniform List<...> ...;` as a summary
+- `boundaryField { patch { type ...; value ...; } }`
+
+Example:
+
+```text
+FoamFile
+{
+    version 2.0;
+    format ascii;
+    class volScalarField;
+    object p;
+}
+
+dimensions [0 2 -2 0 0 0 0];
+internalField uniform 0;
+
+boundaryField
+{
+    inlet
+    {
+        type fixedValue;
+        value uniform 10;
+    }
+    outlet
+    {
+        type zeroGradient;
+    }
+}
+```
+
+`checkFerrumMesh` reports the parsed field setup:
+
+```text
+initial fields:
+  p: class=volScalarField dimensions=[0 2 -2 0 0 0 0] internal=uniform 0 boundaryPatches=2
+    patch inlet type=fixedValue value=uniform 10
+    patch outlet type=zeroGradient
 ```
 
 ## Import A Gmsh Mesh
@@ -376,7 +451,9 @@ accepts `auto`, `f32`, and `f64`.
   cells.
 - Region splitting currently reads Ferrum-generated ASCII `polyMesh` files.
 - `checkFerrumMesh` is currently a structural summary plus basic topology
-  warning report, with interface and backend configuration validation.
+  warning report, with field, interface, and backend configuration validation.
+- Initial field parsing currently summarizes fields and boundary entries; it
+  does not yet validate dimensions against solver equations or patch types.
 - Solver support is not implemented yet.
 - CPU/GPU backend selection is validated as configuration and not yet
   executable solver behavior.

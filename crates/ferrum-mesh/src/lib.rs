@@ -1,5 +1,7 @@
 pub mod backends;
 pub mod check;
+pub mod dictionary;
+pub mod fields;
 pub mod foam;
 pub mod gmsh;
 pub mod interfaces;

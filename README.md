@@ -60,6 +60,8 @@ The importer currently targets the membrane reactor test mesh shape:
   are preserved as `faceZones`
 - patch types can be written as OpenFOAM-compatible `patch`, `empty`, `wedge`,
   `symmetryPlane`, or custom patch types
+- OpenFOAM-like initial fields below `0/` are parsed for `dimensions`,
+  `internalField`, and `boundaryField` summaries
 
 `splitFerrumMeshRegions` can write one region mesh per imported cell zone under
 `constant/<region>/polyMesh`.

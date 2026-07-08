@@ -46,6 +46,20 @@ The goal is not to copy OpenFOAM internals. The goal is to keep the established
 case layout, patch naming, command rhythm, and dictionary style where that
 reduces user friction.
 
+## Dictionary And Field Parsing
+
+FerrumCFD now has a shared OpenFOAM-style token/cursor parser used by case
+dictionaries such as:
+
+- `constant/interfaces`
+- `system/ferrumBackends`
+- initial field files below `0/`
+
+Initial field parsing is intentionally structural at this stage. It reads
+`FoamFile`, `dimensions`, `internalField`, and `boundaryField`, then reports the
+setup in `checkFerrumMesh`. Solver modules will later interpret these fields in
+the context of equations, patch constraints, and dimensions.
+
 ## Reduced Dimensions And Axisymmetry
 
 The mesh importer can now write OpenFOAM-compatible patch types such as

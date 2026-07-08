@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use case::{InitCaseOptions, init_case};
 use ferrum_mesh::backends::read_backend_config;
 use ferrum_mesh::check::read_case_summary;
+use ferrum_mesh::fields::{FieldFile, read_initial_fields};
 use ferrum_mesh::foam::{FoamWriteOptions, write_openfoam_case_with_options};
 use ferrum_mesh::gmsh::read_msh22_ascii;
 use ferrum_mesh::interfaces::{read_interface_config, validate_interface_config};
@@ -194,6 +195,7 @@ fn check_mesh(args: Vec<String>) -> Result<(), String> {
     print_interface_registry(&interfaces);
     print_interface_config(&case_dir, &interfaces)?;
     print_backend_config(&case_dir)?;
+    print_initial_fields(&case_dir)?;
 
     let unmatched = summary.unmatched_boundary_faces.unwrap_or(0);
     let duplicate = summary.duplicate_boundary_faces.unwrap_or(0);
@@ -378,6 +380,64 @@ fn print_backend_config(case_dir: &Path) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn print_initial_fields(case_dir: &Path) -> Result<(), String> {
+    let fields = read_initial_fields(case_dir).map_err(|error| error.to_string())?;
+    if fields.fields.is_empty() {
+        println!("initial fields: none");
+        return Ok(());
+    }
+
+    println!("initial fields:");
+    for field in &fields.fields {
+        print_initial_field(field);
+    }
+
+    Ok(())
+}
+
+fn print_initial_field(field: &FieldFile) {
+    let display_name = if let Some(region) = &field.region {
+        format!("{region}/{}", field.name)
+    } else {
+        field.name.clone()
+    };
+    let dimensions = field
+        .dimensions
+        .as_ref()
+        .map(|values| format!("[{}]", values.join(" ")))
+        .unwrap_or_else(|| "unknown".to_string());
+    let internal = field
+        .internal_field
+        .as_ref()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "missing".to_string());
+
+    println!(
+        "  {}: class={} dimensions={} internal={} boundaryPatches={}",
+        display_name,
+        field.class_name.as_deref().unwrap_or("unknown"),
+        dimensions,
+        internal,
+        field.boundary_patches.len()
+    );
+    for patch in &field.boundary_patches {
+        if let Some(value) = &patch.value {
+            println!(
+                "    patch {} type={} value={}",
+                patch.name,
+                patch.patch_type.as_deref().unwrap_or("unknown"),
+                value
+            );
+        } else {
+            println!(
+                "    patch {} type={}",
+                patch.name,
+                patch.patch_type.as_deref().unwrap_or("unknown")
+            );
+        }
+    }
 }
 
 fn print_region_patch(patch: &ferrum_mesh::regions::RegionPatchSummary) {
