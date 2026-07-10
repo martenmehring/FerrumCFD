@@ -191,11 +191,11 @@ Follow-up isolation on 2026-07-09 with the pressure-assembly reports shows:
 Local experiment on the same medium pipe case:
 
 ```powershell
-ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --momentumLinearSolver bicgstab --pressureLinearSolver pcg --pressurePreconditioner DIC --maxSimpleIterations 20
-ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --momentumLinearSolver bicgstab --pressureLinearSolver pcg --minSimpleIterations 30 --maxSimpleIterations 30
-ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --solveTolerance 1e-6 --maxIterations 100 --maxSimpleIterations 20
-ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --maxSimpleIterations 20
-ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --maxSimpleIterations 80
+ferrumSolver -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solveLaminarSimple --momentumLinearSolver bicgstab --pressureLinearSolver pcg --pressurePreconditioner DIC --maxSimpleIterations 20
+ferrumSolver -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solveLaminarSimple --momentumLinearSolver bicgstab --pressureLinearSolver pcg --minSimpleIterations 30 --maxSimpleIterations 30
+ferrumSolver -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solveLaminarSimple --solveTolerance 1e-6 --maxIterations 100 --maxSimpleIterations 20
+ferrumSolver -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solveLaminarSimple --maxSimpleIterations 20
+ferrumSolver -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solveLaminarSimple --maxSimpleIterations 80
 ```
 
 | Momentum solver | Pressure solver | Linear controls | Relaxation source | SIMPLE tries | DeltaP from mean [Pa] | Error to analytic | Final continuity L2 | Solve time [s] | Notes |

@@ -18,7 +18,7 @@ param(
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($CaseRoot)) {
-    $CaseRoot = Join-Path $RepoRoot "examples\laminar_pipe"
+    $CaseRoot = Join-Path $RepoRoot "tutorials\steadyIncompressible\laminarPipe\ferrum\case"
 }
 if ([string]::IsNullOrWhiteSpace($OpenFoamJson)) {
     $OpenFoamJson = Join-Path $RepoRoot "target\benchmarks\laminar_pipe_openfoam.json"
@@ -33,7 +33,7 @@ if ([string]::IsNullOrWhiteSpace($ReportFile)) {
     $ReportFile = Join-Path $RepoRoot "target\benchmarks\laminar_pipe_compare.md"
 }
 if ([string]::IsNullOrWhiteSpace($BenchmarkProperties)) {
-    $BenchmarkProperties = Join-Path $RepoRoot "benchmarks\laminar_pipe\pipeBenchmark"
+    $BenchmarkProperties = Join-Path $RepoRoot "tutorials\steadyIncompressible\laminarPipe\analytical\pipeBenchmark"
 }
 if (!(Test-Path -LiteralPath $BenchmarkProperties)) {
     throw "benchmark properties not found: $BenchmarkProperties"
@@ -514,6 +514,15 @@ function Write-MarkdownReport($Path, $Result) {
     $mesh = $Result.mesh
     $physics = $Result.physics
     $ferrumSolverLabel = if ($null -ne $ferrumSolve -and $ferrumSolve.mode -eq "laminar-simple") { "laminar SIMPLE" } else { "Poiseuille" }
+    $openFoamLabel = "OpenFOAM reference"
+    if ($null -ne $openFoam) {
+        $versionLabel = if ($null -ne $openFoam.version) { " $($openFoam.version)" } else { "" }
+        if ($openFoam.application -eq "foamRun" -and $null -ne $openFoam.solverModule) {
+            $openFoamLabel = "OpenFOAM$versionLabel foamRun/$($openFoam.solverModule)"
+        } elseif ($null -ne $openFoam.application) {
+            $openFoamLabel = "OpenFOAM$versionLabel $($openFoam.application)"
+        }
+    }
     $lines = New-Object System.Collections.Generic.List[string]
 
     $lines.Add("# Laminar Pipe Benchmark")
@@ -582,7 +591,7 @@ function Write-MarkdownReport($Path, $Result) {
     } else {
         $lines.Add("| FerrumCFD Poiseuille | $(Format-NullableNumber $comparison.ferrumDeltaPPa "G8") | $(Format-NullablePercent $comparison.ferrumRelativeErrorToAnalytic) |")
     }
-    $lines.Add("| OpenFOAM simpleFoam | $(Format-NullableNumber $comparison.openFoamDeltaPPa "G8") | $(Format-NullablePercent $comparison.openFoamRelativeErrorToAnalytic) |")
+    $lines.Add("| $openFoamLabel | $(Format-NullableNumber $comparison.openFoamDeltaPPa "G8") | $(Format-NullablePercent $comparison.openFoamRelativeErrorToAnalytic) |")
     if ($null -ne $comparison.openFoamPressureLossMethod) {
         $method = $comparison.openFoamPressureLossMethod
         $lines.Add("")
@@ -626,9 +635,9 @@ function Write-MarkdownReport($Path, $Result) {
     if ($null -ne $openFoam) {
         $foamExecution = if ($null -ne $openFoam.foamTiming) { $openFoam.foamTiming.executionTimeSeconds } else { $null }
         $foamSteps = if ($null -ne $Result.openFoamRunControl) { $Result.openFoamRunControl.simulatedSteps } else { "n/a" }
-        $lines.Add("| OpenFOAM simpleFoam | $(Format-NullableNumber $comparison.timing.openFoamWallClockSeconds "G6") | $(Format-NullableNumber $foamExecution "G6") | $foamSteps |")
+        $lines.Add("| $openFoamLabel | $(Format-NullableNumber $comparison.timing.openFoamWallClockSeconds "G6") | $(Format-NullableNumber $foamExecution "G6") | $foamSteps |")
     } else {
-        $lines.Add("| OpenFOAM simpleFoam | n/a | n/a | n/a |")
+        $lines.Add("| $openFoamLabel | n/a | n/a | n/a |")
     }
     $lines.Add("")
     $lines.Add("## Notes")

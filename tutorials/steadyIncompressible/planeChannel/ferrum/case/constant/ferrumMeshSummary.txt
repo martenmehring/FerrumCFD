@@ -1,0 +1,28 @@
+FerrumCFD mesh summary
+source=tutorials/steadyIncompressible/planeChannel/shared/geometry/plane_channel.geo
+case=tutorials/steadyIncompressible/planeChannel/ferrum/case
+points=4242
+cells=2000
+faces=8120
+internal_faces=3880
+boundary_faces=4240
+unmatched_boundary_faces=0
+duplicate_boundary_faces=0
+non_manifold_faces=0
+
+[patches]
+front type=empty tag=1 faces=2000 startFace=3880
+wall type=wall tag=2 faces=200 startFace=5880
+outlet type=patch tag=3 faces=20 startFace=6080
+inlet type=patch tag=4 faces=20 startFace=6100
+back type=empty tag=5 faces=2000 startFace=6120
+
+[face_zones]
+front tag=1 faces=2000
+wall tag=2 faces=200
+outlet tag=3 faces=20
+inlet tag=4 faces=20
+back tag=5 faces=2000
+
+[cell_zones]
+fluid tag=6 cells=2000

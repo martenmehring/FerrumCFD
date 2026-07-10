@@ -18,7 +18,7 @@ if ([string]::IsNullOrWhiteSpace($StudyRoot)) {
     $StudyRoot = Join-Path $RepoRoot "target\benchmarks\laminar_simple_mesh_study"
 }
 if ([string]::IsNullOrWhiteSpace($BenchmarkProperties)) {
-    $BenchmarkProperties = Join-Path $RepoRoot "benchmarks\laminar_pipe\pipeBenchmark"
+    $BenchmarkProperties = Join-Path $RepoRoot "tutorials\steadyIncompressible\laminarPipe\analytical\pipeBenchmark"
 }
 if (!(Test-Path -LiteralPath $BenchmarkProperties -PathType Leaf)) {
     throw "benchmark properties not found: $BenchmarkProperties"
@@ -130,7 +130,7 @@ New-Item -ItemType Directory -Force -Path $casesRoot, $resultsRoot, $openFoamRoo
 $generator = Join-Path $PSScriptRoot "generate_laminar_pipe_case.ps1"
 $runOpenFoam = Join-Path $PSScriptRoot "run_openfoam_laminar_pipe.ps1"
 $compare = Join-Path $PSScriptRoot "compare_laminar_pipe.ps1"
-$sourceSystem = Join-Path $RepoRoot "examples\laminar_pipe\system"
+$sourceSystem = Join-Path $RepoRoot "tutorials\steadyIncompressible\laminarPipe\ferrum\case\system"
 
 $variants = @(
     [pscustomobject][ordered]@{ name = "coarse"; axialCells = 12; radialCells = 4; angularSectors = 24 },
@@ -180,7 +180,7 @@ foreach ($variant in $variants) {
         } else {
             Write-Output "variant $($variant.name): running OpenFOAM reference"
             $openFoamArgs = @{
-                CaseRoot = $caseRoot
+                FerrumOverlayCaseRoot = $caseRoot
                 WorkDir = $openFoamWorkDir
                 OutFile = $openFoamJson
                 BenchmarkProperties = $BenchmarkProperties

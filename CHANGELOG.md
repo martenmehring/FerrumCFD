@@ -6,6 +6,24 @@ are distinguished explicitly.
 
 ## Unreleased
 
+### OpenFOAM-13-Inspired Layout And Driver Roadmap - 2026-07-11
+
+- Moved reusable implementation code to `src/` and the current combined
+  executable package to `applications/legacy/` without changing Cargo package
+  names or public commands.
+- Replaced the tracked `examples/`/`benchmarks/` split with Driver 1 tutorial
+  bundles under `tutorials/steadyIncompressible/`.
+- Added separate Ferrum, OpenFOAM Foundation 13, shared-geometry, analytical,
+  and comparison inputs for `laminarPipe` and `planeChannel`.
+- Added independently runnable OpenFOAM 13 source cases using
+  `foamRun -solver incompressibleFluid`, and pinned the automated pipe runner
+  to `WM_PROJECT_VERSION=13`.
+- Defined the six-case steady laminar validation matrix and the fixed
+  seven-driver sequence. Porous-media, Ergun, and packed-bed work is explicitly
+  deferred until all seven drivers pass the common readiness gate.
+- Documented `FerrumFile v1` and `ferrumRun` as target contracts while keeping
+  the current OpenFOAM-like Ferrum input as an explicit compatibility bridge.
+
 ### Command Naming And Licensing - 2026-07-10
 
 - Added the repository-level MIT license.

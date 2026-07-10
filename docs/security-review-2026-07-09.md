@@ -49,7 +49,7 @@ Status meanings:
 - `cargo test --workspace --all-targets`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - PowerShell AST parsing for every script below `scripts/`
-- One real `examples/laminar_pipe` SIMPLE iteration using the case's
+- One real `tutorials/steadyIncompressible/laminarPipe/ferrum/case` SIMPLE iteration using the case's
   `fvSchemes`, `fvSolution`, fields, properties, and `constant/polyMesh`
 
 ## Remaining Work

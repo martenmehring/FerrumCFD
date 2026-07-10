@@ -210,7 +210,7 @@ layers:
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_gmsh_pipe_import.ps1
 ```
 
-The script uses `examples/gmsh_pipe/pipe_prism2.geo`, writes the generated
+The script uses `tutorials/steadyIncompressible/laminarPipe/shared/geometry/pipe_prism2.geo`, writes the generated
 `.msh` below `target/gmsh/`, imports it to `target/cases/gmsh_pipe`, and runs
 `checkFerrumMesh`. It finds `gmsh.exe` from `PATH`; pass the trusted installation
 explicitly with `-GmshExe <path-to-gmsh.exe>` when needed. This Gmsh pipe is
@@ -441,10 +441,10 @@ results back to SI pressure in `Pa` before comparison.
 
 ## Laminar Pipe Benchmark
 
-`examples/laminar_pipe` is the first SI pipe simulation case used by the
+`tutorials/steadyIncompressible/laminarPipe/ferrum/case` is the first SI pipe simulation case used by the
 benchmark suite. It contains the mesh, fields, material properties, and solver
 dictionaries. The analytical Hagen-Poiseuille reference is separate at
-`benchmarks/laminar_pipe/pipeBenchmark`.
+`tutorials/steadyIncompressible/laminarPipe/analytical/pipeBenchmark`.
 
 Regenerate the versioned medium-resolution case with:
 
@@ -496,7 +496,8 @@ when fine OpenFOAM cases still have moving SIMPLE residuals.
 The current local Gmsh pipe mesh-study record is summarized in
 `docs/benchmarks/gmsh-pipe-mesh-study.md`.
 
-`scripts\run_poiseuille_benchmark.ps1` runs OpenFOAM `simpleFoam`, runs
+`scripts\run_poiseuille_benchmark.ps1` runs OpenFOAM Foundation 13
+`foamRun -solver incompressibleFluid`, runs
 `ferrumSolver --solvePoiseuille`, compares both with Hagen-Poiseuille, and
 writes `target/benchmarks/laminar_pipe_compare.json` plus
 `target/benchmarks/laminar_pipe_compare.md`. Use `-SkipOpenFoam
@@ -513,8 +514,8 @@ the solver-neutral run plan used by current CPU and later GPU solver paths.
 ferrumSolver -case cases\my_case --preflight
 ferrumSolver -case cases\my_case --preflight --planJson target\ferrumSolverPlan.json
 ferrumSolver -case cases\my_case --runnerDryRun --maxRunnerSteps 2
-ferrumSolver -case examples\laminar_pipe --solveScalarDiffusion T --diffusivity 1 --linearSolver cg
-ferrumSolver -case examples\laminar_pipe --solvePoiseuille --linearSolver cg
+ferrumSolver -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solveScalarDiffusion T --diffusivity 1 --linearSolver cg
+ferrumSolver -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solvePoiseuille --linearSolver cg
 ```
 
 Equivalent combined command:
@@ -599,7 +600,7 @@ It reads the selected `volScalarField` from `0/`, converts supported
 system, and solves it with `cg` or `jacobi`:
 
 ```powershell
-ferrumSolver -case examples\laminar_pipe --solveScalarDiffusion T --diffusivity 1 --linearSolver cg --solveTolerance 1e-8 --maxIterations 20000
+ferrumSolver -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solveScalarDiffusion T --diffusivity 1 --linearSolver cg --solveTolerance 1e-8 --maxIterations 20000
 ```
 
 Supported field boundary types for this path are currently `fixedValue uniform
@@ -620,7 +621,7 @@ benchmark-oriented. `deltaP`, `L`, and `D` must be supplied explicitly;
 `mu` may be explicit or read from `constant/transportProperties`:
 
 ```powershell
-ferrumSolver -case examples\laminar_pipe --solvePoiseuille --pressureDrop 1.6032 --mu 0.001002 --length 1 --diameter 0.02 --wallPatch wall --linearSolver cg
+ferrumSolver -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solvePoiseuille --pressureDrop 1.6032 --mu 0.001002 --length 1 --diameter 0.02 --wallPatch wall --linearSolver cg
 ```
 
 The analytical reference is Hagen-Poiseuille:
@@ -677,9 +678,9 @@ boundary-condition contract is:
 Current practical command:
 
 ```powershell
-ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --solveTolerance 1e-6 --maxIterations 100 --solveReportJson target\benchmarks\laminar_pipe_laminar_simple.json --solveReportMarkdown target\benchmarks\laminar_pipe_laminar_simple.md
-ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --maxSimpleIterations 2 --writeFinalFields target\benchmarks\laminar_pipe_fields\1
-ferrumPipeBenchmark -case examples\laminar_pipe --fields target\benchmarks\laminar_pipe_fields\1 --pressureDrop 1.6032 --mu 0.001002 --length 1 --diameter 0.02 --axis x --inletPatch inlet --outletPatch outlet --outJson target\benchmarks\laminar_pipe_fields\1.pipe.json
+ferrumSolver -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solveLaminarSimple --solveTolerance 1e-6 --maxIterations 100 --solveReportJson target\benchmarks\laminar_pipe_laminar_simple.json --solveReportMarkdown target\benchmarks\laminar_pipe_laminar_simple.md
+ferrumSolver -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solveLaminarSimple --maxSimpleIterations 2 --writeFinalFields target\benchmarks\laminar_pipe_fields\1
+ferrumPipeBenchmark -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --fields target\benchmarks\laminar_pipe_fields\1 --pressureDrop 1.6032 --mu 0.001002 --length 1 --diameter 0.02 --axis x --inletPatch inlet --outletPatch outlet --outJson target\benchmarks\laminar_pipe_fields\1.pipe.json
 ```
 
 The first two commands are geometry-independent SIMPLE execution. The third is
@@ -691,10 +692,10 @@ The generic `--linearSolver` value is still accepted, but the laminar SIMPLE
 path can also split the linear solver choice and linear controls by equation:
 
 ```powershell
-ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --momentumLinearSolver bicgstab --pressureLinearSolver pcg --pressurePreconditioner DIC --maxSimpleIterations 20
-ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --momentumSolveTolerance 1e-7 --pressureSolveTolerance 1e-9 --momentumMaxIterations 300 --pressureMaxIterations 400
-ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --nNonOrthogonalCorrectors 1 --pRefCell 0 --pRefValue 0
-ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --simpleConsistent true --maxSimpleIterations 20
+ferrumSolver -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solveLaminarSimple --momentumLinearSolver bicgstab --pressureLinearSolver pcg --pressurePreconditioner DIC --maxSimpleIterations 20
+ferrumSolver -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solveLaminarSimple --momentumSolveTolerance 1e-7 --pressureSolveTolerance 1e-9 --momentumMaxIterations 300 --pressureMaxIterations 400
+ferrumSolver -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solveLaminarSimple --nNonOrthogonalCorrectors 1 --pRefCell 0 --pRefValue 0
+ferrumSolver -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solveLaminarSimple --simpleConsistent true --maxSimpleIterations 20
 ```
 
 By default, `--solveLaminarSimple` reads OpenFOAM-style relaxation factors from
@@ -806,7 +807,7 @@ parallel-plate case. It reads stored `U`/`p`, applies
 simulation. Use `--pressureScale <rho>` only when post-processing OpenFOAM's
 kinematic incompressible pressure; Ferrum fields remain SI Pa by default. The
 reference `.geo`, case dictionaries, and SI inputs are under
-`benchmarks/plane_channel/`.
+`tutorials/steadyIncompressible/planeChannel/`.
 
 For the standard pipe benchmark, the automated comparison command is:
 
@@ -834,8 +835,8 @@ The matched-time benchmark fixes OpenFOAM `endTime=MatchedTimeSeconds` with
 `deltaT=1` and Ferrum `minSimpleIterations=maxSimpleIterations` to the same
 number. For steady SIMPLE solvers this is an equal pseudo-time/iteration budget,
 not a transient physical-time integration.
-The OpenFOAM step sweep answers the inverse question: how many OpenFOAM
-`simpleFoam` pseudo-time steps are needed to reach a target analytic
+The OpenFOAM step sweep answers the inverse question: how many OpenFOAM 13
+`foamRun -solver incompressibleFluid` steady iterations are needed to reach a target analytic
 pressure-loss error. The older 100-1200 step table used axial-slice
 extrapolation; rerun it with the current named-patch owner-cell sampler before
 using it as an acceptance result.

@@ -9,8 +9,8 @@ param(
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $TargetRoot = Join-Path $RepoRoot "target"
-$GeoFile = Join-Path $RepoRoot "benchmarks\plane_channel\plane_channel.geo"
-$TemplateRoot = Join-Path $RepoRoot "benchmarks\plane_channel\case"
+$GeoFile = Join-Path $RepoRoot "tutorials\steadyIncompressible\planeChannel\shared\geometry\plane_channel.geo"
+$TemplateRoot = Join-Path $RepoRoot "tutorials\steadyIncompressible\planeChannel\ferrum\case"
 
 if ([string]::IsNullOrWhiteSpace($CaseRoot)) {
     $CaseRoot = Join-Path $TargetRoot "cases\plane_channel"
@@ -103,12 +103,16 @@ try {
         throw "initFerrumCase failed with exit code $LASTEXITCODE"
     }
 
-    cargo run -p ferrum-cli --bin gmshToFerrum -- $MeshFile -case $CaseRoot -emptyPatch front -emptyPatch back
+    cargo run -p ferrum-cli --bin gmshToFerrum -- $MeshFile -case $CaseRoot -emptyPatch front -emptyPatch back -patchType wall=wall
     if ($LASTEXITCODE -ne 0) {
         throw "gmshToFerrum failed with exit code $LASTEXITCODE"
     }
 
-    Copy-Item -Path (Join-Path $TemplateRoot "*") -Destination $CaseRoot -Recurse -Force
+    Copy-Item -Path (Join-Path $TemplateRoot "0\*") -Destination (Join-Path $CaseRoot "0") -Recurse -Force
+    Copy-Item -Path (Join-Path $TemplateRoot "system\*") -Destination (Join-Path $CaseRoot "system") -Recurse -Force
+    Get-ChildItem -LiteralPath (Join-Path $TemplateRoot "constant") -File |
+        Where-Object Name -ne "ferrumMeshSummary.txt" |
+        Copy-Item -Destination (Join-Path $CaseRoot "constant") -Force
 
     cargo run -p ferrum-cli --bin checkFerrumMesh -- -case $CaseRoot
     if ($LASTEXITCODE -ne 0) {

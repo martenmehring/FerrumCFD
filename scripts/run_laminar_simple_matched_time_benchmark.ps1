@@ -15,13 +15,13 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 
 if ([string]::IsNullOrWhiteSpace($CaseRoot)) {
-    $CaseRoot = Join-Path $RepoRoot "examples\laminar_pipe"
+    $CaseRoot = Join-Path $RepoRoot "tutorials\steadyIncompressible\laminarPipe\ferrum\case"
 }
 if ([string]::IsNullOrWhiteSpace($BenchmarkRoot)) {
     $BenchmarkRoot = Join-Path $RepoRoot "target\benchmarks"
 }
 if ([string]::IsNullOrWhiteSpace($BenchmarkProperties)) {
-    $BenchmarkProperties = Join-Path $RepoRoot "benchmarks\laminar_pipe\pipeBenchmark"
+    $BenchmarkProperties = Join-Path $RepoRoot "tutorials\steadyIncompressible\laminarPipe\analytical\pipeBenchmark"
 }
 if (!(Test-Path -LiteralPath $BenchmarkProperties -PathType Leaf)) {
     throw "benchmark properties not found: $BenchmarkProperties"
@@ -39,7 +39,7 @@ $reportFile = Join-Path $BenchmarkRoot "$tag.compare.md"
 $runner = Join-Path $PSScriptRoot "run_poiseuille_benchmark.ps1"
 
 Write-Output "running matched laminar SIMPLE benchmark"
-Write-Output "OpenFOAM: simpleFoam endTime=$MatchedTimeSeconds deltaT=1"
+Write-Output "OpenFOAM 13: foamRun/incompressibleFluid endTime=$MatchedTimeSeconds deltaT=1"
 Write-Output "Ferrum: minSimpleIterations=maxSimpleIterations=$MatchedTimeSeconds"
 Write-Output "Note: for steady SIMPLE this is a pseudo-time/iteration budget, not a transient physical-time solve."
 

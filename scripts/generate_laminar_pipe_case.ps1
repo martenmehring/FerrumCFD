@@ -13,7 +13,7 @@ param(
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($CaseRoot)) {
-    $CaseRoot = Join-Path $RepoRoot "examples\laminar_pipe"
+    $CaseRoot = Join-Path $RepoRoot "tutorials\steadyIncompressible\laminarPipe\ferrum\case"
 }
 if ($AxialCells -le 0 -or $RadialCells -le 0 -or $AngularSectors -lt 3) {
     throw "AxialCells and RadialCells must be positive; AngularSectors must be at least 3"
@@ -487,7 +487,7 @@ Write-AsciiFile (Join-Path $CaseRoot "constant\transportProperties") $transportL
 $summaryLines = New-Object System.Collections.Generic.List[string]
 $summaryLines.Add("FerrumCFD mesh summary")
 $summaryLines.Add("source=generated structured circular pipe")
-$summaryLines.Add("case=examples\laminar_pipe")
+$summaryLines.Add("case=tutorials\steadyIncompressible\laminarPipe\ferrum\case")
 $summaryLines.Add("points=$($points.Count)")
 $summaryLines.Add("cells=$($cells.Count)")
 $summaryLines.Add("faces=$($orderedFaces.Count)")

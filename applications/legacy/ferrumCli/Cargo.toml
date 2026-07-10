@@ -1,0 +1,45 @@
+[package]
+name = "ferrum-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ferrum-mesh = { path = "../../../src/ferrumMesh" }
+
+[lib]
+name = "ferrum_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ferrum"
+path = "src/main.rs"
+
+[[bin]]
+name = "gmshToFerrum"
+path = "src/bin/gmsh_to_ferrum.rs"
+
+[[bin]]
+name = "checkFerrumMesh"
+path = "src/bin/check_ferrum_mesh.rs"
+
+[[bin]]
+name = "splitFerrumMeshRegions"
+path = "src/bin/split_ferrum_mesh_regions.rs"
+
+[[bin]]
+name = "initFerrumCase"
+path = "src/bin/init_ferrum_case.rs"
+
+[[bin]]
+name = "ferrumSolver"
+path = "src/bin/ferrum_solver.rs"
+
+[[bin]]
+name = "ferrumPipeBenchmark"
+path = "src/bin/ferrum_pipe_benchmark.rs"
+
+[[bin]]
+name = "ferrumPlaneChannelBenchmark"
+path = "src/bin/ferrum_plane_channel_benchmark.rs"

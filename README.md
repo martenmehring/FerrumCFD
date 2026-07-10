@@ -1,8 +1,8 @@
 # FerrumCFD
 
-FerrumCFD is an early Rust CFD platform prototype. It imports existing Gmsh
-meshes into an OpenFOAM-like case layout without forcing users to change their
-usual workflow.
+FerrumCFD is an early Rust CFD platform prototype. The current compatibility
+reader imports existing Gmsh meshes and OpenFOAM-like dictionaries while the
+native `FerrumFile v1` format is being introduced.
 
 The first executable flow-solver milestone is now available:
 `ferrumSolver --solveLaminarSimple` is a Rust finite-volume SIMPLE solver for
@@ -18,30 +18,32 @@ Current benchmark notes are kept under [docs/benchmarks](docs/benchmarks).
 Release-level changes are summarized in [CHANGELOG.md](CHANGELOG.md), and the
 solver completion criteria remain in [docs/solver-roadmap.md](docs/solver-roadmap.md).
 
+The repository follows an OpenFOAM-13-inspired separation: reusable Rust code
+lives under `src/`, compiled applications under `applications/`, and curated
+validation bundles under `tutorials/`. Each bundle keeps Ferrum and OpenFOAM 13
+cases independent and adds an analytical or documented benchmark reference
+where appropriate.
+
 ## First Commands
 
 ```powershell
-cargo run -p ferrum-cli --bin ferrum -- initFerrumCase examples\membrane_reactor
-cargo run -p ferrum-cli --bin ferrum -- gmshToFerrum path\to\mesh.msh -case examples\membrane_reactor
-cargo run -p ferrum-cli --bin ferrum -- checkFerrumMesh -case examples\membrane_reactor
-cargo run -p ferrum-cli --bin ferrum -- solve -case examples\membrane_reactor --preflight --planJson target\ferrumSolverPlan.json
+cargo run -p ferrum-cli --bin ferrum -- checkFerrumMesh -case tutorials\steadyIncompressible\laminarPipe\ferrum\case
+cargo run -p ferrum-cli --bin ferrum -- solve -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --preflight --planJson target\ferrumSolverPlan.json
+cargo run -p ferrum-cli --bin ferrum -- solve -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solveLaminarSimple --maxSimpleIterations 2
 ```
 
 Alias binaries are provided too:
 
 ```powershell
-cargo run -p ferrum-cli --bin initFerrumCase -- examples\membrane_reactor
-cargo run -p ferrum-cli --bin gmshToFerrum -- path\to\mesh.msh -case examples\membrane_reactor
-cargo run -p ferrum-cli --bin checkFerrumMesh -- -case examples\membrane_reactor
-cargo run -p ferrum-cli --bin splitFerrumMeshRegions -- -case examples\membrane_reactor -cellZones
-cargo run -p ferrum-cli --bin ferrumSolver -- -case examples\membrane_reactor --preflight --planJson target\ferrumSolverPlan.json
-cargo run -p ferrum-cli --bin ferrumSolver -- -case examples\membrane_reactor --runnerDryRun --maxRunnerSteps 2
-cargo run -p ferrum-cli --bin ferrumSolver -- -case examples\laminar_pipe --solveScalarDiffusion T --diffusivity 1 --linearSolver cg
-cargo run -p ferrum-cli --bin ferrumSolver -- -case examples\laminar_pipe --solvePoiseuille --pressureDrop 1.6032 --mu 0.001002 --length 1 --diameter 0.02 --linearSolver cg
-cargo run -p ferrum-cli --bin ferrumSolver -- -case examples\laminar_pipe --solveLaminarSimple --solveTolerance 1e-6 --maxIterations 100 --solveReportJson target\benchmarks\laminar_pipe_laminar_simple.json --solveReportMarkdown target\benchmarks\laminar_pipe_laminar_simple.md
-cargo run -p ferrum-cli --bin ferrumSolver -- -case examples\laminar_pipe --solveLaminarSimple --maxSimpleIterations 2 --writeFinalFields target\benchmarks\laminar_pipe_fields\1
-cargo run -p ferrum-cli --bin ferrumPipeBenchmark -- -case examples\laminar_pipe --fields target\benchmarks\laminar_pipe_fields\1 --pressureDrop 1.6032 --mu 0.001002 --length 1 --diameter 0.02 --axis x --inletPatch inlet --outletPatch outlet
-cargo run -p ferrum-cli --bin ferrumPlaneChannelBenchmark -- -case target\cases\plane_channel --fields target\benchmarks\plane_channel\ferrum_fields\1 --pressureDrop 0.6012 --mu 0.001002 --length 1 --gap 0.02 --depth 0.001
+cargo run -p ferrum-cli --bin checkFerrumMesh -- -case tutorials\steadyIncompressible\laminarPipe\ferrum\case
+cargo run -p ferrum-cli --bin ferrumSolver -- -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --preflight --planJson target\ferrumSolverPlan.json
+cargo run -p ferrum-cli --bin ferrumSolver -- -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --runnerDryRun --maxRunnerSteps 2
+cargo run -p ferrum-cli --bin ferrumSolver -- -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solveScalarDiffusion T --diffusivity 1 --linearSolver cg
+cargo run -p ferrum-cli --bin ferrumSolver -- -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solvePoiseuille --pressureDrop 1.6032 --mu 0.001002 --length 1 --diameter 0.02 --linearSolver cg
+cargo run -p ferrum-cli --bin ferrumSolver -- -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solveLaminarSimple --solveTolerance 1e-6 --maxIterations 100 --solveReportJson target\benchmarks\laminar_pipe_laminar_simple.json --solveReportMarkdown target\benchmarks\laminar_pipe_laminar_simple.md
+cargo run -p ferrum-cli --bin ferrumSolver -- -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solveLaminarSimple --maxSimpleIterations 2 --writeFinalFields target\benchmarks\laminar_pipe_fields\1
+cargo run -p ferrum-cli --bin ferrumPipeBenchmark -- -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --fields target\benchmarks\laminar_pipe_fields\1 --pressureDrop 1.6032 --mu 0.001002 --length 1 --diameter 0.02 --axis x --inletPatch inlet --outletPatch outlet
+cargo run -p ferrum-cli --bin ferrumPlaneChannelBenchmark -- -case tutorials\steadyIncompressible\planeChannel\ferrum\case --fields target\benchmarks\plane_channel\ferrum_fields\1 --pressureDrop 0.6012 --mu 0.001002 --length 1 --gap 0.02 --depth 0.001
 ```
 
 Run the first Ferrum/OpenFOAM/analytic pipe benchmarks with:
@@ -57,7 +59,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_simple_p
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_pipe_convergence.ps1 -OpenFoamSteps 200
 ```
 
-Prepare the separate 2D plane-channel testcase from its Gmsh geometry with:
+Prepare the separate 2D plane-channel test case from its shared Gmsh geometry
+with:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\prepare_plane_channel_case.ps1 -GmshExe "C:\path\to\gmsh.exe" -Force
@@ -181,9 +184,9 @@ The importer currently targets the membrane reactor test mesh shape:
   steps and logs planned field state, CPU/GPU stage dispatch, runtime handles,
   and missing executable backend status without updating fields or solving
   equations
-- `examples/laminar_pipe` provides a generated circular-pipe SI simulation case
+- `tutorials/steadyIncompressible/laminarPipe/ferrum/case` provides a generated circular-pipe SI simulation case
   with a flow-normalized parabolic inlet. Analytic reference data lives outside
-  the case in `benchmarks/laminar_pipe/pipeBenchmark`; comparison scripts record
+  the case in `tutorials/steadyIncompressible/laminarPipe/analytical/pipeBenchmark`; comparison scripts record
   Ferrum/OpenFOAM wall-clock runtime under `target/benchmarks`
 - `scripts/run_laminar_simple_iteration_sweep.ps1` runs fixed
   `minSimpleIterations=maxSimpleIterations` Ferrum SIMPLE sweeps, stores generic
@@ -193,7 +196,8 @@ The importer currently targets the membrane reactor test mesh shape:
   for OpenFOAM and Ferrum, for example OpenFOAM `endTime=100` and Ferrum
   `100` SIMPLE iterations
 - `scripts/run_openfoam_laminar_pipe_step_sweep.ps1` measures how many
-  OpenFOAM `simpleFoam` pseudo-time steps are needed to reach a target
+  OpenFOAM 13 `foamRun -solver incompressibleFluid` steady iterations are
+  needed to reach a target
   Hagen-Poiseuille pressure-loss error
 - `scripts/run_laminar_simple_mesh_study.ps1` runs coarse/medium/fine mesh
   studies for the current Ferrum laminar SIMPLE path and the OpenFOAM reference
@@ -204,7 +208,7 @@ The importer currently targets the membrane reactor test mesh shape:
   `--solveLaminarSimple` prototype into the first production laminar
   incompressible solver, including numerics, boundary conditions, schemes,
   benchmarks, performance, and later CPU/GPU execution
-- `examples/gmsh_pipe/pipe_prism2.geo` provides a parametric Gmsh pipe with two
+- `tutorials/steadyIncompressible/laminarPipe/shared/geometry/pipe_prism2.geo` provides a parametric Gmsh pipe with two
   near-wall prism layers; `scripts/run_gmsh_pipe_mesh_study.ps1` creates
   coarse/medium/fine Gmsh meshes for OpenFOAM convergence and FerrumCFD
   Poiseuille validation on the selected reference mesh

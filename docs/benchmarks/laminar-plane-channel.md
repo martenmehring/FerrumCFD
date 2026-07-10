@@ -8,7 +8,7 @@ are separate artifacts.
 
 ## Shared Setup
 
-- Gmsh source: `benchmarks/plane_channel/plane_channel.geo`
+- Gmsh source: `tutorials/steadyIncompressible/planeChannel/shared/geometry/plane_channel.geo`
 - shared imported mesh: 2000 hex cells, 100 axial x 20 wall-normal x 1 depth
 - `front` and `back`: OpenFOAM `empty`
 - length: `1 m`

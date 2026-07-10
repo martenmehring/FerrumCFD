@@ -3,69 +3,93 @@
 FerrumCFD should feel familiar to OpenFOAM users at the workflow level, while
 using a new Rust implementation and a backend-aware solver architecture.
 
-## OpenFOAM-Compatible Workflow Target
+## Repository And Tutorial Layout
 
-FerrumCFD should preserve the common OpenFOAM case workflow where practical:
+FerrumCFD follows the OpenFOAM 13 separation of compiled applications,
+reusable implementation modules, utilities, and tutorials while retaining
+Cargo as the Rust build system.
 
 ```text
-case/
-  0/
-    U
-    p
-    ...
-  constant/
-    polyMesh/
-      points
-      faces
-      owner
-      neighbour
-      boundary
-      faceZones
-      cellZones
-    transportProperties
-    thermophysicalProperties
-    ...
-  system/
-    controlDict
-    fvSchemes
-    fvSolution
-    ferrumBackends
+applications/
+  solvers/
+    ferrumRun/
+    ferrumMultiRun/          # later
+  modules/
+  utilities/
+src/
+  ferrumCore/
+  ferrumMesh/
+  ferrumFiniteVolume/
+  ferrumIO/
+  openfoamIO/                # interoperability only
+  ferrumModels/
+tutorials/
+  <driver>/
+    <case>/
+      shared/
+      ferrum/
+      openfoam-v13/
+      analytical/            # optional
+      benchmark/             # optional fallback
+      comparison.toml
+      README.md
+validation/
+test/
+docs/
+target/                      # generated and ignored
 ```
 
-The user-facing command flow should remain familiar:
+Every tutorial is a validation bundle, not one shared runtime case. The
+`ferrum/` and `openfoam-v13/` cases must each run independently. `shared/` may
+contain neutral geometry, units, and physical inputs, but never
+program-specific dictionaries. Each program converts the shared geometry into
+its own native mesh and owns its numerical configuration.
 
-```powershell
-initFerrumCase case
-gmshToFerrum mesh.msh -case case
-checkFerrumMesh -case case
-splitFerrumMeshRegions -case case -cellZones
-ferrumSolver -case case --preflight
-```
+Small canonical validation meshes may be versioned in each program-specific
+source case so a clean checkout is independently runnable. Regenerated mesh
+variants, time directories, logs, and reports belong below `target/`. An
+`analytical/` directory is added only when a closed-form, semi-analytical, or
+manufactured solution is valid. When no such solution exists, `benchmark/`
+contains a documented independent reference with provenance, units, sampling,
+and tolerances. Empty or invented analytical references are forbidden.
 
-The goal is not to copy OpenFOAM internals. The goal is to keep the established
-case layout, patch naming, command rhythm, and dictionary style where that
-reduces user friction.
+The first layout migration places the reusable mesh/finite-volume foundation
+under `src/ferrumMesh` and the still-combined executable package under
+`applications/legacy/ferrumCli`. The legacy package remains executable while
+`ferrumRun`, solver modules, and utilities are split into their final
+directories. This staged move preserves a buildable workspace throughout the
+architecture transition.
 
-## Dictionary And Field Parsing
+## Native Ferrum And OpenFOAM Boundary
 
-FerrumCFD now has a shared OpenFOAM-style token/cursor parser used by case
-dictionaries such as:
+The target Ferrum case format is native:
 
-- `constant/interfaces`
-- `system/controlDict`
-- `system/ferrumBackends`
-- initial field files below `0/`
+- every Ferrum dictionary uses the `FerrumFile` header;
+- Ferrum configuration uses names such as `ferrumControl`, `ferrumSchemes`,
+  `ferrumSolution`, and `ferrumModels`;
+- physical field names such as `U`, `p`, `T`, and species names may remain
+  standard scientific notation;
+- Ferrum-specific parameters use explicit SI-oriented names;
+- the user-facing command flow remains `initFerrumCase`, `gmshToFerrum`,
+  `checkFerrumMesh`, `splitFerrumMeshRegions`, and `ferrumRun`.
 
-Initial field parsing is intentionally structural at this stage. It reads
-`FoamFile`, `dimensions`, `internalField`, and `boundaryField`, then reports the
-setup in `checkFerrumMesh`. Solver modules will later interpret these fields in
-the context of equations, patch constraints, and dimensions.
+The sibling `openfoam-v13/` case remains a genuine OpenFOAM 13 case. It uses
+`FoamFile`, OpenFOAM dictionaries and parameter names, and its own mesh
+conversion and run commands. OpenFOAM parsing and conversion belong in the
+separate `openfoamIO` interoperability layer and must not define the native
+Ferrum format.
 
-`checkFerrumMesh` now validates field boundary entries against mesh patches.
-This is deliberately solver-neutral: it checks names and special patch
+This is the target contract. Until `FerrumFile v1` and its reader/writer are
+implemented, the existing OpenFOAM-like Ferrum reader remains a documented
+compatibility bridge. It currently reads `FoamFile`, `dimensions`,
+`internalField`, and `boundaryField`. Existing executable cases must remain
+usable until native-format parity tests pass.
+
+`checkFerrumMesh` validates field boundary entries against mesh patches. This
+is deliberately solver-neutral: it checks names and special patch
 compatibility such as `empty` fields on `empty` mesh patches, but it does not
-yet decide whether a pressure or velocity boundary condition is physically
-appropriate for a solver.
+decide whether a pressure or velocity boundary condition is physically
+appropriate for a driver.
 
 ## Reduced Dimensions And Axisymmetry
 
@@ -209,9 +233,9 @@ benchmark comparisons dimensionally predictable and avoids hidden display-unit
 conventions.
 
 Compatibility layers may adapt external tools. OpenFOAM incompressible
-benchmarks, for example, can use kinematic pressure internally because that is
-what `simpleFoam` expects, but comparison scripts must convert back to SI
-pressure before writing FerrumCFD benchmark JSON.
+benchmarks use kinematic pressure internally. The OpenFOAM 13
+`incompressibleFluid` comparison therefore converts pressure back to SI before
+writing FerrumCFD benchmark JSON.
 
 ## Solver Preflight Boundary
 
@@ -323,13 +347,20 @@ The solver stack should be written against backend-neutral data and execution
 traits:
 
 ```text
-Mesh topology
-Fields
-Operators
-Physics modules
+ferrumRun dispatcher
+Application drivers
+Equation and coupling modules
+Physical models
+Finite-volume operators
+Fields and mesh topology
 Linear/nonlinear solvers
 Backend implementations: CPU, WGPU, CUDA, HIP
 ```
+
+The public solver portfolio consists of seven application drivers behind
+`ferrumRun`, not seven copied solver programs. Drivers compose reusable
+equation, coupling, and physical-model modules. A model required by several
+drivers has one implementation with driver-specific configuration.
 
 Physics code should express operations in terms of fields, operators, and
 solver steps. Backend implementations should decide where and how those

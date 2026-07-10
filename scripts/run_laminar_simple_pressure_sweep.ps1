@@ -14,7 +14,7 @@ if ([string]::IsNullOrWhiteSpace($StudyRoot)) {
     $StudyRoot = Join-Path $RepoRoot "target\benchmarks\laminar_simple_pressure_sweep"
 }
 if ([string]::IsNullOrWhiteSpace($BenchmarkProperties)) {
-    $BenchmarkProperties = Join-Path $RepoRoot "benchmarks\laminar_pipe\pipeBenchmark"
+    $BenchmarkProperties = Join-Path $RepoRoot "tutorials\steadyIncompressible\laminarPipe\analytical\pipeBenchmark"
 }
 if (!(Test-Path -LiteralPath $BenchmarkProperties -PathType Leaf)) {
     throw "benchmark properties not found: $BenchmarkProperties"
@@ -145,7 +145,7 @@ New-Item -ItemType Directory -Force -Path $StudyRoot, $casesRoot, $variantStudie
 
 $generator = Join-Path $PSScriptRoot "generate_laminar_pipe_case.ps1"
 $iterationSweep = Join-Path $PSScriptRoot "run_laminar_simple_iteration_sweep.ps1"
-$sourceSystem = Join-Path $RepoRoot "examples\laminar_pipe\system"
+$sourceSystem = Join-Path $RepoRoot "tutorials\steadyIncompressible\laminarPipe\ferrum\case\system"
 
 $allVariants = @(
     [pscustomobject][ordered]@{ name = "coarse"; axialCells = 12; radialCells = 4; angularSectors = 24 },

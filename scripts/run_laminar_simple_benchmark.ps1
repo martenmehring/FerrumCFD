@@ -20,7 +20,7 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 
 if ([string]::IsNullOrWhiteSpace($CaseRoot)) {
-    $CaseRoot = Join-Path $RepoRoot "examples\laminar_pipe"
+    $CaseRoot = Join-Path $RepoRoot "tutorials\steadyIncompressible\laminarPipe\ferrum\case"
 }
 if ([string]::IsNullOrWhiteSpace($OpenFoamWorkDir)) {
     $OpenFoamWorkDir = Join-Path $RepoRoot "target\openfoam\laminar_pipe"
@@ -38,7 +38,7 @@ if ([string]::IsNullOrWhiteSpace($ReportFile)) {
     $ReportFile = Join-Path $RepoRoot "target\benchmarks\laminar_pipe_laminar_simple_compare.md"
 }
 if ([string]::IsNullOrWhiteSpace($BenchmarkProperties)) {
-    $BenchmarkProperties = Join-Path $RepoRoot "benchmarks\laminar_pipe\pipeBenchmark"
+    $BenchmarkProperties = Join-Path $RepoRoot "tutorials\steadyIncompressible\laminarPipe\analytical\pipeBenchmark"
 }
 if ($OpenFoamSteps -le 0) {
     throw "OpenFoamSteps must be positive"

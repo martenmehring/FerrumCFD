@@ -16,13 +16,13 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 
 if ([string]::IsNullOrWhiteSpace($CaseRoot)) {
-    $CaseRoot = Join-Path $RepoRoot "examples\laminar_pipe"
+    $CaseRoot = Join-Path $RepoRoot "tutorials\steadyIncompressible\laminarPipe\ferrum\case"
 }
 if ([string]::IsNullOrWhiteSpace($StudyRoot)) {
     $StudyRoot = Join-Path $RepoRoot "target\benchmarks\laminar_simple_iteration_sweep"
 }
 if ([string]::IsNullOrWhiteSpace($BenchmarkProperties)) {
-    $BenchmarkProperties = Join-Path $RepoRoot "benchmarks\laminar_pipe\pipeBenchmark"
+    $BenchmarkProperties = Join-Path $RepoRoot "tutorials\steadyIncompressible\laminarPipe\analytical\pipeBenchmark"
 }
 if ($RunPipeBenchmark -and !(Test-Path -LiteralPath $BenchmarkProperties -PathType Leaf)) {
     throw "benchmark properties not found: $BenchmarkProperties"

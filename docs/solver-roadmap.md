@@ -1,8 +1,11 @@
 # FerrumCFD Solver Roadmap
 
-This roadmap tracks the path from the current executable laminar SIMPLE
-prototype toward a production `simpleFoam`-class incompressible laminar solver
-and later CPU/GPU solver backends.
+This roadmap first completes and broadens the steady laminar incompressible
+foundation, then implements exactly six additional application drivers in a
+fixed order. Every driver is validated with independent Ferrum and OpenFOAM 13
+cases and an analytical, manufactured, or documented benchmark reference.
+Porous-media, Ergun, and packed-bed development starts only after all seven
+application drivers have passed their readiness gates.
 
 ## Current Status
 
@@ -48,7 +51,7 @@ does not yet configure `SIMPLE.residualControl`.
 The solver is therefore promising for the pipe case, but it is not yet a
 production `simpleFoam` replacement.
 
-## Definition Of Done For The First Solver
+## Definition Of Done For Driver 1
 
 The first laminar incompressible solver should be considered ready when it:
 
@@ -218,41 +221,92 @@ Next performance targets:
   nonlinear/interface/ODE stages), with CPU as a valid choice when GPU is busy
   or unnecessary.
 
-## Milestone 6: Generalization Beyond The Pipe
+## Milestone 6: Driver 1 Laminar Validation Matrix
 
-Goal: turn the pipe solver into a reusable laminar CFD foundation.
+Before Driver 2 starts, steady incompressible SIMPLE/SIMPLEC must pass this
+tutorial matrix:
 
-Next physics/application targets:
+| Order | Case | Primary coverage | Reference |
+| ---: | --- | --- | --- |
+| 1 | `laminarPipe` | 3D internal flow and pressure loss | Hagen-Poiseuille analytical solution |
+| 2 | `planeChannel` | true 2D `empty` handling | Plane-Poiseuille analytical solution |
+| 3 | `couettePoiseuille` | moving wall and combined pressure/shear forcing | Analytical velocity profile |
+| 4 | `lidDrivenCavity` | recirculation and closed-pressure reference | Published benchmark |
+| 5 | `backwardFacingStep` | separation, reattachment, and outlet robustness | Published benchmark |
+| 6 | `axisymmetricPipe` | `wedge` handling | Hagen-Poiseuille analytical solution |
 
-- double-pipe or annular heat-transfer case with constant wall temperature;
-- scalar energy equation and wall heat-flux/Nusselt diagnostics;
-- multiregion mesh handling for membrane-reactor-style cases;
-- interface flux models that allow flow reversal from pressure differences
-  instead of encoding physical direction in mesh metadata;
-- later: species transport, membrane source terms, nonlinear material laws,
-  and optional GPU acceleration for linear, nonlinear, and ODE subproblems.
+Every case contains independently runnable `ferrum/` and `openfoam-v13/`
+directories. Analytic cases also contain `analytical/`; benchmark-only cases
+contain `benchmark/`. Coarse/medium/fine, skewed, and non-orthogonal variants
+belong to these bundles instead of becoming unrelated cases.
 
-The membrane-reactor case remains a target application, not a hard-coded solver
-assumption. Any pressure reversal, sweep-side backflow, or water transport must
-come from equations and boundary/interface models, not from `flipMap` or fixed
-mesh orientation choices.
+## Application Driver Portfolio
+
+Drivers are implemented and accepted in this fixed order:
+
+| Driver | Application driver | Required first validation cases |
+| ---: | --- | --- |
+| 1 | Steady incompressible SIMPLE/SIMPLEC | Complete laminar matrix above |
+| 2 | Transient incompressible PISO/PIMPLE | `taylorGreenVortex`, `startUpPlaneChannel`, `womersleyPipe` |
+| 3 | Low-Mach thermal/buoyant | `heatedPlaneChannel`, `rayleighBenardConduction`, `differentiallyHeatedCavity` |
+| 4 | Low-Mach reacting flow | `manufacturedAdvectionDiffusionReaction`, `laminarPremixedFlame` |
+| 5 | Compressible flow | `linearAcousticWave`, `sodShockTube`, `isentropicNozzle` |
+| 6 | Multi-region conjugate/reacting | `compositeSlab`, `conjugateHeatedChannel`, `surfaceReactionChannel` |
+| 7 | Immiscible two-phase VOF | `interfaceAdvection`, `staticDroplet`, `capillaryRise`, `damBreak` |
+
+Within each driver, cases are implemented in the listed order. Packed-bed
+geometry, Ergun resistance, porous momentum sources, and pseudo-homogeneous
+reactor models are explicitly outside this seven-driver phase.
+
+Reference selection follows the strongest available independent contract:
+
+- exact or analytical solutions for Taylor-Green decay, start-up channel flow,
+  Womersley flow, acoustic waves, Sod shock tubes, isentropic nozzles,
+  composite slabs, interface advection, Laplace pressure, and capillary
+  equilibrium;
+- analytical or semi-analytical heat-transfer references for heated channels
+  and the subcritical Rayleigh-Benard conduction state;
+- manufactured solutions for coupled transport/reaction and multiregion
+  coupling where a useful closed form is unavailable;
+- documented external benchmarks for cavities, separated flows, flames,
+  conjugate channels, surface reactions, and dam breaks.
+
+## Driver Readiness Gate
+
+A driver is complete only when:
+
+- its Ferrum cases run from a clean checkout with native `FerrumFile` input;
+- each OpenFOAM 13 sibling case runs independently without Ferrum conversion;
+- an analytical or manufactured reference exists wherever mathematically
+  valid;
+- otherwise a benchmark reference records source, units, sampling, and
+  tolerance;
+- the comparison runner produces machine-readable JSON and human-readable
+  Markdown Ferrum/OpenFOAM/reference reports;
+- conservation, residual, field, and runtime diagnostics are regression-tested;
+- mesh or time-step refinement is demonstrated, or non-monotonic behavior is
+  explained;
+- case-specific acceptance logic remains outside the generic driver.
+
+## Deferred Phase: Porous Media And Packed Beds
+
+Porous-media, Darcy-Forchheimer/Ergun, packed-bed, pellet, membrane-reactor,
+and pseudo-homogeneous reactor development starts only after Driver 7 passes
+the readiness gate. Architecture may keep generic source and interface
+extension points, but this phase must not displace the seven-driver validation
+sequence.
 
 ## Immediate Next Steps
 
-1. Build the separate 2D plane-Poiseuille case from a Gmsh `.geo`, import the
-   same mesh into Ferrum and OpenFOAM, and keep analytic comparison in an
-   external benchmark report.
-2. Rerun the medium/fine pressure sweep with the new `pressureAssembly`
-   diagnostics and isolate whether the fine-mesh p-owner error starts in
-   `phiHbyA`, pressure source assembly, pressure flux, or boundary
-   contributions.
-3. Validate the projected-distance pressure/laplacian coefficient on the pipe
-   mesh and a deliberately skewed mesh, then decide whether corrected
-   non-orthogonal fluxes need additional pressure loops by default.
-4. Add regression checks for pressure-field deltaP and mean-flow deltaP on the
-   medium pipe case.
-5. Profile the pressure correction solve and identify the first CPU
-   preconditioner improvement.
-6. Add one `wedge` axisymmetric smoke case after the 2D benchmark.
-7. Improve the OpenFOAM mesh/reference setup when an under-1% OpenFOAM pressure
-   loss reference is required.
+1. Introduce the OpenFOAM-13-inspired repository layout and tutorial validation
+   bundle contract on a dedicated pull request.
+2. Migrate `laminarPipe` and `planeChannel` first, including independent
+   Ferrum, OpenFOAM 13, and analytical siblings.
+3. Specify and implement `FerrumFile v1`; isolate OpenFOAM support behind the
+   interoperability layer.
+4. Introduce `ferrumRun` and the application-driver/module registry.
+5. Complete Driver 1 SIMPLE/SIMPLEC and the remaining laminar validation
+   matrix.
+6. Implement Drivers 2 through 7 in the fixed order above, applying the common
+   readiness gate to each driver.
+7. Begin porous-media and packed-bed work only after Driver 7 is complete.

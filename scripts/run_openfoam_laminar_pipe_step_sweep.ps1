@@ -1,5 +1,5 @@
 param(
-    [string]$CaseRoot = "",
+    [string]$FerrumOverlayCaseRoot = "",
     [string]$StudyRoot = "",
     [string]$BenchmarkProperties = "",
     [ValidateSet("Auto", "Native", "Wsl")]
@@ -13,14 +13,11 @@ param(
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 
-if ([string]::IsNullOrWhiteSpace($CaseRoot)) {
-    $CaseRoot = Join-Path $RepoRoot "examples\laminar_pipe"
-}
 if ([string]::IsNullOrWhiteSpace($StudyRoot)) {
     $StudyRoot = Join-Path $RepoRoot "target\benchmarks\openfoam_laminar_pipe_step_sweep"
 }
 if ([string]::IsNullOrWhiteSpace($BenchmarkProperties)) {
-    $BenchmarkProperties = Join-Path $RepoRoot "benchmarks\laminar_pipe\pipeBenchmark"
+    $BenchmarkProperties = Join-Path $RepoRoot "tutorials\steadyIncompressible\laminarPipe\analytical\pipeBenchmark"
 }
 if (!(Test-Path -LiteralPath $BenchmarkProperties -PathType Leaf)) {
     throw "benchmark properties not found: $BenchmarkProperties"
@@ -97,7 +94,7 @@ function Write-SweepMarkdown($Path, $Rows, $Summary) {
     $lines.Add("")
     $lines.Add("Case: ``$($Summary.caseDir)``")
     $lines.Add("")
-    $lines.Add('This sweep answers how many steady `simpleFoam` pseudo-time steps are needed to reach the target pressure-loss error against Hagen-Poiseuille.')
+    $lines.Add('This sweep answers how many steady OpenFOAM 13 `foamRun -solver incompressibleFluid` iterations are needed to reach the target pressure-loss error against Hagen-Poiseuille.')
     $lines.Add("")
     $lines.Add("| Steps | DeltaP [Pa] | Error to analytic | Execution [s] | Wall [s] | Meets target |")
     $lines.Add("| ---: | ---: | ---: | ---: | ---: | --- |")
@@ -136,22 +133,24 @@ New-Item -ItemType Directory -Force -Path $StudyRoot, $resultRoot, $caseRootOut 
 
 $rows = New-Object System.Collections.Generic.List[object]
 foreach ($steps in $stepBudgets) {
-    $name = "simpleFoam_$steps"
+    $name = "foamRun_incompressibleFluid_$steps"
     $workDir = Join-Path $caseRootOut $name
     $outFile = Join-Path $resultRoot "$name.json"
     if ($UseExistingReports -and (Test-Path -LiteralPath $outFile)) {
         Write-Output "using existing OpenFOAM report for $steps steps"
         $result = Read-JsonFile $outFile
     } else {
-        Write-Output "running OpenFOAM simpleFoam for $steps steps"
+        Write-Output "running OpenFOAM 13 foamRun/incompressibleFluid for $steps steps"
         $args = @{
-            CaseRoot = $CaseRoot
             WorkDir = $workDir
             OutFile = $outFile
             BenchmarkProperties = $BenchmarkProperties
             Mode = $Mode
             EndTime = $steps
             WriteInterval = $steps
+        }
+        if (![string]::IsNullOrWhiteSpace($FerrumOverlayCaseRoot)) {
+            $args.FerrumOverlayCaseRoot = $FerrumOverlayCaseRoot
         }
         if ($RequireOpenFoam) {
             $args.RequireOpenFoam = $true

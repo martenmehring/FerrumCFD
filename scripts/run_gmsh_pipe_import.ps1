@@ -9,7 +9,7 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 
 if ([string]::IsNullOrWhiteSpace($GeoFile)) {
-    $GeoFile = Join-Path $RepoRoot "examples\gmsh_pipe\pipe_prism2.geo"
+    $GeoFile = Join-Path $RepoRoot "tutorials\steadyIncompressible\laminarPipe\shared\geometry\pipe_prism2.geo"
 }
 if ([string]::IsNullOrWhiteSpace($MeshFile)) {
     $MeshFile = Join-Path $RepoRoot "target\gmsh\pipe_prism2.msh"

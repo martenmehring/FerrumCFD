@@ -20,7 +20,7 @@ if ([string]::IsNullOrWhiteSpace($StudyRoot)) {
     $StudyRoot = Join-Path $RepoRoot "target\benchmarks\laminar_pipe_convergence"
 }
 if ([string]::IsNullOrWhiteSpace($BenchmarkProperties)) {
-    $BenchmarkProperties = Join-Path $RepoRoot "benchmarks\laminar_pipe\pipeBenchmark"
+    $BenchmarkProperties = Join-Path $RepoRoot "tutorials\steadyIncompressible\laminarPipe\analytical\pipeBenchmark"
 }
 if (!(Test-Path -LiteralPath $BenchmarkProperties -PathType Leaf)) {
     throw "benchmark properties not found: $BenchmarkProperties"
@@ -102,7 +102,7 @@ function Write-StudyMarkdown($Path, $Rows, $Summary) {
     $lines.Add("")
     $lines.Add("## Notes")
     $lines.Add("")
-    $lines.Add('- `medium` matches the versioned `examples/laminar_pipe` default mesh resolution.')
+    $lines.Add('- `medium` matches the versioned `tutorials/steadyIncompressible/laminarPipe/ferrum/case` default mesh resolution.')
     $lines.Add('- `Ferrum solve` is the executable source-driven axial Stokes/Poiseuille benchmark, not the later full SIMPLE-like flow solver.')
     $lines.Add('- Ferrum pressure loss is reconstructed from the solved mean velocity and compared to Hagen-Poiseuille.')
     $lines.Add('- OpenFOAM pressure is converted from kinematic pressure (`m2/s2`) back to SI pressure (`Pa`) before comparison.')
@@ -127,7 +127,7 @@ New-Item -ItemType Directory -Force -Path $casesRoot, $resultsRoot, $openFoamRoo
 $generator = Join-Path $PSScriptRoot "generate_laminar_pipe_case.ps1"
 $runOpenFoam = Join-Path $PSScriptRoot "run_openfoam_laminar_pipe.ps1"
 $compare = Join-Path $PSScriptRoot "compare_laminar_pipe.ps1"
-$sourceSystem = Join-Path $RepoRoot "examples\laminar_pipe\system"
+$sourceSystem = Join-Path $RepoRoot "tutorials\steadyIncompressible\laminarPipe\ferrum\case\system"
 
 $variants = @(
     [pscustomobject][ordered]@{ name = "coarse"; axialCells = 12; radialCells = 4; angularSectors = 24 },
@@ -178,7 +178,7 @@ foreach ($variant in $variants) {
     } else {
         Write-Output "variant $($variant.name): running OpenFOAM reference"
         $openFoamArgs = @{
-            CaseRoot = $caseRoot
+            FerrumOverlayCaseRoot = $caseRoot
             WorkDir = $openFoamWorkDir
             OutFile = $openFoamJson
             BenchmarkProperties = $BenchmarkProperties

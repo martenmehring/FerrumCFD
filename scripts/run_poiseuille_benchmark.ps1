@@ -11,6 +11,7 @@ param(
     [int]$OpenFoamSteps = 200,
     [switch]$SkipOpenFoam,
     [switch]$RequireOpenFoam,
+    [switch]$UseFerrumCaseForOpenFoam,
     [switch]$UseExistingOpenFoamJson,
     [switch]$SkipFerrumSolve,
     [ValidateSet("poiseuille", "laminarSimple")]
@@ -25,7 +26,7 @@ param(
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($CaseRoot)) {
-    $CaseRoot = Join-Path $RepoRoot "examples\laminar_pipe"
+    $CaseRoot = Join-Path $RepoRoot "tutorials\steadyIncompressible\laminarPipe\ferrum\case"
 }
 if ([string]::IsNullOrWhiteSpace($OpenFoamWorkDir)) {
     $OpenFoamWorkDir = Join-Path $RepoRoot "target\openfoam\laminar_pipe"
@@ -43,7 +44,7 @@ if ([string]::IsNullOrWhiteSpace($ReportFile)) {
     $ReportFile = Join-Path $RepoRoot "target\benchmarks\laminar_pipe_compare.md"
 }
 if ([string]::IsNullOrWhiteSpace($BenchmarkProperties)) {
-    $BenchmarkProperties = Join-Path $RepoRoot "benchmarks\laminar_pipe\pipeBenchmark"
+    $BenchmarkProperties = Join-Path $RepoRoot "tutorials\steadyIncompressible\laminarPipe\analytical\pipeBenchmark"
 }
 if ($OpenFoamSteps -le 0) {
     throw "OpenFoamSteps must be positive"
@@ -83,15 +84,17 @@ if ($SkipOpenFoam) {
     }
     Write-Output "skipping OpenFOAM reference run"
 } else {
-    Write-Output "running OpenFOAM simpleFoam reference"
+    Write-Output "running independent OpenFOAM 13 foamRun/incompressibleFluid reference"
     $openFoamArgs = @{
-        CaseRoot = $CaseRoot
         WorkDir = $OpenFoamWorkDir
         OutFile = $OpenFoamJson
         BenchmarkProperties = $BenchmarkProperties
         Mode = $Mode
         EndTime = $OpenFoamSteps
         WriteInterval = $OpenFoamSteps
+    }
+    if ($UseFerrumCaseForOpenFoam) {
+        $openFoamArgs.FerrumOverlayCaseRoot = $CaseRoot
     }
     if ($RequireOpenFoam) {
         $openFoamArgs.RequireOpenFoam = $true

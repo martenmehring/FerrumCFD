@@ -1,5 +1,5 @@
 param(
-    [string]$CaseRoot = "",
+    [string]$FerrumOverlayCaseRoot = "",
     [string]$WorkDir = "",
     [string]$OutFile = "",
     [string]$BenchmarkProperties = "",
@@ -12,9 +12,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
-if ([string]::IsNullOrWhiteSpace($CaseRoot)) {
-    $CaseRoot = Join-Path $RepoRoot "examples\laminar_pipe"
-}
+$OpenFoamTemplate = Join-Path $RepoRoot "tutorials\steadyIncompressible\laminarPipe\openfoam-v13\case"
+$UseFerrumOverlay = ![string]::IsNullOrWhiteSpace($FerrumOverlayCaseRoot)
+$SourceCaseRoot = if ($UseFerrumOverlay) { $FerrumOverlayCaseRoot } else { $OpenFoamTemplate }
 if ([string]::IsNullOrWhiteSpace($WorkDir)) {
     $WorkDir = Join-Path $RepoRoot "target\openfoam\laminar_pipe"
 }
@@ -22,13 +22,19 @@ if ([string]::IsNullOrWhiteSpace($OutFile)) {
     $OutFile = Join-Path $RepoRoot "target\benchmarks\laminar_pipe_openfoam.json"
 }
 if ([string]::IsNullOrWhiteSpace($BenchmarkProperties)) {
-    $BenchmarkProperties = Join-Path $RepoRoot "benchmarks\laminar_pipe\pipeBenchmark"
+    $BenchmarkProperties = Join-Path $RepoRoot "tutorials\steadyIncompressible\laminarPipe\analytical\pipeBenchmark"
 }
 if ($EndTime -le 0) {
     throw "EndTime must be a positive integer number of SIMPLE pseudo-time steps"
 }
 if ($WriteInterval -le 0) {
     $WriteInterval = $EndTime
+}
+if (!(Test-Path -LiteralPath $OpenFoamTemplate -PathType Container)) {
+    throw "OpenFOAM 13 source case was not found: $OpenFoamTemplate"
+}
+if (!(Test-Path -LiteralPath $SourceCaseRoot -PathType Container)) {
+    throw "source case was not found: $SourceCaseRoot"
 }
 
 function Format-F64([double]$Value) {
@@ -72,14 +78,15 @@ function Test-IsPathUnder([string]$Child, [string]$Parent) {
 }
 
 function Test-NativeOpenFoam {
-    return $null -ne (Get-Command simpleFoam -ErrorAction SilentlyContinue)
+    return $env:WM_PROJECT_VERSION -eq "13" -and
+        $null -ne (Get-Command foamRun -ErrorAction SilentlyContinue)
 }
 
 function Test-WslOpenFoam {
     if ($null -eq (Get-Command wsl -ErrorAction SilentlyContinue)) {
         return $false
     }
-    & wsl bash -lc "source /opt/openfoam*/etc/bashrc 2>/dev/null || source /usr/lib/openfoam*/etc/bashrc 2>/dev/null || true; command -v simpleFoam >/dev/null 2>&1"
+    & wsl bash -lc "source /opt/openfoam13/etc/bashrc 2>/dev/null && env | grep -q '^WM_PROJECT_VERSION=13$' && command -v foamRun >/dev/null 2>&1"
     return $LASTEXITCODE -eq 0
 }
 
@@ -341,7 +348,7 @@ function Read-LastFoamTiming([string]$LogPath) {
     }
 }
 
-$benchmark = Read-PipeBenchmarkParameters $CaseRoot
+$benchmark = Read-PipeBenchmarkParameters $SourceCaseRoot
 $rho = $benchmark.rho
 $analyticDeltaPPa = $benchmark.analyticDeltaPPa
 foreach ($requiredValue in @(@{ name = "rho"; value = $rho }, @{ name = "expectedDeltaP"; value = $analyticDeltaPPa })) {
@@ -353,8 +360,8 @@ foreach ($requiredValue in @(@{ name = "rho"; value = $rho }, @{ name = "expecte
 $rho = [double]$rho
 $analyticDeltaPPa = [double]$analyticDeltaPPa
 $analyticDeltaPKinematic = $analyticDeltaPPa / $rho
-$sourceOwner = Read-FoamLabelList (Join-Path $CaseRoot "constant\polyMesh\owner")
-$sourceNeighbour = Read-FoamLabelList (Join-Path $CaseRoot "constant\polyMesh\neighbour")
+$sourceOwner = Read-FoamLabelList (Join-Path $SourceCaseRoot "constant\polyMesh\owner")
+$sourceNeighbour = Read-FoamLabelList (Join-Path $SourceCaseRoot "constant\polyMesh\neighbour")
 $sourceOwnerMaximum = if ($sourceOwner.Count -gt 0) { [int](($sourceOwner | Measure-Object -Maximum).Maximum) } else { $null }
 $sourceNeighbourMaximum = if ($sourceNeighbour.Count -gt 0) { [int](($sourceNeighbour | Measure-Object -Maximum).Maximum) } else { $null }
 $sourceMaximumCell = if ($null -eq $sourceOwnerMaximum) {
@@ -366,20 +373,23 @@ $sourceMaximumCell = if ($null -eq $sourceOwnerMaximum) {
 }
 $sourceCellCount = if ($null -ne $sourceMaximumCell) { 1L + [long]$sourceMaximumCell } else { $null }
 $sourceFaceCount = if ($sourceOwner.Count -gt 0) { $sourceOwner.Count } else { $null }
-$initialPressurePa = @(Read-InternalScalarField (Join-Path $CaseRoot "0\p") | ForEach-Object { [double]$_ })
-$initialPressureField = "internalField uniform 0;"
-if ($initialPressurePa.Count -eq 1) {
-    $initialPressureField = "internalField uniform $(Format-F64 ([double]$initialPressurePa[0] / $rho));"
-} elseif ($initialPressurePa.Count -gt 1) {
-    $initialPressureKinematicLines = @($initialPressurePa | ForEach-Object { "    $(Format-F64 ($_ / $rho))" })
-    $initialPressureBlock = $initialPressureKinematicLines -join "`n"
-    $initialPressureField = @"
+$initialPressureField = $null
+if ($UseFerrumOverlay) {
+    $initialPressurePa = @(Read-InternalScalarField (Join-Path $SourceCaseRoot "0\p") | ForEach-Object { [double]$_ })
+    $initialPressureField = "internalField uniform 0;"
+    if ($initialPressurePa.Count -eq 1) {
+        $initialPressureField = "internalField uniform $(Format-F64 ([double]$initialPressurePa[0] / $rho));"
+    } elseif ($initialPressurePa.Count -gt 1) {
+        $initialPressureKinematicLines = @($initialPressurePa | ForEach-Object { "    $(Format-F64 ($_ / $rho))" })
+        $initialPressureBlock = $initialPressureKinematicLines -join "`n"
+        $initialPressureField = @"
 internalField nonuniform List<scalar>
 $($initialPressureKinematicLines.Count)
 (
 $initialPressureBlock
 );
 "@
+    }
 }
 
 $targetRoot = Join-Path $RepoRoot "target"
@@ -391,18 +401,22 @@ if (Test-Path -LiteralPath $WorkDir) {
     Remove-Item -LiteralPath $WorkDir -Recurse -Force
 }
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
-New-Item -ItemType Directory -Force -Path (Join-Path $WorkDir "0") | Out-Null
-New-Item -ItemType Directory -Force -Path (Join-Path $WorkDir "constant") | Out-Null
-New-Item -ItemType Directory -Force -Path (Join-Path $WorkDir "system") | Out-Null
-Copy-Item -LiteralPath (Join-Path $CaseRoot "constant\polyMesh") -Destination (Join-Path $WorkDir "constant\polyMesh") -Recurse
+Copy-Item -Path (Join-Path $OpenFoamTemplate "*") -Destination $WorkDir -Recurse -Force
 
-$sourceU = Join-Path $CaseRoot "0\U"
-if (!(Test-Path -LiteralPath $sourceU -PathType Leaf)) {
-    throw "OpenFOAM benchmark requires the case velocity field: $sourceU"
-}
-Copy-Item -LiteralPath $sourceU -Destination (Join-Path $WorkDir "0\U") -Force
+if ($UseFerrumOverlay) {
+    $workPolyMesh = Join-Path $WorkDir "constant\polyMesh"
+    if (Test-Path -LiteralPath $workPolyMesh) {
+        Remove-Item -LiteralPath $workPolyMesh -Recurse -Force
+    }
+    Copy-Item -LiteralPath (Join-Path $SourceCaseRoot "constant\polyMesh") -Destination $workPolyMesh -Recurse
 
-Write-AsciiFile (Join-Path $WorkDir "0\p") @"
+    $sourceU = Join-Path $SourceCaseRoot "0\U"
+    if (!(Test-Path -LiteralPath $sourceU -PathType Leaf)) {
+        throw "Ferrum overlay requires a velocity field: $sourceU"
+    }
+    Copy-Item -LiteralPath $sourceU -Destination (Join-Path $WorkDir "0\U") -Force
+
+    Write-AsciiFile (Join-Path $WorkDir "0\p") @"
 FoamFile
 {
     version 2.0;
@@ -425,24 +439,34 @@ boundaryField
 }
 "@
 
-$sourceTransportProperties = Join-Path $CaseRoot "constant\transportProperties"
-if (!(Test-Path -LiteralPath $sourceTransportProperties -PathType Leaf)) {
-    throw "OpenFOAM benchmark requires case transportProperties: $sourceTransportProperties"
-}
-Copy-Item -LiteralPath $sourceTransportProperties -Destination (Join-Path $WorkDir "constant\transportProperties") -Force
+    $sourceTransportProperties = Join-Path $SourceCaseRoot "constant\transportProperties"
+    if (!(Test-Path -LiteralPath $sourceTransportProperties -PathType Leaf)) {
+        throw "Ferrum overlay requires transportProperties: $sourceTransportProperties"
+    }
+    $transportContent = Get-Content -LiteralPath $sourceTransportProperties -Raw
+    $nuMatch = [regex]::Match($transportContent, "(?m)^\s*nu\s+\[[^\]]+\]\s+([-+0-9.eE]+)\s*;")
+    if (!$nuMatch.Success) {
+        throw "Ferrum overlay requires a dimensioned nu entry: $sourceTransportProperties"
+    }
+    $nu = [double]::Parse($nuMatch.Groups[1].Value, [System.Globalization.CultureInfo]::InvariantCulture)
+    if ([double]::IsNaN($nu) -or [double]::IsInfinity($nu) -or $nu -le 0.0) {
+        throw "nu must be a positive finite value in $sourceTransportProperties"
+    }
 
-Write-AsciiFile (Join-Path $WorkDir "constant\turbulenceProperties") @"
+    Write-AsciiFile (Join-Path $WorkDir "constant\physicalProperties") @"
 FoamFile
 {
     version 2.0;
     format ascii;
     class dictionary;
     location "constant";
-    object turbulenceProperties;
+    object physicalProperties;
 }
 
-simulationType laminar;
+viscosityModel constant;
+nu [0 2 -1 0 0 0 0] $(Format-F64 $nu);
 "@
+}
 
 Write-AsciiFile (Join-Path $WorkDir "system\controlDict") @"
 FoamFile
@@ -454,7 +478,7 @@ FoamFile
     object controlDict;
 }
 
-application simpleFoam;
+solver incompressibleFluid;
 startFrom startTime;
 startTime 0;
 stopAt endTime;
@@ -468,15 +492,15 @@ runTimeModifiable false;
 "@
 
 foreach ($dictionaryName in @("fvSchemes", "fvSolution")) {
-    $sourceDictionary = Join-Path $CaseRoot "system\$dictionaryName"
+    $sourceDictionary = Join-Path $OpenFoamTemplate "system\$dictionaryName"
     if (!(Test-Path -LiteralPath $sourceDictionary -PathType Leaf)) {
-        throw "OpenFOAM benchmark requires case dictionary: $sourceDictionary"
+        throw "OpenFOAM 13 source case requires dictionary: $sourceDictionary"
     }
     Copy-Item -LiteralPath $sourceDictionary -Destination (Join-Path $WorkDir "system\$dictionaryName") -Force
 }
 
 $selectedMode = Get-OpenFoamMode
-$logPath = Join-Path $WorkDir "log.simpleFoam"
+$logPath = Join-Path $WorkDir "log.foamRun"
 $script:foamExitCode = $null
 $exitCode = $null
 $wallClockSeconds = $null
@@ -484,7 +508,7 @@ $status = "openfoam-unavailable"
 
 if ($null -eq $selectedMode) {
     if ($RequireOpenFoam) {
-        throw "simpleFoam was not found. Install OpenFOAM or run this script from an OpenFOAM-enabled shell."
+        throw "OpenFOAM Foundation 13 foamRun was not found. Install OpenFOAM 13 or run this script from an OpenFOAM-13-enabled shell."
     }
 } else {
     $status = "ran"
@@ -492,7 +516,7 @@ if ($null -eq $selectedMode) {
         if ($selectedMode -eq "Native") {
             Push-Location $WorkDir
             try {
-                & simpleFoam *> $logPath
+                & foamRun -solver incompressibleFluid *> $logPath
                 $script:foamExitCode = $LASTEXITCODE
             } finally {
                 Pop-Location
@@ -500,7 +524,7 @@ if ($null -eq $selectedMode) {
         } else {
             $wslCase = ConvertTo-WslPath $WorkDir
             $quotedWslCase = ConvertTo-BashSingleQuoted $wslCase
-            $bash = "source /opt/openfoam*/etc/bashrc 2>/dev/null || source /usr/lib/openfoam*/etc/bashrc 2>/dev/null || true; cd -- $quotedWslCase && simpleFoam > log.simpleFoam 2>&1"
+            $bash = "source /opt/openfoam13/etc/bashrc 2>/dev/null && env | grep -q '^WM_PROJECT_VERSION=13$' && cd -- $quotedWslCase && foamRun -solver incompressibleFluid > log.foamRun 2>&1"
             & wsl bash -lc $bash
             $script:foamExitCode = $LASTEXITCODE
         }
@@ -510,7 +534,7 @@ if ($null -eq $selectedMode) {
     if ($exitCode -ne 0) {
         $status = "openfoam-failed"
         if ($RequireOpenFoam) {
-            throw "simpleFoam failed with exit code $exitCode. See $logPath"
+            throw "OpenFOAM 13 foamRun failed with exit code $exitCode. See $logPath"
         }
     }
 }
@@ -550,13 +574,15 @@ if ($null -ne $latestTime) {
 } elseif ($status -eq "ran") {
     $status = "pressure-output-missing"
     if ($RequireOpenFoam) {
-        throw "simpleFoam completed without a numeric output time directory in $WorkDir"
+        throw "OpenFOAM 13 foamRun completed without a numeric output time directory in $WorkDir"
     }
 }
 
 $timing = Read-LastFoamTiming $logPath
 $result = [ordered]@{
     case = "laminar_pipe"
+    sourceCase = $SourceCaseRoot
+    ferrumOverlay = $UseFerrumOverlay
     generatedCase = $WorkDir
     status = $status
     units = [ordered]@{
@@ -580,7 +606,9 @@ $result = [ordered]@{
         points = $null
     }
     runControl = [ordered]@{
-        application = "simpleFoam"
+        application = "foamRun"
+        solverModule = "incompressibleFluid"
+        version = 13
         startTime = 0
         endTime = $EndTime
         deltaT = 1
@@ -590,7 +618,9 @@ $result = [ordered]@{
     openFoam = [ordered]@{
         available = $null -ne $selectedMode
         mode = $selectedMode
-        application = "simpleFoam"
+        application = "foamRun"
+        solverModule = "incompressibleFluid"
+        version = 13
         exitCode = $exitCode
         wallClockSeconds = $wallClockSeconds
         log = $logPath

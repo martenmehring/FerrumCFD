@@ -26,7 +26,7 @@ if ([string]::IsNullOrWhiteSpace($StudyRoot)) {
     $StudyRoot = Join-Path $RepoRoot "target\benchmarks\gmsh_pipe_mesh_study"
 }
 if ([string]::IsNullOrWhiteSpace($GeoFile)) {
-    $GeoFile = Join-Path $RepoRoot "examples\gmsh_pipe\pipe_prism2.geo"
+    $GeoFile = Join-Path $RepoRoot "tutorials\steadyIncompressible\laminarPipe\shared\geometry\pipe_prism2.geo"
 }
 if ($OpenFoamSteps -le 0) {
     throw "OpenFoamSteps must be positive"
@@ -638,7 +638,7 @@ Write-AsciiFile $benchmarkProperties $benchmarkLines.ToArray()
 $gmsh = Resolve-GmshExecutable $GmshExe
 $runOpenFoam = Join-Path $PSScriptRoot "run_openfoam_laminar_pipe.ps1"
 $compare = Join-Path $PSScriptRoot "compare_laminar_pipe.ps1"
-$sourceSystem = Join-Path $RepoRoot "examples\laminar_pipe\system"
+$sourceSystem = Join-Path $RepoRoot "tutorials\steadyIncompressible\laminarPipe\ferrum\case\system"
 
 $variants = @(
     [pscustomobject][ordered]@{ name = "coarse"; axialCells = 16; lcCenter = 0.0060; lcWall = 0.0018; blHwall = 0.00070; blHfar = 0.0045; blThickness = 0.0015; blRatio = 1.25; blLayers = 2 },
@@ -691,7 +691,7 @@ foreach ($variant in $variants) {
     } else {
         Write-Output "variant $($variant.name): running OpenFOAM reference"
         $openFoamArgs = @{
-            CaseRoot = $caseRoot
+            FerrumOverlayCaseRoot = $caseRoot
             WorkDir = $openFoamWorkDir
             OutFile = $openFoamJson
             BenchmarkProperties = $benchmarkProperties
