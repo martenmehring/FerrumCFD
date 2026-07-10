@@ -4,8 +4,10 @@ Compiled FerrumCFD applications live here, following the OpenFOAM 13
 separation between solver entry points, runtime-selectable modules, and
 utilities.
 
-- `solvers/`: public solver dispatchers such as the planned `ferrumRun`;
-- `modules/`: the seven application drivers and their equation/coupling code;
+- `solvers/`: public dispatchers including the executable `ferrumRun` crate
+  and the planned `ferrumMultiRun` crate;
+- `modules/`: runtime-selectable equation/physics families such as
+  `incompressibleFluid`;
 - `utilities/`: mesh, case, conversion, and post-processing commands;
 - `legacy/`: buildable transitional packages awaiting a responsibility-based
   split.

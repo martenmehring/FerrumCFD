@@ -10,9 +10,24 @@ are distinguished explicitly.
 
 - Moved reusable implementation code to `src/` and the current combined
   executable package to `applications/legacy/` without changing Cargo package
-  names or public commands.
+  names.
+- Added the canonical `ferrumRun -solver incompressibleFluid` public command,
+  including `controlDict` solver selection only for cases explicitly marked
+  `application ferrumRun`, effective-dispatch provenance in plan JSON, and an
+  execution guard requiring steady-state laminar SIMPLE without PISO/PIMPLE or
+  RAS/LES configuration.
+- Versioned solver-plan JSON as schema 2 and added the effective module plus
+  `cli`/`controlDict` selection provenance without overwriting raw case input.
+- Updated solver reports to identify `incompressibleFluid` as the module and
+  record `SIMPLE`, `laminar`, and the internal implementation separately;
+  schema version 2 also preserves `legacySolver=laminarSimple` for migration.
+- Kept `ferrumSolver --solveLaminarSimple` as an explicit temporary
+  compatibility and low-level benchmark interface.
+- Added tracked responsibility boundaries for `ferrumRun`, `ferrumMultiRun`,
+  `incompressibleFluid`, mesh/case/post-processing utilities, native I/O,
+  OpenFOAM interoperability, finite-volume code, core runtime, and models.
 - Replaced the tracked `examples/`/`benchmarks/` split with Driver 1 tutorial
-  bundles under `tutorials/steadyIncompressible/`.
+  bundles under `tutorials/incompressibleFluid/`.
 - Added separate Ferrum, OpenFOAM Foundation 13, shared-geometry, analytical,
   and comparison inputs for `laminarPipe` and `planeChannel`.
 - Added independently runnable OpenFOAM 13 source cases using
@@ -21,7 +36,13 @@ are distinguished explicitly.
 - Defined the six-case steady laminar validation matrix and the fixed
   seven-driver sequence. Porous-media, Ergun, and packed-bed work is explicitly
   deferred until all seven drivers pass the common readiness gate.
-- Documented `FerrumFile v1` and `ferrumRun` as target contracts while keeping
+- Defined `ferrumMultiRun` as a coupled multi-region runner, not a parameter
+  sweep, with a shared CPU/GPU lifecycle, per-region/stage placement, explicit
+  interface barriers, mixed-backend operation, and a multi-GPU path.
+- Moved PowerShell orchestration from the root `scripts/` directory to
+  `validation/scripts/incompressibleFluid/` and documented retention/removal
+  criteria so reproducible comparisons are not deleted prematurely.
+- Documented `FerrumFile v1` as a target contract while keeping
   the current OpenFOAM-like Ferrum input as an explicit compatibility bridge.
 
 ### Command Naming And Licensing - 2026-07-10

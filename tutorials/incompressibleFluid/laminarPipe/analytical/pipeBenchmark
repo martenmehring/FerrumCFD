@@ -1,0 +1,96 @@
+ReferenceFile
+{
+    version 1;
+    format ascii;
+    class analyticalReference;
+    location "tutorials/incompressibleFluid/laminarPipe/analytical";
+    object pipeBenchmark;
+}
+
+description "Laminar circular-pipe reference for the laminarPipe tutorial";
+
+mesh
+{
+    type structuredCircularPipe;
+    axialCells 24;
+    radialCells 6;
+    angularSectors 32;
+    cells 4608;
+    points 4825;
+}
+
+geometry
+{
+    length [0 1 0 0 0 0 0] 1;
+    diameter [0 1 0 0 0 0 0] 0.02;
+}
+
+water
+{
+    referenceTemperature [0 0 0 1 0 0 0] 293.14999999999998;
+    rho [1 -3 0 0 0 0 0] 998.20000000000005;
+    mu [1 -1 -1 0 0 0 0] 0.0010020000000000001;
+    k [1 1 -3 -1 0 0 0] 0.59799999999999998;
+}
+
+flowReference
+{
+    meanVelocity [0 1 -1 0 0 0 0] 0.02;
+    inletVelocityProfile parabolicFullyDeveloped;
+    inletVelocityScale [0 0 0 0 0 0 0] 0.97745440097270619;
+    reynolds [0 0 0 0 0 0 0] 398.48303393213575;
+    pressureLossModel HagenPoiseuille;
+    expectedDeltaP [1 -1 -2 0 0 0 0] 1.6032;
+    minorLosses off;
+}
+
+openFoamReference
+{
+    application foamRun;
+    solver incompressibleFluid;
+    version 13;
+    pressureConvention kinematic;
+    pressureConversion "p_Pa = rho * p_OpenFOAM";
+    expectedDeltaPKinematic [0 2 -2 0 0 0 0] 0.0016060909637347224;
+    generatedCase "target/openfoam/laminar_pipe";
+    resultJson "target/benchmarks/laminar_pipe_openfoam.json";
+}
+
+timingReference
+{
+    recordWallClock yes;
+    recordOpenFoamExecutionTime yes;
+    recordFerrumPreflightWallClock yes;
+    resultJson "target/benchmarks/laminar_pipe_compare.json";
+}
+
+heatReference
+{
+    enabled yes;
+    wallTemperature [0 0 0 1 0 0 0] 333.14999999999998;
+    nusseltConstantWallTemperature [0 0 0 0 0 0 0] 3.6600000000000001;
+    expectedH [1 0 -3 -1 0 0 0] 109.43400000000001;
+}
+
+variants
+{
+    noLosses
+    {
+        wallFriction off;
+        heatTransfer off;
+    }
+
+    hagenPoiseuille
+    {
+        wallFriction on;
+        minorLosses off;
+        heatTransfer off;
+    }
+
+    constantWallTemperature
+    {
+        wallFriction on;
+        minorLosses off;
+        heatTransfer fixedWallTemperature;
+    }
+}

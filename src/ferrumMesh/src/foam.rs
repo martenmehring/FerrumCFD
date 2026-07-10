@@ -457,7 +457,8 @@ fn write_minimal_system_files(case_dir: &Path) -> Result<()> {
         "controlDict",
         "system",
     )?;
-    writeln!(control, "application ferrum;")?;
+    writeln!(control, "application ferrumRun;")?;
+    writeln!(control, "solver incompressibleFluid;")?;
     writeln!(control, "startFrom startTime;")?;
     writeln!(control, "startTime 0;")?;
     writeln!(control, "endTime 1;")?;
@@ -471,7 +472,7 @@ fn write_minimal_system_files(case_dir: &Path) -> Result<()> {
         "fvSchemes",
         "system",
     )?;
-    writeln!(schemes, "ddtSchemes {{ default Euler; }}")?;
+    writeln!(schemes, "ddtSchemes {{ default steadyState; }}")?;
     writeln!(schemes, "gradSchemes {{ default Gauss linear; }}")?;
     writeln!(schemes, "divSchemes {{ default none; }}")?;
     writeln!(

@@ -13,9 +13,9 @@ current direct-pressure comparison.
 Commands:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_poiseuille_benchmark.ps1 -OpenFoamSteps 200
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_simple_benchmark.ps1 -SkipOpenFoam -UseExistingOpenFoamJson
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_pipe_convergence.ps1 -OpenFoamSteps 200
+powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_poiseuille_benchmark.ps1 -OpenFoamSteps 200
+powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_laminar_simple_benchmark.ps1 -SkipOpenFoam -UseExistingOpenFoamJson
+powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_laminar_pipe_convergence.ps1 -OpenFoamSteps 200
 ```
 
 ## Medium Case
@@ -52,15 +52,17 @@ path no longer caps finite `U`, `p`, or `phi` updates. The mean-flow pressure
 loss and continuity are now close to the reference, while the stored pressure
 field is still too high and is the next pressure-coupling target.
 
-### Matched 100-Step SIMPLE Comparison
+### Historical Matched 100-Step SIMPLE Comparison
 
-Current matched-budget rerun on 2026-07-10:
+The table below is the 2026-07-10 `simpleFoam` baseline. The command now uses
+OpenFOAM 13 `foamRun -solver incompressibleFluid`; running it creates a new
+module-based result and must not silently relabel the historical values below:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_simple_matched_time_benchmark.ps1 -MatchedTimeSeconds 100
+powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_laminar_simple_matched_time_benchmark.ps1 -MatchedTimeSeconds 100
 ```
 
-For steady SIMPLE solvers, this is an equal pseudo-time/iteration budget rather
+For steady SIMPLE solvers, the comparison is an equal pseudo-time/iteration budget rather
 than a transient physical-time integration: OpenFOAM uses `endTime=100` with
 `deltaT=1`, and Ferrum uses
 `minSimpleIterations=maxSimpleIterations=100`.
@@ -84,7 +86,7 @@ the fixed 100 iterations but reports `converged=false` with
 Historical OpenFOAM-only sweep on 2026-07-09:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_openfoam_laminar_pipe_step_sweep.ps1 -OpenFoamSteps 100,200,400,800,1200 -TargetRelativeError 0.01
+powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_openfoam_laminar_pipe_step_sweep.ps1 -OpenFoamSteps 100,200,400,800,1200 -TargetRelativeError 0.01
 ```
 
 This answers the inverse question: how long OpenFOAM needs to reach the same
@@ -114,7 +116,7 @@ reference setup or use a finer/better-resolved mesh, not only to extend
 Local Ferrum SIMPLE coarse/medium/fine study on 2026-07-09:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_simple_mesh_study.ps1 -OpenFoamSteps 400 -FerrumSimpleIterations 100
+powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_laminar_simple_mesh_study.ps1 -OpenFoamSteps 400 -FerrumSimpleIterations 100
 ```
 
 | Variant | Cells | Ferrum p-owner deltaP [Pa] | Ferrum p-owner error | Ferrum mean-U deltaP [Pa] | Ferrum mean-U error | OpenFOAM deltaP [Pa] | OpenFOAM error | Ferrum solve [s] | OpenFOAM execution [s] |
@@ -137,7 +139,7 @@ reference setup still needs refinement for stricter mesh studies.
 Local Ferrum-only pressure-field sweep on 2026-07-09:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_simple_pressure_sweep.ps1 -VariantName medium,fine -SimpleIterations 50,100,200
+powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_laminar_simple_pressure_sweep.ps1 -VariantName medium,fine -SimpleIterations 50,100,200
 ```
 
 | Variant | Cells | SIMPLE iterations | p-owner deltaP [Pa] | p-owner error | pEqn owner deltaP [Pa] | pEqn owner error | mean-U deltaP [Pa] | mean-U error |
@@ -191,11 +193,11 @@ Follow-up isolation on 2026-07-09 with the pressure-assembly reports shows:
 Local experiment on the same medium pipe case:
 
 ```powershell
-ferrumSolver -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solveLaminarSimple --momentumLinearSolver bicgstab --pressureLinearSolver pcg --pressurePreconditioner DIC --maxSimpleIterations 20
-ferrumSolver -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solveLaminarSimple --momentumLinearSolver bicgstab --pressureLinearSolver pcg --minSimpleIterations 30 --maxSimpleIterations 30
-ferrumSolver -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solveLaminarSimple --solveTolerance 1e-6 --maxIterations 100 --maxSimpleIterations 20
-ferrumSolver -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solveLaminarSimple --maxSimpleIterations 20
-ferrumSolver -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solveLaminarSimple --maxSimpleIterations 80
+ferrumSolver -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --solveLaminarSimple --momentumLinearSolver bicgstab --pressureLinearSolver pcg --pressurePreconditioner DIC --maxSimpleIterations 20
+ferrumSolver -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --solveLaminarSimple --momentumLinearSolver bicgstab --pressureLinearSolver pcg --minSimpleIterations 30 --maxSimpleIterations 30
+ferrumSolver -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --solveLaminarSimple --solveTolerance 1e-6 --maxIterations 100 --maxSimpleIterations 20
+ferrumSolver -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --solveLaminarSimple --maxSimpleIterations 20
+ferrumSolver -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --solveLaminarSimple --maxSimpleIterations 80
 ```
 
 | Momentum solver | Pressure solver | Linear controls | Relaxation source | SIMPLE tries | DeltaP from mean [Pa] | Error to analytic | Final continuity L2 | Solve time [s] | Notes |

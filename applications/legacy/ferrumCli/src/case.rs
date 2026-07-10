@@ -171,7 +171,10 @@ fn write_case_readme(
     writeln!(writer, "gmshToFerrum path\\to\\mesh.msh -case .")?;
     writeln!(writer, "checkFerrumMesh -case .")?;
     writeln!(writer, "splitFerrumMeshRegions -case . -cellZones")?;
-    writeln!(writer, "ferrumSolver -case . --preflight")?;
+    writeln!(
+        writer,
+        "ferrumRun -solver incompressibleFluid -case . --preflight"
+    )?;
     writeln!(writer, "```")?;
     if !regions.is_empty() {
         writeln!(writer)?;
@@ -186,7 +189,8 @@ fn write_case_readme(
 
 fn write_control_dict(writer: &mut BufWriter<File>) -> Result<(), std::io::Error> {
     write_foam_header(writer, "dictionary", "controlDict", "system")?;
-    writeln!(writer, "application ferrumSolver;")?;
+    writeln!(writer, "application ferrumRun;")?;
+    writeln!(writer, "solver incompressibleFluid;")?;
     writeln!(writer, "startFrom startTime;")?;
     writeln!(writer, "startTime 0;")?;
     writeln!(writer, "stopAt endTime;")?;
@@ -199,7 +203,7 @@ fn write_control_dict(writer: &mut BufWriter<File>) -> Result<(), std::io::Error
 
 fn write_fv_schemes(writer: &mut BufWriter<File>) -> Result<(), std::io::Error> {
     write_foam_header(writer, "dictionary", "fvSchemes", "system")?;
-    writeln!(writer, "ddtSchemes {{ default Euler; }}")?;
+    writeln!(writer, "ddtSchemes {{ default steadyState; }}")?;
     writeln!(writer, "gradSchemes {{ default Gauss linear; }}")?;
     writeln!(writer, "divSchemes {{ default none; }}")?;
     writeln!(

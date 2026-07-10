@@ -1,0 +1,29 @@
+schema_version = 2
+case_id = "incompressibleFluid.laminarPipe"
+module = "incompressibleFluid"
+readiness_driver = "steadyIncompressible"
+algorithm = "SIMPLE"
+regime = "laminar"
+title = "Laminar circular-pipe flow"
+
+[implementations]
+ferrum_case = "ferrum/case"
+openfoam_v13_case = "openfoam-v13/case"
+reference = "analytical/pipeBenchmark"
+
+[physics]
+unit_system = "SI"
+length_m = 1.0
+diameter_m = 0.02
+density_kg_per_m3 = 998.2
+dynamic_viscosity_pa_s = 0.001002
+mean_velocity_m_per_s = 0.02
+
+[reference]
+kind = "analytical"
+model = "Hagen-Poiseuille"
+pressure_drop_pa = 1.6032
+
+[comparison]
+sample_pressure_on = ["inlet", "outlet"]
+compare = ["pressureDrop", "meanVelocity", "flowRate", "velocityProfile"]

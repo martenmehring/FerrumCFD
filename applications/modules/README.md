@@ -1,15 +1,14 @@
 # Application Modules
 
-Application-driver modules will be implemented here in the fixed order from
-`docs/solver-roadmap.md`:
+Runtime-selectable application modules live here. A module is an equation and
+physics family, not a coupling algorithm or flow regime. The first module is
+`incompressibleFluid`; it covers both the steady SIMPLE/SIMPLEC and transient
+PISO/PIMPLE readiness drivers.
 
-1. steady incompressible SIMPLE/SIMPLEC;
-2. transient incompressible PISO/PIMPLE;
-3. low-Mach thermal/buoyant;
-4. low-Mach reacting flow;
-5. compressible flow;
-6. multi-region conjugate/reacting;
-7. immiscible two-phase VOF.
+Later module names are finalized against their OpenFOAM 13 comparison modules
+when each driver begins. Reusable thermal, species, chemistry, turbulence,
+porous, and interface models belong under `src/ferrumModels`, rather than
+being duplicated in dispatcher crates.
 
-Drivers compose reusable code from `src/`. Porous-media and packed-bed modules
-are deliberately deferred until all seven drivers pass their readiness gates.
+Porous-media and packed-bed implementation is deliberately deferred until all
+seven drivers pass their readiness gates.

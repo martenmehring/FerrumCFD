@@ -1138,7 +1138,8 @@ mod tests {
     ) -> ControlDict {
         ControlDict {
             path: PathBuf::from("controlDict"),
-            application: "ferrumSolver".to_string(),
+            application: Some("ferrumRun".to_string()),
+            solver: Some("incompressibleFluid".to_string()),
             start_from: "startTime".to_string(),
             start_time: Some(start_time),
             stop_at: "endTime".to_string(),

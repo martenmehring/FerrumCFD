@@ -9,8 +9,15 @@ application drivers have passed their readiness gates.
 
 ## Current Status
 
-`ferrumSolver --solveLaminarSimple` is an executable finite-volume
-pressure-velocity solver prototype. It reads OpenFOAM-like `U`, `p`,
+The canonical public entry point is now
+`ferrumRun -solver incompressibleFluid`. It dispatches the executable
+finite-volume pressure-velocity prototype only for unambiguous steady-state
+laminar cases with exactly one SIMPLE section and no PISO/PIMPLE section.
+Explicit `momentumTransport`/`turbulenceProperties` input must select
+`simulationType laminar`; RAS/LES is not dispatched to the laminar kernel.
+The older `ferrumSolver --solveLaminarSimple` spelling remains only as a
+temporary compatibility and benchmark interface. The implementation reads
+OpenFOAM-like `U`, `p`,
 `transportProperties`, `fvSchemes`, and `fvSolution`, uses the runtime
 `constant/polyMesh` geometry, runs an uncapped SIMPLE correction path, and
 writes JSON/Markdown reports including pressure-assembly diagnostics for
@@ -29,9 +36,11 @@ and wall-clock solve time was `33.54 s`. This validation is separate from the
 analytic pipe benchmark and is recorded in
 `docs/benchmarks/laminar-simple-residual-control.md`.
 
-For the medium laminar pipe benchmark (`4608` cells, SI units), using the
-matched steady SIMPLE budget OpenFOAM `endTime=100`/`deltaT=1` and Ferrum
-`100` SIMPLE iterations:
+The following medium-pipe table (`4608` cells, SI units) is the historical
+matched `simpleFoam` baseline recorded before the comparison runner migrated
+to OpenFOAM 13 `foamRun -solver incompressibleFluid`. It preserves provenance
+and must not be relabeled as a `foamRun` result. The current module-based
+reference still needs a full matched-budget regeneration.
 
 | Source | DeltaP [Pa] | Error to analytic | Mean U [m/s] | Runtime |
 | --- | ---: | ---: | ---: | ---: |
@@ -40,7 +49,7 @@ matched steady SIMPLE budget OpenFOAM `endTime=100`/`deltaT=1` and Ferrum
 | Ferrum SIMPLE, from mean U | 1.600432 | -0.173% | 0.0199655 | 144.99 s solve |
 | OpenFOAM `simpleFoam`, pressure owner cells | 1.627046 | 1.487% | n/a | 4.21 s execution / 7.85 s driver wall |
 
-This 2026-07-10 rerun uses the same named-patch owner-cell averaging for Ferrum
+This historical 2026-07-10 rerun uses the same named-patch owner-cell averaging for Ferrum
 and OpenFOAM, with no axial-cell ordering assumption or full-length
 extrapolation. `Ferrum SIMPLE, from mean U` is an external benchmark diagnostic:
 it back-calculates pressure loss from the simulated mean velocity with the
@@ -154,7 +163,8 @@ Goal: make correctness measurable with analytic and OpenFOAM references.
 Current benchmark:
 
 - medium circular pipe, laminar water, SI units;
-- Ferrum SIMPLE vs OpenFOAM `simpleFoam` vs Hagen-Poiseuille;
+- historical Ferrum SIMPLE vs OpenFOAM `simpleFoam` vs Hagen-Poiseuille, with
+  the current `foamRun -solver incompressibleFluid` regeneration pending;
 - generic solver and pipe-reference diagnostics are separate artifacts;
 - matched steady pseudo-time comparison is available, for example OpenFOAM
   `endTime=100`/`deltaT=1` against Ferrum `100` SIMPLE iterations.
@@ -200,8 +210,9 @@ Current status:
 
 - Ferrum SIMPLE medium pipe: `144.99 s` solve time in the 2026-07-10
   100-iteration rerun;
-- OpenFOAM `simpleFoam`: `4.21 s` solver execution and `7.85 s` driver
-  wall time in the matched 100-step rerun;
+- historical OpenFOAM `simpleFoam`: `4.21 s` solver execution and `7.85 s`
+  driver wall time in the matched 100-step rerun; do not use this as current
+  `foamRun` performance data;
 - CPU pressure PCG now has an IC(0) incomplete-Cholesky path for OpenFOAM
   `DIC`/`FDIC`, replacing the earlier diagonal-only mapping for pressure;
 - CG/PCG breakdown tests are scale-relative rather than absolute
@@ -240,6 +251,47 @@ directories. Analytic cases also contain `analytical/`; benchmark-only cases
 contain `benchmark/`. Coarse/medium/fine, skewed, and non-orthogonal variants
 belong to these bundles instead of becoming unrelated cases.
 
+## Runner And Multi-Region Milestone
+
+The solver lifecycle must be shared by both public dispatchers:
+
+- `ferrumRun`: one region and one runtime-selected module;
+- `ferrumMultiRun`: multiple coupled regions and one module per region.
+
+`ferrumMultiRun` follows OpenFOAM 13 `foamMultiRun` semantics. It is not an
+independent-case batch runner and has no `-solver` option. Region-to-module
+selection comes entirely from the case. It advances regions through one
+capability/dependency graph, applies a global time-step limited by global
+constraints and all active transient regions, and declares convergence only
+after all participating region criteria pass. Mixed steady/transient regions
+are an explicit supported scheduling mode.
+
+Implementation order:
+
+1. extract a module registry and common solver lifecycle while completing
+   `ferrumRun`;
+2. define a backend-neutral execution context that distinguishes sockets,
+   cores, worker threads, process ranks, domain partitions, GPU devices,
+   memory, and queues while preventing oversubscription;
+3. implement a deterministic CPU scheduler with a capability/dependency graph,
+   rank/partition mapping, halo/ghost exchange, interface barriers, and failure
+   propagation;
+4. add per-region and per-stage CPU/GPU placement, a data-residency/transfer
+   graph, backend capability checks including `f64`, and mixed-backend parity
+   tests;
+5. add multi-GPU placement, deterministic cross-device reductions, and
+   conservative region/partition interface exchange;
+6. require CPU/GPU, mixed-backend, and multi-GPU parity plus
+   mass/energy/species conservation at every coupled interface with stated
+   tolerances.
+
+The lifecycle and backend contracts are established during Drivers 1 and 2 so
+GPU support does not require a later architectural rewrite. A working coupled
+CPU runner plus the CPU/GPU execution contract is required before Driver 6;
+mixed CPU/GPU and multi-GPU Driver 6 acceptance follows as kernels become
+available. Independent parameter studies will use a separate future batch or
+sweep command.
+
 ## Application Driver Portfolio
 
 Drivers are implemented and accepted in this fixed order:
@@ -253,6 +305,11 @@ Drivers are implemented and accepted in this fixed order:
 | 5 | Compressible flow | `linearAcousticWave`, `sodShockTube`, `isentropicNozzle` |
 | 6 | Multi-region conjugate/reacting | `compositeSlab`, `conjugateHeatedChannel`, `surfaceReactionChannel` |
 | 7 | Immiscible two-phase VOF | `interfaceAdvection`, `staticDroplet`, `capillaryRise`, `damBreak` |
+
+Drivers 1 and 2 are separate readiness gates but share the public
+`incompressibleFluid` module. Steady/transient mode, SIMPLE/SIMPLEC/PISO/PIMPLE,
+and laminar/turbulence selection come from the case rather than executable
+names.
 
 Within each driver, cases are implemented in the listed order. Packed-bed
 geometry, Ergun resistance, porous momentum sources, and pseudo-homogeneous
@@ -298,15 +355,16 @@ sequence.
 
 ## Immediate Next Steps
 
-1. Introduce the OpenFOAM-13-inspired repository layout and tutorial validation
-   bundle contract on a dedicated pull request.
-2. Migrate `laminarPipe` and `planeChannel` first, including independent
-   Ferrum, OpenFOAM 13, and analytical siblings.
+1. Merge the repository-layout, tutorial-bundle, and canonical `ferrumRun`
+   naming migration.
+2. Extract the `incompressibleFluid` module registry and common solver
+   lifecycle from the transitional combined crates with parity tests.
 3. Specify and implement `FerrumFile v1`; isolate OpenFOAM support behind the
-   interoperability layer.
-4. Introduce `ferrumRun` and the application-driver/module registry.
-5. Complete Driver 1 SIMPLE/SIMPLEC and the remaining laminar validation
+   `openfoamIO` interoperability layer.
+4. Complete Driver 1 SIMPLE/SIMPLEC and the remaining laminar validation
    matrix.
+5. Establish the shared CPU/GPU execution context and deterministic CPU
+   `ferrumMultiRun` scheduler while Driver 2 PISO/PIMPLE is developed.
 6. Implement Drivers 2 through 7 in the fixed order above, applying the common
-   readiness gate to each driver.
+   readiness gate and completing coupled `ferrumMultiRun` before Driver 6.
 7. Begin porous-media and packed-bed work only after Driver 7 is complete.

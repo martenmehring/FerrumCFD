@@ -2,6 +2,7 @@
 members = [
     "src/ferrumMesh",
     "applications/legacy/ferrumCli",
+    "applications/solvers/ferrumRun",
 ]
 resolver = "3"
 

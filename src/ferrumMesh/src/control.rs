@@ -7,7 +7,8 @@ use crate::{MeshError, Result};
 #[derive(Debug)]
 pub struct ControlDict {
     pub path: PathBuf,
-    pub application: String,
+    pub application: Option<String>,
+    pub solver: Option<String>,
     pub start_from: String,
     pub start_time: Option<f64>,
     pub stop_at: String,
@@ -37,6 +38,10 @@ pub fn read_control_dict(case_dir: &Path) -> Result<ControlDict> {
 
 pub fn validate_control_dict(control: &ControlDict) -> ControlValidation {
     let mut warnings = Vec::new();
+
+    if control.application.is_none() {
+        warnings.push("missing application".to_string());
+    }
 
     if !matches!(
         control.start_from.as_str(),
@@ -121,6 +126,7 @@ fn parse_control_dict_str(content: &str, path: &Path) -> Result<ControlDict> {
         let values = cursor.read_value_until_semicolon()?;
         match key.as_str() {
             "application" => builder.application = Some(single_value(&values, "application")?),
+            "solver" => builder.solver = Some(single_value(&values, "solver")?),
             "startFrom" => builder.start_from = Some(single_value(&values, "startFrom")?),
             "startTime" => builder.start_time = Some(number_value(&values, "startTime", path)?),
             "stopAt" => builder.stop_at = Some(single_value(&values, "stopAt")?),
@@ -166,6 +172,7 @@ fn number_value(values: &[String], label: &str, path: &Path) -> Result<f64> {
 struct ControlDictBuilder {
     path: PathBuf,
     application: Option<String>,
+    solver: Option<String>,
     start_from: Option<String>,
     start_time: Option<f64>,
     stop_at: Option<String>,
@@ -180,6 +187,7 @@ impl ControlDictBuilder {
         Self {
             path: path.to_path_buf(),
             application: None,
+            solver: None,
             start_from: None,
             start_time: None,
             stop_at: None,
@@ -193,9 +201,8 @@ impl ControlDictBuilder {
     fn finish(self) -> Result<ControlDict> {
         Ok(ControlDict {
             path: self.path,
-            application: self
-                .application
-                .unwrap_or_else(|| "ferrumSolver".to_string()),
+            application: self.application,
+            solver: self.solver,
             start_from: self.start_from.unwrap_or_else(|| "startTime".to_string()),
             start_time: self.start_time,
             stop_at: self.stop_at.unwrap_or_else(|| "endTime".to_string()),
@@ -223,7 +230,8 @@ mod tests {
             object controlDict;
         }
 
-        application ferrumSolver;
+        application ferrumRun;
+        solver incompressibleFluid;
         startFrom startTime;
         startTime 0;
         stopAt endTime;
@@ -234,7 +242,8 @@ mod tests {
         "#;
 
         let control = parse_control_dict_str(content, Path::new("controlDict")).unwrap();
-        assert_eq!(control.application, "ferrumSolver");
+        assert_eq!(control.application.as_deref(), Some("ferrumRun"));
+        assert_eq!(control.solver.as_deref(), Some("incompressibleFluid"));
         assert_eq!(control.start_from, "startTime");
         assert_eq!(control.start_time, Some(0.0));
         assert_eq!(control.end_time, Some(10.0));
@@ -245,7 +254,8 @@ mod tests {
     #[test]
     fn uses_openfoam_like_defaults_for_missing_optional_values() {
         let control = parse_control_dict_str("", Path::new("controlDict")).unwrap();
-        assert_eq!(control.application, "ferrumSolver");
+        assert_eq!(control.application, None);
+        assert_eq!(control.solver, None);
         assert_eq!(control.start_from, "startTime");
         assert_eq!(control.stop_at, "endTime");
         assert_eq!(control.write_control, "timeStep");
@@ -255,7 +265,8 @@ mod tests {
     fn validates_basic_control_dict() {
         let control = parse_control_dict_str(
             r#"
-            application ferrumSolver;
+            application ferrumRun;
+            solver incompressibleFluid;
             startFrom startTime;
             startTime 0;
             stopAt endTime;

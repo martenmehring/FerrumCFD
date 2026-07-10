@@ -13,6 +13,7 @@ use ferrum_mesh::backends::{
     read_backend_config, validate_backend_policy, validate_backend_resources,
 };
 use ferrum_mesh::check::read_case_summary;
+use ferrum_mesh::control::{ControlDict, read_control_dict};
 use ferrum_mesh::diffusion::{
     assemble_scalar_diffusion_system, diffusion_assembly_capabilities,
     scalar_diffusion_options_from_field,
@@ -95,6 +96,7 @@ pub enum Alias {
     CheckFerrumMesh,
     SplitFerrumMeshRegions,
     InitFerrumCase,
+    FerrumRun,
     FerrumSolver,
     FerrumPipeBenchmark,
     FerrumPlaneChannelBenchmark,
@@ -112,6 +114,7 @@ fn run_command(mode: CommandMode, args: Vec<String>) -> Result<(), String> {
         CommandMode::Alias(Alias::CheckFerrumMesh) => check_mesh(args),
         CommandMode::Alias(Alias::SplitFerrumMeshRegions) => split_mesh_regions(args),
         CommandMode::Alias(Alias::InitFerrumCase) => init_case_command(args),
+        CommandMode::Alias(Alias::FerrumRun) => run_solver_module(args),
         CommandMode::Alias(Alias::FerrumSolver) => solve_case(args),
         CommandMode::Alias(Alias::FerrumPipeBenchmark) => pipe_benchmark(args),
         CommandMode::Alias(Alias::FerrumPlaneChannelBenchmark) => plane_channel_benchmark(args),
@@ -130,6 +133,7 @@ fn run_ferrum_subcommand(mut args: Vec<String>) -> Result<(), String> {
         "checkFerrumMesh" => check_mesh(args),
         "splitFerrumMeshRegions" => split_mesh_regions(args),
         "initFerrumCase" => init_case_command(args),
+        "run" | "ferrumRun" => run_solver_module(args),
         "solve" | "solver" | "ferrumSolver" => solve_case(args),
         "pipeBenchmark" | "ferrumPipeBenchmark" => pipe_benchmark(args),
         "planeChannelBenchmark" | "ferrumPlaneChannelBenchmark" => plane_channel_benchmark(args),
@@ -357,7 +361,184 @@ fn split_mesh_regions(args: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Debug)]
+struct FerrumRunArgs {
+    solver: Option<String>,
+    forwarded_args: Vec<String>,
+    execute: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SolverSelectionSource {
+    Cli,
+    ControlDict,
+}
+
+impl std::fmt::Display for SolverSelectionSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cli => formatter.write_str("cli"),
+            Self::ControlDict => formatter.write_str("controlDict"),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SolverDispatch {
+    module: String,
+    source: SolverSelectionSource,
+}
+
+fn run_solver_module(args: Vec<String>) -> Result<(), String> {
+    if args.iter().any(|arg| is_help(arg)) {
+        print_ferrum_run_usage();
+        return Ok(());
+    }
+
+    let FerrumRunArgs {
+        solver,
+        mut forwarded_args,
+        execute,
+    } = parse_ferrum_run_args(&args)?;
+
+    let dispatch = match solver {
+        Some(solver) => resolve_solver_dispatch(Some(solver), None)?,
+        None => {
+            let case_dir = parse_case_dir(&forwarded_args, PathBuf::from("."))?;
+            let control = read_control_dict(&case_dir).map_err(|error| error.to_string())?;
+            resolve_solver_dispatch(None, Some(&control))?
+        }
+    };
+
+    if execute {
+        forwarded_args.push("--solveLaminarSimple".to_string());
+    }
+
+    solve_case_with_contract(
+        forwarded_args,
+        execute.then_some(("incompressibleFluid", "SIMPLE")),
+        Some(dispatch),
+    )
+}
+
+fn resolve_solver_dispatch(
+    cli_solver: Option<String>,
+    control: Option<&ControlDict>,
+) -> Result<SolverDispatch, String> {
+    let (module, source) = if let Some(module) = cli_solver {
+        (module, SolverSelectionSource::Cli)
+    } else {
+        let control = control.ok_or_else(|| "solver selection is missing".to_string())?;
+        if control.application.as_deref() != Some("ferrumRun") {
+            return Err(
+                "controlDict solver fallback requires the explicit Ferrum marker 'application ferrumRun;'; pass '-solver incompressibleFluid' only for an intentional interoperability run"
+                    .to_string(),
+            );
+        }
+        let module = control.solver.clone().ok_or_else(|| {
+            "solver not specified; add 'solver incompressibleFluid;' to system/controlDict or pass '-solver incompressibleFluid'"
+                .to_string()
+        })?;
+        (module, SolverSelectionSource::ControlDict)
+    };
+
+    if module != "incompressibleFluid" {
+        return Err(format!(
+            "unknown Ferrum solver module '{module}'; the first executable module is 'incompressibleFluid'"
+        ));
+    }
+
+    Ok(SolverDispatch { module, source })
+}
+
+fn parse_ferrum_run_args(args: &[String]) -> Result<FerrumRunArgs, String> {
+    let mut solver = None;
+    let mut forwarded_args = Vec::new();
+    let mut index = 0;
+
+    while index < args.len() {
+        let arg = &args[index];
+        if matches!(arg.as_str(), "-solver" | "--solver") {
+            if solver.is_some() {
+                return Err("-solver may be specified only once".to_string());
+            }
+            let value = args
+                .get(index + 1)
+                .filter(|value| !value.starts_with('-'))
+                .ok_or_else(|| "-solver requires a module name".to_string())?;
+            solver = Some(value.to_string());
+            index += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--solver=") {
+            if solver.is_some() {
+                return Err("-solver may be specified only once".to_string());
+            }
+            if value.is_empty() {
+                return Err("--solver requires a module name".to_string());
+            }
+            solver = Some(value.to_string());
+            index += 1;
+            continue;
+        }
+        if is_legacy_execution_selector(arg) {
+            return Err(format!(
+                "'{arg}' is a legacy execution selector; use 'ferrumRun -solver incompressibleFluid' and configure SIMPLE/PISO/PIMPLE in the case"
+            ));
+        }
+
+        forwarded_args.push(arg.clone());
+        index += 1;
+    }
+
+    let execute = !forwarded_args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "-preflight"
+                | "--preflight"
+                | "-dryRun"
+                | "--dry-run"
+                | "-runnerDryRun"
+                | "--runnerDryRun"
+                | "-runner-dry-run"
+                | "--runner-dry-run"
+        )
+    });
+
+    Ok(FerrumRunArgs {
+        solver,
+        forwarded_args,
+        execute,
+    })
+}
+
+fn is_legacy_execution_selector(arg: &str) -> bool {
+    matches!(
+        arg,
+        "-solveScalarDiffusion"
+            | "--solveScalarDiffusion"
+            | "-solve-scalar-diffusion"
+            | "--solve-scalar-diffusion"
+            | "-solvePoiseuille"
+            | "--solvePoiseuille"
+            | "-solve-poiseuille"
+            | "--solve-poiseuille"
+            | "-solveLaminarSimple"
+            | "--solveLaminarSimple"
+            | "-solve-laminar-simple"
+            | "--solve-laminar-simple"
+    )
+}
+
 fn solve_case(args: Vec<String>) -> Result<(), String> {
+    solve_case_with_contract(args, None, None)
+}
+
+fn solve_case_with_contract(
+    args: Vec<String>,
+    required_module_section: Option<(&str, &str)>,
+    dispatch: Option<SolverDispatch>,
+) -> Result<(), String> {
     if args.iter().any(|arg| is_help(arg)) {
         print_solver_usage();
         return Ok(());
@@ -365,7 +546,10 @@ fn solve_case(args: Vec<String>) -> Result<(), String> {
 
     let options = parse_solver_args(&args)?;
     let plan = build_solver_case_plan(&options.case_dir).map_err(|error| error.to_string())?;
-    print_solver_case_plan(&plan);
+    if let Some((module, required_section)) = required_module_section {
+        validate_module_execution_contract(&plan, module, required_section)?;
+    }
+    print_solver_case_plan(&plan, dispatch.as_ref());
     if options.runner_dry_run {
         let dry_run = build_solver_runner_dry_run(
             &plan,
@@ -385,7 +569,7 @@ fn solve_case(args: Vec<String>) -> Result<(), String> {
         run_laminar_simple_solve(&plan, solve)?;
     }
     if let Some(path) = options.plan_json {
-        write_solver_plan_json(&plan, &path).map_err(|error| {
+        write_solver_plan_json(&plan, dispatch.as_ref(), &path).map_err(|error| {
             format!(
                 "could not write solver plan JSON to {} ({error})",
                 path.display()
@@ -393,6 +577,126 @@ fn solve_case(args: Vec<String>) -> Result<(), String> {
         })?;
         println!("wrote solver plan json: {}", path.display());
     }
+    Ok(())
+}
+
+fn validate_module_execution_contract(
+    plan: &SolverCasePlan,
+    module: &str,
+    required_section: &str,
+) -> Result<(), String> {
+    if module != "incompressibleFluid" || required_section != "SIMPLE" {
+        return Err(format!(
+            "no executable contract is registered for module '{module}' and algorithm section '{required_section}'"
+        ));
+    }
+
+    let simple_sections = plan
+        .numerics
+        .fv_solution
+        .sections
+        .iter()
+        .filter(|section| section.path == "SIMPLE")
+        .count();
+    if simple_sections != 1 {
+        return Err(format!(
+            "solver module 'incompressibleFluid' currently requires exactly one 'SIMPLE' section in system/fvSolution, found {simple_sections}"
+        ));
+    }
+
+    let conflicting_algorithms = plan
+        .numerics
+        .fv_solution
+        .sections
+        .iter()
+        .filter(|section| matches!(section.path.as_str(), "PISO" | "PIMPLE"))
+        .map(|section| section.path.as_str())
+        .collect::<Vec<_>>();
+    if !conflicting_algorithms.is_empty() {
+        return Err(format!(
+            "solver module 'incompressibleFluid' cannot execute the current SIMPLE kernel while {} is also configured; PISO/PIMPLE execution is not implemented yet",
+            conflicting_algorithms.join(" and ")
+        ));
+    }
+
+    let ddt_schemes = plan
+        .numerics
+        .fv_schemes
+        .entries
+        .iter()
+        .filter(|entry| entry.section == "ddtSchemes" && entry.key == "default")
+        .map(|entry| entry.value.as_str())
+        .collect::<Vec<_>>();
+    if ddt_schemes.len() != 1 {
+        return Err(format!(
+            "solver module 'incompressibleFluid' requires exactly one ddtSchemes.default entry, found {}",
+            ddt_schemes.len()
+        ));
+    }
+    if ddt_schemes[0] != "steadyState" {
+        return Err(format!(
+            "solver module 'incompressibleFluid' currently executes SIMPLE only with ddtSchemes.default=steadyState, found {}; transient PISO/PIMPLE execution is not implemented yet",
+            ddt_schemes[0]
+        ));
+    }
+
+    validate_laminar_transport_regime(plan)?;
+
+    Ok(())
+}
+
+fn validate_laminar_transport_regime(plan: &SolverCasePlan) -> Result<(), String> {
+    let regime_dictionaries = plan
+        .properties
+        .dictionaries
+        .iter()
+        .filter(|dictionary| {
+            dictionary.region.is_none()
+                && matches!(
+                    dictionary.name.as_str(),
+                    "momentumTransport" | "turbulenceProperties"
+                )
+        })
+        .map(|dictionary| dictionary.name.as_str())
+        .collect::<Vec<_>>();
+
+    if regime_dictionaries.is_empty() {
+        // Ferrum's current compatibility cases predate momentumTransport and
+        // are explicitly treated as laminar until FerrumFile v1 is available.
+        return Ok(());
+    }
+    if regime_dictionaries.len() != 1 {
+        return Err(format!(
+            "laminar incompressible execution requires one transport-regime dictionary, found {}",
+            regime_dictionaries.join(" and ")
+        ));
+    }
+
+    let dictionary = regime_dictionaries[0];
+    let simulation_types = plan
+        .properties
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.dictionary == dictionary
+                && entry.section.is_none()
+                && entry.key == "simulationType"
+        })
+        .map(|entry| entry.value.as_str())
+        .collect::<Vec<_>>();
+    if simulation_types.len() != 1 {
+        return Err(format!(
+            "constant/{dictionary} requires exactly one top-level simulationType for laminar execution, found {}",
+            simulation_types.len()
+        ));
+    }
+    if simulation_types[0] != "laminar" {
+        return Err(format!(
+            "the current incompressibleFluid kernel requires simulationType laminar, found '{}' in constant/{dictionary}; RAS/LES execution is not implemented yet",
+            simulation_types[0]
+        ));
+    }
+
     Ok(())
 }
 
@@ -2900,12 +3204,13 @@ fn summarize_scalar_solution(values: &[f64]) -> ScalarSolutionSummary {
     }
 }
 
-fn print_solver_case_plan(plan: &SolverCasePlan) {
+fn print_solver_case_plan(plan: &SolverCasePlan, dispatch: Option<&SolverDispatch>) {
     println!("Ferrum solver preflight");
     println!("case: {}", plan.case_dir.display());
     println!(
-        "control: application={} startFrom={} startTime={} stopAt={} endTime={} deltaT={} writeControl={} writeInterval={}",
-        plan.control.application,
+        "control: application={} solver={} startFrom={} startTime={} stopAt={} endTime={} deltaT={} writeControl={} writeInterval={}",
+        plan.control.application.as_deref().unwrap_or("missing"),
+        plan.control.solver.as_deref().unwrap_or("missing"),
         plan.control.start_from,
         format_optional_number(plan.control.start_time),
         plan.control.stop_at,
@@ -2914,6 +3219,12 @@ fn print_solver_case_plan(plan: &SolverCasePlan) {
         plan.control.write_control,
         format_optional_number(plan.control.write_interval)
     );
+    if let Some(dispatch) = dispatch {
+        println!(
+            "dispatch: module={} source={}",
+            dispatch.module, dispatch.source
+        );
+    }
     println!(
         "mesh: dimensionality={} points={} cells={} faces={} internal={} boundary={} patches={}",
         plan.mesh.dimensionality,
@@ -3420,15 +3731,24 @@ fn print_solver_runner_state(plan: &SolverStatePlan) {
     }
 }
 
-fn write_solver_plan_json(plan: &SolverCasePlan, path: &Path) -> std::io::Result<()> {
+fn write_solver_plan_json(
+    plan: &SolverCasePlan,
+    dispatch: Option<&SolverDispatch>,
+    path: &Path,
+) -> std::io::Result<()> {
+    ensure_parent_dir(path)?;
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
 
     writeln!(writer, "{{")?;
+    write_json_number_field(&mut writer, 2, "schemaVersion", 2)?;
+    writeln!(writer, ",")?;
     write_json_key(&mut writer, 2, "caseDir")?;
     write_json_string(&mut writer, &plan.case_dir.display().to_string())?;
     writeln!(writer, ",")?;
     write_json_control(&mut writer, plan)?;
+    writeln!(writer, ",")?;
+    write_json_dispatch(&mut writer, dispatch)?;
     writeln!(writer, ",")?;
     write_json_mesh(&mut writer, &plan.mesh)?;
     writeln!(writer, ",")?;
@@ -3468,10 +3788,24 @@ fn write_laminar_simple_report_json(
     let mut writer = BufWriter::new(file);
 
     writeln!(writer, "{{")?;
+    write_json_number_field(&mut writer, 2, "schemaVersion", 2)?;
+    writeln!(writer, ",")?;
     write_json_key(&mut writer, 2, "caseDir")?;
     write_json_string(&mut writer, &plan.case_dir.display().to_string())?;
     writeln!(writer, ",")?;
     write_json_key(&mut writer, 2, "solver")?;
+    write_json_string(&mut writer, "incompressibleFluid")?;
+    writeln!(writer, ",")?;
+    write_json_key(&mut writer, 2, "algorithm")?;
+    write_json_string(&mut writer, "SIMPLE")?;
+    writeln!(writer, ",")?;
+    write_json_key(&mut writer, 2, "regime")?;
+    write_json_string(&mut writer, "laminar")?;
+    writeln!(writer, ",")?;
+    write_json_key(&mut writer, 2, "implementation")?;
+    write_json_string(&mut writer, "laminarSimple")?;
+    writeln!(writer, ",")?;
+    write_json_key(&mut writer, 2, "legacySolver")?;
     write_json_string(&mut writer, "laminarSimple")?;
     writeln!(writer, ",")?;
     write_json_key(&mut writer, 2, "backend")?;
@@ -4410,9 +4744,15 @@ fn write_laminar_simple_report_markdown(
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
 
-    writeln!(writer, "# Laminar SIMPLE Report")?;
+    writeln!(writer, "# incompressibleFluid Solver Report")?;
     writeln!(writer)?;
     writeln!(writer, "Case: `{}`", plan.case_dir.display())?;
+    writeln!(writer)?;
+    writeln!(writer, "- Schema version: `2`")?;
+    writeln!(writer, "- Module: `incompressibleFluid`")?;
+    writeln!(writer, "- Algorithm: `SIMPLE`")?;
+    writeln!(writer, "- Regime: `laminar`")?;
+    writeln!(writer, "- Backend: `cpu`")?;
     writeln!(writer)?;
     writeln!(writer, "## Inputs")?;
     writeln!(writer)?;
@@ -5198,7 +5538,10 @@ fn write_json_control(writer: &mut impl Write, plan: &SolverCasePlan) -> std::io
     write_json_key(writer, 2, "control")?;
     writeln!(writer, "{{")?;
     write_json_key(writer, 4, "application")?;
-    write_json_string(writer, &plan.control.application)?;
+    write_json_optional_string(writer, plan.control.application.as_deref())?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "solver")?;
+    write_json_optional_string(writer, plan.control.solver.as_deref())?;
     writeln!(writer, ",")?;
     write_json_key(writer, 4, "startFrom")?;
     write_json_string(writer, &plan.control.start_from)?;
@@ -5223,6 +5566,27 @@ fn write_json_control(writer: &mut impl Write, plan: &SolverCasePlan) -> std::io
     writeln!(writer)?;
     write_indent(writer, 2)?;
     write!(writer, "}}")
+}
+
+fn write_json_dispatch(
+    writer: &mut impl Write,
+    dispatch: Option<&SolverDispatch>,
+) -> std::io::Result<()> {
+    write_json_key(writer, 2, "dispatch")?;
+    match dispatch {
+        Some(dispatch) => {
+            writeln!(writer, "{{")?;
+            write_json_key(writer, 4, "module")?;
+            write_json_string(writer, &dispatch.module)?;
+            writeln!(writer, ",")?;
+            write_json_key(writer, 4, "source")?;
+            write_json_string(writer, &dispatch.source.to_string())?;
+            writeln!(writer)?;
+            write_indent(writer, 2)?;
+            write!(writer, "}}")
+        }
+        None => write!(writer, "null"),
+    }
 }
 
 fn write_json_mesh(writer: &mut impl Write, plan: &SolverMeshPlan) -> std::io::Result<()> {
@@ -7230,13 +7594,14 @@ fn is_help(arg: &str) -> bool {
 }
 
 fn print_help() {
-    println!("FerrumCFD mesh tools");
+    println!("FerrumCFD command-line tools");
     println!();
     println!("usage:");
     println!("  ferrum initFerrumCase <caseDir> [--region <name> ...] [--force]");
     println!("  ferrum gmshToFerrum <mesh.msh> [-case <caseDir>] [patch type options]");
     println!("  ferrum checkFerrumMesh [-case <caseDir>]");
     println!("  ferrum splitFerrumMeshRegions [-case <caseDir>] [-cellZones]");
+    println!("  ferrum run -solver incompressibleFluid [-case <caseDir>] [run options]");
     println!("  ferrum solve [-case <caseDir>] [--preflight] [--planJson <file>] [--runnerDryRun]");
     println!("  ferrum pipeBenchmark -case <caseDir> --fields <timeDir> [reference options]");
     println!(
@@ -7248,13 +7613,35 @@ fn print_help() {
     println!("  gmshToFerrum <mesh.msh> [-case <caseDir>] [patch type options]");
     println!("  checkFerrumMesh [-case <caseDir>]");
     println!("  splitFerrumMeshRegions [-case <caseDir>] [-cellZones]");
-    println!("  ferrumSolver [-case <caseDir>] [--preflight] [--planJson <file>] [--runnerDryRun]");
+    println!("  ferrumRun -solver incompressibleFluid [-case <caseDir>] [run options]");
+    println!("  ferrumSolver ...  compatibility interface for prototype and benchmark modes");
     println!("  ferrumPipeBenchmark -case <caseDir> --fields <timeDir> [reference options]");
     println!(
         "  ferrumPlaneChannelBenchmark -case <caseDir> --fields <timeDir> [reference options]"
     );
     println!();
     print_patch_type_options();
+}
+
+fn print_ferrum_run_usage() {
+    println!(
+        "usage: ferrumRun [-solver incompressibleFluid] [-case <caseDir>] [--preflight|--runnerDryRun] [run options]"
+    );
+    println!();
+    println!("runs one FerrumCFD case through a runtime-selectable solver module");
+    println!("the solver may be supplied on the command line or as this controlDict entry:");
+    println!("  solver incompressibleFluid;");
+    println!();
+    println!("current executable contract:");
+    println!("  module: incompressibleFluid");
+    println!("  coupling: SIMPLE section required for execution");
+    println!("  regime: laminar");
+    println!("  backend: CPU equation kernels; GPU kernels are planned");
+    println!();
+    println!(
+        "SIMPLE, SIMPLEC, PISO, PIMPLE, and laminar/turbulent model choices belong in the case, not in the public solver name"
+    );
+    println!("--preflight and --runnerDryRun inspect the case without executing equations");
 }
 
 fn print_init_case_usage() {
@@ -7423,15 +7810,16 @@ mod tests {
     use super::{
         ContinuitySummary, LaminarSimpleIterationSummary, LaminarSimpleOptions,
         LaminarSimpleResidualControlSummary, LaminarSimpleSchemes, ScalarDiffusionLinearSolver,
-        SolverNumericsDictionaryPlan, estimate_iterations_to_convergence,
+        SolverNumericsDictionaryPlan, SolverSelectionSource, estimate_iterations_to_convergence,
         estimate_simple_iterations_to_convergence, numerics_dictionary_number,
-        numerics_dictionary_usize, numerics_dictionary_value,
+        numerics_dictionary_usize, numerics_dictionary_value, parse_ferrum_run_args,
         parse_laminar_simple_convection_scheme, parse_laminar_simple_gradient_scheme,
         parse_laminar_simple_laplacian_scheme, parse_laminar_simple_sn_grad_scheme,
         parse_openfoam_laminar_preconditioner, parse_openfoam_laminar_solver,
         parse_pipe_benchmark_args, parse_plane_channel_benchmark_args, parse_solver_args,
-        resolve_laminar_simple_options, run_ferrum_subcommand,
-        validate_laminar_residual_control_dictionary, write_json_solver_state, write_json_string,
+        resolve_laminar_simple_options, resolve_solver_dispatch, run_ferrum_subcommand,
+        validate_laminar_residual_control_dictionary, validate_module_execution_contract,
+        write_json_solver_state, write_json_string, write_solver_plan_json,
     };
     use ferrum_mesh::backends::BackendChoice;
     use ferrum_mesh::control::ControlDict;
@@ -7444,7 +7832,8 @@ mod tests {
     use ferrum_mesh::solver_plan::{
         SolverBackendPlan, SolverCasePlan, SolverCpuResourcePlan, SolverDimensionality,
         SolverFieldPlan, SolverGpuResourcePlan, SolverInterfacePlan, SolverMeshPlan,
-        SolverNumericsPlan, SolverPropertiesPlan, SolverPropertyEntryPlan, SolverRunPlan,
+        SolverNumericsPlan, SolverPropertiesPlan, SolverPropertyDictionaryPlan,
+        SolverPropertyEntryPlan, SolverRunPlan,
     };
     use ferrum_mesh::solver_state::{
         SolverStateCpuBufferPlan, SolverStateCpuBufferStatus, SolverStateFieldKind,
@@ -7454,12 +7843,92 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn parses_canonical_ferrum_run_module() {
+        let parsed = parse_ferrum_run_args(&[
+            "-solver".to_string(),
+            "incompressibleFluid".to_string(),
+            "-case".to_string(),
+            "cases/pipe".to_string(),
+            "--maxSimpleIterations".to_string(),
+            "2".to_string(),
+        ])
+        .expect("canonical ferrumRun args should parse");
+
+        assert_eq!(parsed.solver.as_deref(), Some("incompressibleFluid"));
+        assert_eq!(
+            parsed.forwarded_args,
+            vec!["-case", "cases/pipe", "--maxSimpleIterations", "2"]
+        );
+        assert!(parsed.execute);
+    }
+
+    #[test]
+    fn ferrum_run_preflight_does_not_execute() {
+        let parsed = parse_ferrum_run_args(&[
+            "--solver=incompressibleFluid".to_string(),
+            "--preflight".to_string(),
+        ])
+        .expect("ferrumRun preflight args should parse");
+
+        assert!(!parsed.execute);
+        assert_eq!(parsed.forwarded_args, vec!["--preflight"]);
+    }
+
+    #[test]
+    fn ferrum_run_rejects_duplicate_solver_selection() {
+        let error = parse_ferrum_run_args(&[
+            "-solver".to_string(),
+            "incompressibleFluid".to_string(),
+            "--solver=incompressibleFluid".to_string(),
+        ])
+        .expect_err("duplicate solver selection should fail");
+
+        assert!(error.contains("only once"));
+    }
+
+    #[test]
+    fn ferrum_run_rejects_legacy_execution_selector() {
+        let error = parse_ferrum_run_args(&[
+            "-solver".to_string(),
+            "incompressibleFluid".to_string(),
+            "--solveLaminarSimple".to_string(),
+        ])
+        .expect_err("legacy solver selector should fail on ferrumRun");
+
+        assert!(error.contains("legacy execution selector"));
+    }
+
+    #[test]
+    fn control_solver_fallback_requires_explicit_ferrum_application() {
+        let mut plan = laminar_simple_test_plan(1000.0, 0.001);
+        plan.control.application = None;
+
+        let error = resolve_solver_dispatch(None, Some(&plan.control))
+            .expect_err("unmarked controlDict must not select a Ferrum solver");
+
+        assert!(error.contains("application ferrumRun"));
+    }
+
+    #[test]
+    fn solver_dispatch_records_selection_source() {
+        let plan = laminar_simple_test_plan(1000.0, 0.001);
+        let from_control = resolve_solver_dispatch(None, Some(&plan.control))
+            .expect("marked Ferrum controlDict should select its solver");
+        let from_cli = resolve_solver_dispatch(Some("incompressibleFluid".to_string()), None)
+            .expect("explicit CLI solver should be accepted");
+
+        assert_eq!(from_control.source, SolverSelectionSource::ControlDict);
+        assert_eq!(from_cli.source, SolverSelectionSource::Cli);
+    }
+
+    #[test]
     fn ferrum_branded_workflow_commands_are_canonical() {
         for command in [
             "initFerrumCase",
             "gmshToFerrum",
             "checkFerrumMesh",
             "splitFerrumMeshRegions",
+            "run",
         ] {
             assert!(
                 run_ferrum_subcommand(vec![command.to_string(), "--help".to_string()]).is_ok(),
@@ -7614,7 +8083,7 @@ mod tests {
     fn parses_scalar_diffusion_solve_options() {
         let args = vec![
             "-case".to_string(),
-            "tutorials/steadyIncompressible/laminarPipe/ferrum/case".to_string(),
+            "tutorials/incompressibleFluid/laminarPipe/ferrum/case".to_string(),
             "--solveScalarDiffusion".to_string(),
             "T".to_string(),
             "--diffusivity".to_string(),
@@ -8226,7 +8695,8 @@ mod tests {
             case_dir: PathBuf::from("case"),
             control: ControlDict {
                 path: PathBuf::from("controlDict"),
-                application: "ferrumSolver".to_string(),
+                application: Some("ferrumRun".to_string()),
+                solver: Some("incompressibleFluid".to_string()),
                 start_from: "startTime".to_string(),
                 start_time: Some(0.0),
                 stop_at: "endTime".to_string(),
@@ -8300,6 +8770,11 @@ mod tests {
                     sections: Vec::new(),
                     entries: vec![
                         ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
+                            section: "ddtSchemes".to_string(),
+                            key: "default".to_string(),
+                            value: "steadyState".to_string(),
+                        },
+                        ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
                             section: "gradSchemes".to_string(),
                             key: "default".to_string(),
                             value: "Gauss linear".to_string(),
@@ -8328,7 +8803,10 @@ mod tests {
                 },
                 fv_solution: SolverNumericsDictionaryPlan {
                     present: true,
-                    sections: Vec::new(),
+                    sections: vec![ferrum_mesh::solver_plan::SolverNumericsSectionPlan {
+                        path: "SIMPLE".to_string(),
+                        entries: 0,
+                    }],
                     entries: vec![
                         ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
                             section: "solvers.U".to_string(),
@@ -8404,6 +8882,118 @@ mod tests {
             },
             warnings: Vec::new(),
         }
+    }
+
+    #[test]
+    fn current_incompressible_execution_contract_is_unambiguously_steady_simple() {
+        let plan = laminar_simple_test_plan(1000.0, 0.001);
+        validate_module_execution_contract(&plan, "incompressibleFluid", "SIMPLE")
+            .expect("steady SIMPLE plan should pass");
+    }
+
+    #[test]
+    fn current_incompressible_execution_rejects_competing_pimple_section() {
+        let mut plan = laminar_simple_test_plan(1000.0, 0.001);
+        plan.numerics.fv_solution.sections.push(
+            ferrum_mesh::solver_plan::SolverNumericsSectionPlan {
+                path: "PIMPLE".to_string(),
+                entries: 0,
+            },
+        );
+
+        let error = validate_module_execution_contract(&plan, "incompressibleFluid", "SIMPLE")
+            .expect_err("competing PIMPLE configuration must fail");
+
+        assert!(error.contains("PISO/PIMPLE execution is not implemented"));
+    }
+
+    #[test]
+    fn current_incompressible_execution_rejects_transient_ddt_scheme() {
+        let mut plan = laminar_simple_test_plan(1000.0, 0.001);
+        plan.numerics
+            .fv_schemes
+            .entries
+            .iter_mut()
+            .find(|entry| entry.section == "ddtSchemes" && entry.key == "default")
+            .expect("test plan ddt scheme")
+            .value = "Euler".to_string();
+
+        let error = validate_module_execution_contract(&plan, "incompressibleFluid", "SIMPLE")
+            .expect_err("transient ddt scheme must fail");
+
+        assert!(error.contains("ddtSchemes.default=steadyState"));
+    }
+
+    #[test]
+    fn current_incompressible_execution_accepts_explicit_laminar_regime() {
+        let mut plan = laminar_simple_test_plan(1000.0, 0.001);
+        plan.properties
+            .dictionaries
+            .push(SolverPropertyDictionaryPlan {
+                name: "momentumTransport".to_string(),
+                region: None,
+                sections: 0,
+                entries: 1,
+            });
+        plan.properties.entries.push(SolverPropertyEntryPlan {
+            dictionary: "momentumTransport".to_string(),
+            section: None,
+            key: "simulationType".to_string(),
+            value: "laminar".to_string(),
+        });
+
+        validate_module_execution_contract(&plan, "incompressibleFluid", "SIMPLE")
+            .expect("explicit laminar momentum transport should pass");
+    }
+
+    #[test]
+    fn current_incompressible_execution_rejects_ras_regime() {
+        let mut plan = laminar_simple_test_plan(1000.0, 0.001);
+        plan.properties
+            .dictionaries
+            .push(SolverPropertyDictionaryPlan {
+                name: "momentumTransport".to_string(),
+                region: None,
+                sections: 0,
+                entries: 1,
+            });
+        plan.properties.entries.push(SolverPropertyEntryPlan {
+            dictionary: "momentumTransport".to_string(),
+            section: None,
+            key: "simulationType".to_string(),
+            value: "RAS".to_string(),
+        });
+
+        let error = validate_module_execution_contract(&plan, "incompressibleFluid", "SIMPLE")
+            .expect_err("RAS must not run through the laminar kernel");
+
+        assert!(error.contains("requires simulationType laminar"));
+        assert!(error.contains("RAS/LES execution is not implemented"));
+    }
+
+    #[test]
+    fn solver_plan_json_records_effective_dispatch() {
+        let plan = laminar_simple_test_plan(1000.0, 0.001);
+        let dispatch = resolve_solver_dispatch(Some("incompressibleFluid".to_string()), None)
+            .expect("explicit solver selection");
+        let path = std::env::temp_dir().join(format!(
+            "ferrum-plan-dispatch-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after Unix epoch")
+                .as_nanos()
+        ));
+
+        write_solver_plan_json(&plan, Some(&dispatch), &path)
+            .expect("solver plan JSON should be written");
+        let json = std::fs::read_to_string(&path).expect("solver plan JSON should be readable");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(json.contains("\"schemaVersion\": 2"));
+        assert!(json.contains("\"dispatch\""));
+        assert!(json.contains("\"module\": \"incompressibleFluid\""));
+        assert!(json.contains("\"source\": \"cli\""));
     }
 
     #[test]

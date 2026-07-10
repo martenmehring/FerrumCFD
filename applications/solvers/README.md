@@ -1,8 +1,12 @@
 # Solver Dispatchers
 
-This directory is reserved for public solver entry points. The first target is
-`ferrumRun`, which selects one of the seven application drivers without
-duplicating physical-model or finite-volume implementations.
+This directory contains the permanent public solver entry-point boundaries:
 
-The existing `ferrumSolver` binary remains under `../legacy/ferrumCli` until
-`FerrumFile v1`, the driver registry, and behavior-parity tests are complete.
+- `ferrumRun`: one case, one region, one runtime-selectable module;
+- `ferrumMultiRun`: one coupled case with multiple regions and one module per
+  region.
+
+`ferrumRun` is compiled from its permanent dispatcher crate. Its behavior
+still delegates to `../legacy/ferrumCli` during the staged split.
+`ferrumSolver --solveLaminarSimple` remains a temporary compatibility and
+benchmark interface.

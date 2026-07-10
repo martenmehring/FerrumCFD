@@ -13,7 +13,7 @@ and shared HPC front ends that expose FerrumCFD to other users must constrain
 those operator-controlled arguments and enforce process-level CPU, memory,
 wall-time, filesystem, and GPU quotas.
 
-Files below `scripts/` are local development and benchmark tooling. They are
+Files below `validation/scripts/` are local development and benchmark tooling. They are
 not a hosted service interface. Scripts may execute only explicitly selected
 tools or applications resolved through `PATH`; they must not auto-execute a
 binary discovered in user-writable download folders.

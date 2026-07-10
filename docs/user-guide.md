@@ -20,6 +20,7 @@ target/debug/initFerrumCase.exe
 target/debug/gmshToFerrum.exe
 target/debug/checkFerrumMesh.exe
 target/debug/splitFerrumMeshRegions.exe
+target/debug/ferrumRun.exe
 target/debug/ferrumSolver.exe
 target/debug/ferrumPipeBenchmark.exe
 target/debug/ferrumPlaneChannelBenchmark.exe
@@ -207,27 +208,29 @@ The repository also contains a small SI pipe `.geo` with two near-wall prism
 layers:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_gmsh_pipe_import.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_gmsh_pipe_import.ps1
 ```
 
-The script uses `tutorials/steadyIncompressible/laminarPipe/shared/geometry/pipe_prism2.geo`, writes the generated
+The script uses `tutorials/incompressibleFluid/laminarPipe/shared/geometry/pipe_prism2.geo`, writes the generated
 `.msh` below `target/gmsh/`, imports it to `target/cases/gmsh_pipe`, and runs
 `checkFerrumMesh`. It finds `gmsh.exe` from `PATH`; pass the trusted installation
 explicitly with `-GmshExe <path-to-gmsh.exe>` when needed. This Gmsh pipe is
 a benchmark fixture for comparing FerrumCFD and OpenFOAM on the same mesh. It
 does not make OpenFOAM part of the normal FerrumCFD workflow.
 
-For a Gmsh-based pipe mesh study, run:
+The older source-driven Poiseuille Gmsh mesh study is retained only to
+reproduce historical benchmark records:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_gmsh_pipe_mesh_study.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_gmsh_pipe_mesh_study.ps1
 ```
 
-This generates `coarse`, `medium`, and `fine` variants from the same `.geo`,
+It generates `coarse`, `medium`, and `fine` variants from the same `.geo`,
 imports each one into FerrumCFD, writes SI fields and benchmark metadata, runs
 `checkFerrumMesh`, and optionally runs OpenFOAM for the same imported mesh. Use
 `-SkipOpenFoam` for a quick Ferrum-only preparation pass, or increase
-`-OpenFoamSteps` for a proper OpenFOAM convergence study.
+`-OpenFoamSteps` when reproducing that historical OpenFOAM convergence study.
+New pressure-velocity work uses `run_laminar_simple_mesh_study.ps1` instead.
 
 ## Interface Registry
 
@@ -401,8 +404,8 @@ ferrum initFerrumCase cases\my_case
 ferrum gmshToFerrum path\to\mesh.msh -case cases\my_case
 ferrum checkFerrumMesh -case cases\my_case
 ferrum splitFerrumMeshRegions -case cases\my_case -cellZones
-ferrum solve -case cases\my_case --preflight --planJson target\ferrumSolverPlan.json
-ferrum solve -case cases\my_case --runnerDryRun --maxRunnerSteps 2
+ferrum run -solver incompressibleFluid -case cases\my_case --preflight --planJson target\ferrumRunPlan.json
+ferrum run -solver incompressibleFluid -case cases\my_case --runnerDryRun --maxRunnerSteps 2
 ```
 
 The same naming convention is used by the dedicated binaries:
@@ -412,10 +415,14 @@ initFerrumCase
 gmshToFerrum
 checkFerrumMesh
 splitFerrumMeshRegions
-ferrumSolver
+ferrumRun
 ferrumPipeBenchmark
 ferrumPlaneChannelBenchmark
 ```
+
+`ferrumSolver` remains available as a temporary compatibility interface for
+the prototype scalar and Poiseuille benchmark modes. New case workflows use
+`ferrumRun`.
 
 ## Units Policy
 
@@ -441,15 +448,15 @@ results back to SI pressure in `Pa` before comparison.
 
 ## Laminar Pipe Benchmark
 
-`tutorials/steadyIncompressible/laminarPipe/ferrum/case` is the first SI pipe simulation case used by the
+`tutorials/incompressibleFluid/laminarPipe/ferrum/case` is the first SI pipe simulation case used by the
 benchmark suite. It contains the mesh, fields, material properties, and solver
 dictionaries. The analytical Hagen-Poiseuille reference is separate at
-`tutorials/steadyIncompressible/laminarPipe/analytical/pipeBenchmark`.
+`tutorials/incompressibleFluid/laminarPipe/analytical/pipeBenchmark`.
 
 Regenerate the versioned medium-resolution case with:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\generate_laminar_pipe_case.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\generate_laminar_pipe_case.ps1
 ```
 
 The inlet velocity is a fully developed parabolic profile. The generator scales
@@ -459,44 +466,47 @@ the discrete patch values so the patch-integrated flow equals
 Run the OpenFOAM comparison only as a benchmark artifact:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_poiseuille_benchmark.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_poiseuille_benchmark.ps1
 ```
 
-Run the mesh convergence study with:
+The following source-driven Poiseuille convergence commands are historical
+reproducibility tools, not the current solver workflow:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_pipe_convergence.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_pipe_convergence.ps1 -OpenFoamSteps 1000
+powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_laminar_pipe_convergence.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_laminar_pipe_convergence.ps1 -OpenFoamSteps 1000
 ```
 
-For the Gmsh-first workflow, use:
+The corresponding historical Gmsh-first study is:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_gmsh_pipe_mesh_study.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_gmsh_pipe_mesh_study.ps1 -OpenFoamSteps 1000
+powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_gmsh_pipe_mesh_study.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_gmsh_pipe_mesh_study.ps1 -OpenFoamSteps 1000
 ```
 
 If `gmsh.exe` is not on `PATH`, pass a trusted installation explicitly with
 `-GmshExe <path-to-gmsh.exe>`. FerrumCFD does not auto-execute a same-named
 binary discovered in Downloads.
 
-The intended validation order is:
+The historical validation order was:
 
 - generate several Gmsh meshes
 - run OpenFOAM on the imported meshes and compare pressure loss to
   Hagen-Poiseuille
 - select the converged reference mesh
 - run the FerrumCFD Poiseuille benchmark on exactly that mesh
-- use the selected mesh later for the full pressure-velocity and heat-transfer
-  solvers
+- hand the selected mesh to the later pressure-velocity work
 
-The generated OpenFOAM cases and reports stay below `target/benchmarks/`.
+Current SIMPLE mesh refinement uses
+`validation/scripts/incompressibleFluid/run_laminar_simple_mesh_study.ps1`.
+The historical generated OpenFOAM cases and reports stay below
+`target/benchmarks/`.
 They are not part of the normal FerrumCFD workflow. Increase `-OpenFoamSteps`
 when fine OpenFOAM cases still have moving SIMPLE residuals.
 The current local Gmsh pipe mesh-study record is summarized in
 `docs/benchmarks/gmsh-pipe-mesh-study.md`.
 
-`scripts\run_poiseuille_benchmark.ps1` runs OpenFOAM Foundation 13
+`validation\scripts\incompressibleFluid\run_poiseuille_benchmark.ps1` runs OpenFOAM Foundation 13
 `foamRun -solver incompressibleFluid`, runs
 `ferrumSolver --solvePoiseuille`, compares both with Hagen-Poiseuille, and
 writes `target/benchmarks/laminar_pipe_compare.json` plus
@@ -504,24 +514,45 @@ writes `target/benchmarks/laminar_pipe_compare.json` plus
 -UseExistingOpenFoamJson` when only the Ferrum side should be rerun against an
 existing OpenFOAM result.
 
-## Solver Preflight
+## Solver Selection And Preflight
 
-`ferrumSolver` is the solver front door. Its `--preflight` and
+`ferrumRun` is the solver front door. Its `--preflight` and
 `--runnerDryRun` modes do not execute CFD kernels; they read the case and print
 the solver-neutral run plan used by current CPU and later GPU solver paths.
 
 ```powershell
-ferrumSolver -case cases\my_case --preflight
-ferrumSolver -case cases\my_case --preflight --planJson target\ferrumSolverPlan.json
-ferrumSolver -case cases\my_case --runnerDryRun --maxRunnerSteps 2
-ferrumSolver -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solveScalarDiffusion T --diffusivity 1 --linearSolver cg
-ferrumSolver -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solvePoiseuille --linearSolver cg
+ferrumRun -solver incompressibleFluid -case cases\my_case --preflight
+ferrumRun -solver incompressibleFluid -case cases\my_case --preflight --planJson target\ferrumRunPlan.json
+ferrumRun -solver incompressibleFluid -case cases\my_case --runnerDryRun --maxRunnerSteps 2
+```
+
+The solver may instead be selected in `system/controlDict`:
+
+```text
+application ferrumRun;
+solver incompressibleFluid;
+```
+
+Control-dictionary fallback is accepted only with the explicit
+`application ferrumRun;` marker, so a sibling OpenFOAM case is not silently
+adopted as a Ferrum case. An explicit CLI `-solver` is the deliberate
+interoperability override. Plan JSON keeps the raw control values and records
+the effective dispatch separately as `dispatch.module` and
+`dispatch.source=cli|controlDict`.
+
+The following low-level compatibility commands remain useful to solver
+developers and validation automation, but they are not the public naming
+contract:
+
+```powershell
+ferrumSolver -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --solveScalarDiffusion T --diffusivity 1 --linearSolver cg
+ferrumSolver -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --solvePoiseuille --linearSolver cg
 ```
 
 Equivalent combined command:
 
 ```powershell
-ferrum solve -case cases\my_case --preflight --planJson target\ferrumSolverPlan.json
+ferrum run -solver incompressibleFluid -case cases\my_case --preflight --planJson target\ferrumRunPlan.json
 ```
 
 The preflight reads:
@@ -600,7 +631,7 @@ It reads the selected `volScalarField` from `0/`, converts supported
 system, and solves it with `cg` or `jacobi`:
 
 ```powershell
-ferrumSolver -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solveScalarDiffusion T --diffusivity 1 --linearSolver cg --solveTolerance 1e-8 --maxIterations 20000
+ferrumSolver -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --solveScalarDiffusion T --diffusivity 1 --linearSolver cg --solveTolerance 1e-8 --maxIterations 20000
 ```
 
 Supported field boundary types for this path are currently `fixedValue uniform
@@ -621,7 +652,7 @@ benchmark-oriented. `deltaP`, `L`, and `D` must be supplied explicitly;
 `mu` may be explicit or read from `constant/transportProperties`:
 
 ```powershell
-ferrumSolver -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solvePoiseuille --pressureDrop 1.6032 --mu 0.001002 --length 1 --diameter 0.02 --wallPatch wall --linearSolver cg
+ferrumSolver -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --solvePoiseuille --pressureDrop 1.6032 --mu 0.001002 --length 1 --diameter 0.02 --wallPatch wall --linearSolver cg
 ```
 
 The analytical reference is Hagen-Poiseuille:
@@ -636,8 +667,9 @@ relative error, flow rate, reconstructed pressure drop, solver iterations,
 residual, and wall-clock seconds. It does not write velocity or pressure fields
 back to the case.
 
-`--solveLaminarSimple` is the first laminar incompressible pressure-velocity
-path. It reads the OpenFOAM-like case dictionaries and fields that a
+`incompressibleFluid` is the first public pressure-velocity module. Its
+current executable path is steady laminar SIMPLE and reads the OpenFOAM-like
+case dictionaries and fields that a
 `simpleFoam` user expects:
 
 - `0/U`
@@ -646,6 +678,11 @@ path. It reads the OpenFOAM-like case dictionaries and fields that a
 - `system/fvSchemes`
 - `system/fvSolution`
 - `constant/polyMesh`
+
+Execution requires `ddtSchemes.default=steadyState`, exactly one `SIMPLE`
+section, no `PISO`/`PIMPLE` section, and a laminar transport regime. A present
+`momentumTransport` or legacy `turbulenceProperties` dictionary must contain
+exactly `simulationType laminar`; RAS/LES cases are rejected.
 
 It builds the first finite-volume flow operators on the runtime mesh:
 `phi = U_f . S_f`, `grad(p)`, `div(phi,U)`, and `laplacian(nu,U)`. The SIMPLE
@@ -678,27 +715,33 @@ boundary-condition contract is:
 Current practical command:
 
 ```powershell
-ferrumSolver -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solveLaminarSimple --solveTolerance 1e-6 --maxIterations 100 --solveReportJson target\benchmarks\laminar_pipe_laminar_simple.json --solveReportMarkdown target\benchmarks\laminar_pipe_laminar_simple.md
-ferrumSolver -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solveLaminarSimple --maxSimpleIterations 2 --writeFinalFields target\benchmarks\laminar_pipe_fields\1
-ferrumPipeBenchmark -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --fields target\benchmarks\laminar_pipe_fields\1 --pressureDrop 1.6032 --mu 0.001002 --length 1 --diameter 0.02 --axis x --inletPatch inlet --outletPatch outlet --outJson target\benchmarks\laminar_pipe_fields\1.pipe.json
+ferrumRun -solver incompressibleFluid -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --solveTolerance 1e-6 --maxIterations 100 --solveReportJson target\benchmarks\laminar_pipe_laminar_simple.json --solveReportMarkdown target\benchmarks\laminar_pipe_laminar_simple.md
+ferrumRun -solver incompressibleFluid -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --maxSimpleIterations 2 --writeFinalFields target\benchmarks\laminar_pipe_fields\1
+ferrumPipeBenchmark -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --fields target\benchmarks\laminar_pipe_fields\1 --pressureDrop 1.6032 --mu 0.001002 --length 1 --diameter 0.02 --axis x --inletPatch inlet --outletPatch outlet --outJson target\benchmarks\laminar_pipe_fields\1.pipe.json
 ```
+
+Solver report schema version 2 records `solver=incompressibleFluid`,
+`algorithm=SIMPLE`, `regime=laminar`, and the internal
+`implementation=laminarSimple` separately. `legacySolver=laminarSimple` is
+retained as an explicit migration field.
 
 The first two commands are geometry-independent SIMPLE execution. The third is
 optional external post-processing of stored fields. `--pressureDrop`, `--length`,
 `--diameter`, `--axis`, and the sampling patch names are intentionally rejected
-by `--solveLaminarSimple`; they belong only to `ferrumPipeBenchmark`.
+by the generic `incompressibleFluid` execution path; they belong only to
+`ferrumPipeBenchmark`.
 
 The generic `--linearSolver` value is still accepted, but the laminar SIMPLE
 path can also split the linear solver choice and linear controls by equation:
 
 ```powershell
-ferrumSolver -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solveLaminarSimple --momentumLinearSolver bicgstab --pressureLinearSolver pcg --pressurePreconditioner DIC --maxSimpleIterations 20
-ferrumSolver -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solveLaminarSimple --momentumSolveTolerance 1e-7 --pressureSolveTolerance 1e-9 --momentumMaxIterations 300 --pressureMaxIterations 400
-ferrumSolver -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solveLaminarSimple --nNonOrthogonalCorrectors 1 --pRefCell 0 --pRefValue 0
-ferrumSolver -case tutorials\steadyIncompressible\laminarPipe\ferrum\case --solveLaminarSimple --simpleConsistent true --maxSimpleIterations 20
+ferrumRun -solver incompressibleFluid -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --momentumLinearSolver bicgstab --pressureLinearSolver pcg --pressurePreconditioner DIC --maxSimpleIterations 20
+ferrumRun -solver incompressibleFluid -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --momentumSolveTolerance 1e-7 --pressureSolveTolerance 1e-9 --momentumMaxIterations 300 --pressureMaxIterations 400
+ferrumRun -solver incompressibleFluid -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --nNonOrthogonalCorrectors 1 --pRefCell 0 --pRefValue 0
+ferrumRun -solver incompressibleFluid -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --simpleConsistent true --maxSimpleIterations 20
 ```
 
-By default, `--solveLaminarSimple` reads OpenFOAM-style relaxation factors from
+By default, the current SIMPLE implementation reads OpenFOAM-style relaxation factors from
 `system/fvSolution`: `relaxationFactors.equations.U` for velocity and
 `relaxationFactors.fields.p` for pressure. The CLI flags above are explicit
 overrides for experiments. It also reads `solvers.U.tolerance`,
@@ -755,7 +798,7 @@ external benchmark scripts; they cannot stop, cap, roll back, or force a flow
 direction in the generic solver. `minSimpleIterations` can still be set as a
 case-level `SIMPLE` value.
 
-Without `--writeFinalFields`, `--solveLaminarSimple` only reports and does not
+Without `--writeFinalFields`, the current `incompressibleFluid` SIMPLE path only reports and does not
 write fields back to the case. With `--writeFinalFields <dir>`, Ferrum writes
 final `U` and `p` files into the selected OpenFOAM-like time directory. The
 internal fields come from the solved cell values, while the dimensions and
@@ -807,18 +850,18 @@ parallel-plate case. It reads stored `U`/`p`, applies
 simulation. Use `--pressureScale <rho>` only when post-processing OpenFOAM's
 kinematic incompressible pressure; Ferrum fields remain SI Pa by default. The
 reference `.geo`, case dictionaries, and SI inputs are under
-`tutorials/steadyIncompressible/planeChannel/`.
+`tutorials/incompressibleFluid/planeChannel/`.
 
 For the standard pipe benchmark, the automated comparison command is:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_poiseuille_benchmark.ps1 -OpenFoamSteps 200
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_simple_matched_time_benchmark.ps1 -MatchedTimeSeconds 100
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_openfoam_laminar_pipe_step_sweep.ps1 -OpenFoamSteps 100,200,400,800,1200 -TargetRelativeError 0.01
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_simple_benchmark.ps1 -SkipOpenFoam -UseExistingOpenFoamJson
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_simple_iteration_sweep.ps1 -SimpleIterations 2,5,10,20,30
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_simple_mesh_study.ps1 -OpenFoamSteps 400 -FerrumSimpleIterations 100
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_simple_pressure_sweep.ps1 -VariantName medium,fine -SimpleIterations 50,100,200
+powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_poiseuille_benchmark.ps1 -OpenFoamSteps 200
+powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_laminar_simple_matched_time_benchmark.ps1 -MatchedTimeSeconds 100
+powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_openfoam_laminar_pipe_step_sweep.ps1 -OpenFoamSteps 100,200,400,800,1200 -TargetRelativeError 0.01
+powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_laminar_simple_benchmark.ps1 -SkipOpenFoam -UseExistingOpenFoamJson
+powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_laminar_simple_iteration_sweep.ps1 -SimpleIterations 2,5,10,20,30
+powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_laminar_simple_mesh_study.ps1 -OpenFoamSteps 400 -FerrumSimpleIterations 100
+powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_laminar_simple_pressure_sweep.ps1 -VariantName medium,fine -SimpleIterations 50,100,200
 ```
 
 The resulting Markdown tables record Ferrum pressure-loss error, OpenFOAM
@@ -1061,9 +1104,9 @@ consumed by built-in solver code.
   OpenFOAM schemes and solver controls are still future work.
 - Constant property dictionaries are parsed structurally; solver-specific
   required material models and coefficients are not enforced yet.
-- `ferrumSolver` is currently a preflight/run planner; `--runnerDryRun`
+- `ferrumRun` is the public preflight/run dispatcher; `--runnerDryRun`
   previews scheduling only. `--solveScalarDiffusion <field>` and
-  `--solvePoiseuille` can each execute one CPU equation solve, but full CFD
-  time-loop execution is not implemented yet.
+  `--solvePoiseuille` remain low-level `ferrumSolver` compatibility modes, and
+  full general CFD time-loop execution is not implemented yet.
 - CPU/GPU backend selection is validated as configuration and not yet
   executable solver behavior.

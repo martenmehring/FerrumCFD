@@ -13,9 +13,13 @@ Cargo as the Rust build system.
 applications/
   solvers/
     ferrumRun/
-    ferrumMultiRun/          # later
+    ferrumMultiRun/
   modules/
+    incompressibleFluid/
   utilities/
+    mesh/
+    case/
+    postProcessing/
 src/
   ferrumCore/
   ferrumMesh/
@@ -24,7 +28,7 @@ src/
   openfoamIO/                # interoperability only
   ferrumModels/
 tutorials/
-  <driver>/
+  incompressibleFluid/
     <case>/
       shared/
       ferrum/
@@ -34,6 +38,7 @@ tutorials/
       comparison.toml
       README.md
 validation/
+  scripts/
 test/
 docs/
 target/                      # generated and ignored
@@ -54,11 +59,87 @@ contains a documented independent reference with provenance, units, sampling,
 and tolerances. Empty or invented analytical references are forbidden.
 
 The first layout migration places the reusable mesh/finite-volume foundation
-under `src/ferrumMesh` and the still-combined executable package under
-`applications/legacy/ferrumCli`. The legacy package remains executable while
-`ferrumRun`, solver modules, and utilities are split into their final
-directories. This staged move preserves a buildable workspace throughout the
-architecture transition.
+under `src/ferrumMesh` and the still-combined implementation package under
+`applications/legacy/ferrumCli`. The canonical `ferrumRun` executable crate
+already lives at `applications/solvers/ferrumRun` and delegates to that legacy
+library. Solver modules and utilities move behind their permanent boundaries
+only with behavior-parity tests. This staged move preserves a buildable
+workspace throughout the architecture transition.
+
+## Public Runner And Module Naming
+
+The public single-region command is:
+
+```text
+ferrumRun -solver incompressibleFluid -case <case>
+```
+
+This mirrors the OpenFOAM 13 runtime-module boundary. `incompressibleFluid` is
+the equation-family module name. `laminar` is a physical-model regime and
+SIMPLE, SIMPLEC, PISO, and PIMPLE are coupling algorithms selected by case
+configuration. None of them should be baked into a permanent executable or
+module name.
+
+The current `ferrumRun` command dispatches the existing steady laminar SIMPLE
+kernel only when `ddtSchemes.default=steadyState`, exactly one `SIMPLE` section
+exists, and no competing `PISO` or `PIMPLE` section is present. It rejects
+transient execution until those algorithms exist. Existing Ferrum compatibility
+cases without a transport-regime dictionary are treated as laminar; when
+`momentumTransport` or legacy `turbulenceProperties` is present, it must set
+exactly `simulationType laminar`. RAS/LES is rejected instead of silently
+running the wrong kernel. `ferrumSolver --solveLaminarSimple` remains available
+only as a temporary compatibility and low-level benchmark interface during the
+staged split.
+
+Drivers 1 and 2 are separate validation/readiness gates, but both are served
+by the same `incompressibleFluid` module: Driver 1 validates steady
+SIMPLE/SIMPLEC and Driver 2 validates transient PISO/PIMPLE.
+
+## Single-Region And Multi-Region Runners
+
+`ferrumRun` owns one case, one region, and one selected solver module.
+`ferrumMultiRun` owns one coupled case with multiple named regions and one
+module per region. The latter follows OpenFOAM 13 `foamMultiRun`; it is not a
+batch launcher for unrelated cases or parameter sweeps.
+
+A future native control dictionary will express a mapping such as the
+following illustrative form. The actual thermal-fluid and solid-energy module
+names remain intentionally undecided until Drivers 3 and 6:
+
+```text
+regionSolvers
+{
+    fluidRegion    <thermal-fluid-module>;
+    wallRegion     <solid-energy-module>;
+}
+```
+
+`ferrumMultiRun` has no `-solver` option; every region-to-module selection
+comes from the case's region registry. It advances regions through a
+capability- and dependency-based phase graph covering mesh motion, model
+correction, momentum, energy, species, chemistry, pressure correction,
+VOF/interface advection, and post-solve work. Only independent region tasks may
+run concurrently. Transfers and synchronization barriers are placed at every
+actual data dependency, including coupled interface values needed before an
+energy, species, reaction, pressure, or phase-fraction step.
+
+The global time-step is the minimum of global/function constraints and the
+limits reported by active transient regions; steady regions do not contribute
+a transient stability limit. Mixed steady/transient region operation must be
+represented explicitly. Convergence is reached only when all participating
+region criteria pass.
+
+Both runners must use the same backend-neutral lifecycle and execution
+context. The resource contract distinguishes sockets, cores, worker threads,
+process ranks, and domain partitions; maps regions and partitions to ranks and
+GPU devices; defines halo/ghost and conservative interface exchange; and
+tracks a data-residency/transfer graph. It also includes GPU memory and queue
+selection, backend capability checks including required `f64` support,
+oversubscription prevention, per-region and per-stage backend choice, mixed
+CPU/GPU operation, multi-GPU placement, deterministic reductions,
+cancellation/error propagation, and conservation checks with stated
+tolerances. Independent cases and parameter studies will use a separate future
+batch/sweep tool so multi-region semantics remain clear.
 
 ## Native Ferrum And OpenFOAM Boundary
 
@@ -216,6 +297,11 @@ worker-thread budget FerrumCFD may use. For mixed CPU/GPU policies, the case
 should provide both CPU and GPU resource blocks so the solver can report where
 each major stage is intended to run.
 
+Those names are the current compatibility schema. Before distributed
+`ferrumMultiRun`, the native resource schema will use unambiguous `sockets`,
+`cores`, `workers`, `ranks`, and `partitions` fields while retaining a
+documented migration path from `cpus`/`coresPerCpu`.
+
 Backend policy validation should catch obvious configuration mistakes without
 blocking future physics modules. Known built-in sections such as `mesh`,
 `interfaces`, `flow`, `chemistry`, `heat`, and `species` can warn about
@@ -239,8 +325,8 @@ writing FerrumCFD benchmark JSON.
 
 ## Solver Preflight Boundary
 
-`ferrumSolver` currently builds a solver-neutral case plan instead of executing
-CFD kernels. This is intentional. The plan is the boundary between the
+`ferrumRun --preflight` currently builds a solver-neutral case plan without
+executing CFD kernels. The plan is the boundary between the
 OpenFOAM-like case layout and the future backend-specific solver runtime.
 The normal output is human-readable text; `--planJson <file>` writes the same
 plan as machine-readable JSON for future solver launchers, GUIs, benchmarks,
@@ -347,8 +433,9 @@ The solver stack should be written against backend-neutral data and execution
 traits:
 
 ```text
-ferrumRun dispatcher
-Application drivers
+ferrumRun / ferrumMultiRun dispatchers
+Shared module registry and solver lifecycle
+Application-driver readiness contracts
 Equation and coupling modules
 Physical models
 Finite-volume operators
@@ -357,10 +444,12 @@ Linear/nonlinear solvers
 Backend implementations: CPU, WGPU, CUDA, HIP
 ```
 
-The public solver portfolio consists of seven application drivers behind
-`ferrumRun`, not seven copied solver programs. Drivers compose reusable
-equation, coupling, and physical-model modules. A model required by several
-drivers has one implementation with driver-specific configuration.
+The public solver portfolio consists of seven application-driver readiness
+contracts behind a shared module registry, not seven copied solver programs.
+Single-region drivers run through `ferrumRun`; Driver 6 exercises coupled
+modules through `ferrumMultiRun`. Drivers compose reusable equation, coupling,
+and physical-model modules. A model required by several drivers has one
+implementation with driver-specific configuration.
 
 Physics code should express operations in terms of fields, operators, and
 solver steps. Backend implementations should decide where and how those
@@ -381,19 +470,20 @@ terms. Constraint patches such as `empty`, `wedge`, and `symmetryPlane` remain
 solver constraints rather than ordinary diffusive boundary faces. This assembly
 layer must stay separate from the linear solver implementation: equation code
 builds a system, while CPU/GPU backends decide how that system is solved.
-`ferrumSolver --solveScalarDiffusion <field>` is the first executable path
+The compatibility command `ferrumSolver --solveScalarDiffusion <field>` is the first executable path
 through that stack: it reads one scalar field, assembles one CPU system, solves
 it with CG or Jacobi, reports residual and wall-clock time, and deliberately
 does not write fields or enter the full CFD time loop.
 
-`ferrumSolver --solvePoiseuille` is the first flow benchmark path. It uses the
+The compatibility command `ferrumSolver --solvePoiseuille` is the first flow benchmark path. It uses the
 same scalar operator for the fully developed axial Stokes balance driven by
 `deltaP/L`, applies wall no-slip as `Ux=0`, compares the resulting volume
 average against Hagen-Poiseuille, and reports timing and residuals. This is a
 controlled bridge toward the later momentum-pressure solver; it is not yet a
 SIMPLE, PISO, or full Navier-Stokes implementation.
 
-`ferrumSolver --solveLaminarSimple` is the next bridge: it reads `U`, `p`,
+The implementation behind `ferrumRun -solver incompressibleFluid` is currently
+the legacy `ferrumSolver --solveLaminarSimple` bridge. It reads `U`, `p`,
 `transportProperties`, `fvSchemes`, and `fvSolution`, constructs the first flow
 operators on the same runtime `polyMesh` geometry, writes solver reports as
 JSON/Markdown, and can write final `U`/`p` fields into an explicitly selected

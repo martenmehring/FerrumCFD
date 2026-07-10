@@ -405,7 +405,8 @@ mod tests {
             case_dir: PathBuf::from("case"),
             control: ControlDict {
                 path: PathBuf::from("controlDict"),
-                application: "ferrumSolver".to_string(),
+                application: Some("ferrumRun".to_string()),
+                solver: Some("incompressibleFluid".to_string()),
                 start_from: "startTime".to_string(),
                 start_time: Some(0.0),
                 stop_at: "endTime".to_string(),
