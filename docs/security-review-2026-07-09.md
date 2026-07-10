@@ -16,7 +16,7 @@ Status meanings:
 | ---: | --- | --- | --- |
 | 0 | Solver preflight can exhaust memory on sparse cell labels | Fixed | `PolyMesh::validate` rejects overflowing, sparse, and non-dense labels before geometry or field allocation; regression test covers a billion-cell label. |
 | 1 | Property preflight can leak files via constant symlinks | Fixed | Property files and region directories are inspected without following symlinks; property symlinks are rejected. |
-| 2 | checkMesh now allocates from untrusted sparse cell labels | Fixed | Region and base-mesh label validation runs before cell-to-zone allocation. |
+| 2 | checkFerrumMesh now allocates from untrusted sparse cell labels | Fixed | Region and base-mesh label validation runs before cell-to-zone allocation. |
 | 3 | Unbounded non-orthogonal correctors can DoS solver | Policy | The `+ 1` overflow is checked. Iteration counts remain operator controls by design; services must enforce CPU/wall-time quotas. |
 | 4 | Laminar SIMPLE convergence ignores pressure-field drop | Fixed | Benchmark pressure-drop acceptance no longer participates in solver convergence. `converged=true` requires configured residual controls, continuity, and successful linear solves. |
 | 5 | Unbounded fvSolution maxIter enables CPU denial of service | Policy | `maxIter` is intentional numerical configuration, matching OpenFOAM behavior. Hosted execution must constrain cases or process resources rather than silently changing solver settings. |
@@ -30,11 +30,11 @@ Status meanings:
 | 13 | Unrestricted --planJson path can clobber writable files | Policy | An explicit CLI output path is expected local behavior. Hosted wrappers must supply an isolated approved output path. |
 | 14 | Quadratic fvSolution preflight can DoS untrusted cases | Fixed | Solver-field membership uses precomputed sets instead of repeated all-pairs scans. |
 | 15 | Unbounded recursive fvSchemes/fvSolution parsing can DoS | Fixed | Dictionary parsing rejects nesting beyond 128 levels; a regression test covers excessive nesting. |
-| 16 | Quadratic field-boundary validation can DoS checkMesh | Fixed | Boundary lookup uses a hash map, reducing matching to linear expected time. |
-| 17 | checkMesh panics on crafted polyMesh owner label | Fixed | Checked, dense cell-label validation precedes geometry allocation and indexing. |
+| 16 | Quadratic field-boundary validation can DoS checkFerrumMesh | Fixed | Boundary lookup uses a hash map, reducing matching to linear expected time. |
+| 17 | checkFerrumMesh panics on crafted polyMesh owner label | Fixed | Checked, dense cell-label validation precedes geometry allocation and indexing. |
 | 18 | Unbounded initial-field parsing can exhaust memory | Open | Field files are still read and tokenized completely, with additional owned token/value storage. Replace this with a streaming or load-policy-aware parser without imposing an arbitrary CFD field-size cap. |
 | 19 | Case initializer follows symlinks when writing templates | Fixed | Initializer directories and files use `symlink_metadata` and reject symlink targets, including with `--force`. |
-| 20 | checkMesh can be crashed by crafted region mesh counts | Fixed | List parsers validate the actual list before allocation and no longer reserve from an untrusted declared count. |
+| 20 | checkFerrumMesh can be crashed by crafted region mesh counts | Fixed | List parsers validate the actual list before allocation and no longer reserve from an untrusted declared count. |
 | 21 | Unbounded split-region parsing enables DoS | Fixed | Split parsing uses safe list allocation plus checked and bounded patch ranges. |
 | 22 | Unvalidated patch type injection in OpenFOAM writer | Fixed | The public writer validates every patch type as an OpenFOAM word before creating output; a syntax-injection regression test is present. |
 | 23 | Malformed Gmsh element tag count can panic parser | Fixed | Signed values use checked conversions and checked index arithmetic; a negative-tag-count test returns a parse error. |

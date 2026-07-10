@@ -51,9 +51,9 @@ if (!(Test-Path -LiteralPath $MeshFile)) {
     throw "gmsh did not write mesh file '$MeshFile'"
 }
 
-cargo run -p ferrum-cli --bin gmshToFerrumFoam -- $MeshFile -case $CaseRoot
+cargo run -p ferrum-cli --bin gmshToFerrum -- $MeshFile -case $CaseRoot
 if ($LASTEXITCODE -ne 0) {
-    throw "gmshToFerrumFoam failed with exit code $LASTEXITCODE"
+    throw "gmshToFerrum failed with exit code $LASTEXITCODE"
 }
 
 cargo run -p ferrum-cli --bin checkFerrumMesh -- -case $CaseRoot

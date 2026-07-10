@@ -36,7 +36,7 @@ The user-facing command flow should remain familiar:
 
 ```powershell
 initFerrumCase case
-gmshToFerrumFoam mesh.msh -case case
+gmshToFerrum mesh.msh -case case
 checkFerrumMesh -case case
 splitFerrumMeshRegions -case case -cellZones
 ferrumSolver -case case --preflight
@@ -512,5 +512,6 @@ positive direction.
 - [OpenFOAM numerical schemes](https://www.openfoam.com/documentation/user-guide/6-solving/6.2-numerical-schemes):
   `system/fvSchemes` as the user-facing dictionary for discretisation choices.
 - [OpenFOAM standard utilities](https://doc.cfd.direct/openfoam/user-guide-v13/standard-utilities):
-  reference names and workflow anchors such as `gmshToFoam`, `checkMesh`, and
-  `splitMeshRegions`.
+  upstream workflow references. FerrumCFD deliberately exposes the distinct
+  `gmshToFerrum`, `checkFerrumMesh`, and `splitFerrumMeshRegions` names instead
+  of reusing the OpenFOAM utility names.

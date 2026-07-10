@@ -23,7 +23,7 @@ pub fn read_case_summary(case_dir: &Path) -> Result<CaseSummary> {
     let summary_path = case_dir.join("constant").join("ferrumMeshSummary.txt");
     let content = fs::read_to_string(&summary_path).map_err(|error| {
         MeshError::InvalidInput(format!(
-            "could not read {}; run gmshToFerrumFoam first ({error})",
+            "could not read {}; run gmshToFerrum first ({error})",
             summary_path.display()
         ))
     })?;

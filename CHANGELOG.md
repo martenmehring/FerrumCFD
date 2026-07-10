@@ -6,6 +6,20 @@ are distinguished explicitly.
 
 ## Unreleased
 
+### Command Naming And Licensing - 2026-07-10
+
+- Added the repository-level MIT license.
+- Renamed the Gmsh importer from `gmshToFerrumFoam` to `gmshToFerrum`.
+- Removed the unbranded Ferrum aliases for the upstream-style `gmshToFoam`,
+  `checkMesh`, and `splitMeshRegions` names. Use `gmshToFerrum`,
+  `checkFerrumMesh`, and `splitFerrumMeshRegions` instead.
+- Standardized FerrumCFD's public command names on lowerCamelCase. Native
+  OpenFOAM utility names remain only in migration diagnostics or in
+  documentation and scripts that describe or execute the external OpenFOAM
+  benchmark toolchain.
+- Audited project-maintained documentation, comments, diagnostics, warnings,
+  and help text for English-language consistency.
+
 ### First Executable Flow Solver - 2026-07-10
 
 FerrumCFD now has its first independent finite-volume flow solver. The Rust

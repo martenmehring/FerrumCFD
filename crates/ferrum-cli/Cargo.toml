@@ -17,8 +17,8 @@ name = "ferrum"
 path = "src/main.rs"
 
 [[bin]]
-name = "gmshToFerrumFoam"
-path = "src/bin/gmsh_to_ferrum_foam.rs"
+name = "gmshToFerrum"
+path = "src/bin/gmsh_to_ferrum.rs"
 
 [[bin]]
 name = "checkFerrumMesh"

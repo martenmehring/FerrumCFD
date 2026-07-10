@@ -17,17 +17,18 @@ The debug binaries are written to:
 ```text
 target/debug/ferrum.exe
 target/debug/initFerrumCase.exe
-target/debug/gmshToFerrumFoam.exe
+target/debug/gmshToFerrum.exe
 target/debug/checkFerrumMesh.exe
 target/debug/splitFerrumMeshRegions.exe
 target/debug/ferrumSolver.exe
+target/debug/ferrumPipeBenchmark.exe
 target/debug/ferrumPlaneChannelBenchmark.exe
 ```
 
 During development, commands can also be run through Cargo:
 
 ```powershell
-cargo run -p ferrum-cli --bin gmshToFerrumFoam -- --help
+cargo run -p ferrum-cli --bin gmshToFerrum -- --help
 ```
 
 ## Initialize A Case
@@ -41,7 +42,7 @@ initFerrumCase cases\my_case
 Equivalent combined command:
 
 ```powershell
-ferrum initCase cases\my_case
+ferrum initFerrumCase cases\my_case
 ```
 
 For a multi-region case, region folders can be created immediately:
@@ -184,13 +185,13 @@ The first supported mesh path is Gmsh 2.2 ASCII with `tri3`/`quad4` physical
 surfaces and `prism6`/`hex8` physical volumes:
 
 ```powershell
-gmshToFerrumFoam path\to\mesh.msh -case cases\my_case
+gmshToFerrum path\to\mesh.msh -case cases\my_case
 ```
 
 Equivalent Cargo command:
 
 ```powershell
-cargo run -p ferrum-cli --bin gmshToFerrumFoam -- path\to\mesh.msh -case cases\my_case
+cargo run -p ferrum-cli --bin gmshToFerrum -- path\to\mesh.msh -case cases\my_case
 ```
 
 The importer maps:
@@ -276,8 +277,8 @@ The current checker reports:
 - topology warnings from import
 - field boundary entries against mesh patches
 
-This is not yet a full OpenFOAM-grade `checkMesh`, but it is the command that
-will grow into that role.
+This is not yet a full production-grade mesh validator, but `checkFerrumMesh`
+is the command that will grow into that role.
 
 Example geometry output:
 
@@ -337,7 +338,7 @@ FerrumCFD follows the OpenFOAM convention: a 2D case is represented as a thin
 Example:
 
 ```powershell
-gmshToFerrumFoam path\to\mesh2d.msh -case cases\plate2d -emptyPatch frontAndBack
+gmshToFerrum path\to\mesh2d.msh -case cases\plate2d -emptyPatch frontAndBack
 ```
 
 This writes:
@@ -365,7 +366,7 @@ two angular patches must be separate patches of type `wedge`.
 Example:
 
 ```powershell
-gmshToFerrumFoam path\to\axisymmetric.msh -case cases\reactor_axi -wedgePatch wedgeMin -wedgePatch wedgeMax
+gmshToFerrum path\to\axisymmetric.msh -case cases\reactor_axi -wedgePatch wedgeMin -wedgePatch wedgeMax
 ```
 
 Important solver rule: `wedge` must later be interpreted as an axisymmetric
@@ -378,7 +379,7 @@ patches is odd, because axisymmetric wedge patches normally come in pairs.
 OpenFOAM-compatible patch types can be assigned during import:
 
 ```powershell
-gmshToFerrumFoam path\to\mesh.msh -case cases\my_case -patchType symmetry=symmetryPlane
+gmshToFerrum path\to\mesh.msh -case cases\my_case -patchType symmetry=symmetryPlane
 ```
 
 Shortcuts:
@@ -391,26 +392,29 @@ Shortcuts:
 
 ## Combined CLI
 
-The `ferrum` binary exposes OpenFOAM-like subcommands:
+The `ferrum` binary exposes lowerCamelCase commands. Utilities inspired by an
+OpenFOAM workflow include `Ferrum` in their name so that FerrumCFD commands are
+unambiguous:
 
 ```powershell
-ferrum initCase cases\my_case
-ferrum gmshToFoam path\to\mesh.msh -case cases\my_case
-ferrum checkMesh -case cases\my_case
-ferrum splitMeshRegions -case cases\my_case -cellZones
+ferrum initFerrumCase cases\my_case
+ferrum gmshToFerrum path\to\mesh.msh -case cases\my_case
+ferrum checkFerrumMesh -case cases\my_case
+ferrum splitFerrumMeshRegions -case cases\my_case -cellZones
 ferrum solve -case cases\my_case --preflight --planJson target\ferrumSolverPlan.json
 ferrum solve -case cases\my_case --runnerDryRun --maxRunnerSteps 2
 ```
 
-The dedicated aliases remain available because they are closer to OpenFOAM
-muscle memory:
+The same naming convention is used by the dedicated binaries:
 
 ```powershell
 initFerrumCase
-gmshToFerrumFoam
+gmshToFerrum
 checkFerrumMesh
 splitFerrumMeshRegions
 ferrumSolver
+ferrumPipeBenchmark
+ferrumPlaneChannelBenchmark
 ```
 
 ## Units Policy
