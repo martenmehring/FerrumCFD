@@ -38,6 +38,7 @@ pub enum FieldValueSummary {
 pub struct FieldBoundaryPatch {
     pub name: String,
     pub patch_type: Option<String>,
+    pub inlet_value: Option<FieldValueSummary>,
     pub value: Option<FieldValueSummary>,
 }
 
@@ -89,7 +90,8 @@ pub fn read_initial_fields(case_dir: &Path) -> Result<InitialFieldSet> {
     for entry in fs::read_dir(&fields_dir)? {
         let entry = entry?;
         let path = entry.path();
-        if !path.is_dir() {
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() || !file_type.is_dir() {
             continue;
         }
 
@@ -104,6 +106,29 @@ pub fn read_initial_fields(case_dir: &Path) -> Result<InitialFieldSet> {
             .then(left.path.cmp(&right.path))
     });
 
+    Ok(InitialFieldSet {
+        case_dir: case_dir.to_path_buf(),
+        fields,
+    })
+}
+
+pub fn read_fields_from_directory(case_dir: &Path, fields_dir: &Path) -> Result<InitialFieldSet> {
+    let metadata = fs::symlink_metadata(fields_dir).map_err(|error| {
+        MeshError::InvalidInput(format!(
+            "could not inspect field directory {} ({error})",
+            fields_dir.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(MeshError::InvalidInput(format!(
+            "field directory must be a real directory, not a symlink: {}",
+            fields_dir.display()
+        )));
+    }
+
+    let mut fields = Vec::new();
+    read_field_files_in_dir(fields_dir, None, &mut fields)?;
+    fields.sort_by(|left, right| left.name.cmp(&right.name).then(left.path.cmp(&right.path)));
     Ok(InitialFieldSet {
         case_dir: case_dir.to_path_buf(),
         fields,
@@ -133,7 +158,14 @@ fn read_field_files_in_dir(
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if !path.is_file() {
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(MeshError::InvalidInput(format!(
+                "initial field symlinks are not allowed: {}",
+                path.display()
+            )));
+        }
+        if !file_type.is_file() {
             continue;
         }
 
@@ -255,6 +287,7 @@ fn parse_boundary_field(cursor: &mut TokenCursor) -> Result<Vec<FieldBoundaryPat
 
 fn parse_boundary_patch(cursor: &mut TokenCursor, name: String) -> Result<FieldBoundaryPatch> {
     let mut patch_type = None;
+    let mut inlet_value = None;
     let mut value = None;
 
     while !cursor.peek_is("}")? {
@@ -268,6 +301,11 @@ fn parse_boundary_patch(cursor: &mut TokenCursor, name: String) -> Result<FieldB
                     cursor.read_value_until_semicolon()?,
                 ));
             }
+            "inletValue" => {
+                inlet_value = Some(parse_field_value_tokens(
+                    cursor.read_value_until_semicolon()?,
+                ));
+            }
             _ => cursor.skip_value_or_block()?,
         }
     }
@@ -276,6 +314,7 @@ fn parse_boundary_patch(cursor: &mut TokenCursor, name: String) -> Result<FieldB
     Ok(FieldBoundaryPatch {
         name,
         patch_type,
+        inlet_value,
         value,
     })
 }
@@ -323,6 +362,9 @@ fn parse_nonuniform_numeric_values(
     for token in &tokens[start_index..] {
         if matches!(token.as_str(), "(" | ")" | "[" | "]") {
             continue;
+        }
+        if values.len() == expected_values {
+            return None;
         }
         values.push(token.parse::<f64>().ok()?);
     }
@@ -407,19 +449,16 @@ impl<'a> FieldBoundaryValidator<'a> {
 
 fn validate_field_boundary_patches(field: &FieldFile, mesh: &PolyMesh, warnings: &mut Vec<String>) {
     let field_label = field_label(field);
-    let field_patch_names = field
-        .boundary_patches
-        .iter()
-        .map(|patch| patch.name.as_str())
-        .collect::<Vec<_>>();
+    let mut field_patches = HashMap::with_capacity(field.boundary_patches.len());
     let mut seen = HashSet::new();
-    for name in &field_patch_names {
-        if !seen.insert(*name) {
+    for patch in &field.boundary_patches {
+        if !seen.insert(patch.name.as_str()) {
             warnings.push(format!(
                 "field '{}' has duplicate boundaryField entry '{}'",
-                field_label, name
+                field_label, patch.name
             ));
         }
+        field_patches.entry(patch.name.as_str()).or_insert(patch);
     }
 
     let mesh_patch_names = mesh
@@ -428,11 +467,7 @@ fn validate_field_boundary_patches(field: &FieldFile, mesh: &PolyMesh, warnings:
         .map(|patch| patch.name.as_str())
         .collect::<HashSet<_>>();
     for patch in &mesh.patches {
-        let field_patch = field
-            .boundary_patches
-            .iter()
-            .find(|field_patch| field_patch.name == patch.name);
-        let Some(field_patch) = field_patch else {
+        let Some(field_patch) = field_patches.get(patch.name.as_str()).copied() else {
             warnings.push(format!(
                 "field '{}' is missing boundaryField entry for mesh patch '{}'",
                 field_label, patch.name
@@ -566,6 +601,38 @@ mod tests {
     }
 
     #[test]
+    fn parses_inlet_value_boundary_entry() {
+        let content = r#"
+        FoamFile
+        {
+            class volVectorField;
+            object U;
+        }
+
+        dimensions [0 1 -1 0 0 0 0];
+        internalField uniform (0 0 0);
+        boundaryField
+        {
+            outlet
+            {
+                type inletOutlet;
+                inletValue uniform (1 0 0);
+                value uniform (0 0 0);
+            }
+        }
+        "#;
+
+        let field = parse_field_file_str(content, Path::new("0/U"), None).unwrap();
+        let patch = &field.boundary_patches[0];
+
+        assert_eq!(patch.patch_type.as_deref(), Some("inletOutlet"));
+        match patch.inlet_value.as_ref().expect("inletValue") {
+            FieldValueSummary::Uniform(value) => assert_eq!(value, "( 1 0 0 )"),
+            other => panic!("unexpected inlet value: {other:?}"),
+        }
+    }
+
+    #[test]
     fn parses_nonuniform_summary() {
         let content = r#"
         FoamFile
@@ -637,16 +704,37 @@ mod tests {
     }
 
     #[test]
+    fn rejects_nonuniform_numeric_tail_beyond_declared_count() {
+        let content = r#"
+        FoamFile { class volScalarField; object p; }
+        internalField nonuniform List<scalar> 1 ( 1 2 3 );
+        boundaryField { }
+        "#;
+
+        let field = parse_field_file_str(content, Path::new("0/p"), None).unwrap();
+
+        match field.internal_field {
+            Some(FieldValueSummary::NonUniform { count, values, .. }) => {
+                assert_eq!(count, Some(1));
+                assert_eq!(values, None);
+            }
+            other => panic!("unexpected field value: {other:?}"),
+        }
+    }
+
+    #[test]
     fn validates_special_field_patch_types() {
         let field = test_field(vec![
             FieldBoundaryPatch {
                 name: "inlet".to_string(),
                 patch_type: Some("fixedValue".to_string()),
+                inlet_value: None,
                 value: None,
             },
             FieldBoundaryPatch {
                 name: "front".to_string(),
                 patch_type: Some("empty".to_string()),
+                inlet_value: None,
                 value: None,
             },
         ]);
@@ -677,11 +765,13 @@ mod tests {
             FieldBoundaryPatch {
                 name: "front".to_string(),
                 patch_type: Some("zeroGradient".to_string()),
+                inlet_value: None,
                 value: None,
             },
             FieldBoundaryPatch {
                 name: "unused".to_string(),
                 patch_type: Some("patch".to_string()),
+                inlet_value: None,
                 value: None,
             },
         ]);

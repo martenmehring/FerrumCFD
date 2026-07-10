@@ -147,11 +147,16 @@ pub fn assemble_scalar_diffusion_system(
     validate_diffusion_input(mesh, options)?;
 
     let mut rows = vec![BTreeMap::<usize, f64>::new(); mesh.cells];
-    let mut rhs = mesh
-        .cell_volumes
-        .iter()
-        .map(|volume| options.source * volume)
-        .collect::<Vec<_>>();
+    let mut rhs = Vec::with_capacity(mesh.cell_volumes.len());
+    for (cell, volume) in mesh.cell_volumes.iter().copied().enumerate() {
+        let value = options.source * volume;
+        if !value.is_finite() {
+            return Err(invalid_input(format!(
+                "scalar diffusion source contribution is not finite for cell {cell}"
+            )));
+        }
+        rhs.push(value);
+    }
     let boundary_conditions = boundary_conditions_by_face(mesh, options)?;
     let mut stats = ScalarDiffusionAssemblyStats {
         cells: mesh.cells,
@@ -169,10 +174,10 @@ pub fn assemble_scalar_diffusion_system(
                 mesh.cell_centres[neighbour],
                 face_index,
             )?;
-            add_entry(&mut rows[owner], owner, coefficient);
-            add_entry(&mut rows[owner], neighbour, -coefficient);
-            add_entry(&mut rows[neighbour], neighbour, coefficient);
-            add_entry(&mut rows[neighbour], owner, -coefficient);
+            add_entry(&mut rows[owner], owner, coefficient, owner)?;
+            add_entry(&mut rows[owner], neighbour, -coefficient, owner)?;
+            add_entry(&mut rows[neighbour], neighbour, coefficient, neighbour)?;
+            add_entry(&mut rows[neighbour], owner, -coefficient, neighbour)?;
             stats.internal_faces += 1;
             stats.record_coefficient(coefficient);
             continue;
@@ -187,8 +192,15 @@ pub fn assemble_scalar_diffusion_system(
                     mesh.face_centres[face_index],
                     face_index,
                 )?;
-                add_entry(&mut rows[owner], owner, coefficient);
-                rhs[owner] += coefficient * value;
+                add_entry(&mut rows[owner], owner, coefficient, owner)?;
+                let contribution = coefficient * value;
+                let updated_rhs = rhs[owner] + contribution;
+                if !contribution.is_finite() || !updated_rhs.is_finite() {
+                    return Err(invalid_input(format!(
+                        "scalar diffusion fixedValue contribution is not finite for face {face_index}"
+                    )));
+                }
+                rhs[owner] = updated_rhs;
                 stats.fixed_value_faces += 1;
                 stats.record_coefficient(coefficient);
             }
@@ -429,11 +441,29 @@ fn face_diffusion_coefficient(
             "face {face_index} has non-positive diffusion distance {distance}"
         )));
     }
-    Ok(diffusivity * area / distance)
+    let coefficient = diffusivity * area / distance;
+    if !coefficient.is_finite() {
+        return Err(invalid_input(format!(
+            "face {face_index} diffusion coefficient is not finite"
+        )));
+    }
+    Ok(coefficient)
 }
 
-fn add_entry(row: &mut BTreeMap<usize, f64>, col: usize, value: f64) {
-    *row.entry(col).or_insert(0.0) += value;
+fn add_entry(
+    row: &mut BTreeMap<usize, f64>,
+    col: usize,
+    value: f64,
+    row_index: usize,
+) -> Result<()> {
+    let updated = row.get(&col).copied().unwrap_or(0.0) + value;
+    if !value.is_finite() || !updated.is_finite() {
+        return Err(invalid_input(format!(
+            "scalar diffusion matrix coefficient is not finite at row {row_index}, column {col}"
+        )));
+    }
+    row.insert(col, updated);
+    Ok(())
 }
 
 fn magnitude(vector: Point3) -> f64 {
@@ -584,6 +614,29 @@ mod tests {
     }
 
     #[test]
+    fn rejects_non_finite_source_contribution() {
+        let mut mesh = two_cell_line_mesh();
+        mesh.cell_volumes[0] = 2.0;
+
+        let error = assemble_scalar_diffusion_system(
+            &mesh,
+            &ScalarDiffusionOptions {
+                diffusivity: 1.0,
+                source: f64::MAX,
+                default_boundary: ScalarBoundaryCondition::ZeroGradient,
+                patch_boundary_conditions: Vec::new(),
+            },
+        )
+        .expect_err("overflowing source contribution must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("source contribution is not finite")
+        );
+    }
+
+    #[test]
     fn treats_empty_wedge_and_symmetry_as_constraints() {
         for patch_type in ["empty", "wedge", "symmetryPlane"] {
             let mut mesh = two_cell_line_mesh();
@@ -633,16 +686,19 @@ mod tests {
             FieldBoundaryPatch {
                 name: "inlet".to_string(),
                 patch_type: Some("fixedValue".to_string()),
+                inlet_value: None,
                 value: Some(FieldValueSummary::Uniform("293.15".to_string())),
             },
             FieldBoundaryPatch {
                 name: "outlet".to_string(),
                 patch_type: Some("zeroGradient".to_string()),
+                inlet_value: None,
                 value: None,
             },
             FieldBoundaryPatch {
                 name: "front".to_string(),
                 patch_type: Some("empty".to_string()),
+                inlet_value: None,
                 value: None,
             },
         ]);
@@ -668,6 +724,7 @@ mod tests {
         let field = scalar_field(vec![FieldBoundaryPatch {
             name: "wall".to_string(),
             patch_type: Some("fixedValue".to_string()),
+            inlet_value: None,
             value: Some(FieldValueSummary::Uniform("( 1 0 0 )".to_string())),
         }]);
 

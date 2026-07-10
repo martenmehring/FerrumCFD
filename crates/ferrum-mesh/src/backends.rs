@@ -318,6 +318,12 @@ fn parse_backend_entries(
         }
         parse_backend_entry(cursor, builder)?;
     }
+    if stop_at_close {
+        return Err(MeshError::InvalidInput(format!(
+            "missing closing '}}' for ferrumBackends block in {}",
+            cursor.path().display()
+        )));
+    }
     Ok(())
 }
 
@@ -699,6 +705,15 @@ mod tests {
         assert_eq!(config.default, BackendChoice::Auto);
         assert_eq!(config.sections[0].name, "flow");
         assert_eq!(config.sections[0].entries[0].choice, BackendChoice::Gpu);
+    }
+
+    #[test]
+    fn rejects_unclosed_outer_ferrum_backends_block() {
+        let error =
+            parse_backend_config_str("ferrumBackends { default cpu;", Path::new("ferrumBackends"))
+                .expect_err("missing closing brace must fail");
+
+        assert!(error.to_string().contains("missing closing"));
     }
 
     #[test]

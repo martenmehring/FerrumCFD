@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use crate::{MeshError, Result};
 
 #[derive(Clone, Debug)]
@@ -13,15 +15,25 @@ pub struct CsrMatrix {
 pub struct LinearSolverCapabilities {
     pub cpu_csr: bool,
     pub cpu_jacobi: bool,
+    pub cpu_gauss_seidel: bool,
+    pub cpu_symmetric_gauss_seidel: bool,
     pub cpu_conjugate_gradient: bool,
     pub cpu_preconditioned_conjugate_gradient: bool,
     pub cpu_bicgstab: bool,
     pub cpu_diagonal_preconditioner: bool,
+    pub cpu_incomplete_cholesky_preconditioner: bool,
     pub gpu_linear_solvers: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct JacobiOptions {
+    pub max_iterations: usize,
+    pub tolerance: f64,
+    pub omega: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct GaussSeidelOptions {
     pub max_iterations: usize,
     pub tolerance: f64,
     pub omega: f64,
@@ -37,6 +49,7 @@ pub struct ConjugateGradientOptions {
 pub enum CgPreconditioner {
     None,
     Diagonal,
+    IncompleteCholesky,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -193,6 +206,16 @@ impl Default for JacobiOptions {
     }
 }
 
+impl Default for GaussSeidelOptions {
+    fn default() -> Self {
+        Self {
+            max_iterations: 1_000,
+            tolerance: 1.0e-10,
+            omega: 1.0,
+        }
+    }
+}
+
 impl Default for ConjugateGradientOptions {
     fn default() -> Self {
         Self {
@@ -226,10 +249,13 @@ pub fn linear_solver_capabilities() -> LinearSolverCapabilities {
     LinearSolverCapabilities {
         cpu_csr: true,
         cpu_jacobi: true,
+        cpu_gauss_seidel: true,
+        cpu_symmetric_gauss_seidel: true,
         cpu_conjugate_gradient: true,
         cpu_preconditioned_conjugate_gradient: true,
         cpu_bicgstab: true,
         cpu_diagonal_preconditioner: true,
+        cpu_incomplete_cholesky_preconditioner: true,
         gpu_linear_solvers: false,
     }
 }
@@ -270,9 +296,9 @@ pub fn jacobi_solve(
 
     let diagonal = matrix.diagonal()?;
     for (row, value) in diagonal.iter().enumerate() {
-        if *value == 0.0 {
+        if !value.is_finite() || *value == 0.0 {
             return Err(invalid_input(format!(
-                "row {row} has a zero diagonal entry"
+                "row {row} has an invalid Jacobi diagonal entry {value}"
             )));
         }
     }
@@ -303,6 +329,11 @@ pub fn jacobi_solve(
                 }
             }
             let raw = (rhs[row] - off_diagonal_sum) / diagonal[row];
+            if !raw.is_finite() {
+                return Err(invalid_input(format!(
+                    "Jacobi update for row {row} is not finite"
+                )));
+            }
             next[row] = (1.0 - options.omega) * x[row] + options.omega * raw;
         }
 
@@ -324,6 +355,147 @@ pub fn jacobi_solve(
         residual_norm,
         converged: false,
     })
+}
+
+pub fn gauss_seidel_solve(
+    matrix: &CsrMatrix,
+    rhs: &[f64],
+    initial: Option<&[f64]>,
+    options: GaussSeidelOptions,
+) -> Result<IterativeSolveReport> {
+    validate_iterative_solve_input(matrix, rhs, initial, options.tolerance)?;
+    if !options.omega.is_finite() || options.omega <= 0.0 {
+        return Err(invalid_input(format!(
+            "Gauss-Seidel omega must be positive and finite, got {}",
+            options.omega
+        )));
+    }
+
+    let mut x = initial
+        .map(|values| values.to_vec())
+        .unwrap_or_else(|| vec![0.0; rhs.len()]);
+    let mut residual_norm = l2_norm(&residual(matrix, &x, rhs)?);
+    if residual_norm <= options.tolerance {
+        return Ok(IterativeSolveReport {
+            solution: x,
+            iterations: 0,
+            residual_norm,
+            converged: true,
+        });
+    }
+
+    for iteration in 1..=options.max_iterations {
+        gauss_seidel_sweep(matrix, rhs, &mut x, options.omega, 0..matrix.rows)?;
+
+        residual_norm = l2_norm(&residual(matrix, &x, rhs)?);
+        if residual_norm <= options.tolerance {
+            return Ok(IterativeSolveReport {
+                solution: x,
+                iterations: iteration,
+                residual_norm,
+                converged: true,
+            });
+        }
+    }
+
+    Ok(IterativeSolveReport {
+        solution: x,
+        iterations: options.max_iterations,
+        residual_norm,
+        converged: false,
+    })
+}
+
+pub fn symmetric_gauss_seidel_solve(
+    matrix: &CsrMatrix,
+    rhs: &[f64],
+    initial: Option<&[f64]>,
+    options: GaussSeidelOptions,
+) -> Result<IterativeSolveReport> {
+    validate_iterative_solve_input(matrix, rhs, initial, options.tolerance)?;
+    if !options.omega.is_finite() || options.omega <= 0.0 {
+        return Err(invalid_input(format!(
+            "symmetric Gauss-Seidel omega must be positive and finite, got {}",
+            options.omega
+        )));
+    }
+
+    let mut x = initial
+        .map(|values| values.to_vec())
+        .unwrap_or_else(|| vec![0.0; rhs.len()]);
+    let mut residual_norm = l2_norm(&residual(matrix, &x, rhs)?);
+    if residual_norm <= options.tolerance {
+        return Ok(IterativeSolveReport {
+            solution: x,
+            iterations: 0,
+            residual_norm,
+            converged: true,
+        });
+    }
+
+    for iteration in 1..=options.max_iterations {
+        gauss_seidel_sweep(matrix, rhs, &mut x, options.omega, 0..matrix.rows)?;
+        gauss_seidel_sweep(matrix, rhs, &mut x, options.omega, (0..matrix.rows).rev())?;
+
+        residual_norm = l2_norm(&residual(matrix, &x, rhs)?);
+        if residual_norm <= options.tolerance {
+            return Ok(IterativeSolveReport {
+                solution: x,
+                iterations: iteration,
+                residual_norm,
+                converged: true,
+            });
+        }
+    }
+
+    Ok(IterativeSolveReport {
+        solution: x,
+        iterations: options.max_iterations,
+        residual_norm,
+        converged: false,
+    })
+}
+
+fn gauss_seidel_sweep(
+    matrix: &CsrMatrix,
+    rhs: &[f64],
+    x: &mut [f64],
+    omega: f64,
+    rows: impl IntoIterator<Item = usize>,
+) -> Result<()> {
+    for row in rows {
+        let start = matrix.row_offsets[row];
+        let end = matrix.row_offsets[row + 1];
+        let mut diagonal = None;
+        let mut off_diagonal_sum = 0.0;
+        for entry in start..end {
+            let column = matrix.col_indices[entry];
+            let value = matrix.values[entry];
+            if column == row {
+                diagonal = Some(value);
+            } else {
+                off_diagonal_sum += value * x[column];
+            }
+        }
+        let Some(diagonal) = diagonal else {
+            return Err(invalid_input(format!(
+                "row {row} has no diagonal entry for Gauss-Seidel"
+            )));
+        };
+        if !diagonal.is_finite() || diagonal == 0.0 {
+            return Err(invalid_input(format!(
+                "row {row} has invalid Gauss-Seidel diagonal value {diagonal}"
+            )));
+        }
+        let raw = (rhs[row] - off_diagonal_sum) / diagonal;
+        if !raw.is_finite() {
+            return Err(invalid_input(format!(
+                "Gauss-Seidel update for row {row} is not finite"
+            )));
+        }
+        x[row] = (1.0 - omega) * x[row] + omega * raw;
+    }
+    Ok(())
 }
 
 pub fn conjugate_gradient_solve(
@@ -359,10 +531,7 @@ pub fn conjugate_gradient_solve(
                     .to_string(),
             ));
         }
-        let denominator_scale = l2_norm(&p) * l2_norm(&ap);
-        if denominator_scale <= f64::EPSILON
-            || denominator.abs() <= f64::EPSILON * denominator_scale
-        {
+        if dot_product_is_singular(denominator, &p, &ap) {
             return Ok(IterativeSolveReport {
                 solution: x,
                 iterations: iteration.saturating_sub(1),
@@ -433,7 +602,7 @@ pub fn preconditioned_conjugate_gradient_solve(
             "preconditioned conjugate-gradient residual product is not finite".to_string(),
         ));
     }
-    if rz.abs() <= f64::EPSILON {
+    if dot_product_is_singular(rz, &r, &z) {
         return Ok(IterativeSolveReport {
             solution: x,
             iterations: 0,
@@ -452,10 +621,7 @@ pub fn preconditioned_conjugate_gradient_solve(
                     .to_string(),
             ));
         }
-        let denominator_scale = l2_norm(&p) * l2_norm(&ap);
-        if denominator_scale <= f64::EPSILON
-            || denominator.abs() <= f64::EPSILON * denominator_scale
-        {
+        if dot_product_is_singular(denominator, &p, &ap) {
             return Ok(IterativeSolveReport {
                 solution: x,
                 iterations: iteration.saturating_sub(1),
@@ -487,7 +653,7 @@ pub fn preconditioned_conjugate_gradient_solve(
                 "preconditioned conjugate-gradient residual product is not finite".to_string(),
             ));
         }
-        if rz.abs() <= f64::EPSILON {
+        if dot_product_is_singular(next_rz, &r, &z) {
             return Ok(IterativeSolveReport {
                 solution: x,
                 iterations: iteration,
@@ -547,7 +713,7 @@ pub fn bicgstab_solve(
                 "BiCGStab residual product is not finite".to_string(),
             ));
         }
-        if rho.abs() <= f64::EPSILON {
+        if dot_product_is_singular(rho, &r_hat, &r) {
             return Ok(IterativeSolveReport {
                 solution: x,
                 iterations: iteration.saturating_sub(1),
@@ -569,7 +735,7 @@ pub fn bicgstab_solve(
                 "BiCGStab alpha denominator is not finite".to_string(),
             ));
         }
-        if alpha_denominator.abs() <= f64::EPSILON {
+        if dot_product_is_singular(alpha_denominator, &r_hat, &v) {
             return Ok(IterativeSolveReport {
                 solution: x,
                 iterations: iteration.saturating_sub(1),
@@ -604,7 +770,7 @@ pub fn bicgstab_solve(
                 "BiCGStab omega denominator is not finite".to_string(),
             ));
         }
-        if omega_denominator.abs() <= f64::EPSILON {
+        if omega_denominator == 0.0 {
             return Ok(IterativeSolveReport {
                 solution: x,
                 iterations: iteration.saturating_sub(1),
@@ -616,7 +782,7 @@ pub fn bicgstab_solve(
         if !omega.is_finite() {
             return Err(invalid_input("BiCGStab omega is not finite".to_string()));
         }
-        if omega.abs() <= f64::EPSILON {
+        if omega == 0.0 {
             return Ok(IterativeSolveReport {
                 solution: x,
                 iterations: iteration.saturating_sub(1),
@@ -652,6 +818,7 @@ pub fn bicgstab_solve(
 enum BuiltPreconditioner {
     None,
     Diagonal(Vec<f64>),
+    IncompleteCholesky(IncompleteCholeskyPreconditioner),
 }
 
 impl BuiltPreconditioner {
@@ -662,15 +829,24 @@ impl BuiltPreconditioner {
                 let diagonal = matrix.diagonal()?;
                 let mut inverse = Vec::with_capacity(diagonal.len());
                 for (row, value) in diagonal.iter().copied().enumerate() {
-                    if !value.is_finite() || value.abs() <= f64::EPSILON {
+                    if !value.is_finite() || value == 0.0 {
                         return Err(invalid_input(format!(
                             "row {row} has invalid diagonal preconditioner value {value}"
                         )));
                     }
-                    inverse.push(1.0 / value);
+                    let inverse_value = 1.0 / value;
+                    if !inverse_value.is_finite() {
+                        return Err(invalid_input(format!(
+                            "row {row} diagonal preconditioner inverse is not finite for value {value}"
+                        )));
+                    }
+                    inverse.push(inverse_value);
                 }
                 Ok(Self::Diagonal(inverse))
             }
+            CgPreconditioner::IncompleteCholesky => Ok(Self::IncompleteCholesky(
+                IncompleteCholeskyPreconditioner::build(matrix)?,
+            )),
         }
     }
 
@@ -682,7 +858,126 @@ impl BuiltPreconditioner {
                 .zip(inverse)
                 .map(|(value, inverse)| value * inverse)
                 .collect(),
+            Self::IncompleteCholesky(preconditioner) => preconditioner.apply(residual),
         }
+    }
+}
+
+struct IncompleteCholeskyPreconditioner {
+    lower_rows: Vec<Vec<(usize, f64)>>,
+    lower_columns: Vec<Vec<(usize, f64)>>,
+}
+
+impl IncompleteCholeskyPreconditioner {
+    fn build(matrix: &CsrMatrix) -> Result<Self> {
+        if matrix.rows != matrix.cols {
+            return Err(invalid_input(format!(
+                "incomplete Cholesky preconditioner requires a square matrix, got {}x{}",
+                matrix.rows, matrix.cols
+            )));
+        }
+
+        let mut lower = vec![BTreeMap::<usize, f64>::new(); matrix.rows];
+        for (row, lower_row) in lower.iter_mut().enumerate() {
+            for entry in matrix.row_offsets[row]..matrix.row_offsets[row + 1] {
+                let column = matrix.col_indices[entry];
+                if column <= row {
+                    lower_row.insert(column, matrix.values[entry]);
+                }
+            }
+            if !lower_row.contains_key(&row) {
+                return Err(invalid_input(format!(
+                    "incomplete Cholesky preconditioner row {row} has no diagonal entry"
+                )));
+            }
+        }
+
+        for row in 0..matrix.rows {
+            let off_diagonal_columns = lower[row]
+                .keys()
+                .copied()
+                .filter(|column| *column < row)
+                .collect::<Vec<_>>();
+            for column in off_diagonal_columns {
+                let mut value = *lower[row].get(&column).unwrap_or(&0.0);
+                for (&shared, &row_value) in lower[row].range(..column) {
+                    if let Some(column_value) = lower[column].get(&shared) {
+                        value -= row_value * column_value;
+                    }
+                }
+                let pivot = *lower[column].get(&column).ok_or_else(|| {
+                    invalid_input(format!(
+                        "incomplete Cholesky preconditioner row {column} has no computed pivot"
+                    ))
+                })?;
+                if !pivot.is_finite() || pivot <= 0.0 {
+                    return Err(invalid_input(format!(
+                        "incomplete Cholesky preconditioner row {column} has invalid pivot {pivot}"
+                    )));
+                }
+                lower[row].insert(column, value / pivot);
+            }
+
+            let mut diagonal = *lower[row].get(&row).unwrap_or(&0.0);
+            for (&column, &value) in lower[row].range(..row) {
+                let _ = column;
+                diagonal -= value * value;
+            }
+            if !diagonal.is_finite() || diagonal <= 0.0 {
+                return Err(invalid_input(format!(
+                    "incomplete Cholesky preconditioner row {row} has non-positive pivot square {diagonal}"
+                )));
+            }
+            lower[row].insert(row, diagonal.sqrt());
+        }
+
+        let lower_rows = lower
+            .into_iter()
+            .map(|row| row.into_iter().collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let mut lower_columns = vec![Vec::<(usize, f64)>::new(); matrix.rows];
+        for (row, entries) in lower_rows.iter().enumerate() {
+            for &(column, value) in entries {
+                if column < row {
+                    lower_columns[column].push((row, value));
+                }
+            }
+        }
+
+        Ok(Self {
+            lower_rows,
+            lower_columns,
+        })
+    }
+
+    fn apply(&self, residual: &[f64]) -> Vec<f64> {
+        let mut y = vec![0.0; residual.len()];
+        for row in 0..residual.len() {
+            let mut sum = residual[row];
+            let mut diagonal = 1.0;
+            for &(column, value) in &self.lower_rows[row] {
+                if column < row {
+                    sum -= value * y[column];
+                } else if column == row {
+                    diagonal = value;
+                }
+            }
+            y[row] = sum / diagonal;
+        }
+
+        let mut x = vec![0.0; residual.len()];
+        for row in (0..residual.len()).rev() {
+            let mut sum = y[row];
+            for &(dependent_row, value) in &self.lower_columns[row] {
+                sum -= value * x[dependent_row];
+            }
+            let diagonal = self.lower_rows[row]
+                .iter()
+                .find_map(|(column, value)| (*column == row).then_some(*value))
+                .unwrap_or(1.0);
+            x[row] = sum / diagonal;
+        }
+        x
     }
 }
 
@@ -734,6 +1029,16 @@ fn validate_csr(
             )));
         }
     }
+    if let Some((entry, value)) = values
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(invalid_input(format!(
+            "CSR value at entry {entry} must be finite, got {value}"
+        )));
+    }
 
     Ok(())
 }
@@ -766,6 +1071,27 @@ fn validate_iterative_solve_input(
             initial.len()
         )));
     }
+    if let Some((index, value)) = rhs
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(invalid_input(format!(
+            "iterative solve rhs entry {index} must be finite, got {value}"
+        )));
+    }
+    if let Some((index, value)) = initial.and_then(|values| {
+        values
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+    }) {
+        return Err(invalid_input(format!(
+            "iterative solve initial entry {index} must be finite, got {value}"
+        )));
+    }
     if !tolerance.is_finite() || tolerance < 0.0 {
         return Err(invalid_input(format!(
             "iterative solve tolerance must be finite and non-negative, got {tolerance}"
@@ -781,6 +1107,11 @@ fn dot(left: &[f64], right: &[f64]) -> f64 {
         .sum()
 }
 
+fn dot_product_is_singular(value: f64, left: &[f64], right: &[f64]) -> bool {
+    let scale = l2_norm(left) * l2_norm(right);
+    scale == 0.0 || !scale.is_finite() || value.abs() <= f64::EPSILON * scale
+}
+
 fn invalid_input(message: String) -> MeshError {
     MeshError::InvalidInput(message)
 }
@@ -788,9 +1119,10 @@ fn invalid_input(message: String) -> MeshError {
 #[cfg(test)]
 mod tests {
     use super::{
-        BiCgStabOptions, CgPreconditioner, ConjugateGradientOptions, CsrMatrix, JacobiOptions,
-        PreconditionedConjugateGradientOptions, bicgstab_solve, conjugate_gradient_solve,
-        jacobi_solve, preconditioned_conjugate_gradient_solve, residual,
+        BiCgStabOptions, CgPreconditioner, ConjugateGradientOptions, CsrMatrix, GaussSeidelOptions,
+        JacobiOptions, PreconditionedConjugateGradientOptions, bicgstab_solve,
+        conjugate_gradient_solve, gauss_seidel_solve, jacobi_solve,
+        preconditioned_conjugate_gradient_solve, residual, symmetric_gauss_seidel_solve,
     };
 
     #[test]
@@ -815,6 +1147,9 @@ mod tests {
 
         let bad_nnz = CsrMatrix::new(1, 1, vec![0, 2], vec![0], vec![1.0]);
         assert!(bad_nnz.is_err());
+
+        let non_finite = CsrMatrix::new(1, 1, vec![0, 1], vec![0], vec![f64::NAN]);
+        assert!(non_finite.is_err());
     }
 
     #[test]
@@ -840,6 +1175,70 @@ mod tests {
     }
 
     #[test]
+    fn jacobi_rejects_non_finite_update_from_tiny_pivot() {
+        let matrix =
+            CsrMatrix::new(1, 1, vec![0, 1], vec![0], vec![1.0e-320]).expect("finite matrix");
+
+        let error = jacobi_solve(
+            &matrix,
+            &[1.0],
+            None,
+            JacobiOptions {
+                max_iterations: 1,
+                tolerance: 0.0,
+                omega: 1.0,
+            },
+        )
+        .expect_err("non-finite update must fail");
+
+        assert!(error.to_string().contains("not finite"));
+    }
+
+    #[test]
+    fn gauss_seidel_solves_nonsymmetric_system() {
+        let matrix =
+            CsrMatrix::from_rows(vec![vec![(0, 4.0), (1, -1.0)], vec![(0, 2.0), (1, 3.0)]], 2)
+                .expect("nonsymmetric matrix");
+        let report = gauss_seidel_solve(
+            &matrix,
+            &[3.0, 8.0],
+            None,
+            GaussSeidelOptions {
+                max_iterations: 64,
+                tolerance: 1.0e-12,
+                omega: 1.0,
+            },
+        )
+        .expect("gauss-seidel solve");
+
+        assert!(report.converged);
+        assert_close(&report.solution, &[17.0 / 14.0, 13.0 / 7.0], 1.0e-10);
+        assert!(report.residual_norm <= 1.0e-12);
+    }
+
+    #[test]
+    fn symmetric_gauss_seidel_solves_nonsymmetric_system() {
+        let matrix =
+            CsrMatrix::from_rows(vec![vec![(0, 4.0), (1, -1.0)], vec![(0, 2.0), (1, 3.0)]], 2)
+                .expect("nonsymmetric matrix");
+        let report = symmetric_gauss_seidel_solve(
+            &matrix,
+            &[3.0, 8.0],
+            None,
+            GaussSeidelOptions {
+                max_iterations: 64,
+                tolerance: 1.0e-12,
+                omega: 1.0,
+            },
+        )
+        .expect("symmetric Gauss-Seidel solve");
+
+        assert!(report.converged);
+        assert_close(&report.solution, &[17.0 / 14.0, 13.0 / 7.0], 1.0e-10);
+        assert!(report.residual_norm <= 1.0e-12);
+    }
+
+    #[test]
     fn conjugate_gradient_solves_poisson_system() {
         let matrix = poisson3();
         let report = conjugate_gradient_solve(
@@ -857,6 +1256,32 @@ mod tests {
         assert!(report.iterations <= 2);
         assert_close(&report.solution, &[1.0, 1.0, 1.0], 1.0e-12);
         assert!(report.residual_norm <= 1.0e-12);
+    }
+
+    #[test]
+    fn conjugate_gradient_is_invariant_to_small_matrix_scale() {
+        let scale = 1.0e-20;
+        let matrix = CsrMatrix::from_rows(
+            vec![
+                vec![(0, 4.0 * scale), (1, scale)],
+                vec![(0, scale), (1, 3.0 * scale)],
+            ],
+            2,
+        )
+        .expect("scaled SPD matrix");
+        let report = conjugate_gradient_solve(
+            &matrix,
+            &[scale, 2.0 * scale],
+            None,
+            ConjugateGradientOptions {
+                max_iterations: 8,
+                tolerance: 1.0e-32,
+            },
+        )
+        .expect("scaled CG solve");
+
+        assert!(report.converged);
+        assert_close(&report.solution, &[1.0 / 11.0, 7.0 / 11.0], 1.0e-12);
     }
 
     #[test]
@@ -878,6 +1303,74 @@ mod tests {
         assert_eq!(report.iterations, 1);
         assert_close(&report.solution, &[2.0, 3.0], 1.0e-14);
         assert!(report.residual_norm <= 1.0e-12);
+    }
+
+    #[test]
+    fn incomplete_cholesky_pcg_solves_spd_poisson_system() {
+        let matrix = poisson3();
+        let report = preconditioned_conjugate_gradient_solve(
+            &matrix,
+            &[1.0, 0.0, 1.0],
+            None,
+            PreconditionedConjugateGradientOptions {
+                max_iterations: 4,
+                tolerance: 1.0e-12,
+                preconditioner: CgPreconditioner::IncompleteCholesky,
+            },
+        )
+        .expect("ic0 pcg solve");
+
+        assert!(report.converged);
+        assert!(report.iterations <= 1);
+        assert_close(&report.solution, &[1.0, 1.0, 1.0], 1.0e-12);
+        assert!(report.residual_norm <= 1.0e-12);
+    }
+
+    #[test]
+    fn incomplete_cholesky_pcg_is_invariant_to_small_matrix_scale() {
+        let scale = 1.0e-20;
+        let matrix = CsrMatrix::from_rows(
+            vec![
+                vec![(0, 4.0 * scale), (1, scale)],
+                vec![(0, scale), (1, 3.0 * scale)],
+            ],
+            2,
+        )
+        .expect("scaled SPD matrix");
+        let report = preconditioned_conjugate_gradient_solve(
+            &matrix,
+            &[scale, 2.0 * scale],
+            None,
+            PreconditionedConjugateGradientOptions {
+                max_iterations: 8,
+                tolerance: 1.0e-32,
+                preconditioner: CgPreconditioner::IncompleteCholesky,
+            },
+        )
+        .expect("scaled IC0 PCG solve");
+
+        assert!(report.converged);
+        assert_close(&report.solution, &[1.0 / 11.0, 7.0 / 11.0], 1.0e-12);
+    }
+
+    #[test]
+    fn incomplete_cholesky_rejects_non_positive_pivot() {
+        let matrix =
+            CsrMatrix::from_rows(vec![vec![(0, 1.0), (1, 2.0)], vec![(0, 2.0), (1, 1.0)]], 2)
+                .expect("matrix");
+        let error = preconditioned_conjugate_gradient_solve(
+            &matrix,
+            &[1.0, 1.0],
+            None,
+            PreconditionedConjugateGradientOptions {
+                max_iterations: 4,
+                tolerance: 1.0e-12,
+                preconditioner: CgPreconditioner::IncompleteCholesky,
+            },
+        )
+        .expect_err("ic0 must reject indefinite pivots");
+
+        assert!(error.to_string().contains("non-positive pivot"));
     }
 
     #[test]

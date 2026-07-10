@@ -1,0 +1,35 @@
+FoamFile
+{
+    version 2.0;
+    format ascii;
+    class dictionary;
+    location "system";
+    object ferrumBackends;
+}
+default cpu;
+
+cpu
+{
+    cpus auto;
+    coresPerCpu auto;
+    threads auto;
+    threadPinning off;
+    numa auto;
+}
+
+gpu
+{
+    backend auto;
+    devices (auto);
+    multiGpu auto;
+    precision f64;
+}
+
+flow
+{
+    residual cpu;
+    jacobian cpu;
+    linearSolve cpu;
+    pressureCorrection cpu;
+    nonlinearSolve cpu;
+}

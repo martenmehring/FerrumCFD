@@ -29,27 +29,16 @@ impl PolyMesh {
         let neighbour = read_label_list(&path.join("neighbour"))?;
         let patches = read_boundary(&path.join("boundary"))?;
 
-        if faces.len() != owner.len() {
-            return Err(MeshError::InvalidInput(format!(
-                "faces/owner size mismatch in {}",
-                path.display()
-            )));
-        }
-        if neighbour.len() > faces.len() {
-            return Err(MeshError::InvalidInput(format!(
-                "neighbour list is longer than face list in {}",
-                path.display()
-            )));
-        }
-
-        Ok(Self {
+        let mesh = Self {
             path: path.to_path_buf(),
             points,
             faces,
             owner,
             neighbour,
             patches,
-        })
+        };
+        mesh.validate()?;
+        Ok(mesh)
     }
 
     pub fn cell_count(&self) -> usize {
@@ -58,9 +47,107 @@ impl PolyMesh {
             .chain(self.neighbour.iter())
             .copied()
             .max()
-            .map(|cell| cell + 1)
+            .map(|cell| cell.saturating_add(1))
             .unwrap_or(0)
     }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.faces.len() != self.owner.len() {
+            return Err(MeshError::InvalidInput(format!(
+                "faces/owner size mismatch in {}",
+                self.path.display()
+            )));
+        }
+        if self.neighbour.len() > self.faces.len() {
+            return Err(MeshError::InvalidInput(format!(
+                "neighbour list is longer than face list in {}",
+                self.path.display()
+            )));
+        }
+
+        validate_cell_labels(&self.owner, &self.neighbour, self.faces.len(), &self.path)?;
+        validate_patch_ranges(
+            &self.patches,
+            self.neighbour.len(),
+            self.faces.len(),
+            &self.path,
+        )
+    }
+}
+
+fn validate_cell_labels(
+    owner: &[usize],
+    neighbour: &[usize],
+    face_count: usize,
+    path: &Path,
+) -> Result<()> {
+    let Some(max_cell) = owner.iter().chain(neighbour).copied().max() else {
+        return Ok(());
+    };
+    let cell_count = max_cell.checked_add(1).ok_or_else(|| {
+        MeshError::InvalidInput(format!(
+            "cell label {max_cell} overflows the cell count in {}",
+            path.display()
+        ))
+    })?;
+    if cell_count > face_count {
+        return Err(MeshError::InvalidInput(format!(
+            "cell labels in {} imply {cell_count} cells from only {face_count} faces; labels must be dense and bounded by the mesh topology",
+            path.display()
+        )));
+    }
+
+    let mut seen = vec![false; cell_count];
+    for &cell in owner.iter().chain(neighbour) {
+        seen[cell] = true;
+    }
+    if let Some(missing) = seen.iter().position(|present| !present) {
+        return Err(MeshError::InvalidInput(format!(
+            "cell labels in {} are sparse; missing cell label {missing}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_patch_ranges(
+    patches: &[BoundaryPatch],
+    internal_faces: usize,
+    face_count: usize,
+    path: &Path,
+) -> Result<()> {
+    let mut claimed = vec![false; face_count.saturating_sub(internal_faces)];
+    for patch in patches {
+        let end_face = patch.start_face.checked_add(patch.faces).ok_or_else(|| {
+            MeshError::InvalidInput(format!(
+                "patch '{}' face range overflows in {}",
+                patch.name,
+                path.display()
+            ))
+        })?;
+        if patch.start_face < internal_faces || end_face > face_count {
+            return Err(MeshError::InvalidInput(format!(
+                "patch '{}' range startFace={} nFaces={} is outside boundary face range {}..{} in {}",
+                patch.name,
+                patch.start_face,
+                patch.faces,
+                internal_faces,
+                face_count,
+                path.display()
+            )));
+        }
+        for face in patch.start_face..end_face {
+            let slot = &mut claimed[face - internal_faces];
+            if *slot {
+                return Err(MeshError::InvalidInput(format!(
+                    "boundary face {face} belongs to more than one patch in {}",
+                    path.display()
+                )));
+            }
+            *slot = true;
+        }
+    }
+    Ok(())
 }
 
 fn read_points(path: &Path) -> Result<Vec<Point3>> {
@@ -160,24 +247,22 @@ fn read_list_entries(path: &Path) -> Result<Vec<String>> {
     }
     index += 1;
 
-    let mut entries = Vec::with_capacity(count);
-    while index < lines.len() {
-        let line = &lines[index];
-        if line == ")" || line == ");" {
-            break;
-        }
-        entries.push(line.clone());
-        index += 1;
-    }
-
-    if entries.len() != count {
+    let end = lines[index..]
+        .iter()
+        .position(|line| line == ")" || line == ");")
+        .map(|offset| index + offset)
+        .ok_or_else(|| {
+            MeshError::InvalidInput(format!("missing list closing ')' in {}", path.display()))
+        })?;
+    let actual_count = end - index;
+    if actual_count != count {
         return Err(MeshError::InvalidInput(format!(
             "expected {count} entries but found {} in {}",
-            entries.len(),
+            actual_count,
             path.display()
         )));
     }
-    Ok(entries)
+    Ok(lines[index..end].to_vec())
 }
 
 fn parse_face(line: &str, path: &Path) -> Result<Vec<usize>> {
@@ -302,5 +387,35 @@ impl DictCursor {
         })?;
         self.index += 1;
         Ok(line)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{BoundaryPatch, validate_cell_labels, validate_patch_ranges};
+
+    #[test]
+    fn rejects_sparse_cell_labels_before_allocation() {
+        let error = validate_cell_labels(&[1_000_000_000], &[], 1, Path::new("polyMesh"))
+            .expect_err("sparse labels must fail");
+
+        assert!(error.to_string().contains("dense and bounded"));
+    }
+
+    #[test]
+    fn rejects_overflowing_patch_ranges() {
+        let patches = vec![BoundaryPatch {
+            name: "wall".to_string(),
+            patch_type: "wall".to_string(),
+            faces: usize::MAX,
+            start_face: 1,
+        }];
+
+        let error = validate_patch_ranges(&patches, 1, 2, Path::new("polyMesh"))
+            .expect_err("overflowing patch must fail");
+
+        assert!(error.to_string().contains("overflows"));
     }
 }

@@ -280,6 +280,7 @@ pub fn build_solver_case_plan(case_dir: &Path) -> Result<SolverCasePlan> {
     };
 
     let fields = read_initial_fields(case_dir)?;
+    validate_openfoam_case_structure(case_dir, &fields, &mut warnings);
     let field_validation = validate_initial_field_boundaries(case_dir, &fields);
     warnings.extend(
         field_validation
@@ -378,6 +379,89 @@ pub fn build_solver_case_plan(case_dir: &Path) -> Result<SolverCasePlan> {
         run,
         warnings,
     })
+}
+
+fn validate_openfoam_case_structure(
+    case_dir: &Path,
+    fields: &crate::fields::InitialFieldSet,
+    warnings: &mut Vec<String>,
+) {
+    if !case_dir.join("system").join("controlDict").exists() {
+        warnings.push("openFOAM compatibility: missing mandatory system/controlDict".to_string());
+    }
+    if !case_dir
+        .join("constant")
+        .join("transportProperties")
+        .exists()
+    {
+        warnings.push(
+            "openFOAM compatibility: missing mandatory constant/transportProperties".to_string(),
+        );
+    }
+    if !case_dir.join("0").exists() {
+        warnings.push(
+            "openFOAM compatibility: missing mandatory time directory 0 (initial field files)"
+                .to_string(),
+        );
+    }
+
+    let velocity = fields
+        .fields
+        .iter()
+        .find(|field| field.region.is_none() && field.name == "U");
+    match velocity {
+        Some(field) if field.class_name.as_deref() == Some("volVectorField") => {}
+        Some(_) => warnings.push(
+            "openFOAM compatibility: field 0/U exists but class is not volVectorField".to_string(),
+        ),
+        None => warnings.push("openFOAM compatibility: missing mandatory field 0/U".to_string()),
+    }
+
+    let pressure = fields
+        .fields
+        .iter()
+        .find(|field| field.region.is_none() && field.name == "p");
+    match pressure {
+        Some(field) if field.class_name.as_deref() == Some("volScalarField") => {}
+        Some(_) => warnings.push(
+            "openFOAM compatibility: field 0/p exists but class is not volScalarField".to_string(),
+        ),
+        None => warnings.push("openFOAM compatibility: missing mandatory field 0/p".to_string()),
+    }
+
+    if !case_dir.join("system").join("fvSchemes").exists() {
+        warnings.push(
+            "openFOAM compatibility: mandatory system/fvSchemes is missing; laminar SIMPLE execution will reject the case".to_string(),
+        );
+    }
+    if !case_dir.join("system").join("fvSolution").exists() {
+        warnings.push(
+            "openFOAM compatibility: mandatory system/fvSolution is missing; laminar SIMPLE execution will reject the case".to_string(),
+        );
+    }
+    // openFOAM-compatible boundary/geometry files are validated by mesh and patch readers elsewhere.
+
+    if !case_dir
+        .join("constant")
+        .join("polyMesh")
+        .join("faces")
+        .exists()
+        || !case_dir
+            .join("constant")
+            .join("polyMesh")
+            .join("owner")
+            .exists()
+        || !case_dir
+            .join("constant")
+            .join("polyMesh")
+            .join("neighbour")
+            .exists()
+    {
+        warnings.push(
+            "openFOAM compatibility: incomplete constant/polyMesh (faces/owner/neighbour)"
+                .to_string(),
+        );
+    }
 }
 
 fn build_mesh_plan(
@@ -788,7 +872,15 @@ fn estimate_write_events(
             if !start_time.is_finite() || !end_time.is_finite() || end_time < start_time {
                 return None;
             }
-            Some(((end_time - start_time) / write_interval).floor() as usize)
+            let writes = ((end_time - start_time) / write_interval).floor();
+            if !writes.is_finite() || writes < 0.0 || writes > usize::MAX as f64 {
+                warnings.push(
+                    "run plan: write-event estimate is outside the supported usize range"
+                        .to_string(),
+                );
+                return None;
+            }
+            Some(writes as usize)
         }
         _ => None,
     }
@@ -825,15 +917,20 @@ fn resolve_stage_backend(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::Path;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::backends::BackendChoice;
     use crate::control::ControlDict;
+    use crate::fields::{FieldFile, InitialFieldSet};
     use crate::patches::PatchValidationSummary;
 
     use super::{
         SolverBackendPlan, SolverBackendStagePlan, SolverCpuResourcePlan, SolverDimensionality,
         SolverGpuResourcePlan, SolverRunStageSource, build_run_plan, classify_dimensionality,
+        validate_openfoam_case_structure,
     };
 
     #[test]
@@ -929,6 +1026,98 @@ mod tests {
         );
     }
 
+    #[test]
+    fn warns_for_missing_openfoam_compatibility_requirements() {
+        let case_dir = create_temp_case_dir("missing-openfoam-structure");
+        let mut warnings = Vec::new();
+        let fields = InitialFieldSet {
+            case_dir: case_dir.clone(),
+            fields: Vec::new(),
+        };
+
+        validate_openfoam_case_structure(&case_dir, &fields, &mut warnings);
+        let compatibility = extract_openfoam_warnings(&warnings);
+
+        assert!(has_openfoam_warning(
+            &compatibility,
+            "missing mandatory system/controlDict"
+        ));
+        assert!(has_openfoam_warning(
+            &compatibility,
+            "missing mandatory constant/transportProperties"
+        ));
+        assert!(has_openfoam_warning(
+            &compatibility,
+            "missing mandatory time directory 0 (initial field files)"
+        ));
+        assert!(has_openfoam_warning(
+            &compatibility,
+            "missing mandatory field 0/U"
+        ));
+        assert!(has_openfoam_warning(
+            &compatibility,
+            "missing mandatory field 0/p"
+        ));
+        assert!(has_openfoam_warning(
+            &compatibility,
+            "incomplete constant/polyMesh (faces/owner/neighbour)"
+        ));
+
+        cleanup_temp_case_dir(&case_dir);
+    }
+
+    #[test]
+    fn accepts_openfoam_compatible_case_structure() {
+        let case_dir = create_temp_case_dir("compatible-openfoam-structure");
+        write_file(&case_dir.join("system/controlDict"), "FoamFile {}");
+        write_file(
+            &case_dir.join("constant/transportProperties"),
+            "FoamFile {}",
+        );
+        write_file(&case_dir.join("system/fvSchemes"), "ddtSchemes {}");
+        write_file(&case_dir.join("system/fvSolution"), "solvers {}");
+        write_file(&case_dir.join("0/U"), "FoamFile {}");
+        write_file(&case_dir.join("0/p"), "FoamFile {}");
+        write_file(&case_dir.join("constant/polyMesh/faces"), "");
+        write_file(&case_dir.join("constant/polyMesh/owner"), "");
+        write_file(&case_dir.join("constant/polyMesh/neighbour"), "");
+
+        let fields = InitialFieldSet {
+            case_dir: case_dir.clone(),
+            fields: vec![
+                FieldFile {
+                    path: case_dir.join("0/U"),
+                    region: None,
+                    name: "U".to_string(),
+                    class_name: Some("volVectorField".to_string()),
+                    dimensions: None,
+                    internal_field: None,
+                    boundary_patches: Vec::new(),
+                },
+                FieldFile {
+                    path: case_dir.join("0/p"),
+                    region: None,
+                    name: "p".to_string(),
+                    class_name: Some("volScalarField".to_string()),
+                    dimensions: None,
+                    internal_field: None,
+                    boundary_patches: Vec::new(),
+                },
+            ],
+        };
+        let mut warnings = Vec::new();
+
+        validate_openfoam_case_structure(&case_dir, &fields, &mut warnings);
+        let compatibility = extract_openfoam_warnings(&warnings);
+        assert!(
+            compatibility.is_empty(),
+            "expected no openFOAM compatibility warnings, got {:?}",
+            compatibility
+        );
+
+        cleanup_temp_case_dir(&case_dir);
+    }
+
     fn patch_summary(empty_patches: usize, wedge_patches: usize) -> PatchValidationSummary {
         PatchValidationSummary {
             case_dir: PathBuf::from("case"),
@@ -994,5 +1183,41 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    fn create_temp_case_dir(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be available")
+            .as_nanos();
+        path.push(format!("ferrum-openfoam-test-{}-{}", name, nanos));
+        fs::create_dir_all(&path).expect("temporary case dir");
+        path
+    }
+
+    fn write_file(path: &Path, content: &str) {
+        let parent = path.parent().expect("test file path has parent");
+        fs::create_dir_all(parent).expect("test file parent dir");
+        fs::write(path, content).expect("test case file");
+    }
+
+    fn cleanup_temp_case_dir(path: &Path) {
+        let _ = fs::remove_dir_all(path);
+    }
+
+    fn extract_openfoam_warnings(warnings: &[String]) -> Vec<String> {
+        warnings
+            .iter()
+            .filter_map(|warning| {
+                warning
+                    .strip_prefix("openFOAM compatibility: ")
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    fn has_openfoam_warning(warnings: &[String], needle: &str) -> bool {
+        warnings.iter().any(|warning| warning.contains(needle))
     }
 }

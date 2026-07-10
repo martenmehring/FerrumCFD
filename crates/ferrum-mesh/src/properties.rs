@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::dictionary::{TokenCursor, tokenize};
+use crate::dictionary::{MAX_DICTIONARY_NESTING, TokenCursor, tokenize};
 use crate::{MeshError, Result};
 
 #[derive(Debug)]
@@ -43,7 +43,8 @@ pub fn read_case_properties(case_dir: &Path) -> Result<Vec<PropertyDictionary>> 
     for entry in fs::read_dir(&constant_dir)? {
         let entry = entry?;
         let path = entry.path();
-        if !path.is_dir() {
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() || !file_type.is_dir() {
             continue;
         }
 
@@ -107,7 +108,14 @@ fn read_property_dictionaries_in_dir(
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if !path.is_file() || !is_property_dictionary_file(&path) {
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(MeshError::InvalidInput(format!(
+                "property dictionary symlinks are not allowed: {}",
+                path.display()
+            )));
+        }
+        if !file_type.is_file() || !is_property_dictionary_file(&path) {
             continue;
         }
 
@@ -154,7 +162,7 @@ fn parse_property_dictionary_str(
 
         let key = cursor.next_required()?;
         if cursor.peek() == Some("{") {
-            sections.push(parse_property_section(&mut cursor, key)?);
+            sections.push(parse_property_section(&mut cursor, key, 1)?);
         } else {
             entries.push(PropertyEntry {
                 key,
@@ -175,7 +183,17 @@ fn parse_property_dictionary_str(
     })
 }
 
-fn parse_property_section(cursor: &mut TokenCursor, name: String) -> Result<PropertySection> {
+fn parse_property_section(
+    cursor: &mut TokenCursor,
+    name: String,
+    depth: usize,
+) -> Result<PropertySection> {
+    if depth > MAX_DICTIONARY_NESTING {
+        return Err(MeshError::InvalidInput(format!(
+            "property dictionary nesting exceeds {MAX_DICTIONARY_NESTING} levels in {}",
+            cursor.path().display()
+        )));
+    }
     cursor.expect("{")?;
     let mut entries = Vec::new();
     let mut sections = Vec::new();
@@ -188,7 +206,7 @@ fn parse_property_section(cursor: &mut TokenCursor, name: String) -> Result<Prop
 
         let key = cursor.next_required()?;
         if cursor.peek() == Some("{") {
-            sections.push(parse_property_section(cursor, key)?);
+            sections.push(parse_property_section(cursor, key, depth + 1)?);
         } else {
             entries.push(PropertyEntry {
                 key,

@@ -1,7 +1,8 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::dictionary::{TokenCursor, tokenize};
+use crate::dictionary::{MAX_DICTIONARY_NESTING, TokenCursor, tokenize};
 use crate::{MeshError, Result};
 
 #[derive(Debug)]
@@ -126,12 +127,27 @@ pub fn validate_fv_solution(solution: &FvSolution, field_names: &[String]) -> Nu
         .iter()
         .any(|section| section.name == "default");
     if !has_default_solver {
-        for field_name in field_names {
-            if !solvers
-                .sections
-                .iter()
-                .any(|section| solver_section_matches_field(&section.name, field_name))
+        let mut configured_fields = HashSet::new();
+        let mut wildcard = false;
+        for section in &solvers.sections {
+            if let Some(pattern) = section
+                .name
+                .strip_prefix('(')
+                .and_then(|value| value.strip_suffix(')'))
             {
+                for candidate in pattern.split('|').map(str::trim) {
+                    if candidate == ".*" {
+                        wildcard = true;
+                    } else {
+                        configured_fields.insert(candidate);
+                    }
+                }
+            } else {
+                configured_fields.insert(section.name.as_str());
+            }
+        }
+        for field_name in field_names {
+            if !wildcard && !configured_fields.contains(field_name.as_str()) {
                 warnings.push(format!(
                     "initial field '{field_name}' has no fvSolution solver entry"
                 ));
@@ -147,24 +163,6 @@ fn top_level_section<'a>(
     name: &str,
 ) -> Option<&'a NumericsSection> {
     sections.iter().find(|section| section.name == name)
-}
-
-fn solver_section_matches_field(section_name: &str, field_name: &str) -> bool {
-    if section_name == field_name {
-        return true;
-    }
-
-    let Some(pattern) = section_name
-        .strip_prefix('(')
-        .and_then(|value| value.strip_suffix(')'))
-    else {
-        return false;
-    };
-
-    pattern
-        .split('|')
-        .map(str::trim)
-        .any(|candidate| candidate == field_name || candidate == ".*")
 }
 
 fn parse_numerics_dictionary_str(content: &str, path: &Path) -> Result<Vec<NumericsSection>> {
@@ -185,7 +183,7 @@ fn parse_numerics_dictionary_str(content: &str, path: &Path) -> Result<Vec<Numer
 
         let name = cursor.next_required()?;
         if cursor.peek() == Some("{") {
-            sections.push(parse_section(&mut cursor, name)?);
+            sections.push(parse_section(&mut cursor, name, 1)?);
         } else {
             cursor.skip_value_or_block()?;
         }
@@ -194,7 +192,13 @@ fn parse_numerics_dictionary_str(content: &str, path: &Path) -> Result<Vec<Numer
     Ok(sections)
 }
 
-fn parse_section(cursor: &mut TokenCursor, name: String) -> Result<NumericsSection> {
+fn parse_section(cursor: &mut TokenCursor, name: String, depth: usize) -> Result<NumericsSection> {
+    if depth > MAX_DICTIONARY_NESTING {
+        return Err(MeshError::InvalidInput(format!(
+            "numerics dictionary nesting exceeds {MAX_DICTIONARY_NESTING} levels in {}",
+            cursor.path().display()
+        )));
+    }
     cursor.expect("{")?;
     let mut entries = Vec::new();
     let mut sections = Vec::new();
@@ -207,7 +211,7 @@ fn parse_section(cursor: &mut TokenCursor, name: String) -> Result<NumericsSecti
 
         let key = cursor.next_required()?;
         if cursor.peek() == Some("{") {
-            sections.push(parse_section(cursor, key)?);
+            sections.push(parse_section(cursor, key, depth + 1)?);
             continue;
         }
 
@@ -429,5 +433,21 @@ mod tests {
         let validation = validate_fv_solution(&solution, &["p".to_string(), "U".to_string()]);
 
         assert!(validation.warnings.is_empty());
+    }
+
+    #[test]
+    fn rejects_excessive_dictionary_nesting_without_stack_overflow() {
+        let mut content = String::new();
+        for index in 0..=super::MAX_DICTIONARY_NESTING {
+            content.push_str(&format!("section{index} {{ "));
+        }
+        for _ in 0..=super::MAX_DICTIONARY_NESTING {
+            content.push_str("} ");
+        }
+
+        let error = parse_numerics_dictionary_str(&content, Path::new("fvSolution"))
+            .expect_err("excessive nesting must fail");
+
+        assert!(error.to_string().contains("nesting exceeds"));
     }
 }

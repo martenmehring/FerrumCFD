@@ -1,12 +1,22 @@
 # FerrumCFD
 
-FerrumCFD is an early Rust CFD platform prototype. The first milestone is
-`ferrum-mesh`: import existing Gmsh meshes into an OpenFOAM-like case layout
-without forcing users to change their usual workflow.
+FerrumCFD is an early Rust CFD platform prototype. It imports existing Gmsh
+meshes into an OpenFOAM-like case layout without forcing users to change their
+usual workflow.
+
+The first executable flow-solver milestone is now available:
+`ferrumSolver --solveLaminarSimple` is a Rust finite-volume SIMPLE solver for
+steady, laminar, incompressible flow. It reads OpenFOAM-like case dictionaries,
+reports OpenFOAM-style outer and linear residuals separately, and has been
+validated on a 3D circular pipe and a true 2D plane channel. It is the CPU
+baseline for the planned parallel CPU and GPU backends; the remaining work
+toward a production `simpleFoam`-class solver is tracked explicitly.
 
 Start with the [User Guide](docs/user-guide.md). Longer-term design notes are
 tracked in [docs/architecture.md](docs/architecture.md).
 Current benchmark notes are kept under [docs/benchmarks](docs/benchmarks).
+Release-level changes are summarized in [CHANGELOG.md](CHANGELOG.md), and the
+solver completion criteria remain in [docs/solver-roadmap.md](docs/solver-roadmap.md).
 
 ## First Commands
 
@@ -27,16 +37,30 @@ cargo run -p ferrum-cli --bin splitFerrumMeshRegions -- -case examples\membrane_
 cargo run -p ferrum-cli --bin ferrumSolver -- -case examples\membrane_reactor --preflight --planJson target\ferrumSolverPlan.json
 cargo run -p ferrum-cli --bin ferrumSolver -- -case examples\membrane_reactor --runnerDryRun --maxRunnerSteps 2
 cargo run -p ferrum-cli --bin ferrumSolver -- -case examples\laminar_pipe --solveScalarDiffusion T --diffusivity 1 --linearSolver cg
-cargo run -p ferrum-cli --bin ferrumSolver -- -case examples\laminar_pipe --solvePoiseuille --linearSolver cg
+cargo run -p ferrum-cli --bin ferrumSolver -- -case examples\laminar_pipe --solvePoiseuille --pressureDrop 1.6032 --mu 0.001002 --length 1 --diameter 0.02 --linearSolver cg
 cargo run -p ferrum-cli --bin ferrumSolver -- -case examples\laminar_pipe --solveLaminarSimple --solveTolerance 1e-6 --maxIterations 100 --solveReportJson target\benchmarks\laminar_pipe_laminar_simple.json --solveReportMarkdown target\benchmarks\laminar_pipe_laminar_simple.md
+cargo run -p ferrum-cli --bin ferrumSolver -- -case examples\laminar_pipe --solveLaminarSimple --maxSimpleIterations 2 --writeFinalFields target\benchmarks\laminar_pipe_fields\1
+cargo run -p ferrum-cli --bin ferrumPipeBenchmark -- -case examples\laminar_pipe --fields target\benchmarks\laminar_pipe_fields\1 --pressureDrop 1.6032 --mu 0.001002 --length 1 --diameter 0.02 --axis x --inletPatch inlet --outletPatch outlet
+cargo run -p ferrum-cli --bin ferrumPlaneChannelBenchmark -- -case target\cases\plane_channel --fields target\benchmarks\plane_channel\ferrum_fields\1 --pressureDrop 0.6012 --mu 0.001002 --length 1 --gap 0.02 --depth 0.001
 ```
 
 Run the first Ferrum/OpenFOAM/analytic pipe benchmarks with:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_poiseuille_benchmark.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_simple_matched_time_benchmark.ps1 -MatchedTimeSeconds 100
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_openfoam_laminar_pipe_step_sweep.ps1 -OpenFoamSteps 100,200,400,800,1200 -TargetRelativeError 0.01
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_simple_benchmark.ps1 -SkipOpenFoam -UseExistingOpenFoamJson
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_simple_iteration_sweep.ps1 -SimpleIterations 2,5,10,20,30
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_simple_mesh_study.ps1 -OpenFoamSteps 400 -FerrumSimpleIterations 100
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_simple_pressure_sweep.ps1 -VariantName medium,fine -SimpleIterations 50,100,200
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_pipe_convergence.ps1 -OpenFoamSteps 200
+```
+
+Prepare the separate 2D plane-channel testcase from its Gmsh geometry with:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\prepare_plane_channel_case.ps1 -GmshExe "C:\path\to\gmsh.exe" -Force
 ```
 
 ## 2D And Axisymmetric Meshes
@@ -92,30 +116,52 @@ The importer currently targets the membrane reactor test mesh shape:
   volumes, and materialized CPU f64 field buffers for later CPU/GPU kernels
 - CPU linear algebra now has a small executable CSR foundation with matrix-vector
   products, residuals, Jacobi, conjugate-gradient, preconditioned-CG, and
-  BiCGStab solves for the first Poisson/diffusion and flow assembly steps
+  BiCGStab solves for the first Poisson/diffusion and flow assembly steps,
+  including diagonal and incomplete-Cholesky IC(0) preconditioners for CPU PCG
 - scalar diffusion/Poisson assembly can build and solve an opt-in CPU CSR system
   from runtime mesh geometry with internal-face diffusion, `fixedValue`,
   `zeroGradient`, and volume source terms; it reports iterations, residual,
   solution summary, and wall-clock time without writing field files
 - `--solvePoiseuille` runs a source-driven axial Stokes/Poiseuille benchmark on
-  the pipe mesh, reads default `deltaP`, `mu`, `L`, and `D` from the existing
-  benchmark dictionaries when present, and reports mean velocity, flow rate,
+  the pipe mesh, requires explicit `deltaP`, `L`, and `D` benchmark inputs
+  (`mu` may come from `transportProperties`), and reports mean velocity, flow rate,
   Hagen-Poiseuille reference values, relative error, residual, and wall-clock
   time without writing field files
 - `--solveLaminarSimple` is the first laminar incompressible SIMPLE
   path. It reads `U`, `p`, `transportProperties`, `fvSchemes`, and
   `fvSolution`, builds finite-volume `phi`, `grad(p)`, `div(phi,U)`, and
   `laplacian(nu,U)` operators on the runtime `constant/polyMesh` geometry,
-  writes JSON/Markdown reports, supports separate momentum and pressure
-  correction linear-solver choices, maps OpenFOAM `smoothSolver` on `U` to a
-  non-symmetric CPU `bicgstab` path, supports `pRefCell`/`pRefValue` and
-  `nNonOrthogonalCorrectors`, and runs an uncapped OpenFOAM-shaped `phiHbyA`
-  pressure-velocity correction path for the pipe benchmark
+  writes JSON/Markdown reports, can write final OpenFOAM-like `U`/`p` fields
+  with `--writeFinalFields <dir>`, supports separate momentum and pressure
+  correction linear-solver choices, executes OpenFOAM `smoothSolver` with the
+  configured CPU `GaussSeidel` or `symGaussSeidel` smoother while keeping
+  explicit `bicgstab` available for nonsymmetric experiments, supports `pRefCell`/`pRefValue` and
+  `nNonOrthogonalCorrectors`, reads `SIMPLE.consistent` and
+  OpenFOAM Foundation-style scalar `SIMPLE.residualControl`, leaves
+  Hagen-Poiseuille acceptance to external benchmark tooling, reports the
+  maximum initial `U` component residual, per-component initial/final
+  residuals, separate linear-solve convergence profiles, and
+  `adjustPhi` mass-balance data, reads the supported `fvSchemes` subset for
+  `grad(p)`, `grad(U)`, `div(phi,U)`, `laplacian`, `interpolation`, and
+  `snGrad`, supports flux-dependent open velocity boundaries such as
+  `inletOutlet`, reconstructs `HbyA`, computes boundary-constrained `phiHbyA`,
+  records pressure-assembly diagnostics for `rAU/rAtU`, `HbyA`, pressure
+  source, pressure matrix, pressure flux, and corrected `phi`, maps
+  OpenFOAM `DIC`/`FDIC` on pressure PCG to a CPU IC(0) preconditioner,
+  and runs an uncapped OpenFOAM-shaped pressure-velocity correction path without
+  embedding pipe geometry or analytic acceptance criteria
+- `ferrumPipeBenchmark` is a separate post-processor. It reads stored `U`/`p`
+  fields, applies explicit pipe geometry/reference inputs, and writes
+  Hagen-Poiseuille diagnostics without changing solver convergence or fields
+- `ferrumPlaneChannelBenchmark` is the corresponding external plane-Poiseuille
+  post-processor for a 2D parallel-plate case; it supports an explicit pressure
+  scale when reading OpenFOAM kinematic pressure
 - mesh geometry summaries compute face areas, boundary area, and cell volumes
 - special patch validation counts `empty`, `wedge`, and `symmetryPlane`
   patches and reports basic patch-range warnings
-- `system/fvSchemes` and `system/fvSolution` are parsed and checked
-  structurally for the solver preflight
+- `system/fvSchemes` and `system/fvSolution` are parsed and checked for the
+  solver preflight; the laminar SIMPLE path already executes a supported
+  `fvSchemes` subset
 - constant property dictionaries such as `transportProperties` and
   region-local property files are parsed structurally for the solver preflight
 - `system/controlDict` is checked for basic run-control consistency such as
@@ -135,10 +181,29 @@ The importer currently targets the membrane reactor test mesh shape:
   steps and logs planned field state, CPU/GPU stage dispatch, runtime handles,
   and missing executable backend status without updating fields or solving
   equations
-- `examples/laminar_pipe` provides a generated circular-pipe SI benchmark with
-  a flow-normalized parabolic inlet, analytical Hagen-Poiseuille data,
-  executable Ferrum Poiseuille and laminar SIMPLE solves, and OpenFOAM
-  comparison/convergence scripts that record wall-clock runtime
+- `examples/laminar_pipe` provides a generated circular-pipe SI simulation case
+  with a flow-normalized parabolic inlet. Analytic reference data lives outside
+  the case in `benchmarks/laminar_pipe/pipeBenchmark`; comparison scripts record
+  Ferrum/OpenFOAM wall-clock runtime under `target/benchmarks`
+- `scripts/run_laminar_simple_iteration_sweep.ps1` runs fixed
+  `minSimpleIterations=maxSimpleIterations` Ferrum SIMPLE sweeps, stores generic
+  reports and fields, then produces separate external pipe diagnostics
+- `scripts/run_laminar_simple_matched_time_benchmark.ps1` runs the current
+  laminar SIMPLE comparison with the same steady pseudo-time/iteration budget
+  for OpenFOAM and Ferrum, for example OpenFOAM `endTime=100` and Ferrum
+  `100` SIMPLE iterations
+- `scripts/run_openfoam_laminar_pipe_step_sweep.ps1` measures how many
+  OpenFOAM `simpleFoam` pseudo-time steps are needed to reach a target
+  Hagen-Poiseuille pressure-loss error
+- `scripts/run_laminar_simple_mesh_study.ps1` runs coarse/medium/fine mesh
+  studies for the current Ferrum laminar SIMPLE path and the OpenFOAM reference
+- `scripts/run_laminar_simple_pressure_sweep.ps1` runs Ferrum-only
+  pressure-field convergence sweeps over SIMPLE iteration budgets and mesh
+  variants
+- `docs/solver-roadmap.md` tracks the work needed to turn the current
+  `--solveLaminarSimple` prototype into the first production laminar
+  incompressible solver, including numerics, boundary conditions, schemes,
+  benchmarks, performance, and later CPU/GPU execution
 - `examples/gmsh_pipe/pipe_prism2.geo` provides a parametric Gmsh pipe with two
   near-wall prism layers; `scripts/run_gmsh_pipe_mesh_study.ps1` creates
   coarse/medium/fine Gmsh meshes for OpenFOAM convergence and FerrumCFD

@@ -170,14 +170,24 @@ fn read_elements<R: BufRead>(
             return Err(reader.parse_error("element entry is too short"));
         }
 
-        let source_id = fields[0] as usize;
-        let element_type = fields[1] as i32;
-        let tag_count = fields[2] as usize;
-        let node_start = 3 + tag_count;
+        let source_id = usize::try_from(fields[0])
+            .map_err(|_| reader.parse_error("element id must be non-negative"))?;
+        let element_type = i32::try_from(fields[1])
+            .map_err(|_| reader.parse_error("element type is outside the supported i32 range"))?;
+        let tag_count = usize::try_from(fields[2])
+            .map_err(|_| reader.parse_error("element tag count must be non-negative"))?;
+        let node_start = 3usize
+            .checked_add(tag_count)
+            .ok_or_else(|| reader.parse_error("element tag count overflows the entry length"))?;
         if fields.len() < node_start {
             return Err(reader.parse_error("element entry has fewer tags than declared"));
         }
-        let physical_tag = if tag_count > 0 { fields[3] as i32 } else { 0 };
+        let physical_tag = if tag_count > 0 {
+            i32::try_from(fields[3])
+                .map_err(|_| reader.parse_error("physical tag is outside the i32 range"))?
+        } else {
+            0
+        };
 
         match element_type {
             2 => {
@@ -428,6 +438,29 @@ mod tests {
 
         let _ = fs::remove_file(mesh_path);
         let _ = fs::remove_dir_all(case_dir);
+    }
+
+    #[test]
+    fn rejects_negative_element_tag_count_without_panicking() {
+        let mesh_path = unique_temp_path("negative_tag_count", "msh");
+        let content = r#"$MeshFormat
+2.2 0 8
+$EndMeshFormat
+$Nodes
+1
+1 0 0 0
+$EndNodes
+$Elements
+1
+1 15 -1
+$EndElements
+"#;
+        fs::write(&mesh_path, content).expect("write malformed mesh");
+
+        let error = read_msh22_ascii(&mesh_path).expect_err("negative tag count must fail");
+
+        assert!(error.to_string().contains("tag count must be non-negative"));
+        let _ = fs::remove_file(mesh_path);
     }
 
     fn unique_temp_path(label: &str, extension: &str) -> std::path::PathBuf {

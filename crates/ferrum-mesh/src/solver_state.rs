@@ -940,6 +940,7 @@ mod tests {
             boundary_patches: vec![FieldBoundaryPatch {
                 name: "wall".to_string(),
                 patch_type: Some("zeroGradient".to_string()),
+                inlet_value: None,
                 value: None,
             }],
         }

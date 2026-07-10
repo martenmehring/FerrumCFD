@@ -31,8 +31,17 @@ if ([string]::IsNullOrWhiteSpace($GeoFile)) {
 if ($OpenFoamSteps -le 0) {
     throw "OpenFoamSteps must be positive"
 }
-if ($Length -le 0.0 -or $Diameter -le 0.0 -or $MeanVelocity -le 0.0) {
-    throw "Length, Diameter, and MeanVelocity must be positive SI values"
+foreach ($inputValue in @(
+        @{ name = "Length"; value = $Length },
+        @{ name = "Diameter"; value = $Diameter },
+        @{ name = "MeanVelocity"; value = $MeanVelocity },
+        @{ name = "Temperature"; value = $Temperature },
+        @{ name = "WallTemperature"; value = $WallTemperature }
+    )) {
+    if ([double]::IsNaN([double]$inputValue.value) -or [double]::IsInfinity([double]$inputValue.value) -or
+        [double]$inputValue.value -le 0.0) {
+        throw "$($inputValue.name) must be a positive finite SI value"
+    }
 }
 if ($FerrumSolveTolerance -le 0.0) {
     throw "FerrumSolveTolerance must be positive"
@@ -122,32 +131,18 @@ function Remove-DirectoryIfExists([string]$Path, [string]$AllowedRoot) {
 
 function Resolve-GmshExecutable([string]$ExplicitPath) {
     if (![string]::IsNullOrWhiteSpace($ExplicitPath)) {
-        if (Test-Path -LiteralPath $ExplicitPath) {
+        if (Test-Path -LiteralPath $ExplicitPath -PathType Leaf) {
             return (Resolve-Path -LiteralPath $ExplicitPath).Path
         }
         throw "Gmsh executable not found at '$ExplicitPath'"
     }
 
-    $command = Get-Command gmsh -ErrorAction SilentlyContinue
+    $command = Get-Command gmsh -CommandType Application -ErrorAction SilentlyContinue
     if ($null -ne $command) {
         return $command.Source
     }
 
-    $bundled = Join-Path $env:USERPROFILE "Downloads\gmsh-4.15.2-Windows64\gmsh-4.15.2-Windows64\gmsh.exe"
-    if (Test-Path -LiteralPath $bundled) {
-        return $bundled
-    }
-
-    $downloadRoot = Join-Path $env:USERPROFILE "Downloads"
-    if (Test-Path -LiteralPath $downloadRoot) {
-        $found = Get-ChildItem -LiteralPath $downloadRoot -Filter gmsh.exe -Recurse -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-        if ($null -ne $found) {
-            return $found.FullName
-        }
-    }
-
-    throw "gmsh.exe was not found in PATH or Downloads. Pass -GmshExe <path-to-gmsh.exe>."
+    throw "gmsh.exe was not found in PATH. Pass the trusted installation explicitly with -GmshExe <path-to-gmsh.exe>."
 }
 
 function Read-FoamCountedBlockLines([string]$Path) {
@@ -375,7 +370,16 @@ function Write-GmshPipeCaseInputs($CaseRoot, $Variant, [string]$MeshFile) {
         $inletUnscaledFlow += $profile * $area
         $inletProfileValues.Add([pscustomobject][ordered]@{ profile = $profile; area = $area }) | Out-Null
     }
-    $inletVelocityScale = if ($inletUnscaledFlow -gt 0.0) { ($MeanVelocity * $inletArea) / $inletUnscaledFlow } else { 1.0 }
+    if ([double]::IsNaN($inletUnscaledFlow) -or [double]::IsInfinity($inletUnscaledFlow) -or
+        $inletUnscaledFlow -le 0.0 -or [double]::IsNaN($inletArea) -or
+        [double]::IsInfinity($inletArea) -or $inletArea -le 0.0) {
+        throw "imported inlet patch must have positive finite area and unscaled flow"
+    }
+    $inletVelocityScale = ($MeanVelocity * $inletArea) / $inletUnscaledFlow
+    if ([double]::IsNaN($inletVelocityScale) -or [double]::IsInfinity($inletVelocityScale) -or
+        $inletVelocityScale -le 0.0) {
+        throw "imported inlet velocity scale must be positive and finite"
+    }
 
     $linesU = New-Object System.Collections.Generic.List[string]
     Add-Lines $linesU (New-FoamHeader "volVectorField" "U" "0")
@@ -472,72 +476,6 @@ function Write-GmshPipeCaseInputs($CaseRoot, $Variant, [string]$MeshFile) {
     Write-AsciiFile (Join-Path $CaseRoot "constant\transportProperties") $transportLines.ToArray()
 
     $summary = Read-FerrumMeshSummary $CaseRoot
-    $benchmarkLines = New-Object System.Collections.Generic.List[string]
-    Add-Lines $benchmarkLines (New-FoamHeader "dictionary" "pipeBenchmark" "constant")
-    $benchmarkLines.Add('description "Gmsh laminar pipe mesh-study case";')
-    $benchmarkLines.Add("")
-    $benchmarkLines.Add("mesh")
-    $benchmarkLines.Add("{")
-    $benchmarkLines.Add("    type gmshPipe;")
-    $benchmarkLines.Add("    variant $($Variant.name);")
-    $benchmarkLines.Add("    sourceGeo `"$GeoFile`";")
-    $benchmarkLines.Add("    sourceMsh `"$MeshFile`";")
-    $benchmarkLines.Add("    axialCells $($Variant.axialCells);")
-    $benchmarkLines.Add("    cells $($summary.cells);")
-    $benchmarkLines.Add("    points $($summary.points);")
-    $benchmarkLines.Add("    inletFaces $($patches["inlet"].nFaces);")
-    $benchmarkLines.Add("    outletFaces $($patches["outlet"].nFaces);")
-    $benchmarkLines.Add("    wallFaces $($patches["wall"].nFaces);")
-    $benchmarkLines.Add("}")
-    $benchmarkLines.Add("")
-    $benchmarkLines.Add("geometry")
-    $benchmarkLines.Add("{")
-    $benchmarkLines.Add("    length [0 1 0 0 0 0 0] $(Format-F64 $Length);")
-    $benchmarkLines.Add("    diameter [0 1 0 0 0 0 0] $(Format-F64 $Diameter);")
-    $benchmarkLines.Add("}")
-    $benchmarkLines.Add("")
-    $benchmarkLines.Add("water")
-    $benchmarkLines.Add("{")
-    $benchmarkLines.Add("    referenceTemperature [0 0 0 1 0 0 0] $(Format-F64 $Temperature);")
-    $benchmarkLines.Add("    rho [1 -3 0 0 0 0 0] $(Format-F64 $rho);")
-    $benchmarkLines.Add("    mu [1 -1 -1 0 0 0 0] $(Format-F64 $mu);")
-    $benchmarkLines.Add("    k [1 1 -3 -1 0 0 0] $(Format-F64 $kThermal);")
-    $benchmarkLines.Add("}")
-    $benchmarkLines.Add("")
-    $benchmarkLines.Add("flowReference")
-    $benchmarkLines.Add("{")
-    $benchmarkLines.Add("    meanVelocity [0 1 -1 0 0 0 0] $(Format-F64 $MeanVelocity);")
-    $benchmarkLines.Add("    inletVelocityProfile parabolicFullyDeveloped;")
-    $benchmarkLines.Add("    inletVelocityScale [0 0 0 0 0 0 0] $(Format-F64 $inletVelocityScale);")
-    $benchmarkLines.Add("    reynolds [0 0 0 0 0 0 0] $(Format-F64 $reynolds);")
-    $benchmarkLines.Add("    pressureLossModel HagenPoiseuille;")
-    $benchmarkLines.Add("    expectedDeltaP [1 -1 -2 0 0 0 0] $(Format-F64 $deltaP);")
-    $benchmarkLines.Add("    minorLosses off;")
-    $benchmarkLines.Add("}")
-    $benchmarkLines.Add("")
-    $benchmarkLines.Add("openFoamReference")
-    $benchmarkLines.Add("{")
-    $benchmarkLines.Add("    application simpleFoam;")
-    $benchmarkLines.Add("    pressureConvention kinematic;")
-    $benchmarkLines.Add('    pressureConversion "p_Pa = rho * p_OpenFOAM";')
-    $benchmarkLines.Add("    expectedDeltaPKinematic [0 2 -2 0 0 0 0] $(Format-F64 $deltaPKinematic);")
-    $benchmarkLines.Add("}")
-    $benchmarkLines.Add("")
-    $benchmarkLines.Add("timingReference")
-    $benchmarkLines.Add("{")
-    $benchmarkLines.Add("    recordWallClock yes;")
-    $benchmarkLines.Add("    recordOpenFoamExecutionTime yes;")
-    $benchmarkLines.Add("    recordFerrumPreflightWallClock yes;")
-    $benchmarkLines.Add("}")
-    $benchmarkLines.Add("")
-    $benchmarkLines.Add("heatReference")
-    $benchmarkLines.Add("{")
-    $benchmarkLines.Add("    enabled yes;")
-    $benchmarkLines.Add("    wallTemperature [0 0 0 1 0 0 0] $(Format-F64 $WallTemperature);")
-    $benchmarkLines.Add("    nusseltConstantWallTemperature [0 0 0 0 0 0 0] $(Format-F64 $nusseltWallTemperature);")
-    $benchmarkLines.Add("    expectedH [1 0 -3 -1 0 0 0] $(Format-F64 $heatTransferCoefficient);")
-    $benchmarkLines.Add("}")
-    Write-AsciiFile (Join-Path $CaseRoot "constant\pipeBenchmark") $benchmarkLines.ToArray()
 
     return [pscustomobject][ordered]@{
         inletVelocityScale = $inletVelocityScale
@@ -672,6 +610,31 @@ $resultsRoot = Join-Path $StudyRoot "results"
 $logsRoot = Join-Path $StudyRoot "logs"
 New-Item -ItemType Directory -Force -Path $casesRoot, $meshesRoot, $openFoamRoot, $resultsRoot, $logsRoot | Out-Null
 
+$benchmarkProperties = Join-Path $StudyRoot "pipeBenchmark"
+$benchmarkLines = New-Object System.Collections.Generic.List[string]
+Add-Lines $benchmarkLines (New-FoamHeader "dictionary" "pipeBenchmark" "benchmark")
+$benchmarkLines.Add('description "External reference inputs for the generated Gmsh pipe mesh study";')
+$benchmarkLines.Add("")
+$benchmarkLines.Add("geometry")
+$benchmarkLines.Add("{")
+$benchmarkLines.Add("    length [0 1 0 0 0 0 0] $(Format-F64 $Length);")
+$benchmarkLines.Add("    diameter [0 1 0 0 0 0 0] $(Format-F64 $Diameter);")
+$benchmarkLines.Add("}")
+$benchmarkLines.Add("")
+$benchmarkLines.Add("water")
+$benchmarkLines.Add("{")
+$benchmarkLines.Add("    rho [1 -3 0 0 0 0 0] $(Format-F64 $rho);")
+$benchmarkLines.Add("    mu [1 -1 -1 0 0 0 0] $(Format-F64 $mu);")
+$benchmarkLines.Add("}")
+$benchmarkLines.Add("")
+$benchmarkLines.Add("flowReference")
+$benchmarkLines.Add("{")
+$benchmarkLines.Add("    meanVelocity [0 1 -1 0 0 0 0] $(Format-F64 $MeanVelocity);")
+$benchmarkLines.Add("    pressureLossModel HagenPoiseuille;")
+$benchmarkLines.Add("    expectedDeltaP [1 -1 -2 0 0 0 0] $(Format-F64 $deltaP);")
+$benchmarkLines.Add("}")
+Write-AsciiFile $benchmarkProperties $benchmarkLines.ToArray()
+
 $gmsh = Resolve-GmshExecutable $GmshExe
 $runOpenFoam = Join-Path $PSScriptRoot "run_openfoam_laminar_pipe.ps1"
 $compare = Join-Path $PSScriptRoot "compare_laminar_pipe.ps1"
@@ -731,6 +694,7 @@ foreach ($variant in $variants) {
             CaseRoot = $caseRoot
             WorkDir = $openFoamWorkDir
             OutFile = $openFoamJson
+            BenchmarkProperties = $benchmarkProperties
             Mode = $Mode
             EndTime = $OpenFoamSteps
             WriteInterval = $OpenFoamSteps
@@ -749,6 +713,7 @@ foreach ($variant in $variants) {
                 FerrumPlanJson = $planJson
                 OutFile = $compareJson
                 ReportFile = $compareReport
+                BenchmarkProperties = $benchmarkProperties
                 FerrumLinearSolver = $FerrumLinearSolver
                 FerrumSolveTolerance = $FerrumSolveTolerance
                 FerrumMaxIterations = $FerrumMaxIterations
@@ -840,6 +805,7 @@ $summary = [pscustomobject][ordered]@{
     generatedAt = Get-Date -Format "o"
     geoFile = $GeoFile
     gmsh = $gmsh
+    benchmarkProperties = $benchmarkProperties
     openFoamMode = if ($SkipOpenFoam) { "skipped" } else { $Mode }
     openFoamSteps = if ($SkipOpenFoam) { 0 } else { $OpenFoamSteps }
     ferrumSolve = if ($SkipFerrumSolve) { "skipped" } else { "poiseuille" }

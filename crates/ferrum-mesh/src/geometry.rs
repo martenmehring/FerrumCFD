@@ -80,6 +80,7 @@ pub fn summarize_poly_mesh_geometry(case_dir: &Path, mesh: &PolyMesh) -> Result<
 }
 
 pub fn compute_poly_mesh_geometry(mesh: &PolyMesh) -> Result<PolyMeshGeometry> {
+    mesh.validate()?;
     let face_geometry = compute_face_geometry(mesh)?;
     let cell_centres = compute_cell_centres(mesh, &face_geometry);
     let oriented_area_vectors = orient_face_area_vectors(mesh, &face_geometry, &cell_centres);

@@ -280,11 +280,15 @@ does not update fields, advance physics, assemble matrices, or solve equations.
 Its job is to harden the scheduling contract before CPU/GPU solver kernels
 exist.
 
-`fvSchemes` and `fvSolution` parsing is currently structural. The preflight can
-report entries such as `ddtSchemes.default=Euler` or
-`SIMPLE.nNonOrthogonalCorrectors=0`, but executable solver code must later
-decide which schemes and linear/nonlinear solver settings are valid for each
-equation system.
+`fvSchemes` and `fvSolution` parsing is broad and structural at preflight
+level. The preflight can report entries such as `ddtSchemes.default=Euler` or
+`SIMPLE.nNonOrthogonalCorrectors=0`, while executable solver code decides which
+schemes and linear/nonlinear solver settings are valid for each equation
+system. The current laminar SIMPLE bridge already consumes a focused
+`fvSchemes` subset: `grad(p)`, `grad(U)`, `div(phi,U)` with `Gauss upwind` or
+`Gauss linearUpwind grad(U)`, `Gauss linear` laplacians with
+`corrected`/`orthogonal`/`uncorrected` snGrad behavior, `linear`
+interpolation, and matching `snGradSchemes`.
 
 Basic structural validation belongs in the preflight. Examples include missing
 standard `fvSchemes` sections, missing `default` entries, missing
@@ -360,48 +364,88 @@ SIMPLE, PISO, or full Navier-Stokes implementation.
 
 `ferrumSolver --solveLaminarSimple` is the next bridge: it reads `U`, `p`,
 `transportProperties`, `fvSchemes`, and `fvSolution`, constructs the first flow
-operators on the same runtime `polyMesh` geometry, and writes solver reports as
-JSON/Markdown. The current implementation is an executable laminar SIMPLE
+operators on the same runtime `polyMesh` geometry, writes solver reports as
+JSON/Markdown, and can write final `U`/`p` fields into an explicitly selected
+OpenFOAM-like time directory. The current implementation is an executable laminar SIMPLE
 development path rather than a production `simpleFoam` replacement: it uses
 OpenFOAM-style equation relaxation and pressure relaxation, continues SIMPLE
 iterations without artificial field clipping, and reports continuity,
-Hagen-Poiseuille pressure-drop error, stored pressure-field pressure drop, and
-relative `U`/`p` field changes.
+equation residuals, stored fields, and relative `U`/`p` field changes.
 Momentum and pressure-correction linear solvers can be selected separately, so
-experiments can run the non-symmetric `bicgstab` momentum path with a PCG
-pressure solve without changing the case files. OpenFOAM-style `fvSolution`
+the OpenFOAM-style `smoothSolver` entry on `U` dispatches to its configured CPU
+`GaussSeidel` or `symGaussSeidel` smoothing path, while experiments can still run the explicit
+non-symmetric `bicgstab` momentum path with a PCG pressure solve without
+changing the case files. OpenFOAM-style `fvSolution`
 entries are the default source for pressure and velocity under-relaxation and
 for per-equation linear
 tolerances: `relaxationFactors.equations.U`,
 `relaxationFactors.fields.p`, `solvers.U.tolerance`, `solvers.p.tolerance`,
 `solvers.p.solver PCG`, `solvers.p.preconditioner DIC`,
 `SIMPLE.nNonOrthogonalCorrectors`, `SIMPLE.pRefCell`, `SIMPLE.pRefValue`, and
-optional `maxIter` values. OpenFOAM-style `SIMPLE.residualControl` entries for
-`U` and `p` are read as optional additional convergence criteria.
-Ferrum-specific SIMPLE entries can additionally set `minSimpleIterations`,
-`pressureDropTolerance`, and `fieldChangeTolerance`. `PCG` dispatches to
-Ferrum's CPU preconditioned-CG path, and OpenFOAM `smoothSolver` on `U` maps to
-Ferrum's CPU `bicgstab` path because the current upwind momentum matrix is
-non-symmetric. OpenFOAM `DIC`/`FDIC`/`DILU` currently map to a diagonal
-preconditioner, while true incomplete factorizations are tracked as later
-numerical upgrades. CLI flags remain explicit experiment overrides.
+`SIMPLE.consistent`, and optional `maxIter` values. OpenFOAM-style
+`SIMPLE.residualControl` entries for `U` and `p` are read as the normal
+early-convergence criteria. As in OpenFOAM Foundation 13, each steady SIMPLE
+criterion is one absolute scalar. Ferrum evaluates the initial residual from
+the first equation solve in the SIMPLE iteration; `U` uses the maximum vector
+component and `p` uses the first pressure solve before any further
+non-orthogonal corrector solves. Linear-solver initial/final residuals,
+iteration counts, and convergence flags remain a separate reporting layer.
+Continuity is diagnostic and is not an extra hidden convergence gate.
+Ferrum-specific SIMPLE entries can additionally set `minSimpleIterations`.
+Only OpenFOAM-style residual controls can mark the generic solver converged.
+Hagen-Poiseuille acceptance, OpenFOAM comparison, and matched-time decisions
+belong to the external benchmark scripts and never alter SIMPLE convergence.
+The SIMPLE options/report types contain no pipe diameter, pipe length, named
+inlet/outlet reference, pressure-loss target, or analytic solution. The separate
+`ferrumPipeBenchmark` binary reads already written `U`/`p` fields and adds those
+case-specific diagnostics. Reference input is stored under `benchmarks/`, not
+inside a simulation case's `constant/` directory.
+The production-readiness plan for this solver lives in
+`docs/solver-roadmap.md`; it tracks the remaining numerical, boundary-condition,
+scheme, benchmark, performance, and generalization work.
+`PCG` dispatches to Ferrum's CPU preconditioned-CG path, OpenFOAM
+`smoothSolver` on `U` requires and executes a supported `GaussSeidel` or
+`symGaussSeidel` smoother, and
+explicit `bicgstab` remains available for nonsymmetric momentum experiments.
+OpenFOAM `DIC`/`FDIC` on pressure PCG maps to IC(0). `DILU` is rejected until a
+true nonsymmetric ILU/DILU preconditioner exists; Ferrum never substitutes a
+diagonal preconditioner silently. CLI flags remain explicit experiment
+overrides. Solver execution also requires `system/fvSchemes` and
+`system/fvSolution` instead of inventing a missing case configuration.
+Absent `tolerance` and `maxIter` entries use the OpenFOAM 13
+`lduMatrix::solver` defaults (`1e-6` and `1000`). Ferrum currently supports the
+OpenFOAM defaults `relTol=0`, `minIter=0`, and `smoothSolver nSweeps=1`; a
+different configured value is rejected explicitly until its stopping semantics
+are implemented.
 The pressure bridge now follows the OpenFOAM shape more closely: it applies
-equation relaxation to the momentum equation, builds cell-wise `rAU` from the
-original momentum diagonal, reconstructs `phiHbyA` by removing the old pressure
-flux from the momentum predictor flux, solves an absolute variable-coefficient
-pressure equation, corrects `phi` with the pressure-equation flux, and carries
-that corrected surface flux into the next SIMPLE iteration. The normal solver
-path no longer bounds or rolls back finite `U`, `p`, or `phi` updates; only
-non-finite fields are treated as numerical failure. The pressure equation also
-supports OpenFOAM-like pressure reference anchoring and runs
+equation relaxation through an internal momentum-equation object, builds
+cell-wise `rAU` from the original momentum diagonal, exposes per-component
+momentum residuals plus `A/H1` ranges in reports, reconstructs `HbyA`, computes
+`phiHbyA` from that HbyA field with velocity boundary constraints applied,
+applies an OpenFOAM-like `adjustPhi` mass-balance correction only on
+pressure-controlled open boundaries, treats velocity
+`inletOutlet`/`pressureInletOutletVelocity` as flux-dependent open boundaries
+for backflow, solves an absolute variable-coefficient pressure equation,
+corrects `phi` with the pressure-equation flux, corrects velocity as
+`U = HbyA - rAtU grad(p)`, and carries that corrected surface flux into the next
+SIMPLE iteration. The normal solver path no longer
+bounds or rolls back finite `U`, `p`, or `phi` updates; only non-finite fields
+are treated as numerical failure. The pressure equation also supports
+OpenFOAM-like pressure reference anchoring and runs
 `nNonOrthogonalCorrectors + 1` pressure solves, updating `phi` from the final
-pressure solve. The momentum convection term uses an implicit upwind
-contribution in this SIMPLE path, which moves the pipe benchmark away from the
-earlier central-convection oscillations while the full consistent-SIMPLE and
-non-orthogonal correction terms are still being developed. The
-operator and report boundaries are kept backend-neutral so the same assembly
-path can later dispatch linear and nonlinear solves to CPU, GPU, or mixed
-CPU/GPU resources.
+pressure solve. `SIMPLE.consistent true` switches the pressure and velocity
+correction to a Rust `rAtU` value derived from the current momentum matrix
+(`1/rAU - H1`), and the non-orthogonal corrector loop now rebuilds the pressure
+source with an explicit non-orthogonal pressure-flux correction between solves.
+The momentum convection term is scheme-driven. `Gauss upwind` uses a fully
+implicit upwind contribution. `Gauss linearUpwind grad(U)` keeps the same
+non-symmetric upwind matrix and adds the gradient part as a deferred
+right-hand-side correction, matching the OpenFOAM workflow more closely while
+keeping the first executable path robust. The optional field writer preserves
+dimensions and `boundaryField` entries from the initial `0/U` and `0/p` files
+while replacing the internal cell values with the final SIMPLE solution.
+Operator and report data remain backend-neutral so the same assembly path can later dispatch linear
+and nonlinear solves to CPU, GPU, or mixed CPU/GPU resources.
 
 Important design constraint:
 

@@ -76,7 +76,7 @@ pub fn split_regions_by_cell_zones(case_dir: &Path) -> Result<RegionSplitSummary
     let cell_count = mesh.cell_count();
     let cell_to_zone = build_cell_to_zone(&mesh.cell_zones, cell_count)?;
     let face_zone_by_face = build_face_zone_index(&mesh.face_zones);
-    let boundary_by_face = build_boundary_index(&mesh.patches);
+    let boundary_by_face = build_boundary_index(&mesh.patches)?;
 
     let mut summaries = Vec::new();
     for (zone_index, zone) in mesh.cell_zones.iter().enumerate() {
@@ -427,10 +427,13 @@ fn build_face_zone_index(face_zones: &[FaceZone]) -> HashMap<usize, FaceZoneRef>
     by_face
 }
 
-fn build_boundary_index(patches: &[BoundaryPatch]) -> HashMap<usize, BoundaryPatchRef> {
+fn build_boundary_index(patches: &[BoundaryPatch]) -> Result<HashMap<usize, BoundaryPatchRef>> {
     let mut by_face = HashMap::new();
     for patch in patches {
-        for face in patch.start_face..patch.start_face + patch.faces {
+        let end_face = patch.start_face.checked_add(patch.faces).ok_or_else(|| {
+            MeshError::InvalidInput(format!("patch '{}' face range overflows", patch.name))
+        })?;
+        for face in patch.start_face..end_face {
             by_face.insert(
                 face,
                 BoundaryPatchRef {
@@ -441,7 +444,7 @@ fn build_boundary_index(patches: &[BoundaryPatch]) -> HashMap<usize, BoundaryPat
             );
         }
     }
-    by_face
+    Ok(by_face)
 }
 
 fn build_region_mesh(
@@ -826,6 +829,35 @@ impl PolyMesh {
             )));
         }
 
+        validate_cell_labels(&owner, &neighbour, faces.len(), path)?;
+        validate_patch_ranges(&patches, neighbour.len(), faces.len(), path)?;
+        let cell_count = owner
+            .iter()
+            .chain(&neighbour)
+            .copied()
+            .max()
+            .map(|cell| cell + 1)
+            .unwrap_or(0);
+        for zone in &cell_zones {
+            if let Some(&cell) = zone.cells.iter().find(|cell| **cell >= cell_count) {
+                return Err(MeshError::InvalidInput(format!(
+                    "cellZone '{}' references missing cell {cell} in {}",
+                    zone.name,
+                    path.display()
+                )));
+            }
+        }
+        for zone in &face_zones {
+            if let Some(entry) = zone.faces.iter().find(|entry| entry.face >= faces.len()) {
+                return Err(MeshError::InvalidInput(format!(
+                    "faceZone '{}' references missing face {} in {}",
+                    zone.name,
+                    entry.face,
+                    path.display()
+                )));
+            }
+        }
+
         Ok(Self {
             points,
             faces,
@@ -843,9 +875,72 @@ impl PolyMesh {
             .chain(self.neighbour.iter())
             .copied()
             .max()
-            .map(|cell| cell + 1)
+            .map(|cell| cell.saturating_add(1))
             .unwrap_or(0)
     }
+}
+
+fn validate_cell_labels(
+    owner: &[usize],
+    neighbour: &[usize],
+    face_count: usize,
+    path: &Path,
+) -> Result<()> {
+    let Some(max_cell) = owner.iter().chain(neighbour).copied().max() else {
+        return Ok(());
+    };
+    let cell_count = max_cell.checked_add(1).ok_or_else(|| {
+        MeshError::InvalidInput(format!(
+            "cell label {max_cell} overflows the cell count in {}",
+            path.display()
+        ))
+    })?;
+    if cell_count > face_count {
+        return Err(MeshError::InvalidInput(format!(
+            "cell labels in {} imply {cell_count} cells from only {face_count} faces; labels must be dense and bounded by the mesh topology",
+            path.display()
+        )));
+    }
+    let mut seen = vec![false; cell_count];
+    for &cell in owner.iter().chain(neighbour) {
+        seen[cell] = true;
+    }
+    if let Some(missing) = seen.iter().position(|present| !present) {
+        return Err(MeshError::InvalidInput(format!(
+            "cell labels in {} are sparse; missing cell label {missing}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_patch_ranges(
+    patches: &[BoundaryPatch],
+    internal_faces: usize,
+    face_count: usize,
+    path: &Path,
+) -> Result<()> {
+    for patch in patches {
+        let end_face = patch.start_face.checked_add(patch.faces).ok_or_else(|| {
+            MeshError::InvalidInput(format!(
+                "patch '{}' face range overflows in {}",
+                patch.name,
+                path.display()
+            ))
+        })?;
+        if patch.start_face < internal_faces || end_face > face_count {
+            return Err(MeshError::InvalidInput(format!(
+                "patch '{}' range startFace={} nFaces={} is outside boundary face range {}..{} in {}",
+                patch.name,
+                patch.start_face,
+                patch.faces,
+                internal_faces,
+                face_count,
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 struct BoundaryPatch {
@@ -1033,24 +1128,22 @@ fn read_list_entries(path: &Path) -> Result<Vec<String>> {
     }
     index += 1;
 
-    let mut entries = Vec::with_capacity(count);
-    while index < lines.len() {
-        let line = &lines[index];
-        if line == ")" || line == ");" {
-            break;
-        }
-        entries.push(line.clone());
-        index += 1;
-    }
-
-    if entries.len() != count {
+    let end = lines[index..]
+        .iter()
+        .position(|line| line == ")" || line == ");")
+        .map(|offset| index + offset)
+        .ok_or_else(|| {
+            MeshError::InvalidInput(format!("missing list closing ')' in {}", path.display()))
+        })?;
+    let actual_count = end - index;
+    if actual_count != count {
         return Err(MeshError::InvalidInput(format!(
             "expected {count} entries but found {} in {}",
-            entries.len(),
+            actual_count,
             path.display()
         )));
     }
-    Ok(entries)
+    Ok(lines[index..end].to_vec())
 }
 
 fn parse_face(line: &str, path: &Path) -> Result<Vec<usize>> {

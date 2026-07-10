@@ -20,32 +20,18 @@ if ([string]::IsNullOrWhiteSpace($CaseRoot)) {
 
 function Resolve-GmshExecutable([string]$ExplicitPath) {
     if (![string]::IsNullOrWhiteSpace($ExplicitPath)) {
-        if (Test-Path -LiteralPath $ExplicitPath) {
+        if (Test-Path -LiteralPath $ExplicitPath -PathType Leaf) {
             return (Resolve-Path -LiteralPath $ExplicitPath).Path
         }
         throw "Gmsh executable not found at '$ExplicitPath'"
     }
 
-    $command = Get-Command gmsh -ErrorAction SilentlyContinue
+    $command = Get-Command gmsh -CommandType Application -ErrorAction SilentlyContinue
     if ($null -ne $command) {
         return $command.Source
     }
 
-    $bundled = Join-Path $env:USERPROFILE "Downloads\gmsh-4.15.2-Windows64\gmsh-4.15.2-Windows64\gmsh.exe"
-    if (Test-Path -LiteralPath $bundled) {
-        return $bundled
-    }
-
-    $downloadRoot = Join-Path $env:USERPROFILE "Downloads"
-    if (Test-Path -LiteralPath $downloadRoot) {
-        $found = Get-ChildItem -LiteralPath $downloadRoot -Filter gmsh.exe -Recurse -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-        if ($null -ne $found) {
-            return $found.FullName
-        }
-    }
-
-    throw "gmsh.exe was not found in PATH or Downloads. Pass -GmshExe <path-to-gmsh.exe>."
+    throw "gmsh.exe was not found in PATH. Pass the trusted installation explicitly with -GmshExe <path-to-gmsh.exe>."
 }
 
 $gmsh = Resolve-GmshExecutable $GmshExe

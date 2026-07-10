@@ -5,6 +5,7 @@ param(
     [string]$FerrumPlanJson = "",
     [string]$OutFile = "",
     [string]$ReportFile = "",
+    [string]$BenchmarkProperties = "",
     [ValidateSet("Auto", "Native", "Wsl")]
     [string]$Mode = "Auto",
     [int]$OpenFoamSteps = 200,
@@ -12,10 +13,13 @@ param(
     [switch]$RequireOpenFoam,
     [switch]$UseExistingOpenFoamJson,
     [switch]$SkipFerrumSolve,
+    [ValidateSet("poiseuille", "laminarSimple")]
+    [string]$FerrumSolver = "poiseuille",
     [ValidateSet("jacobi", "cg")]
     [string]$FerrumLinearSolver = "cg",
     [double]$FerrumSolveTolerance = 1e-8,
-    [int]$FerrumMaxIterations = 20000
+    [int]$FerrumMaxIterations = 20000,
+    [int]$FerrumSimpleIterations = 100
 )
 
 $ErrorActionPreference = "Stop"
@@ -38,6 +42,9 @@ if ([string]::IsNullOrWhiteSpace($OutFile)) {
 if ([string]::IsNullOrWhiteSpace($ReportFile)) {
     $ReportFile = Join-Path $RepoRoot "target\benchmarks\laminar_pipe_compare.md"
 }
+if ([string]::IsNullOrWhiteSpace($BenchmarkProperties)) {
+    $BenchmarkProperties = Join-Path $RepoRoot "benchmarks\laminar_pipe\pipeBenchmark"
+}
 if ($OpenFoamSteps -le 0) {
     throw "OpenFoamSteps must be positive"
 }
@@ -46,6 +53,9 @@ if ($FerrumSolveTolerance -le 0.0) {
 }
 if ($FerrumMaxIterations -le 0) {
     throw "FerrumMaxIterations must be positive"
+}
+if ($FerrumSimpleIterations -le 0) {
+    throw "FerrumSimpleIterations must be positive"
 }
 
 function Test-IsPathUnder([string]$Child, [string]$Parent) {
@@ -78,6 +88,7 @@ if ($SkipOpenFoam) {
         CaseRoot = $CaseRoot
         WorkDir = $OpenFoamWorkDir
         OutFile = $OpenFoamJson
+        BenchmarkProperties = $BenchmarkProperties
         Mode = $Mode
         EndTime = $OpenFoamSteps
         WriteInterval = $OpenFoamSteps
@@ -88,21 +99,24 @@ if ($SkipOpenFoam) {
     & $runOpenFoam @openFoamArgs
 }
 
-Write-Output "running Ferrum/OpenFOAM/analytic Poiseuille comparison"
+Write-Output "running Ferrum/OpenFOAM/analytic $FerrumSolver comparison"
 $compareArgs = @{
     CaseRoot = $CaseRoot
     OpenFoamJson = $openFoamJsonForCompare
     FerrumPlanJson = $FerrumPlanJson
     OutFile = $OutFile
     ReportFile = $ReportFile
+    BenchmarkProperties = $BenchmarkProperties
+    FerrumSolver = $FerrumSolver
     FerrumLinearSolver = $FerrumLinearSolver
     FerrumSolveTolerance = $FerrumSolveTolerance
     FerrumMaxIterations = $FerrumMaxIterations
+    FerrumSimpleIterations = $FerrumSimpleIterations
 }
 if ($SkipFerrumSolve) {
     $compareArgs.SkipFerrumSolve = $true
 }
 & $compare @compareArgs
 
-Write-Output "poiseuille benchmark JSON: $OutFile"
-Write-Output "poiseuille benchmark report: $ReportFile"
+Write-Output "$FerrumSolver benchmark JSON: $OutFile"
+Write-Output "$FerrumSolver benchmark report: $ReportFile"

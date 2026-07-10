@@ -18,8 +18,17 @@ if ([string]::IsNullOrWhiteSpace($CaseRoot)) {
 if ($AxialCells -le 0 -or $RadialCells -le 0 -or $AngularSectors -lt 3) {
     throw "AxialCells and RadialCells must be positive; AngularSectors must be at least 3"
 }
-if ($Length -le 0.0 -or $Diameter -le 0.0) {
-    throw "Length and Diameter must be positive SI values"
+foreach ($inputValue in @(
+        @{ name = "Length"; value = $Length },
+        @{ name = "Diameter"; value = $Diameter },
+        @{ name = "MeanVelocity"; value = $MeanVelocity },
+        @{ name = "Temperature"; value = $Temperature },
+        @{ name = "WallTemperature"; value = $WallTemperature }
+    )) {
+    if ([double]::IsNaN([double]$inputValue.value) -or [double]::IsInfinity([double]$inputValue.value) -or
+        [double]$inputValue.value -le 0.0) {
+        throw "$($inputValue.name) must be a positive finite SI value"
+    }
 }
 
 $culture = [System.Globalization.CultureInfo]::InvariantCulture
@@ -405,7 +414,16 @@ foreach ($face in $inletFaces) {
     $inletUnscaledFlow += $profile * $area
     $inletProfileValues.Add([pscustomobject]@{ profile = $profile; area = $area }) | Out-Null
 }
-$inletVelocityScale = if ($inletUnscaledFlow -gt 0.0) { ($MeanVelocity * $inletArea) / $inletUnscaledFlow } else { 1.0 }
+if ([double]::IsNaN($inletUnscaledFlow) -or [double]::IsInfinity($inletUnscaledFlow) -or
+    $inletUnscaledFlow -le 0.0 -or [double]::IsNaN($inletArea) -or
+    [double]::IsInfinity($inletArea) -or $inletArea -le 0.0) {
+    throw "generated inlet patch must have positive finite area and unscaled flow"
+}
+$inletVelocityScale = ($MeanVelocity * $inletArea) / $inletUnscaledFlow
+if ([double]::IsNaN($inletVelocityScale) -or [double]::IsInfinity($inletVelocityScale) -or
+    $inletVelocityScale -le 0.0) {
+    throw "generated inlet velocity scale must be positive and finite"
+}
 $linesU.Add("        value nonuniform List<vector>")
 $linesU.Add("        $($inletFaces.Count)")
 $linesU.Add("        (")
@@ -465,95 +483,6 @@ $transportLines = New-Object System.Collections.Generic.List[string]
 Add-Lines $transportLines (New-FoamHeader "dictionary" "transportProperties" "constant")
 Add-Lines $transportLines $transport
 Write-AsciiFile (Join-Path $CaseRoot "constant\transportProperties") $transportLines.ToArray()
-
-$benchmarkLines = New-Object System.Collections.Generic.List[string]
-Add-Lines $benchmarkLines (New-FoamHeader "dictionary" "pipeBenchmark" "constant")
-$benchmarkLines.Add('description "Laminar circular pipe reference for the laminar_pipe case";')
-$benchmarkLines.Add("")
-$benchmarkLines.Add("mesh")
-$benchmarkLines.Add("{")
-$benchmarkLines.Add("    type structuredCircularPipe;")
-$benchmarkLines.Add("    axialCells $AxialCells;")
-$benchmarkLines.Add("    radialCells $RadialCells;")
-$benchmarkLines.Add("    angularSectors $AngularSectors;")
-$benchmarkLines.Add("    cells $($cells.Count);")
-$benchmarkLines.Add("    points $($points.Count);")
-$benchmarkLines.Add("}")
-$benchmarkLines.Add("")
-$benchmarkLines.Add("geometry")
-$benchmarkLines.Add("{")
-$benchmarkLines.Add("    length [0 1 0 0 0 0 0] $(Format-F64 $Length);")
-$benchmarkLines.Add("    diameter [0 1 0 0 0 0 0] $(Format-F64 $Diameter);")
-$benchmarkLines.Add("}")
-$benchmarkLines.Add("")
-$benchmarkLines.Add("water")
-$benchmarkLines.Add("{")
-$benchmarkLines.Add("    referenceTemperature [0 0 0 1 0 0 0] $(Format-F64 $Temperature);")
-$benchmarkLines.Add("    rho [1 -3 0 0 0 0 0] $(Format-F64 $rho);")
-$benchmarkLines.Add("    mu [1 -1 -1 0 0 0 0] $(Format-F64 $mu);")
-$benchmarkLines.Add("    k [1 1 -3 -1 0 0 0] $(Format-F64 $kThermal);")
-$benchmarkLines.Add("}")
-$benchmarkLines.Add("")
-$benchmarkLines.Add("flowReference")
-$benchmarkLines.Add("{")
-$benchmarkLines.Add("    meanVelocity [0 1 -1 0 0 0 0] $(Format-F64 $MeanVelocity);")
-$benchmarkLines.Add("    inletVelocityProfile parabolicFullyDeveloped;")
-$benchmarkLines.Add("    inletVelocityScale [0 0 0 0 0 0 0] $(Format-F64 $inletVelocityScale);")
-$benchmarkLines.Add("    reynolds [0 0 0 0 0 0 0] $(Format-F64 $reynolds);")
-$benchmarkLines.Add("    pressureLossModel HagenPoiseuille;")
-$benchmarkLines.Add("    expectedDeltaP [1 -1 -2 0 0 0 0] $(Format-F64 $deltaP);")
-$benchmarkLines.Add("    minorLosses off;")
-$benchmarkLines.Add("}")
-$benchmarkLines.Add("")
-$benchmarkLines.Add("openFoamReference")
-$benchmarkLines.Add("{")
-$benchmarkLines.Add("    application simpleFoam;")
-$benchmarkLines.Add("    pressureConvention kinematic;")
-$benchmarkLines.Add('    pressureConversion "p_Pa = rho * p_OpenFOAM";')
-$benchmarkLines.Add("    expectedDeltaPKinematic [0 2 -2 0 0 0 0] $(Format-F64 $deltaPKinematic);")
-$benchmarkLines.Add('    generatedCase "target/openfoam/laminar_pipe";')
-$benchmarkLines.Add('    resultJson "target/benchmarks/laminar_pipe_openfoam.json";')
-$benchmarkLines.Add("}")
-$benchmarkLines.Add("")
-$benchmarkLines.Add("timingReference")
-$benchmarkLines.Add("{")
-$benchmarkLines.Add("    recordWallClock yes;")
-$benchmarkLines.Add("    recordOpenFoamExecutionTime yes;")
-$benchmarkLines.Add("    recordFerrumPreflightWallClock yes;")
-$benchmarkLines.Add('    resultJson "target/benchmarks/laminar_pipe_compare.json";')
-$benchmarkLines.Add("}")
-$benchmarkLines.Add("")
-$benchmarkLines.Add("heatReference")
-$benchmarkLines.Add("{")
-$benchmarkLines.Add("    enabled yes;")
-$benchmarkLines.Add("    wallTemperature [0 0 0 1 0 0 0] $(Format-F64 $WallTemperature);")
-$benchmarkLines.Add("    nusseltConstantWallTemperature [0 0 0 0 0 0 0] $(Format-F64 $nusseltWallTemperature);")
-$benchmarkLines.Add("    expectedH [1 0 -3 -1 0 0 0] $(Format-F64 $heatTransferCoefficient);")
-$benchmarkLines.Add("}")
-$benchmarkLines.Add("")
-$benchmarkLines.Add("variants")
-$benchmarkLines.Add("{")
-$benchmarkLines.Add("    noLosses")
-$benchmarkLines.Add("    {")
-$benchmarkLines.Add("        wallFriction off;")
-$benchmarkLines.Add("        heatTransfer off;")
-$benchmarkLines.Add("    }")
-$benchmarkLines.Add("")
-$benchmarkLines.Add("    hagenPoiseuille")
-$benchmarkLines.Add("    {")
-$benchmarkLines.Add("        wallFriction on;")
-$benchmarkLines.Add("        minorLosses off;")
-$benchmarkLines.Add("        heatTransfer off;")
-$benchmarkLines.Add("    }")
-$benchmarkLines.Add("")
-$benchmarkLines.Add("    constantWallTemperature")
-$benchmarkLines.Add("    {")
-$benchmarkLines.Add("        wallFriction on;")
-$benchmarkLines.Add("        minorLosses off;")
-$benchmarkLines.Add("        heatTransfer fixedWallTemperature;")
-$benchmarkLines.Add("    }")
-$benchmarkLines.Add("}")
-Write-AsciiFile (Join-Path $CaseRoot "constant\pipeBenchmark") $benchmarkLines.ToArray()
 
 $summaryLines = New-Object System.Collections.Generic.List[string]
 $summaryLines.Add("FerrumCFD mesh summary")

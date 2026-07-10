@@ -2,6 +2,7 @@ param(
     [string]$CaseRoot = "",
     [string]$WorkDir = "",
     [string]$OutFile = "",
+    [string]$BenchmarkProperties = "",
     [ValidateSet("Auto", "Native", "Wsl")]
     [string]$Mode = "Auto",
     [int]$EndTime = 200,
@@ -19,6 +20,9 @@ if ([string]::IsNullOrWhiteSpace($WorkDir)) {
 }
 if ([string]::IsNullOrWhiteSpace($OutFile)) {
     $OutFile = Join-Path $RepoRoot "target\benchmarks\laminar_pipe_openfoam.json"
+}
+if ([string]::IsNullOrWhiteSpace($BenchmarkProperties)) {
+    $BenchmarkProperties = Join-Path $RepoRoot "benchmarks\laminar_pipe\pipeBenchmark"
 }
 if ($EndTime -le 0) {
     throw "EndTime must be a positive integer number of SIMPLE pseudo-time steps"
@@ -48,6 +52,23 @@ function ConvertTo-WslPath([string]$Path) {
         throw "could not convert '$resolved' to a WSL path"
     }
     return $converted.Trim()
+}
+
+function ConvertTo-BashSingleQuoted([string]$Value) {
+    $singleQuoteEscape = "'" + '"' + "'" + '"' + "'"
+    return "'" + $Value.Replace("'", $singleQuoteEscape) + "'"
+}
+
+function Get-FullPath([string]$Path) {
+    return [System.IO.Path]::GetFullPath($Path)
+}
+
+function Test-IsPathUnder([string]$Child, [string]$Parent) {
+    $childFull = Get-FullPath $Child
+    $parentFull = (Get-FullPath $Parent).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+    return $childFull.Equals($parentFull, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $childFull.StartsWith($parentFull + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $childFull.StartsWith($parentFull + [System.IO.Path]::AltDirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)
 }
 
 function Test-NativeOpenFoam {
@@ -199,7 +220,7 @@ function Read-BoundaryPatchRanges([string]$BoundaryPath) {
 }
 
 function Read-PipeBenchmarkParameters([string]$CaseRoot) {
-    $path = Join-Path $CaseRoot "constant\pipeBenchmark"
+    $path = $script:BenchmarkProperties
     $result = [ordered]@{
         type = $null
         rho = $null
@@ -211,7 +232,7 @@ function Read-PipeBenchmarkParameters([string]$CaseRoot) {
         points = $null
     }
     if (!(Test-Path -LiteralPath $path)) {
-        return [pscustomobject]$result
+        throw "benchmark properties not found: $path"
     }
 
     $content = Get-Content -LiteralPath $path -Raw
@@ -253,14 +274,7 @@ function Get-Average([double[]]$Values) {
     return $sum / [double]$Values.Count
 }
 
-function Get-CellCenterLengthFraction($Benchmark) {
-    if ($null -eq $Benchmark.axialCells -or [int]$Benchmark.axialCells -le 1) {
-        return $null
-    }
-    return ([double]([int]$Benchmark.axialCells - 1)) / [double]$Benchmark.axialCells
-}
-
-function Measure-PatchOwnerPressureLoss($Values, [string]$CaseRoot, $Benchmark) {
+function Measure-PatchOwnerPressureLoss($Values, [string]$CaseRoot) {
     $patches = Read-BoundaryPatchRanges (Join-Path $CaseRoot "constant\polyMesh\boundary")
     if (!$patches.ContainsKey("inlet") -or !$patches.ContainsKey("outlet")) {
         return $null
@@ -300,53 +314,15 @@ function Measure-PatchOwnerPressureLoss($Values, [string]$CaseRoot, $Benchmark) 
         inletAverage = $inletAverage
         outletAverage = $outletAverage
         delta = $inletAverage - $outletAverage
-        effectiveLengthFraction = Get-CellCenterLengthFraction $Benchmark
+        effectiveLengthFraction = $null
     }
 }
 
-function Measure-AxialPressureLoss($Values, $Benchmark, [string]$CaseRoot) {
+function Measure-AxialPressureLoss($Values, [string]$CaseRoot) {
     if ($Values.Count -lt 2) {
         return $null
     }
-
-    if ($null -ne $Benchmark.axialCells -and $null -ne $Benchmark.radialCells -and $null -ne $Benchmark.angularSectors) {
-        $cellsPerSlice = [int]$Benchmark.radialCells * [int]$Benchmark.angularSectors
-        $lastStart = ([int]$Benchmark.axialCells - 1) * $cellsPerSlice
-        if ($cellsPerSlice -gt 0 -and $Values.Count -ge ($lastStart + $cellsPerSlice)) {
-            $inlet = New-Object System.Collections.Generic.List[double]
-            $outlet = New-Object System.Collections.Generic.List[double]
-            for ($i = 0; $i -lt $cellsPerSlice; $i++) {
-                $inlet.Add([double]$Values[$i]) | Out-Null
-                $outlet.Add([double]$Values[$lastStart + $i]) | Out-Null
-            }
-            $inletAverage = Get-Average $inlet.ToArray()
-            $outletAverage = Get-Average $outlet.ToArray()
-            return [pscustomobject][ordered]@{
-                method = "axialSliceAverage"
-                inletSamples = $inlet.Count
-                outletSamples = $outlet.Count
-                inletAverage = $inletAverage
-                outletAverage = $outletAverage
-                delta = $inletAverage - $outletAverage
-                effectiveLengthFraction = Get-CellCenterLengthFraction $Benchmark
-            }
-        }
-    }
-
-    $patchLoss = Measure-PatchOwnerPressureLoss $Values $CaseRoot $Benchmark
-    if ($null -ne $patchLoss) {
-        return $patchLoss
-    }
-
-    return [pscustomobject][ordered]@{
-        method = "firstLastCell"
-        inletSamples = 1
-        outletSamples = 1
-        inletAverage = [double]$Values[0]
-        outletAverage = [double]$Values[$Values.Count - 1]
-        delta = [double]$Values[0] - [double]$Values[$Values.Count - 1]
-        effectiveLengthFraction = $null
-    }
+    return Measure-PatchOwnerPressureLoss $Values $CaseRoot
 }
 
 function Read-LastFoamTiming([string]$LogPath) {
@@ -366,9 +342,30 @@ function Read-LastFoamTiming([string]$LogPath) {
 }
 
 $benchmark = Read-PipeBenchmarkParameters $CaseRoot
-$rho = if ($null -ne $benchmark.rho) { [double]$benchmark.rho } else { 998.2 }
-$analyticDeltaPPa = if ($null -ne $benchmark.analyticDeltaPPa) { [double]$benchmark.analyticDeltaPPa } else { 1.6032 }
+$rho = $benchmark.rho
+$analyticDeltaPPa = $benchmark.analyticDeltaPPa
+foreach ($requiredValue in @(@{ name = "rho"; value = $rho }, @{ name = "expectedDeltaP"; value = $analyticDeltaPPa })) {
+    if ($null -eq $requiredValue.value -or [double]::IsNaN([double]$requiredValue.value) -or
+        [double]::IsInfinity([double]$requiredValue.value) -or [double]$requiredValue.value -le 0.0) {
+        throw "$($requiredValue.name) must be a positive finite value in $BenchmarkProperties"
+    }
+}
+$rho = [double]$rho
+$analyticDeltaPPa = [double]$analyticDeltaPPa
 $analyticDeltaPKinematic = $analyticDeltaPPa / $rho
+$sourceOwner = Read-FoamLabelList (Join-Path $CaseRoot "constant\polyMesh\owner")
+$sourceNeighbour = Read-FoamLabelList (Join-Path $CaseRoot "constant\polyMesh\neighbour")
+$sourceOwnerMaximum = if ($sourceOwner.Count -gt 0) { [int](($sourceOwner | Measure-Object -Maximum).Maximum) } else { $null }
+$sourceNeighbourMaximum = if ($sourceNeighbour.Count -gt 0) { [int](($sourceNeighbour | Measure-Object -Maximum).Maximum) } else { $null }
+$sourceMaximumCell = if ($null -eq $sourceOwnerMaximum) {
+    $sourceNeighbourMaximum
+} elseif ($null -eq $sourceNeighbourMaximum) {
+    $sourceOwnerMaximum
+} else {
+    [Math]::Max($sourceOwnerMaximum, $sourceNeighbourMaximum)
+}
+$sourceCellCount = if ($null -ne $sourceMaximumCell) { 1L + [long]$sourceMaximumCell } else { $null }
+$sourceFaceCount = if ($sourceOwner.Count -gt 0) { $sourceOwner.Count } else { $null }
 $initialPressurePa = @(Read-InternalScalarField (Join-Path $CaseRoot "0\p") | ForEach-Object { [double]$_ })
 $initialPressureField = "internalField uniform 0;"
 if ($initialPressurePa.Count -eq 1) {
@@ -385,6 +382,11 @@ $initialPressureBlock
 "@
 }
 
+$targetRoot = Join-Path $RepoRoot "target"
+if (!(Test-IsPathUnder $WorkDir $targetRoot)) {
+    throw "WorkDir must be inside the repository target directory: $targetRoot"
+}
+
 if (Test-Path -LiteralPath $WorkDir) {
     Remove-Item -LiteralPath $WorkDir -Recurse -Force
 }
@@ -395,30 +397,10 @@ New-Item -ItemType Directory -Force -Path (Join-Path $WorkDir "system") | Out-Nu
 Copy-Item -LiteralPath (Join-Path $CaseRoot "constant\polyMesh") -Destination (Join-Path $WorkDir "constant\polyMesh") -Recurse
 
 $sourceU = Join-Path $CaseRoot "0\U"
-if (Test-Path -LiteralPath $sourceU) {
-    Copy-Item -LiteralPath $sourceU -Destination (Join-Path $WorkDir "0\U") -Force
-} else {
-    Write-AsciiFile (Join-Path $WorkDir "0\U") @"
-FoamFile
-{
-    version 2.0;
-    format ascii;
-    class volVectorField;
-    location "0";
-    object U;
+if (!(Test-Path -LiteralPath $sourceU -PathType Leaf)) {
+    throw "OpenFOAM benchmark requires the case velocity field: $sourceU"
 }
-
-dimensions [0 1 -1 0 0 0 0];
-internalField uniform (0.02 0 0);
-
-boundaryField
-{
-    inlet { type fixedValue; value uniform (0.02 0 0); }
-    outlet { type zeroGradient; }
-    wall { type noSlip; }
-}
-"@
-}
+Copy-Item -LiteralPath $sourceU -Destination (Join-Path $WorkDir "0\U") -Force
 
 Write-AsciiFile (Join-Path $WorkDir "0\p") @"
 FoamFile
@@ -443,19 +425,11 @@ boundaryField
 }
 "@
 
-Write-AsciiFile (Join-Path $WorkDir "constant\transportProperties") @"
-FoamFile
-{
-    version 2.0;
-    format ascii;
-    class dictionary;
-    location "constant";
-    object transportProperties;
+$sourceTransportProperties = Join-Path $CaseRoot "constant\transportProperties"
+if (!(Test-Path -LiteralPath $sourceTransportProperties -PathType Leaf)) {
+    throw "OpenFOAM benchmark requires case transportProperties: $sourceTransportProperties"
 }
-
-transportModel Newtonian;
-nu [0 2 -1 0 0 0 0] 1.0038e-6;
-"@
+Copy-Item -LiteralPath $sourceTransportProperties -Destination (Join-Path $WorkDir "constant\transportProperties") -Force
 
 Write-AsciiFile (Join-Path $WorkDir "constant\turbulenceProperties") @"
 FoamFile
@@ -493,51 +467,13 @@ writePrecision 10;
 runTimeModifiable false;
 "@
 
-Write-AsciiFile (Join-Path $WorkDir "system\fvSchemes") @"
-FoamFile
-{
-    version 2.0;
-    format ascii;
-    class dictionary;
-    location "system";
-    object fvSchemes;
+foreach ($dictionaryName in @("fvSchemes", "fvSolution")) {
+    $sourceDictionary = Join-Path $CaseRoot "system\$dictionaryName"
+    if (!(Test-Path -LiteralPath $sourceDictionary -PathType Leaf)) {
+        throw "OpenFOAM benchmark requires case dictionary: $sourceDictionary"
+    }
+    Copy-Item -LiteralPath $sourceDictionary -Destination (Join-Path $WorkDir "system\$dictionaryName") -Force
 }
-
-ddtSchemes { default steadyState; }
-gradSchemes { default Gauss linear; }
-divSchemes { default none; div(phi,U) Gauss linearUpwind grad(U); }
-laplacianSchemes { default Gauss linear corrected; }
-interpolationSchemes { default linear; }
-snGradSchemes { default corrected; }
-"@
-
-Write-AsciiFile (Join-Path $WorkDir "system\fvSolution") @"
-FoamFile
-{
-    version 2.0;
-    format ascii;
-    class dictionary;
-    location "system";
-    object fvSolution;
-}
-
-solvers
-{
-    p { solver PCG; preconditioner DIC; tolerance 1e-12; relTol 0; }
-    U { solver smoothSolver; smoother symGaussSeidel; tolerance 1e-12; relTol 0; }
-}
-
-SIMPLE
-{
-    nNonOrthogonalCorrectors 0;
-}
-
-relaxationFactors
-{
-    fields { p 0.3; }
-    equations { U 0.7; }
-}
-"@
 
 $selectedMode = Get-OpenFoamMode
 $logPath = Join-Path $WorkDir "log.simpleFoam"
@@ -563,7 +499,8 @@ if ($null -eq $selectedMode) {
             }
         } else {
             $wslCase = ConvertTo-WslPath $WorkDir
-            $bash = "source /opt/openfoam*/etc/bashrc 2>/dev/null || source /usr/lib/openfoam*/etc/bashrc 2>/dev/null || true; cd '$wslCase' && simpleFoam > log.simpleFoam 2>&1"
+            $quotedWslCase = ConvertTo-BashSingleQuoted $wslCase
+            $bash = "source /opt/openfoam*/etc/bashrc 2>/dev/null || source /usr/lib/openfoam*/etc/bashrc 2>/dev/null || true; cd -- $quotedWslCase && simpleFoam > log.simpleFoam 2>&1"
             & wsl bash -lc $bash
             $script:foamExitCode = $LASTEXITCODE
         }
@@ -582,17 +519,13 @@ $latestTime = Get-LatestTimeDirectory $WorkDir
 $openFoamDelta = $null
 if ($null -ne $latestTime) {
     $pValues = Read-InternalScalarField (Join-Path $latestTime.FullName "p")
-    $loss = Measure-AxialPressureLoss $pValues $benchmark $WorkDir
+    $loss = Measure-AxialPressureLoss $pValues $WorkDir
     if ($null -ne $loss) {
         $sampledDeltaKinematic = $loss.delta
         $sampledDeltaPa = $sampledDeltaKinematic * $rho
         $effectiveLengthFraction = $loss.effectiveLengthFraction
         $deltaPa = $sampledDeltaPa
         $deltaKinematic = $sampledDeltaKinematic
-        if ($null -ne $effectiveLengthFraction -and [double]$effectiveLengthFraction -gt 0.0) {
-            $deltaPa = $sampledDeltaPa / [double]$effectiveLengthFraction
-            $deltaKinematic = $sampledDeltaKinematic / [double]$effectiveLengthFraction
-        }
         $openFoamDelta = [ordered]@{
             latestTime = $latestTime.Name
             samples = $pValues.Count
@@ -608,6 +541,16 @@ if ($null -ne $latestTime) {
             deltaPPa = $deltaPa
             relativeErrorToAnalytic = if ($analyticDeltaPPa -ne 0.0) { ($deltaPa - $analyticDeltaPPa) / $analyticDeltaPPa } else { $null }
         }
+    } elseif ($status -eq "ran") {
+        $status = "pressure-sampling-failed"
+        if ($RequireOpenFoam) {
+            throw "could not sample inlet/outlet owner-cell pressure from $($latestTime.FullName)"
+        }
+    }
+} elseif ($status -eq "ran") {
+    $status = "pressure-output-missing"
+    if ($RequireOpenFoam) {
+        throw "simpleFoam completed without a numeric output time directory in $WorkDir"
     }
 }
 
@@ -628,12 +571,13 @@ $result = [ordered]@{
         deltaPKinematic = $analyticDeltaPKinematic
     }
     mesh = [ordered]@{
-        type = $benchmark.type
-        axialCells = $benchmark.axialCells
-        radialCells = $benchmark.radialCells
-        angularSectors = $benchmark.angularSectors
-        cells = $benchmark.cells
-        points = $benchmark.points
+        type = "polyMesh"
+        axialCells = $null
+        radialCells = $null
+        angularSectors = $null
+        cells = $sourceCellCount
+        faces = $sourceFaceCount
+        points = $null
     }
     runControl = [ordered]@{
         application = "simpleFoam"

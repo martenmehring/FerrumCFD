@@ -94,10 +94,29 @@ pub fn init_case(options: &InitCaseOptions) -> Result<InitCaseSummary, String> {
 }
 
 fn ensure_dir(path: &Path, summary: &mut InitCaseSummary) -> Result<(), String> {
-    if !path.exists() {
-        fs::create_dir_all(path)
-            .map_err(|error| format!("could not create {} ({error})", path.display()))?;
-        summary.created_dirs.push(path.to_path_buf());
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "refusing to use symlink as case directory: {}",
+                    path.display()
+                ));
+            }
+            if !metadata.is_dir() {
+                return Err(format!("{} exists but is not a directory", path.display()));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(path)
+                .map_err(|error| format!("could not create {} ({error})", path.display()))?;
+            summary.created_dirs.push(path.to_path_buf());
+        }
+        Err(error) => {
+            return Err(format!(
+                "could not inspect directory {} ({error})",
+                path.display()
+            ));
+        }
     }
     Ok(())
 }
@@ -108,9 +127,26 @@ fn write_file(
     summary: &mut InitCaseSummary,
     write: impl FnOnce(&mut BufWriter<File>) -> Result<(), std::io::Error>,
 ) -> Result<(), String> {
-    if path.exists() && !force {
-        summary.skipped_files.push(path.to_path_buf());
-        return Ok(());
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "refusing to write case template through symlink: {}",
+                    path.display()
+                ));
+            }
+            if !force {
+                summary.skipped_files.push(path.to_path_buf());
+                return Ok(());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "could not inspect output file {} ({error})",
+                path.display()
+            ));
+        }
     }
 
     let file = File::create(path)
@@ -178,7 +214,11 @@ fn write_fv_schemes(writer: &mut BufWriter<File>) -> Result<(), std::io::Error> 
 fn write_fv_solution(writer: &mut BufWriter<File>) -> Result<(), std::io::Error> {
     write_foam_header(writer, "dictionary", "fvSolution", "system")?;
     writeln!(writer, "solvers {{ }}")?;
-    writeln!(writer, "SIMPLE {{ nNonOrthogonalCorrectors 0; }}")?;
+    writeln!(writer, "SIMPLE")?;
+    writeln!(writer, "{{")?;
+    writeln!(writer, "    nNonOrthogonalCorrectors 0;")?;
+    writeln!(writer, "    consistent false;")?;
+    writeln!(writer, "}}")?;
     writeln!(writer)?;
     writeln!(writer, "relaxationFactors")?;
     writeln!(writer, "{{")?;

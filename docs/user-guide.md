@@ -21,6 +21,7 @@ target/debug/gmshToFerrumFoam.exe
 target/debug/checkFerrumMesh.exe
 target/debug/splitFerrumMeshRegions.exe
 target/debug/ferrumSolver.exe
+target/debug/ferrumPlaneChannelBenchmark.exe
 ```
 
 During development, commands can also be run through Cargo:
@@ -210,8 +211,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_gmsh_pipe_import
 
 The script uses `examples/gmsh_pipe/pipe_prism2.geo`, writes the generated
 `.msh` below `target/gmsh/`, imports it to `target/cases/gmsh_pipe`, and runs
-`checkFerrumMesh`. It finds `gmsh.exe` from `PATH` or the local Downloads Gmsh
-installation; pass `-GmshExe <path-to-gmsh.exe>` when needed. This Gmsh pipe is
+`checkFerrumMesh`. It finds `gmsh.exe` from `PATH`; pass the trusted installation
+explicitly with `-GmshExe <path-to-gmsh.exe>` when needed. This Gmsh pipe is
 a benchmark fixture for comparing FerrumCFD and OpenFOAM on the same mesh. It
 does not make OpenFOAM part of the normal FerrumCFD workflow.
 
@@ -436,9 +437,10 @@ results back to SI pressure in `Pa` before comparison.
 
 ## Laminar Pipe Benchmark
 
-`examples/laminar_pipe` is the first SI benchmark case. It uses a generated
-structured circular pipe, water near 20 C, and an analytical
-Hagen-Poiseuille pressure-loss reference.
+`examples/laminar_pipe` is the first SI pipe simulation case used by the
+benchmark suite. It contains the mesh, fields, material properties, and solver
+dictionaries. The analytical Hagen-Poiseuille reference is separate at
+`benchmarks/laminar_pipe/pipeBenchmark`.
 
 Regenerate the versioned medium-resolution case with:
 
@@ -470,6 +472,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_gmsh_pipe_mesh_s
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_gmsh_pipe_mesh_study.ps1 -OpenFoamSteps 1000
 ```
 
+If `gmsh.exe` is not on `PATH`, pass a trusted installation explicitly with
+`-GmshExe <path-to-gmsh.exe>`. FerrumCFD does not auto-execute a same-named
+binary discovered in Downloads.
+
 The intended validation order is:
 
 - generate several Gmsh meshes
@@ -495,9 +501,9 @@ existing OpenFOAM result.
 
 ## Solver Preflight
 
-`ferrumSolver` is the solver front door. At this stage it does not execute CFD
-kernels yet. It reads the case and prints the solver-neutral run plan that
-later CPU/GPU solver code should consume.
+`ferrumSolver` is the solver front door. Its `--preflight` and
+`--runnerDryRun` modes do not execute CFD kernels; they read the case and print
+the solver-neutral run plan used by current CPU and later GPU solver paths.
 
 ```powershell
 ferrumSolver -case cases\my_case --preflight
@@ -568,11 +574,11 @@ does not dump the full geometry or field arrays into JSON. These runtime arrays
 are the handoff point for the future CPU/GPU equation kernels.
 
 FerrumCFD also contains the first executable CPU linear algebra foundation:
-CSR matrices, matrix-vector products, residual calculation, Jacobi, conjugate
-gradient, preconditioned-CG, and BiCGStab. The preflight reports these as CPU
-linear-solver capabilities. They are the solve-side substrate for the scalar
-diffusion and laminar flow assemblies described below, but they are not yet
-driven by a complete CFD time-loop.
+CSR matrices, matrix-vector products, residual calculation, Jacobi,
+Gauss-Seidel, conjugate gradient, preconditioned-CG, and BiCGStab. The
+preflight reports these as CPU linear-solver capabilities. They are the
+solve-side substrate for the scalar diffusion and laminar flow assemblies
+described below, but they are not yet driven by a complete CFD time-loop.
 
 The first equation assembly foundation is now present as well. It can assemble
 a scalar diffusion/Poisson CSR system on CPU from runtime mesh geometry with
@@ -605,9 +611,9 @@ fully developed axial Stokes balance as a source-driven scalar equation:
 -mu * laplacian(Ux) = deltaP / L
 ```
 
-with `Ux=0` on wall patches and `zeroGradient` elsewhere. By default it reads
-`deltaP`, `mu`, `L`, and `D` from the `examples/laminar_pipe` benchmark
-dictionaries. Values can also be supplied explicitly:
+with `Ux=0` on wall patches and `zeroGradient` elsewhere. It is
+benchmark-oriented. `deltaP`, `L`, and `D` must be supplied explicitly;
+`mu` may be explicit or read from `constant/transportProperties`:
 
 ```powershell
 ferrumSolver -case examples\laminar_pipe --solvePoiseuille --pressureDrop 1.6032 --mu 0.001002 --length 1 --diameter 0.02 --wallPatch wall --linearSolver cg
@@ -637,15 +643,28 @@ path. It reads the OpenFOAM-like case dictionaries and fields that a
 - `constant/polyMesh`
 
 It builds the first finite-volume flow operators on the runtime mesh:
-`phi = U_f . S_f`, `grad(p)`, `div(phi,U)`, and `laplacian(nu,U)`. The momentum
-predictor currently assembles `rho * div(phi,U)` as an implicit upwind
-contribution and applies OpenFOAM-style equation relaxation to the velocity
-equation. This avoids the central-convection oscillations seen in early
-multi-step SIMPLE experiments. For the pipe benchmark the supported
+`phi = U_f . S_f`, `grad(p)`, `div(phi,U)`, and `laplacian(nu,U)`. The SIMPLE
+path now reads the supported `system/fvSchemes` subset directly:
+
+- `gradSchemes`: `Gauss linear` for `grad(p)` and `grad(U)`
+- `divSchemes`: `div(phi,U) Gauss upwind` or
+  `div(phi,U) Gauss linearUpwind grad(U)`
+- `laplacianSchemes`: `Gauss linear corrected`, `orthogonal`, or `uncorrected`
+- `interpolationSchemes`: `linear`
+- `snGradSchemes`: `corrected`, `orthogonal`, or `uncorrected`
+
+`Gauss upwind` remains the fully implicit conservative baseline.
+`Gauss linearUpwind grad(U)` keeps that upwind matrix and adds the gradient
+part as a deferred correction to the right-hand side. This is closer to the
+OpenFOAM workflow without hiding artificial field clipping in the solver. For
+pipe/axisymmetric benchmarks and general inlet/outlet workflows, the supported
 boundary-condition contract is:
 
 - `U`: inlet `fixedValue` including nonuniform/parabolic values, wall `noSlip`,
-  outlet `zeroGradient`
+  outlet `zeroGradient`, plus OpenFOAM-style `inletOutlet` and
+  `pressureInletOutletVelocity` for pressure-driven open boundaries. For
+  `inletOutlet`, Ferrum uses `inletValue` on backflow and zero-gradient owner
+  values on outflow.
 - `p`: inlet `zeroGradient`, outlet `fixedValue`, and OpenFOAM-style
   `fixedFluxPressure` as a dynamic pressure-gradient boundary for flux
   consistency
@@ -655,7 +674,14 @@ Current practical command:
 
 ```powershell
 ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --solveTolerance 1e-6 --maxIterations 100 --solveReportJson target\benchmarks\laminar_pipe_laminar_simple.json --solveReportMarkdown target\benchmarks\laminar_pipe_laminar_simple.md
+ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --maxSimpleIterations 2 --writeFinalFields target\benchmarks\laminar_pipe_fields\1
+ferrumPipeBenchmark -case examples\laminar_pipe --fields target\benchmarks\laminar_pipe_fields\1 --pressureDrop 1.6032 --mu 0.001002 --length 1 --diameter 0.02 --axis x --inletPatch inlet --outletPatch outlet --outJson target\benchmarks\laminar_pipe_fields\1.pipe.json
 ```
+
+The first two commands are geometry-independent SIMPLE execution. The third is
+optional external post-processing of stored fields. `--pressureDrop`, `--length`,
+`--diameter`, `--axis`, and the sampling patch names are intentionally rejected
+by `--solveLaminarSimple`; they belong only to `ferrumPipeBenchmark`.
 
 The generic `--linearSolver` value is still accepted, but the laminar SIMPLE
 path can also split the linear solver choice and linear controls by equation:
@@ -664,6 +690,7 @@ path can also split the linear solver choice and linear controls by equation:
 ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --momentumLinearSolver bicgstab --pressureLinearSolver pcg --pressurePreconditioner DIC --maxSimpleIterations 20
 ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --momentumSolveTolerance 1e-7 --pressureSolveTolerance 1e-9 --momentumMaxIterations 300 --pressureMaxIterations 400
 ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --nNonOrthogonalCorrectors 1 --pRefCell 0 --pRefValue 0
+ferrumSolver -case examples\laminar_pipe --solveLaminarSimple --simpleConsistent true --maxSimpleIterations 20
 ```
 
 By default, `--solveLaminarSimple` reads OpenFOAM-style relaxation factors from
@@ -672,53 +699,149 @@ By default, `--solveLaminarSimple` reads OpenFOAM-style relaxation factors from
 overrides for experiments. It also reads `solvers.U.tolerance`,
 `solvers.p.tolerance`, `solvers.p.solver PCG`, `solvers.p.preconditioner DIC`,
 `SIMPLE.nNonOrthogonalCorrectors`, `SIMPLE.pRefCell`, `SIMPLE.pRefValue`, and
-optional `maxIter` values from `system/fvSolution`. The current CPU
-preconditioner maps OpenFOAM `DIC`/`FDIC`/`DILU` to Ferrum's diagonal
-preconditioner; full incomplete factorizations are still future solver work.
-OpenFOAM `smoothSolver` on `U` maps to Ferrum's CPU `bicgstab` path because the
-implicit upwind momentum matrix is non-symmetric. The generic
-`--solveTolerance` and `--maxIterations` flags remain broad overrides for both
-equations. If present, OpenFOAM-style `SIMPLE.residualControl` entries for `U`
-and `p` are read as additional convergence criteria.
+`SIMPLE.consistent`, and optional `maxIter` values from `system/fvSolution`.
+For pressure PCG, OpenFOAM `DIC`/`FDIC` maps to Ferrum's CPU IC(0)
+incomplete-Cholesky preconditioner. `DILU` is rejected until a true
+nonsymmetric ILU/DILU preconditioner exists; no diagonal fallback is applied.
+OpenFOAM `smoothSolver` on `U` requires a `smoother` entry and executes the
+matching CPU `GaussSeidel` or `symGaussSeidel` path. Explicit `bicgstab` remains available for nonsymmetric momentum
+experiments. The generic `--solveTolerance` and `--maxIterations` flags remain
+broad overrides for both equations. If present, OpenFOAM-style
+`SIMPLE.residualControl` entries for `U` and `p` are the primary
+early-convergence criteria. Ferrum follows the OpenFOAM Foundation 13 steady
+SIMPLE form, where each field entry is one absolute scalar tolerance:
 
-When `--maxSimpleIterations` is greater than one, Ferrum defaults to at least
-two SIMPLE iterations before convergence can be accepted. Multi-step
-convergence currently requires continuity L2 below `--simpleTolerance`,
-Hagen-Poiseuille pressure-drop error below `--pressureDropTolerance`, and
-relative `U`/`p` field changes below `--fieldChangeTolerance`. The stored
-pressure-field pressure drop is still reported, but it no longer acts as a
-hidden guard or field-capping mechanism. These controls can also be set as
-Ferrum-specific entries under `SIMPLE` in `system/fvSolution`:
-`minSimpleIterations`, `pressureDropTolerance`, and `fieldChangeTolerance`.
-For OpenFOAM-like runs without benchmark-specific early stopping, set an
-explicit `--minSimpleIterations` close to `--maxSimpleIterations` or provide
-`SIMPLE.residualControl` entries.
+```text
+SIMPLE
+{
+    nNonOrthogonalCorrectors 0;
+    residualControl
+    {
+        U 1e-3;
+        p 1e-2;
+    }
+}
+```
 
-The report records residuals, SIMPLE iterations, wall-clock time,
-finite-volume operator summaries, boundary counts, Hagen-Poiseuille error,
-continuity, and per-iteration field changes. The pressure bridge uses
-equation-relaxed momentum diagonals for cell-wise `rAU`, reconstructs
-`phiHbyA`, solves an absolute pressure equation, corrects `phi` from the
-pressure-equation flux, and carries that corrected surface flux into the next
-SIMPLE iteration. The pressure equation now supports OpenFOAM-like pressure
-reference anchoring for closed-pressure cases and executes
+Dictionary-valued criteria and criteria for fields not solved by the current
+laminar path are rejected instead of being ignored. `U` uses the maximum
+OpenFOAM-normalized initial residual over its three component solves. `p` uses
+the initial residual from the first pressure solve in the SIMPLE iteration,
+including when later non-orthogonal correctors perform additional pressure
+solves. The linear-solver final residual and convergence flag remain separate
+from this outer SIMPLE decision.
+
+If `tolerance` or `maxIter` is absent, the SIMPLE path uses the OpenFOAM 13
+`lduMatrix::solver` defaults `1e-6` and `1000`. Non-zero `relTol`, non-zero
+`minIter`, and `smoothSolver nSweeps` values other than `1` are rejected for
+now instead of being ignored or replaced silently.
+
+Without `--maxSimpleIterations`, Ferrum uses the positive iteration count
+derived from `controlDict` (`endTime - startTime` divided by `deltaT`). When
+the resulting budget is greater than one, Ferrum defaults to at least
+two SIMPLE iterations before convergence can be accepted. `endTime` or
+`--maxSimpleIterations` is the maximum budget; all configured
+`SIMPLE.residualControl` field tolerances permit an earlier stop. Continuity is
+reported as a diagnostic and is not an undocumented extra stopping criterion.
+Without `residualControl`, the solver runs to `--maxSimpleIterations` and reports
+`converged=false` with `convergence-criteria-not-configured`. Hagen-Poiseuille
+error, OpenFOAM comparison, and matched-time acceptance are evaluated by the
+external benchmark scripts; they cannot stop, cap, roll back, or force a flow
+direction in the generic solver. `minSimpleIterations` can still be set as a
+case-level `SIMPLE` value.
+
+Without `--writeFinalFields`, `--solveLaminarSimple` only reports and does not
+write fields back to the case. With `--writeFinalFields <dir>`, Ferrum writes
+final `U` and `p` files into the selected OpenFOAM-like time directory. The
+internal fields come from the solved cell values, while the dimensions and
+`boundaryField` entries are preserved from `0/U` and `0/p`.
+
+The generic solver report records residuals, SIMPLE iterations, wall-clock time,
+the active `fvSchemes` subset,
+finite-volume operator summaries, boundary counts, general `U`/`p` field summaries,
+continuity, per-iteration field changes, per-component momentum residuals,
+momentum `A/H1` ranges, `adjustPhi` mass-balance changes, and final
+pressure-assembly diagnostics under `pressureAssembly` in JSON and
+`Pressure Assembly Diagnostics` in Markdown. These diagnostics include
+`rAU/rAtU`, `HbyA`, `phiHbyA` before and after `adjustPhi`, pressure source,
+pressure-equation flux, pressure matrix size/diagonal/off-diagonal summaries,
+pressure flux, and corrected `phi`. JSON and Markdown reports also include a
+`linearSolves` profile with converged/non-converged momentum predictors,
+component momentum solves, pressure-correction solves, max/average linear
+iterations per SIMPLE step, and final linear-solver convergence flags. The
+iteration history, CSV, console, JSON, and Markdown outputs distinguish each
+field's OpenFOAM-normalized initial residual from its final linear residual and
+show the outer `residualControl` state independently.
+`ferrumPipeBenchmark` writes a different JSON/Markdown report containing mean
+axial velocity, Hagen-Poiseuille values, and named-patch pressure loss. Ferrum
+sets `converged=true` when the configured outer `SIMPLE.residualControl`
+criteria are checked and satisfied. Linear convergence remains explicitly
+reported through the corresponding `SolverPerformance`-style fields. The pressure
+bridge uses an internal momentum-equation object to apply equation relaxation,
+retain cell-wise `A` and `H1` diagnostics for `rAU/rAtU`, reconstruct
+`HbyA`, compute `phiHbyA` from HbyA with velocity boundary constraints applied,
+run OpenFOAM-like `adjustPhi` on pressure-controlled open boundaries, including
+`inletOutlet` faces only while they are outflowing, solve an absolute pressure
+equation, correct `phi` from the pressure-equation flux, correct velocity as
+`U = HbyA - rAtU grad(p)`, and carry that corrected surface flux into the next
+SIMPLE iteration. The pressure equation now supports
+OpenFOAM-like pressure reference anchoring for closed-pressure cases and executes
 `nNonOrthogonalCorrectors + 1` pressure solves, with `phi` updated from the
-final pressure solve. The normal solver path does not cap finite `U`, `p`, or
-`phi` updates and does not roll back a finite SIMPLE step; non-finite values
-are treated as numerical failure. Fully OpenFOAM-grade consistent SIMPLE,
-non-orthogonal correction terms, and true incomplete preconditioning are still
-solver-development work.
+final pressure solve. With `SIMPLE.consistent true`, Ferrum builds a
+consistent `rAtU` correction from the current Rust momentum matrix and applies
+the matching pressure-flux and velocity-correction terms. Non-orthogonal
+correctors use an explicit face-flux correction from the pressure gradient and
+the face area component not aligned with the cell-centre connection. The normal
+solver path does not cap finite `U`, `p`, or `phi` updates and does not roll
+back a finite SIMPLE step; non-finite values are treated as numerical failure.
+True nonsymmetric ILU/DILU preconditioning is still solver-development work.
+
+`ferrumPlaneChannelBenchmark` provides the same external separation for a 2D
+parallel-plate case. It reads stored `U`/`p`, applies
+`meanU = deltaP*H^2/(12*mu*L)`, and writes JSON/Markdown without changing the
+simulation. Use `--pressureScale <rho>` only when post-processing OpenFOAM's
+kinematic incompressible pressure; Ferrum fields remain SI Pa by default. The
+reference `.geo`, case dictionaries, and SI inputs are under
+`benchmarks/plane_channel/`.
 
 For the standard pipe benchmark, the automated comparison command is:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_poiseuille_benchmark.ps1 -OpenFoamSteps 200
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_simple_matched_time_benchmark.ps1 -MatchedTimeSeconds 100
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_openfoam_laminar_pipe_step_sweep.ps1 -OpenFoamSteps 100,200,400,800,1200 -TargetRelativeError 0.01
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_simple_benchmark.ps1 -SkipOpenFoam -UseExistingOpenFoamJson
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_simple_iteration_sweep.ps1 -SimpleIterations 2,5,10,20,30
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_simple_mesh_study.ps1 -OpenFoamSteps 400 -FerrumSimpleIterations 100
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_laminar_simple_pressure_sweep.ps1 -VariantName medium,fine -SimpleIterations 50,100,200
 ```
 
 The resulting Markdown tables record Ferrum pressure-loss error, OpenFOAM
 pressure-loss error, Ferrum solve time, OpenFOAM wall time, and the shared SI
 inputs such as `deltaP`, `rho`, `mu`, `L`, and `D`.
+The solver roadmap in `docs/solver-roadmap.md` records the remaining work from
+the current laminar SIMPLE prototype to the first production laminar
+incompressible solver.
+The iteration sweep is Ferrum-only: it fixes
+`minSimpleIterations=maxSimpleIterations`, writes one generic solver report and
+field directory per budget, and then runs the external pipe post-processor.
+Solver convergence and benchmark agreement therefore remain separate artifacts.
+The matched-time benchmark fixes OpenFOAM `endTime=MatchedTimeSeconds` with
+`deltaT=1` and Ferrum `minSimpleIterations=maxSimpleIterations` to the same
+number. For steady SIMPLE solvers this is an equal pseudo-time/iteration budget,
+not a transient physical-time integration.
+The OpenFOAM step sweep answers the inverse question: how many OpenFOAM
+`simpleFoam` pseudo-time steps are needed to reach a target analytic
+pressure-loss error. The older 100-1200 step table used axial-slice
+extrapolation; rerun it with the current named-patch owner-cell sampler before
+using it as an acceptance result.
+The laminar SIMPLE mesh study generates coarse, medium, and fine pipe cases and
+runs the current Ferrum SIMPLE path plus OpenFOAM on each. The earlier
+coarse/medium/fine direct-pressure table must also be regenerated after the
+sampler and report-separation change. The pressure-field sweep remains
+Ferrum-only, fixes `minSimpleIterations=maxSimpleIterations`, and now writes a
+generic report plus an external pipe report for every row. Pressure coupling
+still requires validation on fine and deliberately skewed meshes.
 
 It also checks basic `controlDict` consistency: recognized `startFrom`,
 `stopAt`, and `writeControl` modes, positive finite `deltaT`, valid
@@ -928,8 +1051,9 @@ consumed by built-in solver code.
   boundary types, and internal value counts, but it does not yet validate
   dimensions against solver equations.
 - `fvSchemes` and `fvSolution` are parsed and checked structurally for the
-  solver preflight; their entries are not yet consumed by executable
-  discretisation or equation assembly.
+  broad solver preflight. The laminar SIMPLE path already consumes the
+  documented `fvSchemes` subset and selected `fvSolution` entries, but many
+  OpenFOAM schemes and solver controls are still future work.
 - Constant property dictionaries are parsed structurally; solver-specific
   required material models and coefficients are not enforced yet.
 - `ferrumSolver` is currently a preflight/run planner; `--runnerDryRun`

@@ -1,0 +1,10 @@
+// External SI reference for the plane-channel benchmark.
+length 1.0;
+gap 0.02;
+depth 0.001;
+meanVelocity 0.02;
+rho 998.2;
+mu 0.001002;
+pressureDrop 0.6012;
+axis x;
+wallNormalAxis y;

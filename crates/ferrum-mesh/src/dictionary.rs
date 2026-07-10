@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 
 use crate::{MeshError, Result};
 
+pub const MAX_DICTIONARY_NESTING: usize = 128;
+
 #[derive(Clone, Debug)]
 pub struct Token {
     pub value: String,
@@ -10,12 +12,28 @@ pub struct Token {
 
 pub fn tokenize(content: &str) -> Vec<Token> {
     let mut tokens = Vec::new();
+    let mut in_block_comment = false;
     for (line_index, line) in content.lines().enumerate() {
         let mut current = String::new();
         let mut chars = line.chars().peekable();
         let mut inline_paren_depth = 0usize;
 
         while let Some(ch) = chars.next() {
+            if in_block_comment {
+                if ch == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    in_block_comment = false;
+                }
+                continue;
+            }
+
+            if ch == '/' && chars.peek() == Some(&'*') {
+                push_token(&mut tokens, &mut current, line_index + 1);
+                chars.next();
+                in_block_comment = true;
+                continue;
+            }
+
             if ch == '/' && chars.peek() == Some(&'/') {
                 break;
             }
@@ -244,6 +262,22 @@ mod tests {
         assert_eq!(
             values,
             vec!["internalField", "uniform", "(", "0", "0", "0", ")", ";"]
+        );
+    }
+
+    #[test]
+    fn skips_openfoam_multiline_block_comments() {
+        let tokens = tokenize(
+            "/* OpenFOAM\n   generated banner */\nFoamFile { class volVectorField; } /* tail */",
+        );
+        let values = tokens
+            .iter()
+            .map(|token| token.value.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            values,
+            vec!["FoamFile", "{", "class", "volVectorField", ";", "}"]
         );
     }
 }

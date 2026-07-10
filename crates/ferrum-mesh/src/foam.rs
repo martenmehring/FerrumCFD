@@ -3,7 +3,7 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use crate::{Mesh, Result};
+use crate::{Mesh, MeshError, Result};
 
 #[derive(Clone, Debug)]
 pub struct FoamWriteSummary {
@@ -77,6 +77,13 @@ pub fn write_openfoam_case_with_options(
     source_path: &Path,
     options: &FoamWriteOptions,
 ) -> Result<FoamWriteSummary> {
+    for (patch, patch_type) in &options.patch_types {
+        validate_openfoam_word(patch_type).map_err(|reason| {
+            MeshError::InvalidInput(format!(
+                "invalid OpenFOAM patch type '{patch_type}' for patch '{patch}': {reason}"
+            ))
+        })?;
+    }
     let poly_mesh_dir = case_dir.join("constant").join("polyMesh");
     fs::create_dir_all(&poly_mesh_dir)?;
     fs::create_dir_all(case_dir.join("system"))?;
@@ -481,7 +488,16 @@ fn write_minimal_system_files(case_dir: &Path) -> Result<()> {
         "system",
     )?;
     writeln!(solution, "solvers {{ }}")?;
-    writeln!(solution, "SIMPLE {{ nNonOrthogonalCorrectors 0; }}")?;
+    writeln!(solution, "SIMPLE")?;
+    writeln!(solution, "{{")?;
+    writeln!(solution, "    nNonOrthogonalCorrectors 0;")?;
+    writeln!(solution, "    consistent false;")?;
+    writeln!(solution, "    residualControl")?;
+    writeln!(solution, "    {{")?;
+    writeln!(solution, "        U 1e-8;")?;
+    writeln!(solution, "        p 1e-8;")?;
+    writeln!(solution, "    }}")?;
+    writeln!(solution, "}}")?;
     Ok(())
 }
 
@@ -624,6 +640,30 @@ fn sanitize_name(name: &str) -> String {
         "unnamed".to_string()
     } else {
         sanitized
+    }
+}
+
+fn validate_openfoam_word(value: &str) -> std::result::Result<(), &'static str> {
+    if value.is_empty() {
+        return Err("value must not be empty");
+    }
+    if !value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+    {
+        return Err("value must contain only OpenFOAM word characters");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::validate_openfoam_word;
+
+    #[test]
+    fn rejects_dictionary_syntax_in_patch_type() {
+        assert!(validate_openfoam_word("wall; #include secret").is_err());
+        assert!(validate_openfoam_word("fixedValue").is_ok());
     }
 }
 

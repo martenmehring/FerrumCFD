@@ -1,5 +1,6 @@
 param(
     [string]$StudyRoot = "",
+    [string]$BenchmarkProperties = "",
     [ValidateSet("Auto", "Native", "Wsl")]
     [string]$Mode = "Auto",
     [string[]]$VariantName = @(),
@@ -17,6 +18,12 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($StudyRoot)) {
     $StudyRoot = Join-Path $RepoRoot "target\benchmarks\laminar_pipe_convergence"
+}
+if ([string]::IsNullOrWhiteSpace($BenchmarkProperties)) {
+    $BenchmarkProperties = Join-Path $RepoRoot "benchmarks\laminar_pipe\pipeBenchmark"
+}
+if (!(Test-Path -LiteralPath $BenchmarkProperties -PathType Leaf)) {
+    throw "benchmark properties not found: $BenchmarkProperties"
 }
 if ($OpenFoamSteps -le 0) {
     throw "OpenFoamSteps must be positive"
@@ -174,6 +181,7 @@ foreach ($variant in $variants) {
             CaseRoot = $caseRoot
             WorkDir = $openFoamWorkDir
             OutFile = $openFoamJson
+            BenchmarkProperties = $BenchmarkProperties
             Mode = $Mode
             EndTime = $OpenFoamSteps
             WriteInterval = $OpenFoamSteps
@@ -192,6 +200,7 @@ foreach ($variant in $variants) {
             FerrumPlanJson = $planJson
             OutFile = $compareJson
             ReportFile = $compareReport
+            BenchmarkProperties = $BenchmarkProperties
             FerrumLinearSolver = $FerrumLinearSolver
             FerrumSolveTolerance = $FerrumSolveTolerance
             FerrumMaxIterations = $FerrumMaxIterations
@@ -272,6 +281,7 @@ $summary = [pscustomobject][ordered]@{
     ferrumLinearSolver = $FerrumLinearSolver
     ferrumSolveTolerance = $FerrumSolveTolerance
     ferrumMaxIterations = $FerrumMaxIterations
+    benchmarkProperties = $BenchmarkProperties
     variants = $rowArray
     summaryJson = $summaryJson
     reportFile = $reportFile

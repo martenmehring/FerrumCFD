@@ -2,11 +2,13 @@ mod case;
 
 use std::env;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Error, ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use case::{InitCaseOptions, init_case};
+use ferrum_mesh::Point3;
 use ferrum_mesh::backends::{
     read_backend_config, validate_backend_policy, validate_backend_resources,
 };
@@ -16,13 +18,18 @@ use ferrum_mesh::diffusion::{
     scalar_diffusion_options_from_field,
 };
 use ferrum_mesh::fields::{
-    FieldBoundaryValidationSummary, FieldFile, InitialFieldSet, read_initial_fields,
-    validate_initial_field_boundaries,
+    FieldBoundaryValidationSummary, FieldFile, FieldValueSummary, InitialFieldSet,
+    read_fields_from_directory, read_initial_fields, validate_initial_field_boundaries,
 };
 use ferrum_mesh::flow::{
-    ContinuitySummary, FlowBoundarySummary, FlowOperatorSummary, LaminarSimpleIterationSummary,
+    ContinuitySummary, FaceFluxDiagnosticSummary, FlowBoundarySummary, FlowOperatorSummary,
+    LaminarSimpleConvectionScheme, LaminarSimpleFieldSummary, LaminarSimpleGradientScheme,
+    LaminarSimpleInterpolationScheme, LaminarSimpleIterationSummary, LaminarSimpleLaplacianScheme,
     LaminarSimpleLinearSolver, LaminarSimpleOptions, LaminarSimplePreconditioner,
-    LaminarSimpleReport, LaminarSimpleSolutionSummary, solve_laminar_simple,
+    LaminarSimpleReport, LaminarSimpleResidualControlSummary, LaminarSimpleSchemes,
+    LaminarSimpleSnGradScheme, LaminarSimpleStopReason, LinearSolveSummary,
+    MatrixDiagnosticSummary, PressureAssemblyDiagnostics, ScalarDiagnosticSummary,
+    VectorDiagnosticSummary, solve_laminar_simple, solve_laminar_simple_with_observer,
 };
 use ferrum_mesh::foam::{FoamWriteOptions, write_openfoam_case_with_options};
 use ferrum_mesh::geometry::{GeometrySummary, summarize_case_geometry};
@@ -34,8 +41,10 @@ use ferrum_mesh::linear::{
 };
 use ferrum_mesh::patches::{PatchValidationSummary, validate_case_patches};
 use ferrum_mesh::poiseuille::{
-    PoiseuilleOptions, poiseuille_diffusion_options, poiseuille_reference,
-    summarize_poiseuille_solution,
+    LaminarPipeBenchmarkOptions, LaminarPipeBenchmarkSummary, LaminarPlaneChannelBenchmarkOptions,
+    LaminarPlaneChannelBenchmarkSummary, PipeAxis, PoiseuilleOptions, poiseuille_diffusion_options,
+    poiseuille_reference, summarize_laminar_pipe_solution,
+    summarize_laminar_plane_channel_solution, summarize_poiseuille_solution,
 };
 use ferrum_mesh::regions::{
     InterfaceRegistrySummary, InterfaceSummary, build_interface_registry,
@@ -51,7 +60,12 @@ use ferrum_mesh::solver_plan::{
     SolverNumericsDictionaryPlan, SolverNumericsPlan, SolverPropertiesPlan, SolverRunPlan,
     build_solver_case_plan,
 };
-use ferrum_mesh::solver_state::SolverStatePlan;
+use ferrum_mesh::solver_state::{
+    SolverStateFieldKind, SolverStatePlan, build_solver_state_plan, materialize_cpu_buffer,
+};
+
+const OPENFOAM_DEFAULT_LDU_TOLERANCE: f64 = 1.0e-6;
+const OPENFOAM_DEFAULT_LDU_MAX_ITERATIONS: usize = 1_000;
 
 pub fn run_ferrum() -> i32 {
     let args = env::args().skip(1).collect::<Vec<_>>();
@@ -82,6 +96,8 @@ pub enum Alias {
     SplitFerrumMeshRegions,
     InitFerrumCase,
     FerrumSolver,
+    FerrumPipeBenchmark,
+    FerrumPlaneChannelBenchmark,
 }
 
 enum CommandMode {
@@ -97,6 +113,8 @@ fn run_command(mode: CommandMode, args: Vec<String>) -> Result<(), String> {
         CommandMode::Alias(Alias::SplitFerrumMeshRegions) => split_mesh_regions(args),
         CommandMode::Alias(Alias::InitFerrumCase) => init_case_command(args),
         CommandMode::Alias(Alias::FerrumSolver) => solve_case(args),
+        CommandMode::Alias(Alias::FerrumPipeBenchmark) => pipe_benchmark(args),
+        CommandMode::Alias(Alias::FerrumPlaneChannelBenchmark) => plane_channel_benchmark(args),
     }
 }
 
@@ -113,6 +131,8 @@ fn run_ferrum_subcommand(mut args: Vec<String>) -> Result<(), String> {
         "splitMeshRegions" | "splitFerrumMeshRegions" => split_mesh_regions(args),
         "initCase" | "initFerrumCase" => init_case_command(args),
         "solve" | "solver" | "ferrumSolver" => solve_case(args),
+        "pipeBenchmark" | "ferrumPipeBenchmark" => pipe_benchmark(args),
+        "planeChannelBenchmark" | "ferrumPlaneChannelBenchmark" => plane_channel_benchmark(args),
         other => Err(format!("unknown ferrum command '{other}'")),
     }
 }
@@ -436,44 +456,806 @@ fn run_poiseuille_solve(plan: &SolverCasePlan, solve: &PoiseuilleSolveArgs) -> R
     Ok(())
 }
 
+#[derive(Debug)]
+struct PipeBenchmarkArgs {
+    case_dir: PathBuf,
+    fields_dir: PathBuf,
+    options: LaminarPipeBenchmarkOptions,
+    out_json: Option<PathBuf>,
+    out_markdown: Option<PathBuf>,
+}
+
+fn pipe_benchmark(args: Vec<String>) -> Result<(), String> {
+    if args.is_empty() || args.iter().any(|arg| is_help(arg)) {
+        print_pipe_benchmark_usage();
+        return Ok(());
+    }
+    let args = parse_pipe_benchmark_args(&args)?;
+    let (plan, velocity, pressure) = read_benchmark_fields(&args.case_dir, &args.fields_dir)?;
+    let summary = summarize_laminar_pipe_solution(
+        &plan.runtime_data.mesh,
+        &velocity,
+        &pressure,
+        &args.options,
+    )
+    .map_err(|error| error.to_string())?;
+
+    println!(
+        "pipeBenchmark result: meanVelocity={} analyticMeanVelocity={} relativeMeanVelocityError={} flowRate={} analyticFlowRate={} pressureDropFromMean={} relativePressureDropFromMeanError={} pressureDropFromOwnerCells={} relativePressureDropFromOwnerCellsError={} minVelocity={} maxVelocity={}",
+        format_scientific(summary.mean_velocity),
+        format_scientific(summary.analytic_mean_velocity),
+        format_scientific(summary.relative_mean_velocity_error),
+        format_scientific(summary.flow_rate),
+        format_scientific(summary.analytic_flow_rate),
+        format_scientific(summary.pressure_drop_from_mean),
+        format_scientific(summary.relative_pressure_drop_from_mean_error),
+        format_scientific(summary.pressure_drop_from_owner_cells),
+        format_scientific(summary.relative_pressure_drop_from_owner_cells_error),
+        format_scientific(summary.min_velocity),
+        format_scientific(summary.max_velocity),
+    );
+
+    if let Some(path) = &args.out_json {
+        write_pipe_benchmark_json(&args, &summary, path).map_err(|error| {
+            format!(
+                "could not write pipe benchmark JSON to {} ({error})",
+                path.display()
+            )
+        })?;
+        println!("wrote pipe benchmark json: {}", path.display());
+    }
+    if let Some(path) = &args.out_markdown {
+        write_pipe_benchmark_markdown(&args, &summary, path).map_err(|error| {
+            format!(
+                "could not write pipe benchmark Markdown to {} ({error})",
+                path.display()
+            )
+        })?;
+        println!("wrote pipe benchmark markdown: {}", path.display());
+    }
+    Ok(())
+}
+
+fn read_benchmark_fields(
+    case_dir: &Path,
+    fields_dir: &Path,
+) -> Result<(SolverCasePlan, Vec<Point3>, Vec<f64>), String> {
+    let plan = build_solver_case_plan(case_dir).map_err(|error| error.to_string())?;
+    let fields =
+        read_fields_from_directory(case_dir, fields_dir).map_err(|error| error.to_string())?;
+    let state = build_solver_state_plan(case_dir, &fields);
+    let velocity_values = benchmark_field_buffer(&state, "U", SolverStateFieldKind::VolVector)?;
+    let pressure = benchmark_field_buffer(&state, "p", SolverStateFieldKind::VolScalar)?;
+    if velocity_values.len() % 3 != 0 {
+        return Err(format!(
+            "benchmark U field has {} scalar values, expected a multiple of 3",
+            velocity_values.len()
+        ));
+    }
+    let velocity = velocity_values
+        .chunks_exact(3)
+        .map(|value| Point3 {
+            x: value[0],
+            y: value[1],
+            z: value[2],
+        })
+        .collect::<Vec<_>>();
+    Ok((plan, velocity, pressure))
+}
+
+fn benchmark_field_buffer(
+    state: &SolverStatePlan,
+    name: &str,
+    kind: SolverStateFieldKind,
+) -> Result<Vec<f64>, String> {
+    let available = state
+        .fields
+        .iter()
+        .map(|field| {
+            format!(
+                "{}:class={}:kind={}",
+                field.name,
+                field.class_name.as_deref().unwrap_or("missing"),
+                field.kind
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let field = state
+        .fields
+        .iter()
+        .find(|field| field.region.is_none() && field.name == name && field.kind == kind)
+        .ok_or_else(|| {
+            format!(
+                "benchmark field '{name}' with kind {kind} was not found; parsed fields: [{}]",
+                available
+            )
+        })?;
+    materialize_cpu_buffer(field).ok_or_else(|| {
+        format!(
+            "benchmark field '{name}' could not be materialized ({})",
+            field.cpu_buffer.status
+        )
+    })
+}
+
+fn parse_pipe_benchmark_args(args: &[String]) -> Result<PipeBenchmarkArgs, String> {
+    let mut case_dir = PathBuf::from(".");
+    let mut fields_dir = None;
+    let mut pressure_drop = None;
+    let mut dynamic_viscosity = None;
+    let mut length = None;
+    let mut diameter = None;
+    let mut inlet_patch = "inlet".to_string();
+    let mut outlet_patch = "outlet".to_string();
+    let mut axis = PipeAxis::X;
+    let mut out_json = None;
+    let mut out_markdown = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-case" | "--case" => {
+                case_dir = PathBuf::from(
+                    args.get(index + 1)
+                        .ok_or_else(|| "-case requires a directory".to_string())?,
+                );
+                index += 2;
+            }
+            "-fields" | "--fields" => {
+                fields_dir =
+                    Some(PathBuf::from(args.get(index + 1).ok_or_else(|| {
+                        "--fields requires a time/field directory".to_string()
+                    })?));
+                index += 2;
+            }
+            "-pressureDrop" | "--pressureDrop" | "-pressure-drop" | "--pressure-drop" => {
+                pressure_drop = Some(parse_positive_f64_arg(
+                    "--pressureDrop",
+                    args.get(index + 1)
+                        .ok_or_else(|| "--pressureDrop requires Pa".to_string())?,
+                )?);
+                index += 2;
+            }
+            "-mu" | "--mu" => {
+                dynamic_viscosity = Some(parse_positive_f64_arg(
+                    "--mu",
+                    args.get(index + 1)
+                        .ok_or_else(|| "--mu requires Pa s".to_string())?,
+                )?);
+                index += 2;
+            }
+            "-length" | "--length" => {
+                length = Some(parse_positive_f64_arg(
+                    "--length",
+                    args.get(index + 1)
+                        .ok_or_else(|| "--length requires m".to_string())?,
+                )?);
+                index += 2;
+            }
+            "-diameter" | "--diameter" => {
+                diameter = Some(parse_positive_f64_arg(
+                    "--diameter",
+                    args.get(index + 1)
+                        .ok_or_else(|| "--diameter requires m".to_string())?,
+                )?);
+                index += 2;
+            }
+            "-inletPatch" | "--inletPatch" | "-inlet-patch" | "--inlet-patch" => {
+                inlet_patch = required_non_empty_arg(args, index, "--inletPatch")?;
+                index += 2;
+            }
+            "-outletPatch" | "--outletPatch" | "-outlet-patch" | "--outlet-patch" => {
+                outlet_patch = required_non_empty_arg(args, index, "--outletPatch")?;
+                index += 2;
+            }
+            "-axis" | "--axis" => {
+                axis = match args
+                    .get(index + 1)
+                    .ok_or_else(|| "--axis requires x, y, or z".to_string())?
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "x" => PipeAxis::X,
+                    "y" => PipeAxis::Y,
+                    "z" => PipeAxis::Z,
+                    other => return Err(format!("invalid --axis '{other}'; expected x, y, or z")),
+                };
+                index += 2;
+            }
+            "-outJson" | "--outJson" | "-out-json" | "--out-json" => {
+                out_json = Some(PathBuf::from(
+                    args.get(index + 1)
+                        .ok_or_else(|| "--outJson requires a file".to_string())?,
+                ));
+                index += 2;
+            }
+            "-outMarkdown" | "--outMarkdown" | "-out-markdown" | "--out-markdown" => {
+                out_markdown =
+                    Some(PathBuf::from(args.get(index + 1).ok_or_else(|| {
+                        "--outMarkdown requires a file".to_string()
+                    })?));
+                index += 2;
+            }
+            other => return Err(format!("unknown ferrumPipeBenchmark option '{other}'")),
+        }
+    }
+
+    Ok(PipeBenchmarkArgs {
+        case_dir,
+        fields_dir: fields_dir
+            .ok_or_else(|| "ferrumPipeBenchmark requires --fields".to_string())?,
+        options: LaminarPipeBenchmarkOptions {
+            pressure_drop: pressure_drop
+                .ok_or_else(|| "ferrumPipeBenchmark requires --pressureDrop".to_string())?,
+            dynamic_viscosity: dynamic_viscosity
+                .ok_or_else(|| "ferrumPipeBenchmark requires --mu".to_string())?,
+            length: length.ok_or_else(|| "ferrumPipeBenchmark requires --length".to_string())?,
+            diameter: diameter
+                .ok_or_else(|| "ferrumPipeBenchmark requires --diameter".to_string())?,
+            inlet_patch,
+            outlet_patch,
+            axis,
+        },
+        out_json,
+        out_markdown,
+    })
+}
+
+fn required_non_empty_arg(args: &[String], index: usize, flag: &str) -> Result<String, String> {
+    let value = args
+        .get(index + 1)
+        .ok_or_else(|| format!("{flag} requires a value"))?;
+    if value.trim().is_empty() {
+        return Err(format!("{flag} must not be empty"));
+    }
+    Ok(value.to_string())
+}
+
+fn write_pipe_benchmark_json(
+    args: &PipeBenchmarkArgs,
+    summary: &LaminarPipeBenchmarkSummary,
+    path: &Path,
+) -> std::io::Result<()> {
+    ensure_parent_dir(path)?;
+    let mut writer = BufWriter::new(File::create(path)?);
+    writeln!(writer, "{{")?;
+    write_json_string_field(&mut writer, 2, "benchmark", "laminarPipeHagenPoiseuille")?;
+    writeln!(writer, ",")?;
+    write_json_string_field(
+        &mut writer,
+        2,
+        "caseDir",
+        &args.case_dir.display().to_string(),
+    )?;
+    writeln!(writer, ",")?;
+    write_json_string_field(
+        &mut writer,
+        2,
+        "fieldsDir",
+        &args.fields_dir.display().to_string(),
+    )?;
+    writeln!(writer, ",")?;
+    write_json_key(&mut writer, 2, "inputs")?;
+    writeln!(writer, "{{")?;
+    write_json_key(&mut writer, 4, "pressureDrop")?;
+    write_json_optional_number(&mut writer, Some(args.options.pressure_drop))?;
+    writeln!(writer, ",")?;
+    write_json_key(&mut writer, 4, "dynamicViscosity")?;
+    write_json_optional_number(&mut writer, Some(args.options.dynamic_viscosity))?;
+    writeln!(writer, ",")?;
+    write_json_key(&mut writer, 4, "length")?;
+    write_json_optional_number(&mut writer, Some(args.options.length))?;
+    writeln!(writer, ",")?;
+    write_json_key(&mut writer, 4, "diameter")?;
+    write_json_optional_number(&mut writer, Some(args.options.diameter))?;
+    writeln!(writer, ",")?;
+    write_json_string_field(&mut writer, 4, "inletPatch", &args.options.inlet_patch)?;
+    writeln!(writer, ",")?;
+    write_json_string_field(&mut writer, 4, "outletPatch", &args.options.outlet_patch)?;
+    writeln!(writer, ",")?;
+    write_json_string_field(&mut writer, 4, "axis", pipe_axis_name(args.options.axis))?;
+    writeln!(writer)?;
+    write_indent(&mut writer, 2)?;
+    writeln!(writer, "}},")?;
+    write_json_key(&mut writer, 2, "solution")?;
+    writeln!(writer, "{{")?;
+    write_pipe_benchmark_summary_json(&mut writer, summary)?;
+    writeln!(writer)?;
+    write_indent(&mut writer, 2)?;
+    writeln!(writer, "}}")?;
+    writeln!(writer, "}}")?;
+    writer.flush()
+}
+
+fn write_pipe_benchmark_summary_json(
+    writer: &mut impl Write,
+    summary: &LaminarPipeBenchmarkSummary,
+) -> std::io::Result<()> {
+    let values = [
+        ("minVelocity", summary.min_velocity),
+        ("maxVelocity", summary.max_velocity),
+        ("meanVelocity", summary.mean_velocity),
+        ("flowRate", summary.flow_rate),
+        ("analyticMeanVelocity", summary.analytic_mean_velocity),
+        ("analyticFlowRate", summary.analytic_flow_rate),
+        ("pressureDropFromMean", summary.pressure_drop_from_mean),
+        (
+            "pressureDropFromOwnerCells",
+            summary.pressure_drop_from_owner_cells,
+        ),
+        (
+            "relativeMeanVelocityError",
+            summary.relative_mean_velocity_error,
+        ),
+        (
+            "relativePressureDropFromMeanError",
+            summary.relative_pressure_drop_from_mean_error,
+        ),
+        (
+            "relativePressureDropFromOwnerCellsError",
+            summary.relative_pressure_drop_from_owner_cells_error,
+        ),
+    ];
+    for (index, (key, value)) in values.iter().enumerate() {
+        write_json_key(writer, 4, key)?;
+        write_json_optional_number(writer, Some(*value))?;
+        if index + 1 != values.len() {
+            writeln!(writer, ",")?;
+        }
+    }
+    Ok(())
+}
+
+fn write_pipe_benchmark_markdown(
+    args: &PipeBenchmarkArgs,
+    summary: &LaminarPipeBenchmarkSummary,
+    path: &Path,
+) -> std::io::Result<()> {
+    ensure_parent_dir(path)?;
+    let mut writer = BufWriter::new(File::create(path)?);
+    writeln!(writer, "# Laminar Pipe Benchmark")?;
+    writeln!(writer)?;
+    writeln!(writer, "Case: `{}`", args.case_dir.display())?;
+    writeln!(writer, "Fields: `{}`", args.fields_dir.display())?;
+    writeln!(writer)?;
+    writeln!(writer, "| Quantity | Value |")?;
+    writeln!(writer, "| --- | ---: |")?;
+    writeln!(writer, "| Axis | {} |", pipe_axis_name(args.options.axis))?;
+    writeln!(
+        writer,
+        "| Analytic deltaP [Pa] | {} |",
+        format_scientific(args.options.pressure_drop)
+    )?;
+    writeln!(
+        writer,
+        "| Mean velocity [m/s] | {} |",
+        format_scientific(summary.mean_velocity)
+    )?;
+    writeln!(
+        writer,
+        "| Analytic mean velocity [m/s] | {} |",
+        format_scientific(summary.analytic_mean_velocity)
+    )?;
+    writeln!(
+        writer,
+        "| Mean velocity error | {} |",
+        format_percent(summary.relative_mean_velocity_error)
+    )?;
+    writeln!(
+        writer,
+        "| DeltaP from mean velocity [Pa] | {} |",
+        format_scientific(summary.pressure_drop_from_mean)
+    )?;
+    writeln!(
+        writer,
+        "| DeltaP from owner cells [Pa] | {} |",
+        format_scientific(summary.pressure_drop_from_owner_cells)
+    )?;
+    writeln!(
+        writer,
+        "| Owner-cell deltaP error | {} |",
+        format_percent(summary.relative_pressure_drop_from_owner_cells_error)
+    )?;
+    writer.flush()
+}
+
+#[derive(Debug)]
+struct PlaneChannelBenchmarkArgs {
+    case_dir: PathBuf,
+    fields_dir: PathBuf,
+    options: LaminarPlaneChannelBenchmarkOptions,
+    pressure_scale: f64,
+    out_json: Option<PathBuf>,
+    out_markdown: Option<PathBuf>,
+}
+
+fn plane_channel_benchmark(args: Vec<String>) -> Result<(), String> {
+    if args.is_empty() || args.iter().any(|arg| is_help(arg)) {
+        print_plane_channel_benchmark_usage();
+        return Ok(());
+    }
+    let args = parse_plane_channel_benchmark_args(&args)?;
+    let (plan, velocity, mut pressure) = read_benchmark_fields(&args.case_dir, &args.fields_dir)?;
+    for value in &mut pressure {
+        *value *= args.pressure_scale;
+    }
+    let summary = summarize_laminar_plane_channel_solution(
+        &plan.runtime_data.mesh,
+        &velocity,
+        &pressure,
+        &args.options,
+    )
+    .map_err(|error| error.to_string())?;
+
+    println!(
+        "planeChannelBenchmark result: meanVelocity={} analyticMeanVelocity={} relativeMeanVelocityError={} flowRate={} flowRatePerUnitDepth={} pressureDropFromMean={} relativePressureDropFromMeanError={} pressureDropFromOwnerCells={} relativePressureDropFromOwnerCellsError={} minVelocity={} maxVelocity={}",
+        format_scientific(summary.mean_velocity),
+        format_scientific(summary.analytic_mean_velocity),
+        format_scientific(summary.relative_mean_velocity_error),
+        format_scientific(summary.flow_rate),
+        format_scientific(summary.flow_rate_per_unit_depth),
+        format_scientific(summary.pressure_drop_from_mean),
+        format_scientific(summary.relative_pressure_drop_from_mean_error),
+        format_scientific(summary.pressure_drop_from_owner_cells),
+        format_scientific(summary.relative_pressure_drop_from_owner_cells_error),
+        format_scientific(summary.min_velocity),
+        format_scientific(summary.max_velocity),
+    );
+
+    if let Some(path) = &args.out_json {
+        write_plane_channel_benchmark_json(&args, &summary, path).map_err(|error| {
+            format!(
+                "could not write plane-channel benchmark JSON to {} ({error})",
+                path.display()
+            )
+        })?;
+        println!("wrote plane-channel benchmark json: {}", path.display());
+    }
+    if let Some(path) = &args.out_markdown {
+        write_plane_channel_benchmark_markdown(&args, &summary, path).map_err(|error| {
+            format!(
+                "could not write plane-channel benchmark Markdown to {} ({error})",
+                path.display()
+            )
+        })?;
+        println!("wrote plane-channel benchmark markdown: {}", path.display());
+    }
+    Ok(())
+}
+
+fn parse_plane_channel_benchmark_args(
+    args: &[String],
+) -> Result<PlaneChannelBenchmarkArgs, String> {
+    let mut case_dir = PathBuf::from(".");
+    let mut fields_dir = None;
+    let mut pressure_drop = None;
+    let mut dynamic_viscosity = None;
+    let mut length = None;
+    let mut gap = None;
+    let mut depth = None;
+    let mut inlet_patch = "inlet".to_string();
+    let mut outlet_patch = "outlet".to_string();
+    let mut axis = PipeAxis::X;
+    let mut pressure_scale = 1.0;
+    let mut out_json = None;
+    let mut out_markdown = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-case" | "--case" => {
+                case_dir = PathBuf::from(
+                    args.get(index + 1)
+                        .ok_or_else(|| "-case requires a directory".to_string())?,
+                );
+                index += 2;
+            }
+            "-fields" | "--fields" => {
+                fields_dir =
+                    Some(PathBuf::from(args.get(index + 1).ok_or_else(|| {
+                        "--fields requires a time/field directory".to_string()
+                    })?));
+                index += 2;
+            }
+            "-pressureDrop" | "--pressureDrop" | "-pressure-drop" | "--pressure-drop" => {
+                pressure_drop = Some(parse_positive_f64_arg(
+                    "--pressureDrop",
+                    args.get(index + 1)
+                        .ok_or_else(|| "--pressureDrop requires Pa".to_string())?,
+                )?);
+                index += 2;
+            }
+            "-mu" | "--mu" => {
+                dynamic_viscosity = Some(parse_positive_f64_arg(
+                    "--mu",
+                    args.get(index + 1)
+                        .ok_or_else(|| "--mu requires Pa s".to_string())?,
+                )?);
+                index += 2;
+            }
+            "-length" | "--length" => {
+                length = Some(parse_positive_f64_arg(
+                    "--length",
+                    args.get(index + 1)
+                        .ok_or_else(|| "--length requires m".to_string())?,
+                )?);
+                index += 2;
+            }
+            "-gap" | "--gap" => {
+                gap = Some(parse_positive_f64_arg(
+                    "--gap",
+                    args.get(index + 1)
+                        .ok_or_else(|| "--gap requires m".to_string())?,
+                )?);
+                index += 2;
+            }
+            "-depth" | "--depth" => {
+                depth = Some(parse_positive_f64_arg(
+                    "--depth",
+                    args.get(index + 1)
+                        .ok_or_else(|| "--depth requires m".to_string())?,
+                )?);
+                index += 2;
+            }
+            "-inletPatch" | "--inletPatch" | "-inlet-patch" | "--inlet-patch" => {
+                inlet_patch = required_non_empty_arg(args, index, "--inletPatch")?;
+                index += 2;
+            }
+            "-outletPatch" | "--outletPatch" | "-outlet-patch" | "--outlet-patch" => {
+                outlet_patch = required_non_empty_arg(args, index, "--outletPatch")?;
+                index += 2;
+            }
+            "-axis" | "--axis" => {
+                axis = parse_pipe_axis(
+                    args.get(index + 1)
+                        .ok_or_else(|| "--axis requires x, y, or z".to_string())?,
+                )?;
+                index += 2;
+            }
+            "-pressureScale" | "--pressureScale" | "-pressure-scale" | "--pressure-scale" => {
+                pressure_scale = parse_positive_f64_arg(
+                    "--pressureScale",
+                    args.get(index + 1)
+                        .ok_or_else(|| "--pressureScale requires a positive factor".to_string())?,
+                )?;
+                index += 2;
+            }
+            "-outJson" | "--outJson" | "-out-json" | "--out-json" => {
+                out_json = Some(PathBuf::from(
+                    args.get(index + 1)
+                        .ok_or_else(|| "--outJson requires a file".to_string())?,
+                ));
+                index += 2;
+            }
+            "-outMarkdown" | "--outMarkdown" | "-out-markdown" | "--out-markdown" => {
+                out_markdown =
+                    Some(PathBuf::from(args.get(index + 1).ok_or_else(|| {
+                        "--outMarkdown requires a file".to_string()
+                    })?));
+                index += 2;
+            }
+            other => {
+                return Err(format!(
+                    "unknown ferrumPlaneChannelBenchmark option '{other}'"
+                ));
+            }
+        }
+    }
+
+    Ok(PlaneChannelBenchmarkArgs {
+        case_dir,
+        fields_dir: fields_dir
+            .ok_or_else(|| "ferrumPlaneChannelBenchmark requires --fields".to_string())?,
+        options: LaminarPlaneChannelBenchmarkOptions {
+            pressure_drop: pressure_drop
+                .ok_or_else(|| "ferrumPlaneChannelBenchmark requires --pressureDrop".to_string())?,
+            dynamic_viscosity: dynamic_viscosity
+                .ok_or_else(|| "ferrumPlaneChannelBenchmark requires --mu".to_string())?,
+            length: length
+                .ok_or_else(|| "ferrumPlaneChannelBenchmark requires --length".to_string())?,
+            gap: gap.ok_or_else(|| "ferrumPlaneChannelBenchmark requires --gap".to_string())?,
+            depth: depth
+                .ok_or_else(|| "ferrumPlaneChannelBenchmark requires --depth".to_string())?,
+            inlet_patch,
+            outlet_patch,
+            axis,
+        },
+        pressure_scale,
+        out_json,
+        out_markdown,
+    })
+}
+
+fn parse_pipe_axis(value: &str) -> Result<PipeAxis, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "x" => Ok(PipeAxis::X),
+        "y" => Ok(PipeAxis::Y),
+        "z" => Ok(PipeAxis::Z),
+        other => Err(format!("invalid --axis '{other}'; expected x, y, or z")),
+    }
+}
+
+fn write_plane_channel_benchmark_json(
+    args: &PlaneChannelBenchmarkArgs,
+    summary: &LaminarPlaneChannelBenchmarkSummary,
+    path: &Path,
+) -> std::io::Result<()> {
+    ensure_parent_dir(path)?;
+    let mut writer = BufWriter::new(File::create(path)?);
+    writeln!(writer, "{{")?;
+    write_json_string_field(&mut writer, 2, "benchmark", "laminarPlanePoiseuille")?;
+    writeln!(writer, ",")?;
+    write_json_string_field(
+        &mut writer,
+        2,
+        "caseDir",
+        &args.case_dir.display().to_string(),
+    )?;
+    writeln!(writer, ",")?;
+    write_json_string_field(
+        &mut writer,
+        2,
+        "fieldsDir",
+        &args.fields_dir.display().to_string(),
+    )?;
+    writeln!(writer, ",")?;
+    write_json_key(&mut writer, 2, "inputs")?;
+    writeln!(writer, "{{")?;
+    for (key, value) in [
+        ("pressureDrop", args.options.pressure_drop),
+        ("dynamicViscosity", args.options.dynamic_viscosity),
+        ("length", args.options.length),
+        ("gap", args.options.gap),
+        ("depth", args.options.depth),
+        ("pressureScale", args.pressure_scale),
+    ]
+    .iter()
+    {
+        write_json_key(&mut writer, 4, key)?;
+        write_json_optional_number(&mut writer, Some(*value))?;
+        writeln!(writer, ",")?;
+    }
+    write_json_string_field(&mut writer, 4, "inletPatch", &args.options.inlet_patch)?;
+    writeln!(writer, ",")?;
+    write_json_string_field(&mut writer, 4, "outletPatch", &args.options.outlet_patch)?;
+    writeln!(writer, ",")?;
+    write_json_string_field(&mut writer, 4, "axis", pipe_axis_name(args.options.axis))?;
+    writeln!(writer)?;
+    write_indent(&mut writer, 2)?;
+    writeln!(writer, "}},")?;
+    write_json_key(&mut writer, 2, "solution")?;
+    writeln!(writer, "{{")?;
+    let values = [
+        ("minVelocity", summary.min_velocity),
+        ("maxVelocity", summary.max_velocity),
+        ("meanVelocity", summary.mean_velocity),
+        ("flowRate", summary.flow_rate),
+        ("flowRatePerUnitDepth", summary.flow_rate_per_unit_depth),
+        ("analyticMeanVelocity", summary.analytic_mean_velocity),
+        ("analyticFlowRate", summary.analytic_flow_rate),
+        (
+            "analyticFlowRatePerUnitDepth",
+            summary.analytic_flow_rate_per_unit_depth,
+        ),
+        ("pressureDropFromMean", summary.pressure_drop_from_mean),
+        (
+            "pressureDropFromOwnerCells",
+            summary.pressure_drop_from_owner_cells,
+        ),
+        (
+            "relativeMeanVelocityError",
+            summary.relative_mean_velocity_error,
+        ),
+        (
+            "relativePressureDropFromMeanError",
+            summary.relative_pressure_drop_from_mean_error,
+        ),
+        (
+            "relativePressureDropFromOwnerCellsError",
+            summary.relative_pressure_drop_from_owner_cells_error,
+        ),
+    ];
+    for (index, (key, value)) in values.iter().enumerate() {
+        write_json_key(&mut writer, 4, key)?;
+        write_json_optional_number(&mut writer, Some(*value))?;
+        if index + 1 != values.len() {
+            writeln!(writer, ",")?;
+        }
+    }
+    writeln!(writer)?;
+    write_indent(&mut writer, 2)?;
+    writeln!(writer, "}}")?;
+    writeln!(writer, "}}")?;
+    writer.flush()
+}
+
+fn write_plane_channel_benchmark_markdown(
+    args: &PlaneChannelBenchmarkArgs,
+    summary: &LaminarPlaneChannelBenchmarkSummary,
+    path: &Path,
+) -> std::io::Result<()> {
+    ensure_parent_dir(path)?;
+    let mut writer = BufWriter::new(File::create(path)?);
+    writeln!(writer, "# Laminar Plane-Channel Benchmark")?;
+    writeln!(writer)?;
+    writeln!(writer, "Case: `{}`", args.case_dir.display())?;
+    writeln!(writer, "Fields: `{}`", args.fields_dir.display())?;
+    writeln!(writer)?;
+    writeln!(writer, "| Quantity | Value |")?;
+    writeln!(writer, "| --- | ---: |")?;
+    writeln!(writer, "| Axis | {} |", pipe_axis_name(args.options.axis))?;
+    writeln!(
+        writer,
+        "| Analytic deltaP [Pa] | {} |",
+        format_scientific(args.options.pressure_drop)
+    )?;
+    writeln!(
+        writer,
+        "| Mean velocity [m/s] | {} |",
+        format_scientific(summary.mean_velocity)
+    )?;
+    writeln!(
+        writer,
+        "| Analytic mean velocity [m/s] | {} |",
+        format_scientific(summary.analytic_mean_velocity)
+    )?;
+    writeln!(
+        writer,
+        "| Mean velocity error | {} |",
+        format_percent(summary.relative_mean_velocity_error)
+    )?;
+    writeln!(
+        writer,
+        "| DeltaP from mean velocity [Pa] | {} |",
+        format_scientific(summary.pressure_drop_from_mean)
+    )?;
+    writeln!(
+        writer,
+        "| DeltaP from mean velocity error | {} |",
+        format_percent(summary.relative_pressure_drop_from_mean_error)
+    )?;
+    writeln!(
+        writer,
+        "| DeltaP from owner cells [Pa] | {} |",
+        format_scientific(summary.pressure_drop_from_owner_cells)
+    )?;
+    writeln!(
+        writer,
+        "| Owner-cell deltaP error | {} |",
+        format_percent(summary.relative_pressure_drop_from_owner_cells_error)
+    )?;
+    writeln!(
+        writer,
+        "| Flow rate per unit depth [m2/s] | {} |",
+        format_scientific(summary.flow_rate_per_unit_depth)
+    )?;
+    writer.flush()
+}
+
+fn pipe_axis_name(axis: PipeAxis) -> &'static str {
+    match axis {
+        PipeAxis::X => "x",
+        PipeAxis::Y => "y",
+        PipeAxis::Z => "z",
+    }
+}
+
 fn resolve_poiseuille_options(
     plan: &SolverCasePlan,
     solve: &PoiseuilleSolveArgs,
 ) -> Result<PoiseuilleOptions, String> {
     let pressure_drop = solve
         .pressure_drop
-        .or_else(|| {
-            property_number(
-                plan,
-                "pipeBenchmark",
-                Some("flowReference"),
-                "expectedDeltaP",
-            )
-        })
-        .ok_or_else(|| {
-            "Poiseuille solve requires --pressureDrop or pipeBenchmark.flowReference.expectedDeltaP"
-                .to_string()
-        })?;
+        .ok_or_else(|| "Poiseuille solve requires --pressureDrop".to_string())?;
     let dynamic_viscosity = solve
         .dynamic_viscosity
         .or_else(|| property_number(plan, "transportProperties", None, "mu"))
-        .or_else(|| property_number(plan, "pipeBenchmark", Some("water"), "mu"))
-        .ok_or_else(|| {
-            "Poiseuille solve requires --mu or transportProperties.mu/pipeBenchmark.water.mu"
-                .to_string()
-        })?;
+        .ok_or_else(|| "Poiseuille solve requires --mu or transportProperties.mu".to_string())?;
     let length = solve
         .length
-        .or_else(|| property_number(plan, "pipeBenchmark", Some("geometry"), "length"))
-        .ok_or_else(|| {
-            "Poiseuille solve requires --length or pipeBenchmark.geometry.length".to_string()
-        })?;
+        .ok_or_else(|| "Poiseuille solve requires --length".to_string())?;
     let diameter = solve
         .diameter
-        .or_else(|| property_number(plan, "pipeBenchmark", Some("geometry"), "diameter"))
-        .ok_or_else(|| {
-            "Poiseuille solve requires --diameter or pipeBenchmark.geometry.diameter".to_string()
-        })?;
+        .ok_or_else(|| "Poiseuille solve requires --diameter".to_string())?;
     let wall_patches = if solve.wall_patches.is_empty() {
         vec!["wall".to_string()]
     } else {
@@ -497,65 +1279,215 @@ fn run_laminar_simple_solve(
     let options = resolve_laminar_simple_options(plan, solve)?;
 
     let started = Instant::now();
-    let report = solve_laminar_simple(&plan.runtime_data, &fields, &options)
-        .map_err(|error| error.to_string())?;
+    let report = if solve.solve_verbose {
+        let mut printed_header = false;
+        let mut print_iteration = |item: &LaminarSimpleIterationSummary| {
+            if !printed_header {
+                println!(
+                    "laminarSimple residual history (OpenFOAM-style initial/final residuals; linear and outer convergence are separate):"
+                );
+                printed_header = true;
+            }
+            println!(
+                "  SIMPLE {:>4}: U initial={} final={} linearConverged={} linearIterations={} | p initial={} final={} linearConverged={} linearIterations={} | continuityL2={} | residualControl={}",
+                item.iteration,
+                format_scientific(item.momentum_initial_normalized_residual_norm),
+                format_scientific(item.momentum_normalized_residual_norm),
+                yes_no(item.momentum_linear_converged),
+                item.momentum_linear_iterations,
+                format_scientific(item.pressure_correction_initial_normalized_residual_norm),
+                format_scientific(item.pressure_correction_normalized_residual_norm),
+                yes_no(item.pressure_linear_converged),
+                item.pressure_linear_iterations,
+                format_scientific(item.continuity_after.l2_norm),
+                residual_control_state(item.residual_control),
+            );
+            let _ = std::io::stdout().flush();
+        };
+        solve_laminar_simple_with_observer(
+            &plan.runtime_data,
+            &fields,
+            &options,
+            Some(&mut print_iteration),
+        )
+        .map_err(|error| error.to_string())?
+    } else {
+        solve_laminar_simple(&plan.runtime_data, &fields, &options)
+            .map_err(|error| error.to_string())?
+    };
     let wall_clock_seconds = started.elapsed().as_secs_f64();
 
     println!(
-        "laminarSimple solve: backend=cpu linearSolver={} momentumLinearSolver={} momentumPreconditioner={} pressureLinearSolver={} pressurePreconditioner={} pRefCell={} pRefValue={} nonOrthogonalCorrectors={} cells={} faces={} simpleIterations={} minSimpleIterations={} converged={} initialContinuityL2={} finalContinuityL2={} simpleTolerance={} pressureDropTolerance={} fieldChangeTolerance={} momentumResidualNorm={} pressureCorrectionResidualNorm={} momentumLinearIterations={} pressureLinearIterations={} wallClockSeconds={:.6}",
+        "laminarSimple solve: backend=cpu linearSolver={} momentumLinearSolver={} momentumPreconditioner={} pressureLinearSolver={} pressurePreconditioner={} divPhiU=\"{}\" gradP=\"{}\" gradU=\"{}\" laplacian=\"{}\" snGrad=\"{}\" interpolation=\"{}\" pRefCell={} pRefValue={} nonOrthogonalCorrectors={} consistent={} stopReason={} cells={} faces={} simpleIterations={} minSimpleIterations={} converged={} residualControl={} initialContinuityL2={} finalContinuityL2={} momentumInitialResidual={} momentumFinalResidual={} momentumResidualNorm={} pressureInitialResidual={} pressureFinalResidual={} pressureResidualNorm={} momentumLinearIterations={} pressureLinearIterations={} wallClockSeconds={:.6}",
         options.linear_solver,
         options.momentum_linear_solver,
         options.momentum_preconditioner,
         options.pressure_linear_solver,
         options.pressure_preconditioner,
+        options.schemes.div_phi_u,
+        options.schemes.grad_p,
+        options.schemes.grad_u,
+        options.schemes.laplacian,
+        options.schemes.sn_grad,
+        options.schemes.interpolation,
         options
             .pressure_reference_cell
             .map(|value| value.to_string())
             .unwrap_or_else(|| "n/a".to_string()),
         format_scientific(options.pressure_reference_value),
         options.non_orthogonal_correctors,
+        yes_no(options.simple_consistent),
+        report.stop_reason,
         report.cells,
         report.faces,
         report.simple_iterations,
         options.min_simple_iterations,
         yes_no(report.converged),
+        residual_control_state(report.residual_control),
         format_scientific(report.initial_continuity.l2_norm),
         format_scientific(report.final_continuity.l2_norm),
-        format_scientific(options.simple_tolerance),
-        format_scientific(options.pressure_drop_tolerance),
-        format_scientific(options.field_change_tolerance),
+        format_scientific(report.final_momentum_initial_normalized_residual_norm),
+        format_scientific(report.final_momentum_normalized_residual_norm),
         format_scientific(report.final_momentum_residual_norm),
+        format_scientific(report.final_pressure_correction_initial_normalized_residual_norm),
+        format_scientific(report.final_pressure_correction_normalized_residual_norm),
         format_scientific(report.final_pressure_correction_residual_norm),
         report.total_momentum_linear_iterations,
         report.total_pressure_linear_iterations,
         wall_clock_seconds
     );
     println!(
-        "laminarSimple result: meanVelocity={} analyticMeanVelocity={} relativeMeanVelocityError={} flowRate={} analyticFlowRate={} pressureDropFromMean={} relativePressureDropError={} pressureDropFromField={} minAxialVelocity={} maxAxialVelocity={}",
-        format_scientific(report.solution.mean_velocity),
-        format_scientific(report.solution.analytic_mean_velocity),
-        format_scientific(report.solution.relative_mean_velocity_error),
-        format_scientific(report.solution.flow_rate),
-        format_scientific(report.solution.analytic_flow_rate),
-        format_scientific(report.solution.pressure_drop_from_mean),
-        format_scientific(report.solution.relative_pressure_drop_error),
-        format_optional_scientific(report.solution.pressure_drop_from_field),
-        format_scientific(report.solution.min_axial_velocity),
-        format_scientific(report.solution.max_axial_velocity)
+        "laminarSimple residualControl: state={} checked={} satisfied={} U(tolerance={},initial={},satisfied={}) p(tolerance={},initial={},satisfied={})",
+        residual_control_state(report.residual_control),
+        yes_no(report.residual_control.checked),
+        yes_no(report.residual_control.satisfied),
+        format_optional_scientific(options.momentum_residual_control),
+        format_scientific(report.final_momentum_initial_normalized_residual_norm),
+        format_optional_bool(report.residual_control.momentum_satisfied),
+        format_optional_scientific(options.pressure_residual_control),
+        format_scientific(report.final_pressure_correction_initial_normalized_residual_norm),
+        format_optional_bool(report.residual_control.pressure_satisfied),
     );
     println!(
-        "laminarSimple operators: phiMin={} phiMax={} phiSumAbs={} gradPL2={} divPhiUL2={} velocityFixedValueFaces={} velocityZeroGradientFaces={} pressureFixedValueFaces={} pressureZeroGradientFaces={}",
+        "laminarSimple linearSolves: finalMomentumConverged={} finalPressureConverged={} momentumPredictors={} momentumNonConvergedPredictors={} momentumComponentSolves={} momentumComponentNonConvergedSolves={} pressureCorrectionSolves={} pressureCorrectionNonConvergedSolves={} maxMomentumIterationsPerSimple={} maxPressureIterationsPerSimple={} avgMomentumIterationsPerSimple={} avgPressureIterationsPerSimple={}",
+        yes_no(report.linear_solve_summary.final_momentum_linear_converged),
+        yes_no(report.linear_solve_summary.final_pressure_linear_converged),
+        report.linear_solve_summary.momentum_predictors,
+        report
+            .linear_solve_summary
+            .momentum_non_converged_predictors,
+        report.linear_solve_summary.momentum_component_solves,
+        report
+            .linear_solve_summary
+            .momentum_component_non_converged_solves,
+        report.linear_solve_summary.pressure_correction_solves,
+        report
+            .linear_solve_summary
+            .pressure_correction_non_converged_solves,
+        report
+            .linear_solve_summary
+            .max_momentum_linear_iterations_per_simple,
+        report
+            .linear_solve_summary
+            .max_pressure_linear_iterations_per_simple,
+        format_scientific(
+            report
+                .linear_solve_summary
+                .average_momentum_linear_iterations_per_simple,
+        ),
+        format_scientific(
+            report
+                .linear_solve_summary
+                .average_pressure_linear_iterations_per_simple,
+        )
+    );
+    println!(
+        "laminarSimple fields: velocityMinMagnitude={} velocityMaxMagnitude={} velocityL2={} velocityXMin={} velocityXMax={} velocityYMin={} velocityYMax={} velocityZMin={} velocityZMax={} pressureMin={} pressureMax={} pressureL2={}",
+        format_scientific(report.fields.velocity.min_magnitude),
+        format_scientific(report.fields.velocity.max_magnitude),
+        format_scientific(report.fields.velocity.l2_norm),
+        format_scientific(report.fields.velocity.x_min),
+        format_scientific(report.fields.velocity.x_max),
+        format_scientific(report.fields.velocity.y_min),
+        format_scientific(report.fields.velocity.y_max),
+        format_scientific(report.fields.velocity.z_min),
+        format_scientific(report.fields.velocity.z_max),
+        format_scientific(report.fields.pressure.min),
+        format_scientific(report.fields.pressure.max),
+        format_scientific(report.fields.pressure.l2_norm)
+    );
+    let mut residual_csv_path = solve.solve_residual_csv.clone();
+    if let Some(path) = &solve.solve_residual_csv {
+        write_laminar_simple_residual_csv(&report, path).map_err(|error| {
+            format!(
+                "could not write laminar SIMPLE residual history CSV to {} ({error})",
+                path.display()
+            )
+        })?;
+        println!("wrote laminar SIMPLE residual CSV: {}", path.display());
+    }
+    if let Some(plot_path) = &solve.solve_residual_plot {
+        if residual_csv_path.is_none() {
+            residual_csv_path = Some(plot_path.with_extension("csv"));
+        }
+        if let Some(csv_path) = &residual_csv_path {
+            if solve.solve_residual_csv.is_none() {
+                write_laminar_simple_residual_csv(&report, csv_path).map_err(|error| {
+                    format!(
+                        "could not write temporary residual history CSV to {} ({error})",
+                        csv_path.display()
+                    )
+                })?;
+                println!(
+                    "wrote temporary residual CSV for plotting: {}",
+                    csv_path.display()
+                );
+            }
+            match write_laminar_simple_residual_plot(csv_path, plot_path) {
+                Ok(()) => {
+                    println!(
+                        "wrote laminar SIMPLE residual plot: {}",
+                        plot_path.display()
+                    )
+                }
+                Err(error) => {
+                    println!(
+                        "laminarSimple residual plot warning: {} (CSV: {})",
+                        error,
+                        csv_path.display()
+                    )
+                }
+            }
+        }
+    }
+    println!(
+        "laminarSimple operators: phiMin={} phiMax={} phiSumAbs={} gradPL2={} hbyAL2={} divPhiUL2={} velocityFixedValueFaces={} velocityZeroGradientFaces={} velocityInletOutletFaces={} pressureFixedValueFaces={} pressureZeroGradientFaces={}",
         format_scientific(report.operator_summary.phi_min),
         format_scientific(report.operator_summary.phi_max),
         format_scientific(report.operator_summary.phi_sum_abs),
         format_scientific(report.operator_summary.grad_p_l2_norm),
+        format_scientific(report.operator_summary.hby_a_l2_norm),
         format_scientific(report.operator_summary.div_phi_u_l2_norm),
         report.boundary_summary.velocity_fixed_value_faces,
         report.boundary_summary.velocity_zero_gradient_faces,
+        report.boundary_summary.velocity_inlet_outlet_faces,
         report.boundary_summary.pressure_fixed_value_faces,
         report.boundary_summary.pressure_zero_gradient_faces
     );
-    println!("laminarSimple status: no field files written");
+    if let Some(output_dir) = &solve.write_final_fields {
+        write_laminar_simple_fields(&fields, &report, output_dir).map_err(|error| {
+            format!(
+                "could not write laminar SIMPLE fields to {} ({error})",
+                output_dir.display()
+            )
+        })?;
+        println!(
+            "wrote laminar SIMPLE final fields: {}",
+            output_dir.display()
+        );
+    } else {
+        println!("laminarSimple status: no field files written");
+    }
 
     if let Some(path) = &solve.report_json {
         write_laminar_simple_report_json(plan, &options, &report, wall_clock_seconds, path)
@@ -577,177 +1509,728 @@ fn run_laminar_simple_solve(
             })?;
         println!("wrote laminar SIMPLE report markdown: {}", path.display());
     }
+    print_laminar_simple_convergence_feedback(&report, &options);
 
     Ok(())
+}
+
+fn write_laminar_simple_residual_csv(
+    report: &LaminarSimpleReport,
+    path: &Path,
+) -> std::io::Result<()> {
+    ensure_parent_dir(path)?;
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+
+    writeln!(
+        writer,
+        "iteration,continuityBeforeL2,continuityAfterL2,momentumInitialResidualNormalized,momentumFinalResidualNormalized,momentumResidualNorm,pressureInitialResidualNormalized,pressureFinalResidualNormalized,pressureResidualNorm,residualControlConfigured,residualControlChecked,residualControlSatisfied,pressureCorrectionAccepted,momentumLinearIterations,momentumLinearConverged,pressureLinearIterations,pressureLinearConverged,relativeVelocityChangeL2,relativePressureChangeL2"
+    )?;
+    for item in &report.history {
+        writeln!(
+            writer,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            item.iteration,
+            item.continuity_before.l2_norm,
+            item.continuity_after.l2_norm,
+            item.momentum_initial_normalized_residual_norm,
+            item.momentum_normalized_residual_norm,
+            item.momentum_residual_norm,
+            item.pressure_correction_initial_normalized_residual_norm,
+            item.pressure_correction_normalized_residual_norm,
+            item.pressure_correction_residual_norm,
+            item.residual_control.configured,
+            item.residual_control.checked,
+            item.residual_control.satisfied,
+            item.pressure_correction_accepted,
+            item.momentum_linear_iterations,
+            item.momentum_linear_converged,
+            item.pressure_linear_iterations,
+            item.pressure_linear_converged,
+            item.relative_velocity_change_l2,
+            item.relative_pressure_change_l2
+        )?;
+    }
+
+    writer.flush()
+}
+
+struct SimpleIterationEstimate {
+    primary_metric: &'static str,
+    additional_iterations: usize,
+    geometric_ratio: f64,
+}
+
+fn estimate_simple_iterations_to_convergence(
+    history: &[LaminarSimpleIterationSummary],
+    options: &LaminarSimpleOptions,
+) -> Option<SimpleIterationEstimate> {
+    let mut candidates = Vec::new();
+    if let Some(target) = options.momentum_residual_control {
+        let momentum_values: Vec<f64> = history
+            .iter()
+            .map(|item| item.momentum_initial_normalized_residual_norm)
+            .collect();
+        if let Some(estimate) = estimate_iterations_to_convergence(&momentum_values, target)
+            && estimate.additional_iterations > 0
+        {
+            candidates.push((
+                "momentum residual",
+                estimate.additional_iterations,
+                estimate.geometric_ratio,
+            ));
+        }
+    }
+
+    if let Some(target) = options.pressure_residual_control {
+        let pressure_values: Vec<f64> = history
+            .iter()
+            .map(|item| item.pressure_correction_initial_normalized_residual_norm)
+            .collect();
+        if let Some(estimate) = estimate_iterations_to_convergence(&pressure_values, target)
+            && estimate.additional_iterations > 0
+        {
+            candidates.push((
+                "pressure residual",
+                estimate.additional_iterations,
+                estimate.geometric_ratio,
+            ));
+        }
+    }
+
+    candidates
+        .into_iter()
+        .max_by_key(|candidate| candidate.1)
+        .map(|(metric, iterations, ratio)| SimpleIterationEstimate {
+            primary_metric: metric,
+            additional_iterations: iterations,
+            geometric_ratio: ratio,
+        })
+}
+
+struct ConvergenceRatioEstimate {
+    additional_iterations: usize,
+    geometric_ratio: f64,
+}
+
+fn estimate_iterations_to_convergence(
+    values: &[f64],
+    target: f64,
+) -> Option<ConvergenceRatioEstimate> {
+    if !target.is_finite() || target <= 0.0 || values.len() < 3 {
+        return None;
+    }
+
+    let values: Vec<f64> = values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .collect();
+    if values.len() < 3 {
+        return None;
+    }
+
+    let tail = if values.len() > 10 {
+        &values[values.len() - 10..]
+    } else {
+        values.as_slice()
+    };
+    let mut ratios = Vec::new();
+    for pair in tail.windows(2) {
+        let previous = pair[0];
+        let current = pair[1];
+        if previous <= 0.0 || current <= 0.0 || !current.is_finite() || !previous.is_finite() {
+            continue;
+        }
+        let ratio = current / previous;
+        if ratio.is_finite() && ratio > 0.0 && ratio < 1.0 {
+            ratios.push(ratio);
+        }
+    }
+    if ratios.is_empty() {
+        return None;
+    }
+
+    let geometric_ratio = ratios
+        .iter()
+        .fold(1.0, |acc, ratio| acc * ratio)
+        .powf(1.0 / ratios.len() as f64);
+    if geometric_ratio <= 0.0 || geometric_ratio >= 1.0 {
+        return None;
+    }
+
+    let latest = *tail.last()?;
+    if latest <= target {
+        return Some(ConvergenceRatioEstimate {
+            additional_iterations: 0,
+            geometric_ratio,
+        });
+    }
+
+    let estimate = (target / latest).ln() / geometric_ratio.ln();
+    if !estimate.is_finite() || estimate <= 0.0 {
+        return None;
+    }
+
+    Some(ConvergenceRatioEstimate {
+        additional_iterations: estimate.ceil().max(1.0) as usize,
+        geometric_ratio,
+    })
+}
+
+fn print_laminar_simple_convergence_feedback(
+    report: &LaminarSimpleReport,
+    options: &LaminarSimpleOptions,
+) {
+    if report.converged {
+        return;
+    }
+
+    match report.stop_reason {
+        LaminarSimpleStopReason::MaxIterationsReached => {
+            let reached_budget = options.max_simple_iterations == report.simple_iterations;
+            let budget_message = if reached_budget {
+                format!(
+                    "iteration budget reached ({})",
+                    options.max_simple_iterations
+                )
+            } else {
+                "iteration budget stopped".to_string()
+            };
+            println!("laminarSimple convergence note: {budget_message}.");
+
+            if report.history.len() >= 2 {
+                let previous = &report.history[report.history.len() - 2];
+                let latest = &report.history[report.history.len() - 1];
+                let momentum_ratio = residual_ratio(
+                    previous.momentum_initial_normalized_residual_norm,
+                    latest.momentum_initial_normalized_residual_norm,
+                );
+                let pressure_ratio = residual_ratio(
+                    previous.pressure_correction_initial_normalized_residual_norm,
+                    latest.pressure_correction_initial_normalized_residual_norm,
+                );
+                let continuity_ratio = residual_ratio(
+                    previous.continuity_after.l2_norm,
+                    latest.continuity_after.l2_norm,
+                );
+                println!(
+                    "  last-iteration trend (iter {} -> {}): momentum {} | pressure {} | continuity {}",
+                    previous.iteration,
+                    latest.iteration,
+                    format_ratio(momentum_ratio),
+                    format_ratio(pressure_ratio),
+                    format_ratio(continuity_ratio)
+                );
+            } else {
+                println!("  last-iteration trend: not enough samples");
+            }
+
+            println!(
+                "  suggestion: if the initial residuals are still decreasing, increase the controlDict endTime or --maxSimpleIterations budget."
+            );
+
+            if let Some(estimate) =
+                estimate_simple_iterations_to_convergence(&report.history, options)
+            {
+                println!(
+                    "  trend estimate: if current geometric decay persists, add about {} SIMPLE iteration(s) for convergence (targeted on {} criterion; last ratio {:.4}).",
+                    estimate.additional_iterations,
+                    estimate.primary_metric,
+                    estimate.geometric_ratio
+                );
+            }
+        }
+        LaminarSimpleStopReason::ConvergenceCriteriaNotConfigured => {
+            if report.simple_iterations > 0
+                && let (Some(momentum), Some(pressure)) = (
+                    report
+                        .history
+                        .last()
+                        .map(|item| item.momentum_initial_normalized_residual_norm),
+                    report
+                        .history
+                        .last()
+                        .map(|item| item.pressure_correction_initial_normalized_residual_norm),
+                )
+            {
+                println!(
+                    "  final SIMPLE-iteration initial residual U={}",
+                    format_scientific(momentum)
+                );
+                println!(
+                    "  final SIMPLE-iteration initial residual p={}",
+                    format_scientific(pressure)
+                );
+            }
+            println!(
+                "laminarSimple convergence note: no active convergence criteria (no residualControl in fvSolution)."
+            );
+            println!(
+                "  to stop early, set SIMPLE.residualControl U/p in system/fvSolution. Benchmark acceptance is evaluated externally."
+            );
+            if options.max_simple_iterations > 1 {
+                println!(
+                    "  run note: you requested --maxSimpleIterations {}, if this case was still improving, increase it and keep a convergence check enabled.",
+                    options.max_simple_iterations
+                );
+            }
+            if let Some(estimate) =
+                estimate_simple_iterations_to_convergence(&report.history, options)
+            {
+                println!(
+                    "  trend estimate: if current geometric decay persists, add about {} SIMPLE iteration(s) for the {} criterion (last ratio {:.4}).",
+                    estimate.additional_iterations,
+                    estimate.primary_metric,
+                    estimate.geometric_ratio
+                );
+            }
+        }
+        LaminarSimpleStopReason::MomentumSolverInvalidState => {
+            println!(
+                "laminarSimple convergence note: momentum equation linear solve entered invalid state."
+            );
+        }
+        LaminarSimpleStopReason::PressureSolverInvalidState => {
+            println!(
+                "laminarSimple convergence note: pressure equation linear solve entered invalid state."
+            );
+        }
+        LaminarSimpleStopReason::SolverInvalidState => {
+            println!(
+                "laminarSimple convergence note: solver encountered a non-finite field/state."
+            );
+        }
+        LaminarSimpleStopReason::Converged => {}
+    }
+}
+
+fn residual_ratio(previous: f64, latest: f64) -> Option<f64> {
+    if !previous.is_finite() || !latest.is_finite() || previous.abs() <= f64::EPSILON {
+        return None;
+    }
+    Some(latest / previous)
+}
+
+fn format_ratio(value: Option<f64>) -> String {
+    value
+        .map(format_scientific)
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn write_laminar_simple_residual_plot(csv_path: &Path, plot_path: &Path) -> std::io::Result<()> {
+    let wants_svg = plot_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"));
+    if wants_svg {
+        return write_laminar_simple_residual_plot_svg(csv_path, plot_path);
+    }
+
+    let python = locate_python_interpreter().ok_or_else(|| {
+        Error::new(
+            ErrorKind::NotFound,
+            "python is required to generate the residual plot, but could not be found",
+        )
+    })?;
+    ensure_parent_dir(plot_path)?;
+
+    const SCRIPT: &str = r#"
+import csv
+import sys
+
+import matplotlib.pyplot as plt
+
+from pathlib import Path
+
+csv_path = Path(sys.argv[1])
+plot_path = Path(sys.argv[2])
+
+with csv_path.open("r", newline="") as handle:
+    rows = list(csv.DictReader(handle))
+
+if not rows:
+    raise RuntimeError("no residual history rows in CSV")
+
+iterations = [float(row["iteration"]) for row in rows]
+momentum = [float(row["momentumInitialResidualNormalized"]) for row in rows]
+pressure = [float(row["pressureInitialResidualNormalized"]) for row in rows]
+continuity = [float(row["continuityAfterL2"]) for row in rows]
+
+plt.figure(figsize=(8, 5))
+plt.plot(iterations, continuity, label="Continuity L2")
+plt.plot(iterations, momentum, label="U initial residual")
+plt.plot(iterations, pressure, label="p initial residual")
+plt.yscale("log")
+plt.xlabel("SIMPLE iteration")
+plt.ylabel("Residual / Continuity metric")
+plt.legend()
+plt.grid(True, which="both", alpha=0.25)
+plt.tight_layout()
+plt.savefig(plot_path, dpi=150)
+"#;
+
+    let status = Command::new(python)
+        .arg("-c")
+        .arg(SCRIPT)
+        .arg(csv_path)
+        .arg(plot_path)
+        .status()?;
+
+    if !status.success() {
+        return Err(Error::other(format!(
+            "python plotting failed with status {status}"
+        )));
+    }
+
+    Ok(())
+}
+
+fn write_laminar_simple_residual_plot_svg(
+    csv_path: &Path,
+    plot_path: &Path,
+) -> std::io::Result<()> {
+    #[derive(Default)]
+    struct ParsedCsvRow {
+        iteration: f64,
+        continuity: f64,
+        momentum: f64,
+        pressure: f64,
+    }
+
+    let raw = std::fs::read_to_string(csv_path)?;
+    let mut rows = Vec::new();
+    for (index, line) in raw.lines().enumerate() {
+        if index == 0 || line.trim().is_empty() {
+            continue;
+        }
+        let values: Vec<&str> = line.split(',').collect();
+        if values.len() < 9 {
+            continue;
+        }
+
+        let parse = |idx: usize| -> f64 {
+            values
+                .get(idx)
+                .and_then(|value| value.parse::<f64>().ok())
+                .unwrap_or(f64::NAN)
+        };
+
+        let row = ParsedCsvRow {
+            iteration: parse(0),
+            continuity: parse(2),
+            momentum: parse(3),
+            pressure: parse(6),
+        };
+        if row.iteration.is_finite()
+            && row.continuity.is_finite()
+            && row.momentum.is_finite()
+            && row.pressure.is_finite()
+        {
+            rows.push(row);
+        }
+    }
+
+    if rows.is_empty() {
+        return Err(Error::other("no residual history rows in CSV"));
+    }
+
+    let width = 800.0f64;
+    let height = 500.0f64;
+    let left = 70.0f64;
+    let right = 20.0f64;
+    let top = 20.0f64;
+    let bottom = 60.0f64;
+    let plot_width = width - left - right;
+    let plot_height = height - top - bottom;
+    let plot_top = top;
+    let plot_bottom = top + plot_height;
+
+    let y_values: Vec<f64> = rows
+        .iter()
+        .flat_map(|row| [row.continuity, row.momentum, row.pressure])
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .collect();
+    let y_min = y_values
+        .iter()
+        .map(|value| value.log10())
+        .fold(f64::INFINITY, |acc, value| acc.min(value));
+    let y_max = y_values
+        .iter()
+        .map(|value| value.log10())
+        .fold(f64::NEG_INFINITY, |acc, value| acc.max(value));
+    let y_display_min = y_min.floor() - 1.0;
+    let y_display_max = y_max.ceil() + 1.0;
+    let y_span = (y_display_max - y_display_min).max(1.0);
+
+    let min_iteration = rows.first().map(|row| row.iteration).unwrap_or(0.0);
+    let max_iteration = rows.last().map(|row| row.iteration).unwrap_or(1.0);
+    let iteration_span = (max_iteration - min_iteration).max(1.0);
+
+    fn map_x(iteration: f64, min_iteration: f64, span: f64, left: f64, width: f64) -> f64 {
+        left + ((iteration - min_iteration) / span) * width
+    }
+
+    fn map_y(value: f64, min_log: f64, span: f64, top: f64, bottom: f64) -> f64 {
+        let y = value.log10();
+        let clamped = y.clamp(min_log, min_log + span);
+        bottom - (clamped - min_log) / span * (bottom - top)
+    }
+
+    let polyline_points = |series: &[ParsedCsvRow], selector: fn(&ParsedCsvRow) -> f64| {
+        let mut points = String::new();
+        for row in series {
+            let y = map_y(selector(row), y_display_min, y_span, plot_top, plot_bottom);
+            let x = map_x(
+                row.iteration,
+                min_iteration,
+                iteration_span,
+                left,
+                plot_width,
+            );
+            points.push_str(&format!("{x:.3},{y:.3} "));
+        }
+        points.trim_end().to_string()
+    };
+
+    let momentum_points = polyline_points(&rows, |row| row.momentum);
+    let pressure_points = polyline_points(&rows, |row| row.pressure);
+    let continuity_points = polyline_points(&rows, |row| row.continuity);
+
+    let y_tick_start = y_display_min as i32;
+    let y_tick_end = y_display_max as i32;
+    let y_ticks = (y_tick_start..=y_tick_end)
+        .map(|tick| {
+            let y = plot_bottom - ((tick as f64 - y_display_min) / y_span) * (plot_bottom - plot_top);
+            format!("<line x1=\"{:.3}\" y1=\"{:.3}\" x2=\"{:.3}\" y2=\"{:.3}\" stroke=\"#ddd\" stroke-width=\"1\"/>\n           <text x=\"{:.3}\" y=\"{:.3}\" font-size=\"10\" fill=\"#444\">1e{}</text>",
+                left, y, left + plot_width, y, left - 12.0, y + 4.0, tick)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let x_ticks = 5usize;
+    let x_tick_lines = (0..=x_ticks)
+        .map(|idx| {
+            let fraction = idx as f64 / x_ticks as f64;
+            let iter = min_iteration + fraction * iteration_span;
+            let x = left + fraction * plot_width;
+            let label = format!("{:.0}", iter.round());
+            format!(
+                "<line x1=\"{x:.3}\" y1=\"{top:.3}\" x2=\"{x:.3}\" y2=\"{:.3}\" stroke=\"#ddd\" stroke-width=\"1\"/>\n           <text x=\"{:.3}\" y=\"{:.3}\" font-size=\"10\" fill=\"#444\" text-anchor=\"middle\">{}</text>",
+                plot_bottom + 3.0,
+                x - 2.0,
+                plot_bottom + 15.0,
+                label
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut svg = String::new();
+    svg.push_str(&format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {width} {height}\" width=\"{width}\" height=\"{height}\">\n",
+        width = width,
+        height = height
+    ));
+    svg.push_str(&format!(
+        "  <rect x=\"0\" y=\"0\" width=\"{width}\" height=\"{height}\" fill=\"#fff\"/>\n",
+        width = width,
+        height = height
+    ));
+    svg.push_str(&format!(
+        "  <rect x=\"{left}\" y=\"{top}\" width=\"{plot_width}\" height=\"{plot_height}\" fill=\"none\" stroke=\"#888\" stroke-width=\"1\"/>\n",
+        left = left,
+        top = top,
+        plot_width = plot_width,
+        plot_height = plot_height
+    ));
+    svg.push_str("  <g stroke=\"none\" fill=\"#666\" font-family=\"Arial,sans-serif\">\n");
+    svg.push_str(&format!("    {y_ticks}\n"));
+    svg.push_str(&format!("    {x_tick_lines}\n"));
+    svg.push_str(&format!(
+        "    <text x=\"{:.1}\" y=\"{:.1}\" font-size=\"12\" text-anchor=\"middle\">Iteration</text>\n",
+        left + plot_width / 2.0,
+        plot_bottom + 40.0
+    ));
+    svg.push_str(&format!(
+        "    <text transform=\"translate(16,{:.1}) rotate(-90)\" font-size=\"12\" text-anchor=\"middle\">Residual (log10 scale)</text>\n",
+        (plot_top + plot_bottom) / 2.0
+    ));
+    svg.push_str("  </g>\n");
+    svg.push_str("  <g fill=\"none\" stroke-width=\"2\">\n");
+    svg.push_str(&format!(
+        "    <polyline points=\"{momentum_points}\" stroke=\"#1f77b4\" />\n"
+    ));
+    svg.push_str(&format!(
+        "    <polyline points=\"{pressure_points}\" stroke=\"#ff7f0e\" />\n"
+    ));
+    svg.push_str(&format!(
+        "    <polyline points=\"{continuity_points}\" stroke=\"#2ca02c\" />\n"
+    ));
+    svg.push_str("  </g>\n");
+    svg.push_str("  <g font-family=\"Arial,sans-serif\" font-size=\"11\" fill=\"#333\">\n");
+    svg.push_str(&format!(
+        "    <text x=\"{:.1}\" y=\"{:.1}\">U initial residual</text>\n",
+        left + plot_width - 10.0,
+        plot_top + 20.0
+    ));
+    svg.push_str(&format!(
+        "    <text x=\"{:.1}\" y=\"{:.1}\">p initial residual</text>\n",
+        left + plot_width - 10.0,
+        plot_top + 38.0
+    ));
+    svg.push_str(&format!(
+        "    <text x=\"{:.1}\" y=\"{:.1}\">Continuity L2</text>\n",
+        left + plot_width - 10.0,
+        plot_top + 56.0
+    ));
+    svg.push_str(&format!(
+        "    <text x=\"{:.1}\" y=\"{:.1}\" fill=\"#1f77b4\">Momentum</text>\n",
+        left + plot_width + 10.0,
+        plot_top + 20.0
+    ));
+    svg.push_str(&format!(
+        "    <text x=\"{:.1}\" y=\"{:.1}\" fill=\"#ff7f0e\">Pressure</text>\n",
+        left + plot_width + 10.0,
+        plot_top + 38.0
+    ));
+    svg.push_str(&format!(
+        "    <text x=\"{:.1}\" y=\"{:.1}\" fill=\"#2ca02c\">Continuity</text>\n",
+        left + plot_width + 10.0,
+        plot_top + 56.0
+    ));
+    svg.push_str("  </g>\n");
+    svg.push_str("</svg>\n");
+
+    ensure_parent_dir(plot_path)?;
+    std::fs::write(plot_path, svg)?;
+    Ok(())
+}
+
+fn locate_python_interpreter() -> Option<&'static str> {
+    ["python", "python3"].into_iter().find(|command| {
+        Command::new(command)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    })
 }
 
 fn resolve_laminar_simple_options(
     plan: &SolverCasePlan,
     solve: &LaminarSimpleSolveArgs,
 ) -> Result<LaminarSimpleOptions, String> {
+    if !plan.numerics.fv_solution.present {
+        return Err("Laminar SIMPLE solve requires OpenFOAM-style system/fvSolution".to_string());
+    }
     let density = solve
         .density
         .or_else(|| property_number(plan, "transportProperties", None, "rho"))
-        .or_else(|| property_number(plan, "pipeBenchmark", Some("water"), "rho"))
         .ok_or_else(|| {
-            "Laminar SIMPLE solve requires --rho or transportProperties.rho/pipeBenchmark.water.rho"
-                .to_string()
+            "Laminar SIMPLE solve requires --rho or transportProperties.rho".to_string()
         })?;
     let dynamic_viscosity = solve
         .dynamic_viscosity
         .or_else(|| property_number(plan, "transportProperties", None, "mu"))
-        .or_else(|| property_number(plan, "pipeBenchmark", Some("water"), "mu"))
         .ok_or_else(|| {
-            "Laminar SIMPLE solve requires --mu or transportProperties.mu/pipeBenchmark.water.mu"
-                .to_string()
+            "Laminar SIMPLE solve requires --mu or transportProperties.mu".to_string()
         })?;
-    let pressure_drop = solve
-        .pressure_drop
-        .or_else(|| {
-            property_number(
-                plan,
-                "pipeBenchmark",
-                Some("flowReference"),
-                "expectedDeltaP",
-            )
-        })
-        .ok_or_else(|| {
-            "Laminar SIMPLE solve requires --pressureDrop or pipeBenchmark.flowReference.expectedDeltaP"
-                .to_string()
-        })?;
-    let length = solve
-        .length
-        .or_else(|| property_number(plan, "pipeBenchmark", Some("geometry"), "length"))
-        .ok_or_else(|| {
-            "Laminar SIMPLE solve requires --length or pipeBenchmark.geometry.length".to_string()
-        })?;
-    let diameter = solve
-        .diameter
-        .or_else(|| property_number(plan, "pipeBenchmark", Some("geometry"), "diameter"))
-        .ok_or_else(|| {
-            "Laminar SIMPLE solve requires --diameter or pipeBenchmark.geometry.diameter"
-                .to_string()
-        })?;
+    let momentum_case_tolerance = fv_solution_number(plan, "solvers.U", "tolerance")?;
+    let pressure_case_tolerance = fv_solution_number(plan, "solvers.p", "tolerance")?;
+    let momentum_case_max_iterations = fv_solution_usize(plan, "solvers.U", "maxIter")?;
+    let pressure_case_max_iterations = fv_solution_usize(plan, "solvers.p", "maxIter")?;
 
-    let linear_tolerance = solve.linear_tolerance.unwrap_or(1.0e-10);
-    let max_linear_iterations = solve.max_linear_iterations.unwrap_or(10_000);
+    let linear_tolerance = solve
+        .linear_tolerance
+        .or(momentum_case_tolerance)
+        .unwrap_or(OPENFOAM_DEFAULT_LDU_TOLERANCE);
+    let max_linear_iterations = solve
+        .max_linear_iterations
+        .unwrap_or(OPENFOAM_DEFAULT_LDU_MAX_ITERATIONS);
     let momentum_linear_tolerance = solve
         .momentum_linear_tolerance
         .or(solve.linear_tolerance)
-        .or_else(|| fv_solution_number(plan, "solvers.U", "tolerance"))
-        .unwrap_or(1.0e-10);
+        .or(momentum_case_tolerance)
+        .unwrap_or(OPENFOAM_DEFAULT_LDU_TOLERANCE);
     let pressure_linear_tolerance = solve
         .pressure_linear_tolerance
         .or(solve.linear_tolerance)
-        .or_else(|| fv_solution_number(plan, "solvers.p", "tolerance"))
-        .unwrap_or(1.0e-10);
+        .or(pressure_case_tolerance)
+        .unwrap_or(OPENFOAM_DEFAULT_LDU_TOLERANCE);
     let momentum_max_linear_iterations = solve
         .momentum_max_linear_iterations
         .or(solve.max_linear_iterations)
-        .or_else(|| fv_solution_usize(plan, "solvers.U", "maxIter"))
-        .unwrap_or(10_000);
+        .or(momentum_case_max_iterations)
+        .unwrap_or(OPENFOAM_DEFAULT_LDU_MAX_ITERATIONS);
     let pressure_max_linear_iterations = solve
         .pressure_max_linear_iterations
         .or(solve.max_linear_iterations)
-        .or_else(|| fv_solution_usize(plan, "solvers.p", "maxIter"))
-        .unwrap_or(10_000);
-    let linear_solver = solve
-        .linear_solver
-        .unwrap_or(LaminarSimpleLinearSolver::BiCgStab);
-    let momentum_linear_solver = solve
-        .momentum_linear_solver
-        .or(solve.linear_solver)
-        .or_else(|| fv_solution_laminar_solver(plan, "solvers.U", "solver"))
-        .unwrap_or(LaminarSimpleLinearSolver::BiCgStab);
-    let pressure_linear_solver = solve
-        .pressure_linear_solver
-        .or(solve.linear_solver)
-        .or_else(|| fv_solution_laminar_solver(plan, "solvers.p", "solver"))
-        .unwrap_or(LaminarSimpleLinearSolver::Pcg);
-    let momentum_preconditioner = solve
-        .momentum_preconditioner
-        .or_else(|| {
-            if matches!(
-                momentum_linear_solver,
-                LaminarSimpleLinearSolver::Pcg | LaminarSimpleLinearSolver::BiCgStab
-            ) {
-                fv_solution_laminar_preconditioner(plan, "solvers.U", "preconditioner")
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| {
-            if matches!(
-                momentum_linear_solver,
-                LaminarSimpleLinearSolver::Pcg | LaminarSimpleLinearSolver::BiCgStab
-            ) {
-                LaminarSimplePreconditioner::Diagonal
-            } else {
-                LaminarSimplePreconditioner::None
-            }
-        });
-    let pressure_preconditioner = solve
-        .pressure_preconditioner
-        .or_else(|| {
-            if matches!(
-                pressure_linear_solver,
-                LaminarSimpleLinearSolver::Pcg | LaminarSimpleLinearSolver::BiCgStab
-            ) {
-                fv_solution_laminar_preconditioner(plan, "solvers.p", "preconditioner")
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| {
-            if matches!(
-                pressure_linear_solver,
-                LaminarSimpleLinearSolver::Pcg | LaminarSimpleLinearSolver::BiCgStab
-            ) {
-                LaminarSimplePreconditioner::Diagonal
-            } else {
-                LaminarSimplePreconditioner::None
-            }
-        });
+        .or(pressure_case_max_iterations)
+        .unwrap_or(OPENFOAM_DEFAULT_LDU_MAX_ITERATIONS);
+    let momentum_linear_solver = match solve.momentum_linear_solver.or(solve.linear_solver) {
+        Some(solver) => solver,
+        None => required_fv_solution_laminar_solver(plan, "solvers.U")?,
+    };
+    let pressure_linear_solver = match solve.pressure_linear_solver.or(solve.linear_solver) {
+        Some(solver) => solver,
+        None => required_fv_solution_laminar_solver(plan, "solvers.p")?,
+    };
+    validate_openfoam_linear_controls(plan, "solvers.U", momentum_linear_solver)?;
+    validate_openfoam_linear_controls(plan, "solvers.p", pressure_linear_solver)?;
+    let linear_solver = solve.linear_solver.unwrap_or(momentum_linear_solver);
+    let momentum_preconditioner = resolve_laminar_preconditioner(
+        plan,
+        "solvers.U",
+        momentum_linear_solver,
+        solve.momentum_preconditioner,
+    )?;
+    let pressure_preconditioner = resolve_laminar_preconditioner(
+        plan,
+        "solvers.p",
+        pressure_linear_solver,
+        solve.pressure_preconditioner,
+    )?;
+    let max_simple_iterations = solve
+        .max_simple_iterations
+        .or(plan.run.estimated_steps)
+        .filter(|iterations| *iterations > 0)
+        .ok_or_else(|| {
+            "Laminar SIMPLE requires --maxSimpleIterations or a positive controlDict endTime/deltaT iteration count"
+                .to_string()
+        })?;
     let min_simple_iterations = solve
         .min_simple_iterations
-        .or_else(|| fv_solution_usize(plan, "SIMPLE", "minSimpleIterations"))
-        .unwrap_or_else(|| {
-            if solve.max_simple_iterations > 1 {
-                2
-            } else {
-                1
-            }
-        });
-    let pressure_drop_tolerance = solve
-        .pressure_drop_tolerance
-        .or_else(|| fv_solution_number(plan, "SIMPLE", "pressureDropTolerance"))
-        .unwrap_or(0.02);
-    let field_change_tolerance = solve
-        .field_change_tolerance
-        .or_else(|| fv_solution_number(plan, "SIMPLE", "fieldChangeTolerance"))
-        .unwrap_or(0.01);
-    let momentum_residual_control = fv_solution_number(plan, "SIMPLE.residualControl", "U");
-    let pressure_residual_control = fv_solution_number(plan, "SIMPLE.residualControl", "p");
+        .or(fv_solution_usize(plan, "SIMPLE", "minSimpleIterations")?)
+        .unwrap_or(if max_simple_iterations > 1 { 2 } else { 1 });
+    validate_laminar_residual_control_dictionary(&plan.numerics.fv_solution)?;
+    let momentum_residual_control = fv_solution_single_scalar(plan, "SIMPLE.residualControl", "U")?;
+    let pressure_residual_control = fv_solution_single_scalar(plan, "SIMPLE.residualControl", "p")?;
     let pressure_reference_cell = solve
         .pressure_reference_cell
-        .or_else(|| fv_solution_usize(plan, "SIMPLE", "pRefCell"));
+        .or(fv_solution_usize(plan, "SIMPLE", "pRefCell")?);
     let pressure_reference_value = solve
         .pressure_reference_value
-        .or_else(|| fv_solution_number(plan, "SIMPLE", "pRefValue"))
+        .or(fv_solution_number(plan, "SIMPLE", "pRefValue")?)
         .unwrap_or(0.0);
     let non_orthogonal_correctors = solve
         .non_orthogonal_correctors
-        .or_else(|| fv_solution_usize(plan, "SIMPLE", "nNonOrthogonalCorrectors"))
+        .or(fv_solution_usize(
+            plan,
+            "SIMPLE",
+            "nNonOrthogonalCorrectors",
+        )?)
         .unwrap_or(0);
+    let simple_consistent = solve
+        .simple_consistent
+        .or(fv_solution_bool(plan, "SIMPLE", "consistent")?)
+        .unwrap_or(false);
+    let schemes = resolve_laminar_simple_schemes(plan)?;
 
     Ok(LaminarSimpleOptions {
         density,
         dynamic_viscosity,
-        pressure_drop,
-        length,
-        diameter,
-        inlet_patch: solve.inlet_patch.clone(),
-        outlet_patch: solve.outlet_patch.clone(),
         linear_solver,
         momentum_linear_solver,
         pressure_linear_solver,
@@ -759,25 +2242,226 @@ fn resolve_laminar_simple_options(
         pressure_linear_tolerance,
         momentum_max_linear_iterations,
         pressure_max_linear_iterations,
-        max_simple_iterations: solve.max_simple_iterations,
+        max_simple_iterations,
         min_simple_iterations,
-        simple_tolerance: solve.simple_tolerance,
-        pressure_drop_tolerance,
-        field_change_tolerance,
         momentum_residual_control,
         pressure_residual_control,
         pressure_reference_cell,
         pressure_reference_value,
         non_orthogonal_correctors,
+        simple_consistent,
         velocity_relaxation: solve
             .velocity_relaxation
-            .or_else(|| fv_solution_number(plan, "relaxationFactors.equations", "U"))
-            .unwrap_or(0.7),
+            .or(fv_solution_number(
+                plan,
+                "relaxationFactors.equations",
+                "U",
+            )?)
+            .unwrap_or(1.0),
         pressure_relaxation: solve
             .pressure_relaxation
-            .or_else(|| fv_solution_number(plan, "relaxationFactors.fields", "p"))
-            .unwrap_or(0.3),
+            .or(fv_solution_number(plan, "relaxationFactors.fields", "p")?)
+            .unwrap_or(1.0),
+        schemes,
     })
+}
+
+fn resolve_laminar_simple_schemes(plan: &SolverCasePlan) -> Result<LaminarSimpleSchemes, String> {
+    if !plan.numerics.fv_schemes.present {
+        return Err("Laminar SIMPLE solve requires OpenFOAM-style system/fvSchemes".to_string());
+    }
+
+    let sn_grad = parse_laminar_simple_sn_grad_scheme(required_fv_scheme(
+        plan,
+        "snGradSchemes",
+        "default",
+        None,
+    )?)?;
+    let laplacian = fv_schemes_value(plan, "laplacianSchemes", "laplacian(nu,U)")
+        .or_else(|| fv_schemes_value(plan, "laplacianSchemes", "laplacian(nuEff,U)"))
+        .or_else(|| fv_schemes_value(plan, "laplacianSchemes", "default"))
+        .ok_or_else(|| {
+            "fvSchemes laplacianSchemes requires laplacian(nu,U), laplacian(nuEff,U), or default"
+                .to_string()
+        })
+        .and_then(|value| parse_laminar_simple_laplacian_scheme(value, sn_grad))?;
+
+    Ok(LaminarSimpleSchemes {
+        grad_p: parse_laminar_simple_gradient_scheme(required_fv_scheme(
+            plan,
+            "gradSchemes",
+            "grad(p)",
+            Some("default"),
+        )?)?,
+        grad_u: parse_laminar_simple_gradient_scheme(required_fv_scheme(
+            plan,
+            "gradSchemes",
+            "grad(U)",
+            Some("default"),
+        )?)?,
+        div_phi_u: parse_laminar_simple_convection_scheme(required_fv_scheme(
+            plan,
+            "divSchemes",
+            "div(phi,U)",
+            Some("default"),
+        )?)?,
+        laplacian,
+        interpolation: parse_laminar_simple_interpolation_scheme(required_fv_scheme(
+            plan,
+            "interpolationSchemes",
+            "default",
+            None,
+        )?)?,
+        sn_grad,
+    })
+}
+
+fn fv_schemes_value<'a>(plan: &'a SolverCasePlan, section: &str, key: &str) -> Option<&'a str> {
+    numerics_dictionary_value(&plan.numerics.fv_schemes, section, key)
+}
+
+fn required_fv_scheme<'a>(
+    plan: &'a SolverCasePlan,
+    section: &str,
+    key: &str,
+    fallback_key: Option<&str>,
+) -> Result<&'a str, String> {
+    fv_schemes_value(plan, section, key)
+        .or_else(|| fallback_key.and_then(|fallback| fv_schemes_value(plan, section, fallback)))
+        .ok_or_else(|| match fallback_key {
+            Some(fallback) => {
+                format!("fvSchemes {section} requires {key} or {fallback}")
+            }
+            None => format!("fvSchemes {section} requires {key}"),
+        })
+}
+
+fn parse_laminar_simple_gradient_scheme(
+    value: &str,
+) -> Result<LaminarSimpleGradientScheme, String> {
+    let tokens = normalized_scheme_tokens(value);
+    if scheme_tokens_are(&tokens, &["gauss", "linear"]) {
+        Ok(LaminarSimpleGradientScheme::GaussLinear)
+    } else {
+        Err(format!(
+            "unsupported laminar SIMPLE grad scheme '{value}'; currently supported: Gauss linear"
+        ))
+    }
+}
+
+fn parse_laminar_simple_convection_scheme(
+    value: &str,
+) -> Result<LaminarSimpleConvectionScheme, String> {
+    let tokens = normalized_scheme_tokens(value);
+    let tokens = strip_bounded_scheme_prefix(&tokens);
+    if scheme_tokens_are(tokens, &["gauss", "upwind"]) {
+        Ok(LaminarSimpleConvectionScheme::GaussUpwind)
+    } else if scheme_token_is(tokens, 0, "gauss") && scheme_token_is(tokens, 1, "linearupwind") {
+        Ok(LaminarSimpleConvectionScheme::GaussLinearUpwind)
+    } else if scheme_tokens_are(tokens, &["none"]) {
+        Err(
+            "laminar SIMPLE requires divSchemes.div(phi,U); divSchemes default none is not executable"
+                .to_string(),
+        )
+    } else {
+        Err(format!(
+            "unsupported laminar SIMPLE div(phi,U) scheme '{value}'; currently supported: Gauss upwind or Gauss linearUpwind grad(U)"
+        ))
+    }
+}
+
+fn parse_laminar_simple_interpolation_scheme(
+    value: &str,
+) -> Result<LaminarSimpleInterpolationScheme, String> {
+    let tokens = normalized_scheme_tokens(value);
+    if scheme_tokens_are(&tokens, &["linear"]) {
+        Ok(LaminarSimpleInterpolationScheme::Linear)
+    } else {
+        Err(format!(
+            "unsupported laminar SIMPLE interpolation scheme '{value}'; currently supported: linear"
+        ))
+    }
+}
+
+fn parse_laminar_simple_sn_grad_scheme(value: &str) -> Result<LaminarSimpleSnGradScheme, String> {
+    let tokens = normalized_scheme_tokens(value);
+    if scheme_tokens_are(&tokens, &["corrected"]) {
+        Ok(LaminarSimpleSnGradScheme::Corrected)
+    } else if scheme_tokens_are(&tokens, &["orthogonal"]) {
+        Ok(LaminarSimpleSnGradScheme::Orthogonal)
+    } else if scheme_tokens_are(&tokens, &["uncorrected"]) {
+        Ok(LaminarSimpleSnGradScheme::Uncorrected)
+    } else {
+        Err(format!(
+            "unsupported laminar SIMPLE snGrad scheme '{value}'; currently supported: corrected, orthogonal, uncorrected"
+        ))
+    }
+}
+
+fn parse_laminar_simple_laplacian_scheme(
+    value: &str,
+    sn_grad: LaminarSimpleSnGradScheme,
+) -> Result<LaminarSimpleLaplacianScheme, String> {
+    let tokens = normalized_scheme_tokens(value);
+    let tokens = strip_bounded_scheme_prefix(&tokens);
+    if !scheme_token_is(tokens, 0, "gauss")
+        || !scheme_token_is(tokens, 1, "linear")
+        || tokens.len() > 3
+    {
+        return Err(format!(
+            "unsupported laminar SIMPLE laplacian scheme '{value}'; currently supported: Gauss linear corrected/orthogonal/uncorrected"
+        ));
+    }
+
+    match tokens.get(2).map(String::as_str) {
+        Some("corrected") => Ok(LaminarSimpleLaplacianScheme::GaussLinearCorrected),
+        Some("orthogonal") => Ok(LaminarSimpleLaplacianScheme::GaussLinearOrthogonal),
+        Some("uncorrected") => Ok(LaminarSimpleLaplacianScheme::GaussLinearUncorrected),
+        Some(other) => Err(format!(
+            "unsupported laminar SIMPLE laplacian correction '{other}' in scheme '{value}'"
+        )),
+        None => Ok(laplacian_from_sn_grad(sn_grad)),
+    }
+}
+
+fn laplacian_from_sn_grad(sn_grad: LaminarSimpleSnGradScheme) -> LaminarSimpleLaplacianScheme {
+    match sn_grad {
+        LaminarSimpleSnGradScheme::Corrected => LaminarSimpleLaplacianScheme::GaussLinearCorrected,
+        LaminarSimpleSnGradScheme::Orthogonal => {
+            LaminarSimpleLaplacianScheme::GaussLinearOrthogonal
+        }
+        LaminarSimpleSnGradScheme::Uncorrected => {
+            LaminarSimpleLaplacianScheme::GaussLinearUncorrected
+        }
+    }
+}
+
+fn normalized_scheme_tokens(value: &str) -> Vec<String> {
+    value
+        .split_whitespace()
+        .map(|token| token.trim_matches(';').to_ascii_lowercase())
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn strip_bounded_scheme_prefix(tokens: &[String]) -> &[String] {
+    if tokens.first().is_some_and(|token| token == "bounded") {
+        &tokens[1..]
+    } else {
+        tokens
+    }
+}
+
+fn scheme_tokens_are(tokens: &[String], expected: &[&str]) -> bool {
+    tokens.len() == expected.len()
+        && tokens
+            .iter()
+            .zip(expected)
+            .all(|(token, expected)| token == expected)
+}
+
+fn scheme_token_is(tokens: &[String], index: usize, expected: &str) -> bool {
+    tokens.get(index).is_some_and(|token| token == expected)
 }
 
 fn property_number(
@@ -797,30 +2481,177 @@ fn property_number(
         .and_then(|entry| last_number(&entry.value))
 }
 
-fn fv_solution_number(plan: &SolverCasePlan, section: &str, key: &str) -> Option<f64> {
-    numerics_dictionary_number(&plan.numerics.fv_solution, section, key)
-}
-
-fn fv_solution_laminar_solver(
+fn fv_solution_number(
     plan: &SolverCasePlan,
     section: &str,
     key: &str,
-) -> Option<LaminarSimpleLinearSolver> {
-    numerics_dictionary_value(&plan.numerics.fv_solution, section, key)
-        .and_then(parse_openfoam_laminar_solver)
+) -> Result<Option<f64>, String> {
+    let Some(value) = numerics_dictionary_value(&plan.numerics.fv_solution, section, key) else {
+        return Ok(None);
+    };
+    last_number(value).map(Some).ok_or_else(|| {
+        format!("fvSolution {section}.{key} must contain a numeric value, got '{value}'")
+    })
 }
 
-fn fv_solution_laminar_preconditioner(
+fn fv_solution_single_scalar(
     plan: &SolverCasePlan,
     section: &str,
     key: &str,
-) -> Option<LaminarSimplePreconditioner> {
-    numerics_dictionary_value(&plan.numerics.fv_solution, section, key)
-        .and_then(parse_openfoam_laminar_preconditioner)
+) -> Result<Option<f64>, String> {
+    let Some(value) = numerics_dictionary_value(&plan.numerics.fv_solution, section, key) else {
+        return Ok(None);
+    };
+    let tokens = value
+        .trim()
+        .trim_end_matches(';')
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    if tokens.len() != 1 {
+        return Err(format!(
+            "fvSolution {section}.{key} must be one scalar value, got '{value}'"
+        ));
+    }
+    tokens[0]
+        .parse::<f64>()
+        .map(Some)
+        .map_err(|_| format!("fvSolution {section}.{key} must be one scalar value, got '{value}'"))
 }
 
-fn fv_solution_usize(plan: &SolverCasePlan, section: &str, key: &str) -> Option<usize> {
-    numerics_dictionary_usize(&plan.numerics.fv_solution, section, key)
+fn validate_laminar_residual_control_dictionary(
+    dictionary: &SolverNumericsDictionaryPlan,
+) -> Result<(), String> {
+    const SECTION: &str = "SIMPLE.residualControl";
+    if let Some(nested) = dictionary
+        .sections
+        .iter()
+        .find(|section| section.path.starts_with(&format!("{SECTION}.")))
+    {
+        return Err(format!(
+            "fvSolution {SECTION} entries must be single scalar values for steady SIMPLE convergence; nested dictionary '{}' is not valid OpenFOAM Foundation syntax here",
+            nested.path
+        ));
+    }
+
+    if let Some(entry) = dictionary
+        .entries
+        .iter()
+        .find(|entry| entry.section == SECTION && entry.key != "U" && entry.key != "p")
+    {
+        return Err(format!(
+            "fvSolution {SECTION}.{} is not supported by laminarSimple; supported solved fields are U and p",
+            entry.key
+        ));
+    }
+
+    Ok(())
+}
+
+fn fv_solution_bool(
+    plan: &SolverCasePlan,
+    section: &str,
+    key: &str,
+) -> Result<Option<bool>, String> {
+    let Some(value) = numerics_dictionary_value(&plan.numerics.fv_solution, section, key) else {
+        return Ok(None);
+    };
+    parse_bool_value(value).map(Some).ok_or_else(|| {
+        format!("fvSolution {section}.{key} must be true/false or yes/no, got '{value}'")
+    })
+}
+
+fn required_fv_solution_laminar_solver(
+    plan: &SolverCasePlan,
+    section: &str,
+) -> Result<LaminarSimpleLinearSolver, String> {
+    let value = numerics_dictionary_value(&plan.numerics.fv_solution, section, "solver")
+        .ok_or_else(|| format!("fvSolution {section} requires a solver entry"))?;
+    if value.trim().trim_end_matches(';') == "smoothSolver" {
+        let smoother = numerics_dictionary_value(&plan.numerics.fv_solution, section, "smoother")
+            .ok_or_else(|| {
+            format!("fvSolution {section} smoothSolver requires a smoother entry")
+        })?;
+        return match smoother.trim().trim_end_matches(';') {
+            "GaussSeidel" | "gaussSeidel" => Ok(LaminarSimpleLinearSolver::GaussSeidel),
+            "symGaussSeidel" => Ok(LaminarSimpleLinearSolver::SymGaussSeidel),
+            other => Err(format!(
+                "unsupported fvSolution {section} smoother '{other}'; Ferrum currently supports GaussSeidel and symGaussSeidel"
+            )),
+        };
+    }
+    parse_openfoam_laminar_solver(value)
+}
+
+fn resolve_laminar_preconditioner(
+    plan: &SolverCasePlan,
+    section: &str,
+    solver: LaminarSimpleLinearSolver,
+    explicit: Option<LaminarSimplePreconditioner>,
+) -> Result<LaminarSimplePreconditioner, String> {
+    if let Some(preconditioner) = explicit {
+        return Ok(preconditioner);
+    }
+    if !matches!(
+        solver,
+        LaminarSimpleLinearSolver::Pcg | LaminarSimpleLinearSolver::BiCgStab
+    ) {
+        return Ok(LaminarSimplePreconditioner::None);
+    }
+
+    let value = numerics_dictionary_value(&plan.numerics.fv_solution, section, "preconditioner")
+        .ok_or_else(|| format!("fvSolution {section} requires a preconditioner entry"))?;
+    parse_openfoam_laminar_preconditioner(value)
+}
+
+fn validate_openfoam_linear_controls(
+    plan: &SolverCasePlan,
+    section: &str,
+    solver: LaminarSimpleLinearSolver,
+) -> Result<(), String> {
+    if let Some(relative_tolerance) = fv_solution_number(plan, section, "relTol")?
+        && relative_tolerance != 0.0
+    {
+        return Err(format!(
+            "fvSolution {section}.relTol={relative_tolerance} is not implemented yet; Ferrum refuses to ignore a non-zero OpenFOAM relative tolerance"
+        ));
+    }
+    if let Some(min_iterations) = fv_solution_usize(plan, section, "minIter")?
+        && min_iterations != 0
+    {
+        return Err(format!(
+            "fvSolution {section}.minIter={min_iterations} is not implemented yet; Ferrum refuses to ignore it"
+        ));
+    }
+    if matches!(
+        solver,
+        LaminarSimpleLinearSolver::GaussSeidel | LaminarSimpleLinearSolver::SymGaussSeidel
+    ) && let Some(sweeps) = fv_solution_usize(plan, section, "nSweeps")?
+        && sweeps != 1
+    {
+        return Err(format!(
+            "fvSolution {section}.nSweeps={sweeps} is not implemented yet; Ferrum currently matches the OpenFOAM default nSweeps=1"
+        ));
+    }
+    Ok(())
+}
+
+fn fv_solution_usize(
+    plan: &SolverCasePlan,
+    section: &str,
+    key: &str,
+) -> Result<Option<usize>, String> {
+    let Some(value) = numerics_dictionary_value(&plan.numerics.fv_solution, section, key) else {
+        return Ok(None);
+    };
+    value
+        .trim()
+        .trim_end_matches(';')
+        .parse::<usize>()
+        .ok()
+        .map(Some)
+        .ok_or_else(|| {
+            format!("fvSolution {section}.{key} must contain a non-negative integer, got '{value}'")
+        })
 }
 
 fn numerics_dictionary_value<'a>(
@@ -835,6 +2666,7 @@ fn numerics_dictionary_value<'a>(
         .map(|entry| entry.value.as_str())
 }
 
+#[cfg(test)]
 fn numerics_dictionary_number(
     dictionary: &SolverNumericsDictionaryPlan,
     section: &str,
@@ -847,6 +2679,7 @@ fn numerics_dictionary_number(
         .and_then(|entry| last_number(&entry.value))
 }
 
+#[cfg(test)]
 fn numerics_dictionary_usize(
     dictionary: &SolverNumericsDictionaryPlan,
     section: &str,
@@ -868,6 +2701,7 @@ fn last_number(value: &str) -> Option<f64> {
     })
 }
 
+#[cfg(test)]
 fn last_usize(value: &str) -> Option<usize> {
     value.split_whitespace().rev().find_map(|token| {
         token
@@ -877,25 +2711,42 @@ fn last_usize(value: &str) -> Option<usize> {
     })
 }
 
-fn parse_openfoam_laminar_solver(value: &str) -> Option<LaminarSimpleLinearSolver> {
-    match value.trim() {
-        "PBiCG" | "PBiCGStab" | "BiCGStab" | "bicgstab" | "smoothSolver" | "smoothSolver;" => {
-            Some(LaminarSimpleLinearSolver::BiCgStab)
+fn parse_openfoam_laminar_solver(value: &str) -> Result<LaminarSimpleLinearSolver, String> {
+    match value.trim().trim_end_matches(';') {
+        "PBiCG" | "PBiCGStab" | "BiCGStab" | "bicgstab" => Ok(LaminarSimpleLinearSolver::BiCgStab),
+        "GaussSeidel" | "gaussSeidel" | "gauss-seidel" => {
+            Ok(LaminarSimpleLinearSolver::GaussSeidel)
         }
-        "PCG" | "pcg" => Some(LaminarSimpleLinearSolver::Pcg),
-        "CG" | "cg" => Some(LaminarSimpleLinearSolver::Cg),
-        "Jacobi" | "jacobi" => Some(LaminarSimpleLinearSolver::Jacobi),
-        _ => None,
+        "symGaussSeidel" | "sym-gauss-seidel" => Ok(LaminarSimpleLinearSolver::SymGaussSeidel),
+        "smoothSolver" => Err(
+            "OpenFOAM smoothSolver requires a smoother entry in fvSolution; use GaussSeidel or symGaussSeidel for a direct CLI override"
+                .to_string(),
+        ),
+        "PCG" | "pcg" => Ok(LaminarSimpleLinearSolver::Pcg),
+        "CG" | "cg" => Ok(LaminarSimpleLinearSolver::Cg),
+        "Jacobi" | "jacobi" => Ok(LaminarSimpleLinearSolver::Jacobi),
+        other => Err(format!(
+            "unsupported OpenFOAM linear solver '{other}'; no fallback was applied"
+        )),
     }
 }
 
-fn parse_openfoam_laminar_preconditioner(value: &str) -> Option<LaminarSimplePreconditioner> {
-    match value.trim() {
-        "none" | "None" => Some(LaminarSimplePreconditioner::None),
-        "DIC" | "FDIC" | "DILU" | "diagonal" | "Diagonal" => {
-            Some(LaminarSimplePreconditioner::Diagonal)
+fn parse_openfoam_laminar_preconditioner(
+    value: &str,
+) -> Result<LaminarSimplePreconditioner, String> {
+    match value.trim().trim_end_matches(';') {
+        "none" | "None" => Ok(LaminarSimplePreconditioner::None),
+        "DIC" | "FDIC" | "incompleteCholesky" | "ic0" | "IC0" => {
+            Ok(LaminarSimplePreconditioner::IncompleteCholesky)
         }
-        _ => None,
+        "diagonal" | "Diagonal" => Ok(LaminarSimplePreconditioner::Diagonal),
+        "DILU" => Err(
+            "OpenFOAM DILU is not implemented yet; refusing to substitute a diagonal preconditioner"
+                .to_string(),
+        ),
+        other => Err(format!(
+            "unsupported OpenFOAM preconditioner '{other}'; no fallback was applied"
+        )),
     }
 }
 
@@ -1115,6 +2966,7 @@ fn print_solver_case_plan(plan: &SolverCasePlan) {
     );
     print_solver_backend_plan(&plan.backends);
     print_solver_run_plan(&plan.run);
+    print_openfoam_case_compatibility_warnings(&plan.warnings);
     if plan.warnings.is_empty() {
         println!("preflight warnings: none");
     } else {
@@ -1128,16 +2980,42 @@ fn print_solver_case_plan(plan: &SolverCasePlan) {
     );
 }
 
+fn print_openfoam_case_compatibility_warnings(warnings: &[String]) {
+    let compatibility_warnings: Vec<String> = warnings
+        .iter()
+        .filter_map(|warning| {
+            warning
+                .strip_prefix("openFOAM compatibility: ")
+                .map(std::string::ToString::to_string)
+        })
+        .collect();
+    if compatibility_warnings.is_empty() {
+        println!("openFOAM compatibility: case layout and required fields look present");
+        return;
+    }
+
+    println!(
+        "openFOAM compatibility: {} item(s) to check",
+        compatibility_warnings.len()
+    );
+    for message in compatibility_warnings {
+        println!("  {}", message);
+    }
+}
+
 fn print_linear_solver_capabilities() {
     let capabilities = linear_solver_capabilities();
     println!(
-        "linear solvers: cpuCsr={} cpuJacobi={} cpuCg={} cpuPcg={} cpuBiCgStab={} cpuDiagonalPreconditioner={} gpuLinearSolvers={}",
+        "linear solvers: cpuCsr={} cpuJacobi={} cpuGaussSeidel={} cpuSymGaussSeidel={} cpuCg={} cpuPcg={} cpuBiCgStab={} cpuDiagonalPreconditioner={} cpuIncompleteCholeskyPreconditioner={} gpuLinearSolvers={}",
         yes_no(capabilities.cpu_csr),
         yes_no(capabilities.cpu_jacobi),
+        yes_no(capabilities.cpu_gauss_seidel),
+        yes_no(capabilities.cpu_symmetric_gauss_seidel),
         yes_no(capabilities.cpu_conjugate_gradient),
         yes_no(capabilities.cpu_preconditioned_conjugate_gradient),
         yes_no(capabilities.cpu_bicgstab),
         yes_no(capabilities.cpu_diagonal_preconditioner),
+        yes_no(capabilities.cpu_incomplete_cholesky_preconditioner),
         yes_no(capabilities.gpu_linear_solvers)
     );
 }
@@ -1196,7 +3074,7 @@ fn print_solver_state_plan(plan: &SolverStatePlan) {
         .fields
         .iter()
         .filter_map(|field| field.storage.bytes_f64)
-        .sum::<usize>();
+        .try_fold(0usize, |total, bytes| total.checked_add(bytes));
     let cpu_buffers = plan
         .fields
         .iter()
@@ -1208,7 +3086,7 @@ fn print_solver_state_plan(plan: &SolverStatePlan) {
         cpu_capable,
         gpu_capable,
         cpu_buffers,
-        bytes_f64
+        format_optional_usize(bytes_f64)
     );
     for field in &plan.fields {
         let name = if let Some(region) = &field.region {
@@ -1484,7 +3362,7 @@ fn print_solver_runner_state(plan: &SolverStatePlan) {
         .fields
         .iter()
         .filter_map(|field| field.storage.bytes_f64)
-        .sum::<usize>();
+        .try_fold(0usize, |total, bytes| total.checked_add(bytes));
     let cpu_buffers = plan
         .fields
         .iter()
@@ -1496,7 +3374,7 @@ fn print_solver_runner_state(plan: &SolverStatePlan) {
         cpu_capable,
         gpu_capable,
         cpu_buffers,
-        bytes_f64
+        format_optional_usize(bytes_f64)
     );
     for field in &plan.fields {
         let name = if let Some(region) = &field.region {
@@ -1611,6 +3489,9 @@ fn write_laminar_simple_report_json(
     writeln!(writer, ",")?;
     write_json_bool_field(&mut writer, 4, "converged", report.converged)?;
     writeln!(writer, ",")?;
+    write_json_key(&mut writer, 4, "stopReason")?;
+    write_json_string(&mut writer, &report.stop_reason.to_string())?;
+    writeln!(writer, ",")?;
     write_json_number_field(
         &mut writer,
         4,
@@ -1628,17 +3509,69 @@ fn write_laminar_simple_report_json(
     write_json_key(&mut writer, 4, "wallClockSeconds")?;
     write_json_optional_number(&mut writer, Some(wall_clock_seconds))?;
     writeln!(writer, ",")?;
+    write_json_key(&mut writer, 4, "finalMomentumInitialResidual")?;
+    write_json_optional_number(
+        &mut writer,
+        Some(report.final_momentum_initial_normalized_residual_norm),
+    )?;
+    writeln!(writer, ",")?;
     write_json_key(&mut writer, 4, "finalMomentumResidualNorm")?;
     write_json_optional_number(&mut writer, Some(report.final_momentum_residual_norm))?;
+    writeln!(writer, ",")?;
+    write_json_key(&mut writer, 4, "finalMomentumNormalizedResidualNorm")?;
+    write_json_optional_number(
+        &mut writer,
+        Some(report.final_momentum_normalized_residual_norm),
+    )?;
+    writeln!(writer, ",")?;
+    write_json_key(&mut writer, 4, "finalPressureCorrectionInitialResidual")?;
+    write_json_optional_number(
+        &mut writer,
+        Some(report.final_pressure_correction_initial_normalized_residual_norm),
+    )?;
     writeln!(writer, ",")?;
     write_json_key(&mut writer, 4, "finalPressureCorrectionResidualNorm")?;
     write_json_optional_number(
         &mut writer,
         Some(report.final_pressure_correction_residual_norm),
     )?;
+    writeln!(writer, ",")?;
+    write_json_key(
+        &mut writer,
+        4,
+        "finalPressureCorrectionNormalizedResidualNorm",
+    )?;
+    write_json_optional_number(
+        &mut writer,
+        Some(report.final_pressure_correction_normalized_residual_norm),
+    )?;
+    writeln!(writer, ",")?;
+    write_json_bool_field(
+        &mut writer,
+        4,
+        "finalMomentumLinearConverged",
+        report.linear_solve_summary.final_momentum_linear_converged,
+    )?;
+    writeln!(writer, ",")?;
+    write_json_bool_field(
+        &mut writer,
+        4,
+        "finalPressureLinearConverged",
+        report.linear_solve_summary.final_pressure_linear_converged,
+    )?;
     writeln!(writer)?;
     write_indent(&mut writer, 2)?;
     writeln!(writer, "}},")?;
+    write_json_residual_control_summary(
+        &mut writer,
+        options,
+        &report.residual_control,
+        report.final_momentum_initial_normalized_residual_norm,
+        report.final_pressure_correction_initial_normalized_residual_norm,
+    )?;
+    writeln!(writer, ",")?;
+    write_json_linear_solve_summary(&mut writer, &report.linear_solve_summary)?;
+    writeln!(writer, ",")?;
     write_json_key(&mut writer, 2, "continuity")?;
     writeln!(writer, "{{")?;
     write_json_key(&mut writer, 4, "initial")?;
@@ -1653,13 +3586,60 @@ fn write_laminar_simple_report_json(
     writeln!(writer, ",")?;
     write_json_boundary_summary(&mut writer, &report.boundary_summary)?;
     writeln!(writer, ",")?;
-    write_json_solution_summary(&mut writer, &report.solution)?;
+    write_json_pressure_assembly_diagnostics(&mut writer, report.pressure_assembly.as_ref())?;
+    writeln!(writer, ",")?;
+    write_json_field_summary(&mut writer, &report.fields)?;
     writeln!(writer, ",")?;
     write_json_laminar_simple_history(&mut writer, &report.history)?;
     writeln!(writer)?;
     writeln!(writer, "}}")?;
 
     writer.flush()
+}
+
+fn write_json_residual_control_summary(
+    writer: &mut impl Write,
+    options: &LaminarSimpleOptions,
+    summary: &LaminarSimpleResidualControlSummary,
+    momentum_initial_residual: f64,
+    pressure_initial_residual: f64,
+) -> std::io::Result<()> {
+    write_json_key(writer, 2, "residualControl")?;
+    writeln!(writer, "{{")?;
+    write_json_bool_field(writer, 4, "configured", summary.configured)?;
+    writeln!(writer, ",")?;
+    write_json_bool_field(writer, 4, "checked", summary.checked)?;
+    writeln!(writer, ",")?;
+    write_json_bool_field(writer, 4, "satisfied", summary.satisfied)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "U")?;
+    writeln!(writer, "{{")?;
+    write_json_key(writer, 6, "tolerance")?;
+    write_json_optional_number(writer, options.momentum_residual_control)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 6, "initialResidual")?;
+    write_json_optional_number(writer, Some(momentum_initial_residual))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 6, "satisfied")?;
+    write_json_optional_bool(writer, summary.momentum_satisfied)?;
+    writeln!(writer)?;
+    write_indent(writer, 4)?;
+    writeln!(writer, "}},")?;
+    write_json_key(writer, 4, "p")?;
+    writeln!(writer, "{{")?;
+    write_json_key(writer, 6, "tolerance")?;
+    write_json_optional_number(writer, options.pressure_residual_control)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 6, "initialResidual")?;
+    write_json_optional_number(writer, Some(pressure_initial_residual))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 6, "satisfied")?;
+    write_json_optional_bool(writer, summary.pressure_satisfied)?;
+    writeln!(writer)?;
+    write_indent(writer, 4)?;
+    writeln!(writer, "}}")?;
+    write_indent(writer, 2)?;
+    write!(writer, "}}")
 }
 
 fn write_json_laminar_simple_options(
@@ -1709,19 +3689,6 @@ fn write_json_laminar_simple_options(
     write_json_key(writer, 4, "dynamicViscosity")?;
     write_json_optional_number(writer, Some(options.dynamic_viscosity))?;
     writeln!(writer, ",")?;
-    write_json_key(writer, 4, "pressureDrop")?;
-    write_json_optional_number(writer, Some(options.pressure_drop))?;
-    writeln!(writer, ",")?;
-    write_json_key(writer, 4, "length")?;
-    write_json_optional_number(writer, Some(options.length))?;
-    writeln!(writer, ",")?;
-    write_json_key(writer, 4, "diameter")?;
-    write_json_optional_number(writer, Some(options.diameter))?;
-    writeln!(writer, ",")?;
-    write_json_string_field(writer, 4, "inletPatch", &options.inlet_patch)?;
-    writeln!(writer, ",")?;
-    write_json_string_field(writer, 4, "outletPatch", &options.outlet_patch)?;
-    writeln!(writer, ",")?;
     write_json_number_field(
         writer,
         4,
@@ -1735,15 +3702,6 @@ fn write_json_laminar_simple_options(
         "minSimpleIterations",
         options.min_simple_iterations,
     )?;
-    writeln!(writer, ",")?;
-    write_json_key(writer, 4, "simpleTolerance")?;
-    write_json_optional_number(writer, Some(options.simple_tolerance))?;
-    writeln!(writer, ",")?;
-    write_json_key(writer, 4, "pressureDropTolerance")?;
-    write_json_optional_number(writer, Some(options.pressure_drop_tolerance))?;
-    writeln!(writer, ",")?;
-    write_json_key(writer, 4, "fieldChangeTolerance")?;
-    write_json_optional_number(writer, Some(options.field_change_tolerance))?;
     writeln!(writer, ",")?;
     write_json_key(writer, 4, "momentumResidualControl")?;
     write_json_optional_number(writer, options.momentum_residual_control)?;
@@ -1766,6 +3724,8 @@ fn write_json_laminar_simple_options(
         "nonOrthogonalCorrectors",
         options.non_orthogonal_correctors,
     )?;
+    writeln!(writer, ",")?;
+    write_json_bool_field(writer, 4, "consistent", options.simple_consistent)?;
     writeln!(writer, ",")?;
     write_json_number_field(
         writer,
@@ -1802,8 +3762,48 @@ fn write_json_laminar_simple_options(
     writeln!(writer, ",")?;
     write_json_key(writer, 4, "pressureRelaxation")?;
     write_json_optional_number(writer, Some(options.pressure_relaxation))?;
+    writeln!(writer, ",")?;
+    write_json_laminar_simple_schemes(writer, 4, &options.schemes)?;
     writeln!(writer)?;
     write_indent(writer, 2)?;
+    write!(writer, "}}")
+}
+
+fn write_json_laminar_simple_schemes(
+    writer: &mut impl Write,
+    indent: usize,
+    schemes: &LaminarSimpleSchemes,
+) -> std::io::Result<()> {
+    write_json_key(writer, indent, "schemes")?;
+    writeln!(writer, "{{")?;
+    write_json_string_field(writer, indent + 2, "gradP", &schemes.grad_p.to_string())?;
+    writeln!(writer, ",")?;
+    write_json_string_field(writer, indent + 2, "gradU", &schemes.grad_u.to_string())?;
+    writeln!(writer, ",")?;
+    write_json_string_field(
+        writer,
+        indent + 2,
+        "divPhiU",
+        &schemes.div_phi_u.to_string(),
+    )?;
+    writeln!(writer, ",")?;
+    write_json_string_field(
+        writer,
+        indent + 2,
+        "laplacian",
+        &schemes.laplacian.to_string(),
+    )?;
+    writeln!(writer, ",")?;
+    write_json_string_field(
+        writer,
+        indent + 2,
+        "interpolation",
+        &schemes.interpolation.to_string(),
+    )?;
+    writeln!(writer, ",")?;
+    write_json_string_field(writer, indent + 2, "snGrad", &schemes.sn_grad.to_string())?;
+    writeln!(writer)?;
+    write_indent(writer, indent)?;
     write!(writer, "}}")
 }
 
@@ -1847,6 +3847,9 @@ fn write_json_operator_summary(
     write_json_key(writer, 4, "gradPL2Norm")?;
     write_json_optional_number(writer, Some(summary.grad_p_l2_norm))?;
     writeln!(writer, ",")?;
+    write_json_key(writer, 4, "hbyAL2Norm")?;
+    write_json_optional_number(writer, Some(summary.hby_a_l2_norm))?;
+    writeln!(writer, ",")?;
     write_json_key(writer, 4, "divPhiUL2Norm")?;
     write_json_optional_number(writer, Some(summary.div_phi_u_l2_norm))?;
     writeln!(writer)?;
@@ -1872,6 +3875,13 @@ fn write_json_boundary_summary(
         4,
         "velocityZeroGradientFaces",
         summary.velocity_zero_gradient_faces,
+    )?;
+    writeln!(writer, ",")?;
+    write_json_number_field(
+        writer,
+        4,
+        "velocityInletOutletFaces",
+        summary.velocity_inlet_outlet_faces,
     )?;
     writeln!(writer, ",")?;
     write_json_number_field(
@@ -1906,41 +3916,299 @@ fn write_json_boundary_summary(
     write!(writer, "}}")
 }
 
-fn write_json_solution_summary(
+fn write_json_linear_solve_summary(
     writer: &mut impl Write,
-    summary: &LaminarSimpleSolutionSummary,
+    summary: &LinearSolveSummary,
 ) -> std::io::Result<()> {
-    write_json_key(writer, 2, "solution")?;
+    write_json_key(writer, 2, "linearSolves")?;
     writeln!(writer, "{{")?;
-    write_json_key(writer, 4, "meanVelocity")?;
-    write_json_optional_number(writer, Some(summary.mean_velocity))?;
+    write_json_number_field(writer, 4, "momentumPredictors", summary.momentum_predictors)?;
     writeln!(writer, ",")?;
-    write_json_key(writer, 4, "analyticMeanVelocity")?;
-    write_json_optional_number(writer, Some(summary.analytic_mean_velocity))?;
+    write_json_number_field(
+        writer,
+        4,
+        "momentumNonConvergedPredictors",
+        summary.momentum_non_converged_predictors,
+    )?;
     writeln!(writer, ",")?;
-    write_json_key(writer, 4, "relativeMeanVelocityError")?;
-    write_json_optional_number(writer, Some(summary.relative_mean_velocity_error))?;
+    write_json_number_field(
+        writer,
+        4,
+        "momentumComponentSolves",
+        summary.momentum_component_solves,
+    )?;
     writeln!(writer, ",")?;
-    write_json_key(writer, 4, "flowRate")?;
-    write_json_optional_number(writer, Some(summary.flow_rate))?;
+    write_json_number_field(
+        writer,
+        4,
+        "momentumComponentNonConvergedSolves",
+        summary.momentum_component_non_converged_solves,
+    )?;
     writeln!(writer, ",")?;
-    write_json_key(writer, 4, "analyticFlowRate")?;
-    write_json_optional_number(writer, Some(summary.analytic_flow_rate))?;
+    write_json_number_field(
+        writer,
+        4,
+        "pressureCorrectionSolves",
+        summary.pressure_correction_solves,
+    )?;
     writeln!(writer, ",")?;
-    write_json_key(writer, 4, "pressureDropFromMean")?;
-    write_json_optional_number(writer, Some(summary.pressure_drop_from_mean))?;
+    write_json_number_field(
+        writer,
+        4,
+        "pressureCorrectionNonConvergedSolves",
+        summary.pressure_correction_non_converged_solves,
+    )?;
     writeln!(writer, ",")?;
-    write_json_key(writer, 4, "relativePressureDropError")?;
-    write_json_optional_number(writer, Some(summary.relative_pressure_drop_error))?;
+    write_json_number_field(
+        writer,
+        4,
+        "maxMomentumLinearIterationsPerSimple",
+        summary.max_momentum_linear_iterations_per_simple,
+    )?;
     writeln!(writer, ",")?;
-    write_json_key(writer, 4, "pressureDropFromField")?;
-    write_json_optional_number(writer, summary.pressure_drop_from_field)?;
+    write_json_number_field(
+        writer,
+        4,
+        "maxPressureLinearIterationsPerSimple",
+        summary.max_pressure_linear_iterations_per_simple,
+    )?;
     writeln!(writer, ",")?;
-    write_json_key(writer, 4, "minAxialVelocity")?;
-    write_json_optional_number(writer, Some(summary.min_axial_velocity))?;
+    write_json_key(writer, 4, "averageMomentumLinearIterationsPerSimple")?;
+    write_json_optional_number(
+        writer,
+        Some(summary.average_momentum_linear_iterations_per_simple),
+    )?;
     writeln!(writer, ",")?;
-    write_json_key(writer, 4, "maxAxialVelocity")?;
-    write_json_optional_number(writer, Some(summary.max_axial_velocity))?;
+    write_json_key(writer, 4, "averagePressureLinearIterationsPerSimple")?;
+    write_json_optional_number(
+        writer,
+        Some(summary.average_pressure_linear_iterations_per_simple),
+    )?;
+    writeln!(writer, ",")?;
+    write_json_bool_field(
+        writer,
+        4,
+        "finalMomentumLinearConverged",
+        summary.final_momentum_linear_converged,
+    )?;
+    writeln!(writer, ",")?;
+    write_json_bool_field(
+        writer,
+        4,
+        "finalPressureLinearConverged",
+        summary.final_pressure_linear_converged,
+    )?;
+    writeln!(writer)?;
+    write_indent(writer, 2)?;
+    write!(writer, "}}")
+}
+
+fn write_json_pressure_assembly_diagnostics(
+    writer: &mut impl Write,
+    diagnostics: Option<&PressureAssemblyDiagnostics>,
+) -> std::io::Result<()> {
+    write_json_key(writer, 2, "pressureAssembly")?;
+    let Some(diagnostics) = diagnostics else {
+        return write!(writer, "null");
+    };
+
+    writeln!(writer, "{{")?;
+    write_json_scalar_diagnostic_summary(writer, 4, "rAU", &diagnostics.r_au)?;
+    writeln!(writer, ",")?;
+    write_json_scalar_diagnostic_summary(writer, 4, "rAtU", &diagnostics.r_at_u)?;
+    writeln!(writer, ",")?;
+    write_json_vector_diagnostic_summary(writer, 4, "HbyA", &diagnostics.hby_a)?;
+    writeln!(writer, ",")?;
+    write_json_face_flux_diagnostic_summary(
+        writer,
+        4,
+        "phiHbyABeforeAdjust",
+        &diagnostics.phi_hby_a_before_adjust,
+    )?;
+    writeln!(writer, ",")?;
+    write_json_face_flux_diagnostic_summary(
+        writer,
+        4,
+        "phiHbyAAfterAdjust",
+        &diagnostics.phi_hby_a_after_adjust,
+    )?;
+    writeln!(writer, ",")?;
+    write_json_scalar_diagnostic_summary(
+        writer,
+        4,
+        "pressureSource",
+        &diagnostics.pressure_source,
+    )?;
+    writeln!(writer, ",")?;
+    write_json_face_flux_diagnostic_summary(
+        writer,
+        4,
+        "pressureEquationFlux",
+        &diagnostics.pressure_equation_flux,
+    )?;
+    writeln!(writer, ",")?;
+    write_json_matrix_diagnostic_summary(
+        writer,
+        4,
+        "pressureMatrix",
+        &diagnostics.pressure_matrix,
+    )?;
+    writeln!(writer, ",")?;
+    write_json_face_flux_diagnostic_summary(writer, 4, "pressureFlux", &diagnostics.pressure_flux)?;
+    writeln!(writer, ",")?;
+    write_json_face_flux_diagnostic_summary(writer, 4, "correctedPhi", &diagnostics.corrected_phi)?;
+    writeln!(writer)?;
+    write_indent(writer, 2)?;
+    write!(writer, "}}")
+}
+
+fn write_json_scalar_diagnostic_summary(
+    writer: &mut impl Write,
+    indent: usize,
+    key: &str,
+    summary: &ScalarDiagnosticSummary,
+) -> std::io::Result<()> {
+    write_json_key(writer, indent, key)?;
+    writeln!(writer, "{{")?;
+    write_json_key(writer, indent + 2, "min")?;
+    write_json_optional_number(writer, Some(summary.min))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "max")?;
+    write_json_optional_number(writer, Some(summary.max))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "l2Norm")?;
+    write_json_optional_number(writer, Some(summary.l2_norm))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "sum")?;
+    write_json_optional_number(writer, Some(summary.sum))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "sumAbs")?;
+    write_json_optional_number(writer, Some(summary.sum_abs))?;
+    writeln!(writer)?;
+    write_indent(writer, indent)?;
+    write!(writer, "}}")
+}
+
+fn write_json_vector_diagnostic_summary(
+    writer: &mut impl Write,
+    indent: usize,
+    key: &str,
+    summary: &VectorDiagnosticSummary,
+) -> std::io::Result<()> {
+    write_json_key(writer, indent, key)?;
+    writeln!(writer, "{{")?;
+    write_json_key(writer, indent + 2, "minMagnitude")?;
+    write_json_optional_number(writer, Some(summary.min_magnitude))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "maxMagnitude")?;
+    write_json_optional_number(writer, Some(summary.max_magnitude))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "l2Norm")?;
+    write_json_optional_number(writer, Some(summary.l2_norm))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "xMin")?;
+    write_json_optional_number(writer, Some(summary.x_min))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "xMax")?;
+    write_json_optional_number(writer, Some(summary.x_max))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "yMin")?;
+    write_json_optional_number(writer, Some(summary.y_min))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "yMax")?;
+    write_json_optional_number(writer, Some(summary.y_max))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "zMin")?;
+    write_json_optional_number(writer, Some(summary.z_min))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "zMax")?;
+    write_json_optional_number(writer, Some(summary.z_max))?;
+    writeln!(writer)?;
+    write_indent(writer, indent)?;
+    write!(writer, "}}")
+}
+
+fn write_json_face_flux_diagnostic_summary(
+    writer: &mut impl Write,
+    indent: usize,
+    key: &str,
+    summary: &FaceFluxDiagnosticSummary,
+) -> std::io::Result<()> {
+    write_json_key(writer, indent, key)?;
+    writeln!(writer, "{{")?;
+    write_json_key(writer, indent + 2, "min")?;
+    write_json_optional_number(writer, Some(summary.min))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "max")?;
+    write_json_optional_number(writer, Some(summary.max))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "l2Norm")?;
+    write_json_optional_number(writer, Some(summary.l2_norm))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "sum")?;
+    write_json_optional_number(writer, Some(summary.sum))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "sumAbs")?;
+    write_json_optional_number(writer, Some(summary.sum_abs))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "internalSumAbs")?;
+    write_json_optional_number(writer, Some(summary.internal_sum_abs))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "boundarySum")?;
+    write_json_optional_number(writer, Some(summary.boundary_sum))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "boundarySumAbs")?;
+    write_json_optional_number(writer, Some(summary.boundary_sum_abs))?;
+    writeln!(writer)?;
+    write_indent(writer, indent)?;
+    write!(writer, "}}")
+}
+
+fn write_json_matrix_diagnostic_summary(
+    writer: &mut impl Write,
+    indent: usize,
+    key: &str,
+    summary: &MatrixDiagnosticSummary,
+) -> std::io::Result<()> {
+    write_json_key(writer, indent, key)?;
+    writeln!(writer, "{{")?;
+    write_json_number_field(writer, indent + 2, "rows", summary.rows)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(writer, indent + 2, "cols", summary.cols)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(writer, indent + 2, "nonzeros", summary.nonzeros)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "diagonalMin")?;
+    write_json_optional_number(writer, Some(summary.diagonal_min))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "diagonalMax")?;
+    write_json_optional_number(writer, Some(summary.diagonal_max))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "diagonalSumAbs")?;
+    write_json_optional_number(writer, Some(summary.diagonal_sum_abs))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "offDiagonalSumAbs")?;
+    write_json_optional_number(writer, Some(summary.off_diagonal_sum_abs))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "maxRowSumAbs")?;
+    write_json_optional_number(writer, Some(summary.max_row_sum_abs))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "maxRowOffDiagonalSumAbs")?;
+    write_json_optional_number(writer, Some(summary.max_row_off_diagonal_sum_abs))?;
+    writeln!(writer)?;
+    write_indent(writer, indent)?;
+    write!(writer, "}}")
+}
+
+fn write_json_field_summary(
+    writer: &mut impl Write,
+    summary: &LaminarSimpleFieldSummary,
+) -> std::io::Result<()> {
+    write_json_key(writer, 2, "fields")?;
+    writeln!(writer, "{{")?;
+    write_json_vector_diagnostic_summary(writer, 4, "velocity", &summary.velocity)?;
+    writeln!(writer, ",")?;
+    write_json_scalar_diagnostic_summary(writer, 4, "pressure", &summary.pressure)?;
     writeln!(writer)?;
     write_indent(writer, 2)?;
     write!(writer, "}}")
@@ -1977,6 +4245,16 @@ fn write_json_laminar_simple_history(
             item.momentum_linear_iterations,
         )?;
         writeln!(writer, ",")?;
+        write_json_bool_field(
+            writer,
+            6,
+            "momentumLinearConverged",
+            item.momentum_linear_converged,
+        )?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 6, "momentumComponentLinearConverged")?;
+        write_json_bool_array(writer, &item.momentum_component_linear_converged)?;
+        writeln!(writer, ",")?;
         write_json_number_field(
             writer,
             6,
@@ -1984,14 +4262,98 @@ fn write_json_laminar_simple_history(
             item.pressure_linear_iterations,
         )?;
         writeln!(writer, ",")?;
+        write_json_bool_field(
+            writer,
+            6,
+            "pressureLinearConverged",
+            item.pressure_linear_converged,
+        )?;
+        writeln!(writer, ",")?;
+        write_json_number_field(
+            writer,
+            6,
+            "pressureLinearSolves",
+            item.pressure_linear_solves,
+        )?;
+        writeln!(writer, ",")?;
+        write_json_number_field(
+            writer,
+            6,
+            "pressureLinearNonConvergedSolves",
+            item.pressure_linear_non_converged_solves,
+        )?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 6, "momentumInitialResidual")?;
+        write_json_optional_number(writer, Some(item.momentum_initial_normalized_residual_norm))?;
+        writeln!(writer, ",")?;
         write_json_key(writer, 6, "momentumResidualNorm")?;
         write_json_optional_number(writer, Some(item.momentum_residual_norm))?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 6, "momentumNormalizedResidualNorm")?;
+        write_json_optional_number(writer, Some(item.momentum_normalized_residual_norm))?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 6, "momentumComponentResidualNorms")?;
+        write_json_optional_f64_array(writer, Some(&item.momentum_component_residual_norms))?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 6, "momentumComponentInitialResiduals")?;
+        write_json_optional_f64_array(
+            writer,
+            Some(&item.momentum_component_initial_normalized_residual_norms),
+        )?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 6, "momentumComponentNormalizedResidualNorms")?;
+        write_json_optional_f64_array(
+            writer,
+            Some(&item.momentum_component_normalized_residual_norms),
+        )?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 6, "momentumDiagonalMin")?;
+        write_json_optional_number(writer, Some(item.momentum_diagonal_min))?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 6, "momentumDiagonalMax")?;
+        write_json_optional_number(writer, Some(item.momentum_diagonal_max))?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 6, "momentumH1Min")?;
+        write_json_optional_number(writer, Some(item.momentum_h1_min))?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 6, "momentumH1Max")?;
+        write_json_optional_number(writer, Some(item.momentum_h1_max))?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 6, "pressureCorrectionInitialResidual")?;
+        write_json_optional_number(
+            writer,
+            Some(item.pressure_correction_initial_normalized_residual_norm),
+        )?;
         writeln!(writer, ",")?;
         write_json_key(writer, 6, "pressureCorrectionResidualNorm")?;
         write_json_optional_number(writer, Some(item.pressure_correction_residual_norm))?;
         writeln!(writer, ",")?;
-        write_json_key(writer, 6, "relativePressureDropError")?;
-        write_json_optional_number(writer, Some(item.relative_pressure_drop_error))?;
+        write_json_key(writer, 6, "pressureCorrectionNormalizedResidualNorm")?;
+        write_json_optional_number(
+            writer,
+            Some(item.pressure_correction_normalized_residual_norm),
+        )?;
+        writeln!(writer, ",")?;
+        write_json_bool_field(
+            writer,
+            6,
+            "residualControlConfigured",
+            item.residual_control.configured,
+        )?;
+        writeln!(writer, ",")?;
+        write_json_bool_field(
+            writer,
+            6,
+            "residualControlChecked",
+            item.residual_control.checked,
+        )?;
+        writeln!(writer, ",")?;
+        write_json_bool_field(
+            writer,
+            6,
+            "residualControlSatisfied",
+            item.residual_control.satisfied,
+        )?;
         writeln!(writer, ",")?;
         write_json_key(writer, 6, "relativeVelocityChangeL2")?;
         write_json_optional_number(writer, Some(item.relative_velocity_change_l2))?;
@@ -2004,6 +4366,19 @@ fn write_json_laminar_simple_history(
         writeln!(writer, ",")?;
         write_json_key(writer, 6, "pressureCorrectionUpdateScale")?;
         write_json_optional_number(writer, Some(item.pressure_correction_update_scale))?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 6, "adjustPhiGlobalFluxBefore")?;
+        write_json_optional_number(writer, Some(item.adjust_phi_global_flux_before))?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 6, "adjustPhiGlobalFluxAfter")?;
+        write_json_optional_number(writer, Some(item.adjust_phi_global_flux_after))?;
+        writeln!(writer, ",")?;
+        write_json_number_field(
+            writer,
+            6,
+            "adjustPhiAdjustedFaces",
+            item.adjust_phi_adjusted_faces,
+        )?;
         writeln!(writer)?;
         write_indent(writer, 4)?;
         if index + 1 == history.len() {
@@ -2027,7 +4402,7 @@ fn write_laminar_simple_report_markdown(
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
 
-    writeln!(writer, "# Laminar SIMPLE Benchmark")?;
+    writeln!(writer, "# Laminar SIMPLE Report")?;
     writeln!(writer)?;
     writeln!(writer, "Case: `{}`", plan.case_dir.display())?;
     writeln!(writer)?;
@@ -2044,21 +4419,6 @@ fn write_laminar_simple_report_markdown(
         writer,
         "| Dynamic viscosity [Pa s] | {} |",
         format_scientific(options.dynamic_viscosity)
-    )?;
-    writeln!(
-        writer,
-        "| Length [m] | {} |",
-        format_scientific(options.length)
-    )?;
-    writeln!(
-        writer,
-        "| Diameter [m] | {} |",
-        format_scientific(options.diameter)
-    )?;
-    writeln!(
-        writer,
-        "| Analytic deltaP [Pa] | {} |",
-        format_scientific(options.pressure_drop)
     )?;
     writeln!(
         writer,
@@ -2107,21 +4467,6 @@ fn write_laminar_simple_report_markdown(
     )?;
     writeln!(
         writer,
-        "| SIMPLE continuity tolerance | {} |",
-        format_scientific(options.simple_tolerance)
-    )?;
-    writeln!(
-        writer,
-        "| Pressure-drop tolerance | {} |",
-        format_percent(options.pressure_drop_tolerance)
-    )?;
-    writeln!(
-        writer,
-        "| Field-change tolerance | {} |",
-        format_percent(options.field_change_tolerance)
-    )?;
-    writeln!(
-        writer,
         "| U residualControl | {} |",
         format_optional_scientific(options.momentum_residual_control)
     )?;
@@ -2148,6 +4493,29 @@ fn write_laminar_simple_report_markdown(
         "| Non-orthogonal correctors | {} |",
         options.non_orthogonal_correctors
     )?;
+    writeln!(writer, "| grad(p) scheme | {} |", options.schemes.grad_p)?;
+    writeln!(writer, "| grad(U) scheme | {} |", options.schemes.grad_u)?;
+    writeln!(
+        writer,
+        "| div(phi,U) scheme | {} |",
+        options.schemes.div_phi_u
+    )?;
+    writeln!(
+        writer,
+        "| laplacian scheme | {} |",
+        options.schemes.laplacian
+    )?;
+    writeln!(
+        writer,
+        "| interpolation scheme | {} |",
+        options.schemes.interpolation
+    )?;
+    writeln!(writer, "| snGrad scheme | {} |", options.schemes.sn_grad)?;
+    writeln!(
+        writer,
+        "| Consistent SIMPLE | {} |",
+        yes_no(options.simple_consistent)
+    )?;
     writeln!(writer)?;
     writeln!(writer, "## Result")?;
     writeln!(writer)?;
@@ -2159,6 +4527,32 @@ fn write_laminar_simple_report_markdown(
         report.simple_iterations
     )?;
     writeln!(writer, "| Converged | {} |", yes_no(report.converged))?;
+    writeln!(writer, "| Stop reason | {} |", report.stop_reason)?;
+    writeln!(
+        writer,
+        "| residualControl state | {} |",
+        residual_control_state(report.residual_control)
+    )?;
+    writeln!(
+        writer,
+        "| U residualControl satisfied | {} |",
+        format_optional_bool(report.residual_control.momentum_satisfied)
+    )?;
+    writeln!(
+        writer,
+        "| p residualControl satisfied | {} |",
+        format_optional_bool(report.residual_control.pressure_satisfied)
+    )?;
+    writeln!(
+        writer,
+        "| Final momentum linear converged | {} |",
+        yes_no(report.linear_solve_summary.final_momentum_linear_converged)
+    )?;
+    writeln!(
+        writer,
+        "| Final pressure linear converged | {} |",
+        yes_no(report.linear_solve_summary.final_pressure_linear_converged)
+    )?;
     writeln!(
         writer,
         "| Final continuity L2 | {} |",
@@ -2166,13 +4560,38 @@ fn write_laminar_simple_report_markdown(
     )?;
     writeln!(
         writer,
-        "| Momentum residual norm | {} |",
+        "| Final SIMPLE iteration U initial residual | {} |",
+        format_scientific(report.final_momentum_initial_normalized_residual_norm)
+    )?;
+    writeln!(
+        writer,
+        "| Final SIMPLE iteration U final residual | {} |",
+        format_scientific(report.final_momentum_normalized_residual_norm)
+    )?;
+    writeln!(
+        writer,
+        "| Momentum raw L2 residual norm | {} |",
         format_scientific(report.final_momentum_residual_norm)
     )?;
     writeln!(
         writer,
-        "| Pressure-correction residual norm | {} |",
+        "| Final SIMPLE iteration p initial residual | {} |",
+        format_scientific(report.final_pressure_correction_initial_normalized_residual_norm)
+    )?;
+    writeln!(
+        writer,
+        "| Final SIMPLE iteration p final residual | {} |",
+        format_scientific(report.final_pressure_correction_normalized_residual_norm)
+    )?;
+    writeln!(
+        writer,
+        "| Pressure-correction raw L2 residual norm | {} |",
         format_scientific(report.final_pressure_correction_residual_norm)
+    )?;
+    writeln!(
+        writer,
+        "| HbyA L2 norm | {} |",
+        format_scientific(report.operator_summary.hby_a_l2_norm)
     )?;
     writeln!(
         writer,
@@ -2181,49 +4600,215 @@ fn write_laminar_simple_report_markdown(
     )?;
     writeln!(
         writer,
-        "| Mean velocity [m/s] | {} |",
-        format_scientific(report.solution.mean_velocity)
+        "| Velocity magnitude min | {} |",
+        format_scientific(report.fields.velocity.min_magnitude)
     )?;
     writeln!(
         writer,
-        "| Analytic mean velocity [m/s] | {} |",
-        format_scientific(report.solution.analytic_mean_velocity)
+        "| Velocity magnitude max | {} |",
+        format_scientific(report.fields.velocity.max_magnitude)
     )?;
     writeln!(
         writer,
-        "| Relative mean-velocity error | {} |",
-        format_percent(report.solution.relative_mean_velocity_error)
+        "| Velocity L2 norm | {} |",
+        format_scientific(report.fields.velocity.l2_norm)
     )?;
     writeln!(
         writer,
-        "| DeltaP from mean [Pa] | {} |",
-        format_scientific(report.solution.pressure_drop_from_mean)
+        "| Pressure min [Pa] | {} |",
+        format_scientific(report.fields.pressure.min)
     )?;
     writeln!(
         writer,
-        "| Relative pressure-drop error | {} |",
-        format_percent(report.solution.relative_pressure_drop_error)
+        "| Pressure max [Pa] | {} |",
+        format_scientific(report.fields.pressure.max)
     )?;
     writeln!(
         writer,
-        "| DeltaP from pressure field [Pa] | {} |",
-        format_optional_scientific(report.solution.pressure_drop_from_field)
+        "| Pressure L2 norm | {} |",
+        format_scientific(report.fields.pressure.l2_norm)
     )?;
     writeln!(writer)?;
+    writeln!(writer, "## Linear Solve Profile")?;
+    writeln!(writer)?;
+    writeln!(writer, "| Quantity | Value |")?;
+    writeln!(writer, "| --- | ---: |")?;
+    writeln!(
+        writer,
+        "| Momentum predictors | {} |",
+        report.linear_solve_summary.momentum_predictors
+    )?;
+    writeln!(
+        writer,
+        "| Momentum non-converged predictors | {} |",
+        report
+            .linear_solve_summary
+            .momentum_non_converged_predictors
+    )?;
+    writeln!(
+        writer,
+        "| Momentum component solves | {} |",
+        report.linear_solve_summary.momentum_component_solves
+    )?;
+    writeln!(
+        writer,
+        "| Momentum component non-converged solves | {} |",
+        report
+            .linear_solve_summary
+            .momentum_component_non_converged_solves
+    )?;
+    writeln!(
+        writer,
+        "| Pressure correction solves | {} |",
+        report.linear_solve_summary.pressure_correction_solves
+    )?;
+    writeln!(
+        writer,
+        "| Pressure correction non-converged solves | {} |",
+        report
+            .linear_solve_summary
+            .pressure_correction_non_converged_solves
+    )?;
+    writeln!(
+        writer,
+        "| Max momentum linear iterations per SIMPLE | {} |",
+        report
+            .linear_solve_summary
+            .max_momentum_linear_iterations_per_simple
+    )?;
+    writeln!(
+        writer,
+        "| Max pressure linear iterations per SIMPLE | {} |",
+        report
+            .linear_solve_summary
+            .max_pressure_linear_iterations_per_simple
+    )?;
+    writeln!(
+        writer,
+        "| Average momentum linear iterations per SIMPLE | {} |",
+        format_scientific(
+            report
+                .linear_solve_summary
+                .average_momentum_linear_iterations_per_simple,
+        )
+    )?;
+    writeln!(
+        writer,
+        "| Average pressure linear iterations per SIMPLE | {} |",
+        format_scientific(
+            report
+                .linear_solve_summary
+                .average_pressure_linear_iterations_per_simple,
+        )
+    )?;
+    writeln!(writer)?;
+    if let Some(diagnostics) = &report.pressure_assembly {
+        writeln!(writer, "## Pressure Assembly Diagnostics")?;
+        writeln!(writer)?;
+        writeln!(writer, "| Field | Min | Max | L2 | Sum abs |")?;
+        writeln!(writer, "| --- | ---: | ---: | ---: | ---: |")?;
+        writeln!(
+            writer,
+            "| rAU | {} | {} | {} | {} |",
+            format_scientific(diagnostics.r_au.min),
+            format_scientific(diagnostics.r_au.max),
+            format_scientific(diagnostics.r_au.l2_norm),
+            format_scientific(diagnostics.r_au.sum_abs)
+        )?;
+        writeln!(
+            writer,
+            "| rAtU | {} | {} | {} | {} |",
+            format_scientific(diagnostics.r_at_u.min),
+            format_scientific(diagnostics.r_at_u.max),
+            format_scientific(diagnostics.r_at_u.l2_norm),
+            format_scientific(diagnostics.r_at_u.sum_abs)
+        )?;
+        writeln!(
+            writer,
+            "| pressureSource | {} | {} | {} | {} |",
+            format_scientific(diagnostics.pressure_source.min),
+            format_scientific(diagnostics.pressure_source.max),
+            format_scientific(diagnostics.pressure_source.l2_norm),
+            format_scientific(diagnostics.pressure_source.sum_abs)
+        )?;
+        writeln!(writer)?;
+        writeln!(
+            writer,
+            "| Vector | Magnitude min | Magnitude max | L2 | x min/max |"
+        )?;
+        writeln!(writer, "| --- | ---: | ---: | ---: | --- |")?;
+        writeln!(
+            writer,
+            "| HbyA | {} | {} | {} | {} / {} |",
+            format_scientific(diagnostics.hby_a.min_magnitude),
+            format_scientific(diagnostics.hby_a.max_magnitude),
+            format_scientific(diagnostics.hby_a.l2_norm),
+            format_scientific(diagnostics.hby_a.x_min),
+            format_scientific(diagnostics.hby_a.x_max)
+        )?;
+        writeln!(writer)?;
+        writeln!(
+            writer,
+            "| Matrix | Rows | Nonzeros | Diagonal min/max | Off-diagonal sum abs | Max row sum abs |"
+        )?;
+        writeln!(writer, "| --- | ---: | ---: | --- | ---: | ---: |")?;
+        writeln!(
+            writer,
+            "| pressureMatrix | {} | {} | {} / {} | {} | {} |",
+            diagnostics.pressure_matrix.rows,
+            diagnostics.pressure_matrix.nonzeros,
+            format_scientific(diagnostics.pressure_matrix.diagonal_min),
+            format_scientific(diagnostics.pressure_matrix.diagonal_max),
+            format_scientific(diagnostics.pressure_matrix.off_diagonal_sum_abs),
+            format_scientific(diagnostics.pressure_matrix.max_row_sum_abs)
+        )?;
+        writeln!(writer)?;
+        writeln!(
+            writer,
+            "| Face flux | Boundary sum | Boundary sum abs | Total sum abs | L2 |"
+        )?;
+        writeln!(writer, "| --- | ---: | ---: | ---: | ---: |")?;
+        write_markdown_face_flux_diagnostic(
+            &mut writer,
+            "phiHbyA before adjust",
+            &diagnostics.phi_hby_a_before_adjust,
+        )?;
+        write_markdown_face_flux_diagnostic(
+            &mut writer,
+            "phiHbyA after adjust",
+            &diagnostics.phi_hby_a_after_adjust,
+        )?;
+        write_markdown_face_flux_diagnostic(
+            &mut writer,
+            "pressureEquationFlux",
+            &diagnostics.pressure_equation_flux,
+        )?;
+        write_markdown_face_flux_diagnostic(
+            &mut writer,
+            "pressureFlux",
+            &diagnostics.pressure_flux,
+        )?;
+        write_markdown_face_flux_diagnostic(
+            &mut writer,
+            "correctedPhi",
+            &diagnostics.corrected_phi,
+        )?;
+        writeln!(writer)?;
+    }
     writeln!(writer, "## Iterations")?;
     writeln!(writer)?;
     writeln!(
         writer,
-        "| Iteration | Continuity before | Continuity after | Pressure correction | Momentum residual | Pressure residual | Pressure-drop error | U change | p change | Momentum scale | Pressure scale |"
+        "| Iteration | Continuity before | Continuity after | Pressure correction | U initial | U final | U linear iter/ok | U components initial | U components final | p initial | p final | p linear iter/ok | p-solves/nonconv | residualControl | A diag min/max | H1 min/max | adjustPhi before/after/faces | U change | p change |"
     )?;
     writeln!(
         writer,
-        "| ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+        "| ---: | ---: | ---: | --- | ---: | ---: | --- | --- | --- | ---: | ---: | --- | --- | --- | --- | --- | --- | ---: | ---: |"
     )?;
     for item in &report.history {
         writeln!(
             writer,
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} / {} | {} | {} | {} | {} | {} / {} | {} / {} | {} | {} / {} | {} / {} | {} / {} / {} | {} | {} |",
             item.iteration,
             format_scientific(item.continuity_before.l2_norm),
             format_scientific(item.continuity_after.l2_norm),
@@ -2232,17 +4817,364 @@ fn write_laminar_simple_report_markdown(
             } else {
                 "skipped"
             },
-            format_scientific(item.momentum_residual_norm),
-            format_scientific(item.pressure_correction_residual_norm),
-            format_percent(item.relative_pressure_drop_error),
+            format_scientific(item.momentum_initial_normalized_residual_norm),
+            format_scientific(item.momentum_normalized_residual_norm),
+            item.momentum_linear_iterations,
+            yes_no(item.momentum_linear_converged),
+            format_triplet(item.momentum_component_initial_normalized_residual_norms),
+            format_triplet(item.momentum_component_normalized_residual_norms),
+            format_scientific(item.pressure_correction_initial_normalized_residual_norm),
+            format_scientific(item.pressure_correction_normalized_residual_norm),
+            item.pressure_linear_iterations,
+            yes_no(item.pressure_linear_converged),
+            item.pressure_linear_solves,
+            item.pressure_linear_non_converged_solves,
+            residual_control_state(item.residual_control),
+            format_scientific(item.momentum_diagonal_min),
+            format_scientific(item.momentum_diagonal_max),
+            format_scientific(item.momentum_h1_min),
+            format_scientific(item.momentum_h1_max),
+            format_scientific(item.adjust_phi_global_flux_before),
+            format_scientific(item.adjust_phi_global_flux_after),
+            item.adjust_phi_adjusted_faces,
             format_percent(item.relative_velocity_change_l2),
-            format_percent(item.relative_pressure_change_l2),
-            format_percent(item.momentum_update_scale),
-            format_percent(item.pressure_correction_update_scale)
+            format_percent(item.relative_pressure_change_l2)
         )?;
     }
 
     writer.flush()
+}
+
+fn write_markdown_face_flux_diagnostic(
+    writer: &mut impl Write,
+    label: &str,
+    summary: &FaceFluxDiagnosticSummary,
+) -> std::io::Result<()> {
+    writeln!(
+        writer,
+        "| {} | {} | {} | {} | {} |",
+        label,
+        format_scientific(summary.boundary_sum),
+        format_scientific(summary.boundary_sum_abs),
+        format_scientific(summary.sum_abs),
+        format_scientific(summary.l2_norm)
+    )
+}
+
+fn write_laminar_simple_fields(
+    fields: &InitialFieldSet,
+    report: &LaminarSimpleReport,
+    output_dir: &Path,
+) -> std::io::Result<()> {
+    if report.final_velocity.len() != report.cells {
+        return Err(invalid_field_data(format!(
+            "final U field has {} cells, expected {}",
+            report.final_velocity.len(),
+            report.cells
+        )));
+    }
+    if report.final_pressure.len() != report.cells {
+        return Err(invalid_field_data(format!(
+            "final p field has {} cells, expected {}",
+            report.final_pressure.len(),
+            report.cells
+        )));
+    }
+    if !report
+        .final_velocity
+        .iter()
+        .all(|value| value.x.is_finite() && value.y.is_finite() && value.z.is_finite())
+    {
+        return Err(invalid_field_data(
+            "final U field contains non-finite values".to_string(),
+        ));
+    }
+    if !report.final_pressure.iter().all(|value| value.is_finite()) {
+        return Err(invalid_field_data(
+            "final p field contains non-finite values".to_string(),
+        ));
+    }
+
+    std::fs::create_dir_all(output_dir)?;
+    let location = openfoam_output_location(output_dir);
+    let velocity_field = solver_initial_field(fields, "U", "volVectorField")?;
+    let pressure_field = solver_initial_field(fields, "p", "volScalarField")?;
+
+    write_openfoam_vector_field(
+        &output_dir.join("U"),
+        velocity_field,
+        &location,
+        &report.final_velocity,
+    )?;
+    write_openfoam_scalar_field(
+        &output_dir.join("p"),
+        pressure_field,
+        &location,
+        &report.final_pressure,
+    )
+}
+
+fn solver_initial_field<'a>(
+    fields: &'a InitialFieldSet,
+    name: &str,
+    class_name: &str,
+) -> std::io::Result<&'a FieldFile> {
+    let field = fields
+        .fields
+        .iter()
+        .find(|field| field.region.is_none() && field.name == name)
+        .ok_or_else(|| {
+            invalid_field_data(format!(
+                "field '{}' was not found below {}",
+                name,
+                fields.case_dir.join("0").display()
+            ))
+        })?;
+    if field.class_name.as_deref() != Some(class_name) {
+        return Err(invalid_field_data(format!(
+            "field '{}' has class '{}', expected '{}'",
+            name,
+            field.class_name.as_deref().unwrap_or("unknown"),
+            class_name
+        )));
+    }
+    Ok(field)
+}
+
+fn write_openfoam_vector_field(
+    path: &Path,
+    source_field: &FieldFile,
+    location: &str,
+    values: &[Point3],
+) -> std::io::Result<()> {
+    ensure_parent_dir(path)?;
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+
+    write_openfoam_field_header(
+        &mut writer,
+        source_field
+            .class_name
+            .as_deref()
+            .unwrap_or("volVectorField"),
+        location,
+        "U",
+    )?;
+    writeln!(writer)?;
+    write_openfoam_dimensions(&mut writer, source_field, "0 1 -1 0 0 0 0")?;
+    writeln!(writer)?;
+    writeln!(writer, "internalField nonuniform List<vector>")?;
+    writeln!(writer, "{}", values.len())?;
+    writeln!(writer, "(")?;
+    for value in values {
+        writeln!(
+            writer,
+            "    ({} {} {})",
+            format_openfoam_f64(value.x),
+            format_openfoam_f64(value.y),
+            format_openfoam_f64(value.z)
+        )?;
+    }
+    writeln!(writer, ");")?;
+    writeln!(writer)?;
+    write_openfoam_boundary_field(&mut writer, source_field)?;
+
+    writer.flush()
+}
+
+fn write_openfoam_scalar_field(
+    path: &Path,
+    source_field: &FieldFile,
+    location: &str,
+    values: &[f64],
+) -> std::io::Result<()> {
+    ensure_parent_dir(path)?;
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+
+    write_openfoam_field_header(
+        &mut writer,
+        source_field
+            .class_name
+            .as_deref()
+            .unwrap_or("volScalarField"),
+        location,
+        "p",
+    )?;
+    writeln!(writer)?;
+    write_openfoam_dimensions(&mut writer, source_field, "1 -1 -2 0 0 0 0")?;
+    writeln!(writer)?;
+    writeln!(writer, "internalField nonuniform List<scalar>")?;
+    writeln!(writer, "{}", values.len())?;
+    writeln!(writer, "(")?;
+    for value in values {
+        writeln!(writer, "    {}", format_openfoam_f64(*value))?;
+    }
+    writeln!(writer, ");")?;
+    writeln!(writer)?;
+    write_openfoam_boundary_field(&mut writer, source_field)?;
+
+    writer.flush()
+}
+
+fn write_openfoam_field_header(
+    writer: &mut impl Write,
+    class_name: &str,
+    location: &str,
+    object: &str,
+) -> std::io::Result<()> {
+    writeln!(writer, "FoamFile")?;
+    writeln!(writer, "{{")?;
+    writeln!(writer, "    version 2.0;")?;
+    writeln!(writer, "    format ascii;")?;
+    writeln!(writer, "    class {class_name};")?;
+    writeln!(
+        writer,
+        "    location \"{}\";",
+        escape_openfoam_string(location)
+    )?;
+    writeln!(writer, "    object {object};")?;
+    writeln!(writer, "}}")
+}
+
+fn write_openfoam_dimensions(
+    writer: &mut impl Write,
+    field: &FieldFile,
+    fallback: &str,
+) -> std::io::Result<()> {
+    let dimensions = field
+        .dimensions
+        .as_ref()
+        .filter(|values| !values.is_empty())
+        .map(|values| values.join(" "))
+        .unwrap_or_else(|| fallback.to_string());
+    writeln!(writer, "dimensions [{dimensions}];")
+}
+
+fn write_openfoam_boundary_field(
+    writer: &mut impl Write,
+    field: &FieldFile,
+) -> std::io::Result<()> {
+    writeln!(writer, "boundaryField")?;
+    writeln!(writer, "{{")?;
+    for patch in &field.boundary_patches {
+        writeln!(writer, "    {}", patch.name)?;
+        writeln!(writer, "    {{")?;
+        if let Some(patch_type) = &patch.patch_type {
+            writeln!(writer, "        type {patch_type};")?;
+        }
+        if let Some(inlet_value) = &patch.inlet_value {
+            write_openfoam_field_value(writer, "inletValue", inlet_value, 8)?;
+        }
+        if let Some(value) = &patch.value {
+            write_openfoam_field_value(writer, "value", value, 8)?;
+        }
+        writeln!(writer, "    }}")?;
+    }
+    writeln!(writer, "}}")
+}
+
+fn write_openfoam_field_value(
+    writer: &mut impl Write,
+    keyword: &str,
+    value: &FieldValueSummary,
+    indent: usize,
+) -> std::io::Result<()> {
+    match value {
+        FieldValueSummary::Uniform(value) => {
+            write_indent(writer, indent)?;
+            writeln!(writer, "{keyword} uniform {};", value.trim())
+        }
+        FieldValueSummary::Other(value) => {
+            write_indent(writer, indent)?;
+            writeln!(writer, "{keyword} {};", value.trim().trim_end_matches(';'))
+        }
+        FieldValueSummary::NonUniform {
+            value_type,
+            count,
+            values,
+        } => {
+            let value_type = value_type.as_deref().ok_or_else(|| {
+                invalid_field_data(format!(
+                    "boundary entry '{keyword}' has nonuniform data without a value type"
+                ))
+            })?;
+            let components = openfoam_nonuniform_components(value_type).ok_or_else(|| {
+                invalid_field_data(format!(
+                    "boundary entry '{keyword}' uses unsupported nonuniform type '{value_type}'"
+                ))
+            })?;
+            let values = values.as_ref().ok_or_else(|| {
+                invalid_field_data(format!(
+                    "boundary entry '{keyword}' has nonuniform {value_type} data without loaded numeric values"
+                ))
+            })?;
+            let count = count.unwrap_or(values.len() / components);
+            if values.len() != count * components {
+                return Err(invalid_field_data(format!(
+                    "boundary entry '{keyword}' has {} scalar values, expected {} for {} {} entries",
+                    values.len(),
+                    count * components,
+                    count,
+                    value_type
+                )));
+            }
+
+            write_indent(writer, indent)?;
+            writeln!(writer, "{keyword} nonuniform {value_type}")?;
+            write_indent(writer, indent)?;
+            writeln!(writer, "{count}")?;
+            write_indent(writer, indent)?;
+            writeln!(writer, "(")?;
+            for entry in values.chunks(components) {
+                write_indent(writer, indent + 4)?;
+                if components == 1 {
+                    writeln!(writer, "{}", format_openfoam_f64(entry[0]))?;
+                } else {
+                    writeln!(
+                        writer,
+                        "({} {} {})",
+                        format_openfoam_f64(entry[0]),
+                        format_openfoam_f64(entry[1]),
+                        format_openfoam_f64(entry[2])
+                    )?;
+                }
+            }
+            write_indent(writer, indent)?;
+            writeln!(writer, ");")
+        }
+    }
+}
+
+fn openfoam_nonuniform_components(value_type: &str) -> Option<usize> {
+    match value_type {
+        "List<scalar>" | "scalarField" | "Field<scalar>" => Some(1),
+        "List<vector>" | "vectorField" | "Field<vector>" => Some(3),
+        _ => None,
+    }
+}
+
+fn openfoam_output_location(output_dir: &Path) -> String {
+    output_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| output_dir.display().to_string())
+}
+
+fn escape_openfoam_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn format_openfoam_f64(value: f64) -> String {
+    if value == 0.0 {
+        "0".to_string()
+    } else {
+        format!("{value:.16e}")
+    }
+}
+
+fn invalid_field_data(message: String) -> Error {
+    Error::new(ErrorKind::InvalidData, message)
 }
 
 fn ensure_parent_dir(path: &Path) -> std::io::Result<()> {
@@ -2952,6 +5884,17 @@ fn write_json_optional_bool(writer: &mut impl Write, value: Option<bool>) -> std
     }
 }
 
+fn write_json_bool_array(writer: &mut impl Write, values: &[bool]) -> std::io::Result<()> {
+    write!(writer, "[")?;
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            write!(writer, ", ")?;
+        }
+        write!(writer, "{value}")?;
+    }
+    write!(writer, "]")
+}
+
 fn write_json_optional_f64_array(
     writer: &mut impl Write,
     values: Option<&[f64]>,
@@ -3181,6 +6124,18 @@ fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
 
+fn residual_control_state(summary: LaminarSimpleResidualControlSummary) -> &'static str {
+    if !summary.configured {
+        "not-configured"
+    } else if !summary.checked {
+        "not-checked"
+    } else if summary.satisfied {
+        "satisfied"
+    } else {
+        "not-satisfied"
+    }
+}
+
 fn print_initial_fields(fields: &InitialFieldSet) {
     if fields.fields.is_empty() {
         println!("initial fields: none");
@@ -3314,6 +6269,15 @@ fn format_percent(value: f64) -> String {
     format!("{:.3}%", value * 100.0)
 }
 
+fn format_triplet(values: [f64; 3]) -> String {
+    format!(
+        "{} / {} / {}",
+        format_scientific(values[0]),
+        format_scientific(values[1]),
+        format_scientific(values[2])
+    )
+}
+
 fn print_region_patch(patch: &ferrum_mesh::regions::RegionPatchSummary) {
     if patch.source_flipped_faces > 0 {
         println!(
@@ -3381,11 +6345,6 @@ struct PoiseuilleSolveArgs {
 struct LaminarSimpleSolveArgs {
     density: Option<f64>,
     dynamic_viscosity: Option<f64>,
-    pressure_drop: Option<f64>,
-    length: Option<f64>,
-    diameter: Option<f64>,
-    inlet_patch: String,
-    outlet_patch: String,
     linear_solver: Option<LaminarSimpleLinearSolver>,
     momentum_linear_solver: Option<LaminarSimpleLinearSolver>,
     pressure_linear_solver: Option<LaminarSimpleLinearSolver>,
@@ -3397,18 +6356,20 @@ struct LaminarSimpleSolveArgs {
     pressure_linear_tolerance: Option<f64>,
     momentum_max_linear_iterations: Option<usize>,
     pressure_max_linear_iterations: Option<usize>,
-    max_simple_iterations: usize,
+    max_simple_iterations: Option<usize>,
     min_simple_iterations: Option<usize>,
-    simple_tolerance: f64,
-    pressure_drop_tolerance: Option<f64>,
-    field_change_tolerance: Option<f64>,
     pressure_reference_cell: Option<usize>,
     pressure_reference_value: Option<f64>,
     non_orthogonal_correctors: Option<usize>,
+    simple_consistent: Option<bool>,
     velocity_relaxation: Option<f64>,
     pressure_relaxation: Option<f64>,
+    solve_verbose: bool,
+    solve_residual_csv: Option<PathBuf>,
+    solve_residual_plot: Option<PathBuf>,
     report_json: Option<PathBuf>,
     report_markdown: Option<PathBuf>,
+    write_final_fields: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3443,13 +6404,12 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
     let mut poiseuille_option_seen = false;
     let mut laminar_simple_solve = false;
     let mut laminar_simple_option_seen = false;
+    let mut shared_flow_option_seen = false;
     let mut density = None;
     let mut pressure_drop = None;
     let mut dynamic_viscosity = None;
     let mut length = None;
     let mut diameter = None;
-    let mut inlet_patch = "inlet".to_string();
-    let mut outlet_patch = "outlet".to_string();
     let mut wall_patches = Vec::new();
     let mut linear_solve_option_seen = false;
     let mut laminar_linear_solver = None;
@@ -3469,18 +6429,20 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
     let mut pressure_linear_tolerance = None;
     let mut momentum_max_linear_iterations = None;
     let mut pressure_max_linear_iterations = None;
-    let mut max_simple_iterations = 1;
+    let mut max_simple_iterations = None;
     let mut min_simple_iterations = None;
-    let mut simple_tolerance = 1.0e-8;
-    let mut pressure_drop_tolerance = None;
-    let mut field_change_tolerance = None;
     let mut pressure_reference_cell = None;
     let mut pressure_reference_value = None;
     let mut non_orthogonal_correctors = None;
+    let mut simple_consistent = None;
     let mut velocity_relaxation = None;
     let mut pressure_relaxation = None;
+    let mut solve_verbose = false;
+    let mut solve_residual_csv = None;
+    let mut solve_residual_plot = None;
     let mut solve_report_json = None;
     let mut solve_report_markdown = None;
+    let mut write_final_fields = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -3579,7 +6541,7 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
                     "--mu requires a positive dynamic viscosity in Pa s".to_string()
                 })?;
                 dynamic_viscosity = Some(parse_positive_f64_arg("--mu", value)?);
-                poiseuille_option_seen = true;
+                shared_flow_option_seen = true;
                 index += 2;
             }
             "-length" | "--length" => {
@@ -3598,28 +6560,6 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
                 poiseuille_option_seen = true;
                 index += 2;
             }
-            "-inletPatch" | "--inletPatch" | "-inlet-patch" | "--inlet-patch" => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| "--inletPatch requires a patch name".to_string())?;
-                if value.trim().is_empty() {
-                    return Err("--inletPatch patch name must not be empty".to_string());
-                }
-                inlet_patch = value.to_string();
-                laminar_simple_option_seen = true;
-                index += 2;
-            }
-            "-outletPatch" | "--outletPatch" | "-outlet-patch" | "--outlet-patch" => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| "--outletPatch requires a patch name".to_string())?;
-                if value.trim().is_empty() {
-                    return Err("--outletPatch patch name must not be empty".to_string());
-                }
-                outlet_patch = value.to_string();
-                laminar_simple_option_seen = true;
-                index += 2;
-            }
             "-wallPatch" | "--wallPatch" | "-wall-patch" | "--wall-patch" => {
                 let value = args
                     .get(index + 1)
@@ -3633,7 +6573,8 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
             }
             "-linearSolver" | "--linearSolver" | "-linear-solver" | "--linear-solver" => {
                 let value = args.get(index + 1).ok_or_else(|| {
-                    "--linearSolver requires 'bicgstab', 'cg', 'pcg', or 'jacobi'".to_string()
+                    "--linearSolver requires 'bicgstab', 'gaussSeidel', 'cg', 'pcg', or 'jacobi'"
+                        .to_string()
                 })?;
                 match parse_scalar_diffusion_linear_solver(value) {
                     Ok(solver) => {
@@ -3651,7 +6592,7 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
             | "-momentum-linear-solver"
             | "--momentum-linear-solver" => {
                 let value = args.get(index + 1).ok_or_else(|| {
-                    "--momentumLinearSolver requires 'bicgstab', 'cg', 'pcg', or 'jacobi'"
+                    "--momentumLinearSolver requires 'bicgstab', 'gaussSeidel', 'cg', 'pcg', or 'jacobi'"
                         .to_string()
                 })?;
                 momentum_linear_solver = Some(parse_laminar_simple_linear_solver(value)?);
@@ -3663,7 +6604,7 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
             | "-pressure-linear-solver"
             | "--pressure-linear-solver" => {
                 let value = args.get(index + 1).ok_or_else(|| {
-                    "--pressureLinearSolver requires 'bicgstab', 'cg', 'pcg', or 'jacobi'"
+                    "--pressureLinearSolver requires 'bicgstab', 'gaussSeidel', 'cg', 'pcg', or 'jacobi'"
                         .to_string()
                 })?;
                 pressure_linear_solver = Some(parse_laminar_simple_linear_solver(value)?);
@@ -3675,7 +6616,8 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
             | "-momentum-preconditioner"
             | "--momentum-preconditioner" => {
                 let value = args.get(index + 1).ok_or_else(|| {
-                    "--momentumPreconditioner requires 'none', 'diagonal', or 'DIC'".to_string()
+                    "--momentumPreconditioner requires 'none', 'diagonal', 'DIC', or 'incompleteCholesky'"
+                        .to_string()
                 })?;
                 momentum_preconditioner = Some(parse_laminar_simple_preconditioner(value)?);
                 laminar_simple_option_seen = true;
@@ -3686,7 +6628,8 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
             | "-pressure-preconditioner"
             | "--pressure-preconditioner" => {
                 let value = args.get(index + 1).ok_or_else(|| {
-                    "--pressurePreconditioner requires 'none', 'diagonal', or 'DIC'".to_string()
+                    "--pressurePreconditioner requires 'none', 'diagonal', 'DIC', or 'incompleteCholesky'"
+                        .to_string()
                 })?;
                 pressure_preconditioner = Some(parse_laminar_simple_preconditioner(value)?);
                 laminar_simple_option_seen = true;
@@ -3770,7 +6713,8 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
                 let value = args.get(index + 1).ok_or_else(|| {
                     "--maxSimpleIterations requires a positive integer".to_string()
                 })?;
-                max_simple_iterations = parse_positive_usize_arg("--maxSimpleIterations", value)?;
+                max_simple_iterations =
+                    Some(parse_positive_usize_arg("--maxSimpleIterations", value)?);
                 laminar_simple_option_seen = true;
                 index += 2;
             }
@@ -3800,6 +6744,31 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
                 laminar_simple_option_seen = true;
                 index += 2;
             }
+            "-simpleConsistent"
+            | "--simpleConsistent"
+            | "-simple-consistent"
+            | "--simple-consistent" => {
+                if args
+                    .get(index + 1)
+                    .is_some_and(|value| !value.starts_with('-'))
+                {
+                    simple_consistent =
+                        Some(parse_bool_arg("--simpleConsistent", &args[index + 1])?);
+                    index += 2;
+                } else {
+                    simple_consistent = Some(true);
+                    index += 1;
+                }
+                laminar_simple_option_seen = true;
+            }
+            "-noSimpleConsistent"
+            | "--noSimpleConsistent"
+            | "-no-simple-consistent"
+            | "--no-simple-consistent" => {
+                simple_consistent = Some(false);
+                laminar_simple_option_seen = true;
+                index += 1;
+            }
             "-pRefCell" | "--pRefCell" | "-p-ref-cell" | "--p-ref-cell" => {
                 let value = args
                     .get(index + 1)
@@ -3813,41 +6782,6 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
                     .get(index + 1)
                     .ok_or_else(|| "--pRefValue requires a finite pressure value".to_string())?;
                 pressure_reference_value = Some(parse_finite_f64_arg("--pRefValue", value)?);
-                laminar_simple_option_seen = true;
-                index += 2;
-            }
-            "-simpleTolerance" | "--simpleTolerance" | "-simple-tolerance"
-            | "--simple-tolerance" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    "--simpleTolerance requires a non-negative number".to_string()
-                })?;
-                simple_tolerance = parse_non_negative_f64_arg("--simpleTolerance", value)?;
-                laminar_simple_option_seen = true;
-                index += 2;
-            }
-            "-pressureDropTolerance"
-            | "--pressureDropTolerance"
-            | "-pressure-drop-tolerance"
-            | "--pressure-drop-tolerance" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    "--pressureDropTolerance requires a non-negative relative tolerance".to_string()
-                })?;
-                pressure_drop_tolerance = Some(parse_non_negative_f64_arg(
-                    "--pressureDropTolerance",
-                    value,
-                )?);
-                laminar_simple_option_seen = true;
-                index += 2;
-            }
-            "-fieldChangeTolerance"
-            | "--fieldChangeTolerance"
-            | "-field-change-tolerance"
-            | "--field-change-tolerance" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    "--fieldChangeTolerance requires a non-negative relative tolerance".to_string()
-                })?;
-                field_change_tolerance =
-                    Some(parse_non_negative_f64_arg("--fieldChangeTolerance", value)?);
                 laminar_simple_option_seen = true;
                 index += 2;
             }
@@ -3873,6 +6807,33 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
                 laminar_simple_option_seen = true;
                 index += 2;
             }
+            "-solveVerbose" | "--solveVerbose" | "-solve-verbose" | "--solve-verbose" => {
+                solve_verbose = true;
+                laminar_simple_option_seen = true;
+                index += 1;
+            }
+            "-solveResidualCsv"
+            | "--solveResidualCsv"
+            | "-solve-residual-csv"
+            | "--solve-residual-csv" => {
+                let path = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--solveResidualCsv requires a file path".to_string())?;
+                solve_residual_csv = Some(PathBuf::from(path));
+                laminar_simple_option_seen = true;
+                index += 2;
+            }
+            "-solveResidualPlot"
+            | "--solveResidualPlot"
+            | "-solve-residual-plot"
+            | "--solve-residual-plot" => {
+                let path = args.get(index + 1).ok_or_else(|| {
+                    "--solveResidualPlot requires an output image path".to_string()
+                })?;
+                solve_residual_plot = Some(PathBuf::from(path));
+                laminar_simple_option_seen = true;
+                index += 2;
+            }
             "-solveReportJson"
             | "--solveReportJson"
             | "-solve-report-json"
@@ -3892,6 +6853,17 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
                     .get(index + 1)
                     .ok_or_else(|| "--solveReportMarkdown requires a file path".to_string())?;
                 solve_report_markdown = Some(PathBuf::from(path));
+                laminar_simple_option_seen = true;
+                index += 2;
+            }
+            "-writeFinalFields"
+            | "--writeFinalFields"
+            | "-write-final-fields"
+            | "--write-final-fields" => {
+                let path = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--writeFinalFields requires an output directory".to_string())?;
+                write_final_fields = Some(PathBuf::from(path));
                 laminar_simple_option_seen = true;
                 index += 2;
             }
@@ -3929,11 +6901,6 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
         Some(LaminarSimpleSolveArgs {
             density,
             dynamic_viscosity,
-            pressure_drop,
-            length,
-            diameter,
-            inlet_patch,
-            outlet_patch,
             linear_solver: laminar_linear_solver,
             momentum_linear_solver,
             pressure_linear_solver,
@@ -3947,27 +6914,32 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
             pressure_max_linear_iterations,
             max_simple_iterations,
             min_simple_iterations,
-            simple_tolerance,
-            pressure_drop_tolerance,
-            field_change_tolerance,
             pressure_reference_cell,
             pressure_reference_value,
             non_orthogonal_correctors,
+            simple_consistent,
             velocity_relaxation,
             pressure_relaxation,
+            solve_verbose,
+            solve_residual_csv,
+            solve_residual_plot,
             report_json: solve_report_json,
             report_markdown: solve_report_markdown,
+            write_final_fields,
         })
     } else {
         None
     };
-    if poiseuille_solve.is_none() && laminar_simple_solve.is_none() && poiseuille_option_seen {
+    if poiseuille_solve.is_none() && poiseuille_option_seen {
         return Err("Poiseuille solve options require --solvePoiseuille".to_string());
     }
+    if poiseuille_solve.is_none() && laminar_simple_solve.is_none() && shared_flow_option_seen {
+        return Err("--mu requires --solvePoiseuille or --solveLaminarSimple".to_string());
+    }
     if (scalar_diffusion_solve.is_some() || poiseuille_solve.is_some())
-        && scalar_diffusion_linear_solver_error.is_some()
+        && let Some(error) = scalar_diffusion_linear_solver_error
     {
-        return Err(scalar_diffusion_linear_solver_error.unwrap());
+        return Err(error);
     }
     if laminar_simple_solve.is_none() && laminar_simple_option_seen {
         return Err("Laminar SIMPLE solve options require --solveLaminarSimple".to_string());
@@ -4015,19 +6987,26 @@ fn parse_scalar_diffusion_linear_solver(
 }
 
 fn parse_laminar_simple_linear_solver(value: &str) -> Result<LaminarSimpleLinearSolver, String> {
-    parse_openfoam_laminar_solver(value).ok_or_else(|| {
-        format!(
-            "invalid laminar SIMPLE linear solver '{value}'; expected 'bicgstab', 'cg', 'pcg', or 'jacobi'"
-        )
-    })
+    parse_openfoam_laminar_solver(value)
 }
 
 fn parse_laminar_simple_preconditioner(value: &str) -> Result<LaminarSimplePreconditioner, String> {
-    parse_openfoam_laminar_preconditioner(value).ok_or_else(|| {
-        format!(
-            "invalid laminar SIMPLE preconditioner '{value}'; expected 'none', 'diagonal', or 'DIC'"
-        )
-    })
+    parse_openfoam_laminar_preconditioner(value)
+}
+
+fn parse_bool_value(value: &str) -> Option<bool> {
+    match value.trim_matches(';') {
+        "true" | "True" | "TRUE" | "yes" | "Yes" | "YES" | "on" | "On" | "ON" | "1" => Some(true),
+        "false" | "False" | "FALSE" | "no" | "No" | "NO" | "off" | "Off" | "OFF" | "0" => {
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
+fn parse_bool_arg(label: &str, value: &str) -> Result<bool, String> {
+    parse_bool_value(value)
+        .ok_or_else(|| format!("invalid {label} value '{value}'; expected true/false or yes/no"))
 }
 
 fn parse_positive_usize_arg(label: &str, value: &str) -> Result<usize, String> {
@@ -4251,6 +7230,10 @@ fn print_help() {
     println!("  ferrum checkMesh [-case <caseDir>]");
     println!("  ferrum splitMeshRegions [-case <caseDir>] [-cellZones]");
     println!("  ferrum solve [-case <caseDir>] [--preflight] [--planJson <file>] [--runnerDryRun]");
+    println!("  ferrum pipeBenchmark -case <caseDir> --fields <timeDir> [reference options]");
+    println!(
+        "  ferrum planeChannelBenchmark -case <caseDir> --fields <timeDir> [reference options]"
+    );
     println!();
     println!("aliases:");
     println!("  initFerrumCase <caseDir> [--region <name> ...] [--force]");
@@ -4258,6 +7241,10 @@ fn print_help() {
     println!("  checkFerrumMesh [-case <caseDir>]");
     println!("  splitFerrumMeshRegions [-case <caseDir>] [-cellZones]");
     println!("  ferrumSolver [-case <caseDir>] [--preflight] [--planJson <file>] [--runnerDryRun]");
+    println!("  ferrumPipeBenchmark -case <caseDir> --fields <timeDir> [reference options]");
+    println!(
+        "  ferrumPlaneChannelBenchmark -case <caseDir> --fields <timeDir> [reference options]"
+    );
     println!();
     print_patch_type_options();
 }
@@ -4305,38 +7292,40 @@ fn print_solver_usage() {
         "  --source <v>         uniform volume source for --solveScalarDiffusion (default: 0)"
     );
     println!(
-        "  --linearSolver <s>   cg, pcg, bicgstab, or jacobi for executable solves (default: cg; laminar SIMPLE default: fvSolution or bicgstab)"
+        "  --linearSolver <s>   cg, pcg, gaussSeidel, symGaussSeidel, bicgstab, or jacobi for executable solves (default: cg; laminar SIMPLE reads fvSolution)"
     );
     println!(
-        "  --momentumLinearSolver <s> override laminar SIMPLE momentum solver (bicgstab, cg, pcg, or jacobi)"
+        "  --momentumLinearSolver <s> override laminar SIMPLE momentum solver (bicgstab, gaussSeidel, symGaussSeidel, cg, pcg, or jacobi)"
     );
     println!(
-        "  --pressureLinearSolver <s> override laminar SIMPLE pressure-correction solver (bicgstab, cg, pcg, or jacobi)"
+        "  --pressureLinearSolver <s> override laminar SIMPLE pressure solver (bicgstab, gaussSeidel, symGaussSeidel, cg, pcg, or jacobi)"
     );
     println!(
-        "  --momentumPreconditioner <s> override laminar SIMPLE U preconditioner (none, diagonal, DIC)"
+        "  --momentumPreconditioner <s> override laminar SIMPLE U preconditioner (none, diagonal; DIC requires PCG/SPD)"
     );
     println!(
-        "  --pressurePreconditioner <s> override laminar SIMPLE p preconditioner (none, diagonal, DIC)"
+        "  --pressurePreconditioner <s> override laminar SIMPLE p preconditioner (none, diagonal, DIC/incompleteCholesky)"
     );
     println!(
-        "  --momentumSolveTolerance <v> override laminar SIMPLE U solve tolerance (default: --solveTolerance, fvSolution solvers.U.tolerance, or 1e-10)"
+        "  --momentumSolveTolerance <v> override laminar SIMPLE U solve tolerance (default: --solveTolerance, fvSolution solvers.U.tolerance, or OpenFOAM 1e-6)"
     );
     println!(
-        "  --pressureSolveTolerance <v> override laminar SIMPLE p solve tolerance (default: --solveTolerance, fvSolution solvers.p.tolerance, or 1e-10)"
+        "  --pressureSolveTolerance <v> override laminar SIMPLE p solve tolerance (default: --solveTolerance, fvSolution solvers.p.tolerance, or OpenFOAM 1e-6)"
     );
-    println!("  --momentumMaxIterations <n> override laminar SIMPLE U linear iteration cap");
-    println!("  --pressureMaxIterations <n> override laminar SIMPLE p linear iteration cap");
-    println!("  --pressureDrop <Pa>  pressure drop for --solvePoiseuille/--solveLaminarSimple");
+    println!(
+        "  --momentumMaxIterations <n> override laminar SIMPLE U linear iteration cap (default: fvSolution or OpenFOAM 1000)"
+    );
+    println!(
+        "  --pressureMaxIterations <n> override laminar SIMPLE p linear iteration cap (default: fvSolution or OpenFOAM 1000)"
+    );
+    println!("  --pressureDrop <Pa>  pressure drop for --solvePoiseuille");
     println!("  --rho <kg/m3>        density for --solveLaminarSimple");
     println!("  --mu <Pa.s>          dynamic viscosity for --solvePoiseuille/--solveLaminarSimple");
-    println!("  --length <m>         pipe length for --solvePoiseuille/--solveLaminarSimple");
-    println!("  --diameter <m>       pipe diameter for --solvePoiseuille/--solveLaminarSimple");
+    println!("  --length <m>         pipe length for --solvePoiseuille");
+    println!("  --diameter <m>       pipe diameter for --solvePoiseuille");
     println!("  --wallPatch <name>   wall patch for --solvePoiseuille (default: wall)");
-    println!("  --inletPatch <name>  inlet patch for --solveLaminarSimple (default: inlet)");
-    println!("  --outletPatch <name> outlet patch for --solveLaminarSimple (default: outlet)");
     println!(
-        "  --maxSimpleIterations <n> SIMPLE iteration cap for --solveLaminarSimple (default: 1)"
+        "  --maxSimpleIterations <n> override SIMPLE iteration count (default: controlDict endTime/deltaT)"
     );
     println!(
         "  --minSimpleIterations <n> minimum SIMPLE iterations before convergence (default: 1 for one-step runs, otherwise 2)"
@@ -4344,25 +7333,27 @@ fn print_solver_usage() {
     println!(
         "  --nNonOrthogonalCorrectors <n> override SIMPLE nNonOrthogonalCorrectors (default: fvSolution or 0)"
     );
+    println!(
+        "  --simpleConsistent [bool] enable OpenFOAM-style SIMPLE consistent rAtU correction (default: fvSolution SIMPLE.consistent or false)"
+    );
     println!("  --pRefCell <n>       pressure reference cell for closed-pressure cases");
     println!("  --pRefValue <Pa>     pressure reference value (default: fvSolution or 0)");
     println!(
-        "  --simpleTolerance <v> SIMPLE continuity tolerance for --solveLaminarSimple (default: 1e-8)"
+        "  --velocityRelaxation <v> override U relaxation for --solveLaminarSimple (default: fvSolution relaxationFactors.equations.U or no relaxation)"
     );
     println!(
-        "  --pressureDropTolerance <v> relative Hagen-Poiseuille pressure-drop tolerance for --solveLaminarSimple (default: 0.02)"
+        "  --pressureRelaxation <v> override p relaxation for --solveLaminarSimple (default: fvSolution relaxationFactors.fields.p or no relaxation)"
     );
     println!(
-        "  --fieldChangeTolerance <v> relative U/p field-change tolerance for --solveLaminarSimple (default: 0.01)"
+        "  --solveVerbose print per-iteration initial/final residuals and linear/outer convergence"
     );
-    println!(
-        "  --velocityRelaxation <v> override U relaxation for --solveLaminarSimple (default: fvSolution relaxationFactors.equations.U or 0.7)"
-    );
-    println!(
-        "  --pressureRelaxation <v> override p relaxation for --solveLaminarSimple (default: fvSolution relaxationFactors.fields.p or 0.3)"
-    );
+    println!("  --solveResidualCsv <file> write SIMPLE residual history as CSV");
+    println!("  --solveResidualPlot <file> render residual plot image from CSV data");
     println!("  --solveReportJson <file> write --solveLaminarSimple JSON report");
     println!("  --solveReportMarkdown <file> write --solveLaminarSimple Markdown report");
+    println!(
+        "  --writeFinalFields <dir> write final U and p fields to an OpenFOAM-like time directory"
+    );
     println!("  --solveTolerance <v> absolute residual tolerance (default: 1e-10)");
     println!("  --maxIterations <n>  linear solver iteration cap (default: 10000)");
     println!();
@@ -4375,6 +7366,33 @@ fn print_gmsh_to_foam_usage() {
     println!("usage: gmshToFerrumFoam <mesh.msh> [-case <caseDir>] [patch type options]");
     println!();
     print_patch_type_options();
+}
+
+fn print_pipe_benchmark_usage() {
+    println!(
+        "usage: ferrumPipeBenchmark -case <caseDir> --fields <timeDir> --pressureDrop <Pa> --mu <Pa.s> --length <m> --diameter <m> [options]"
+    );
+    println!();
+    println!("post-processes stored U/p fields outside the generic SIMPLE solver");
+    println!("  --axis <x|y|z>       axial velocity component (default: x)");
+    println!("  --inletPatch <name>  inlet patch for pressure sampling (default: inlet)");
+    println!("  --outletPatch <name> outlet patch for pressure sampling (default: outlet)");
+    println!("  --outJson <file>     write benchmark JSON");
+    println!("  --outMarkdown <file> write benchmark Markdown");
+}
+
+fn print_plane_channel_benchmark_usage() {
+    println!(
+        "usage: ferrumPlaneChannelBenchmark -case <caseDir> --fields <timeDir> --pressureDrop <Pa> --mu <Pa.s> --length <m> --gap <m> --depth <m> [options]"
+    );
+    println!();
+    println!("post-processes stored U/p fields outside the generic SIMPLE solver");
+    println!("  --axis <x|y|z>       axial velocity component (default: x)");
+    println!("  --inletPatch <name>  inlet patch for pressure sampling (default: inlet)");
+    println!("  --outletPatch <name> outlet patch for pressure sampling (default: outlet)");
+    println!("  --pressureScale <v>  multiply stored p before SI comparison (default: 1)");
+    println!("  --outJson <file>     write benchmark JSON");
+    println!("  --outMarkdown <file> write benchmark Markdown");
 }
 
 fn print_patch_type_options() {
@@ -4395,18 +7413,128 @@ fn normalize_case_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        ScalarDiffusionLinearSolver, SolverNumericsDictionaryPlan, numerics_dictionary_number,
+        ContinuitySummary, LaminarSimpleIterationSummary, LaminarSimpleOptions,
+        LaminarSimpleResidualControlSummary, LaminarSimpleSchemes, ScalarDiffusionLinearSolver,
+        SolverNumericsDictionaryPlan, estimate_iterations_to_convergence,
+        estimate_simple_iterations_to_convergence, numerics_dictionary_number,
         numerics_dictionary_usize, numerics_dictionary_value,
-        parse_openfoam_laminar_preconditioner, parse_openfoam_laminar_solver, parse_solver_args,
+        parse_laminar_simple_convection_scheme, parse_laminar_simple_gradient_scheme,
+        parse_laminar_simple_laplacian_scheme, parse_laminar_simple_sn_grad_scheme,
+        parse_openfoam_laminar_preconditioner, parse_openfoam_laminar_solver,
+        parse_pipe_benchmark_args, parse_plane_channel_benchmark_args, parse_solver_args,
+        resolve_laminar_simple_options, validate_laminar_residual_control_dictionary,
         write_json_solver_state, write_json_string,
     };
-    use ferrum_mesh::flow::{LaminarSimpleLinearSolver, LaminarSimplePreconditioner};
+    use ferrum_mesh::backends::BackendChoice;
+    use ferrum_mesh::control::ControlDict;
+    use ferrum_mesh::flow::{
+        LaminarSimpleConvectionScheme, LaminarSimpleGradientScheme, LaminarSimpleLaplacianScheme,
+        LaminarSimpleLinearSolver, LaminarSimplePreconditioner, LaminarSimpleSnGradScheme,
+    };
+    use ferrum_mesh::poiseuille::PipeAxis;
+    use ferrum_mesh::runtime::{SolverRuntimeData, SolverRuntimeMeshData};
+    use ferrum_mesh::solver_plan::{
+        SolverBackendPlan, SolverCasePlan, SolverCpuResourcePlan, SolverDimensionality,
+        SolverFieldPlan, SolverGpuResourcePlan, SolverInterfacePlan, SolverMeshPlan,
+        SolverNumericsPlan, SolverPropertiesPlan, SolverPropertyEntryPlan, SolverRunPlan,
+    };
     use ferrum_mesh::solver_state::{
         SolverStateCpuBufferPlan, SolverStateCpuBufferStatus, SolverStateFieldKind,
         SolverStateFieldPlan, SolverStateInternalFieldPlan, SolverStatePlan,
         SolverStateStoragePlan, SolverStateStorageStatus, SolverStateValueKind,
     };
     use std::path::PathBuf;
+
+    #[test]
+    fn parses_external_pipe_benchmark_options() {
+        let args = vec![
+            "-case".to_string(),
+            "examples/pipe".to_string(),
+            "--fields".to_string(),
+            "target/fields/100".to_string(),
+            "--pressureDrop".to_string(),
+            "1.6032".to_string(),
+            "--mu".to_string(),
+            "0.001002".to_string(),
+            "--length".to_string(),
+            "1".to_string(),
+            "--diameter".to_string(),
+            "0.02".to_string(),
+            "--axis".to_string(),
+            "z".to_string(),
+            "--inletPatch".to_string(),
+            "feed".to_string(),
+            "--outletPatch".to_string(),
+            "product".to_string(),
+            "--outJson".to_string(),
+            "target/pipe.json".to_string(),
+        ];
+
+        let parsed = parse_pipe_benchmark_args(&args).expect("pipe benchmark args should parse");
+
+        assert_eq!(parsed.case_dir, PathBuf::from("examples/pipe"));
+        assert_eq!(parsed.fields_dir, PathBuf::from("target/fields/100"));
+        assert_eq!(parsed.options.pressure_drop, 1.6032);
+        assert_eq!(parsed.options.dynamic_viscosity, 0.001002);
+        assert_eq!(parsed.options.length, 1.0);
+        assert_eq!(parsed.options.diameter, 0.02);
+        assert_eq!(parsed.options.axis, PipeAxis::Z);
+        assert_eq!(parsed.options.inlet_patch, "feed");
+        assert_eq!(parsed.options.outlet_patch, "product");
+        assert_eq!(parsed.out_json, Some(PathBuf::from("target/pipe.json")));
+    }
+
+    #[test]
+    fn parses_external_plane_channel_benchmark_options() {
+        let args = vec![
+            "-case".to_string(),
+            "target/cases/channel".to_string(),
+            "--fields".to_string(),
+            "target/fields/545".to_string(),
+            "--pressureDrop".to_string(),
+            "0.6012".to_string(),
+            "--mu".to_string(),
+            "0.001002".to_string(),
+            "--length".to_string(),
+            "1".to_string(),
+            "--gap".to_string(),
+            "0.02".to_string(),
+            "--depth".to_string(),
+            "0.001".to_string(),
+            "--axis".to_string(),
+            "x".to_string(),
+            "--pressureScale".to_string(),
+            "998.2".to_string(),
+        ];
+
+        let parsed = parse_plane_channel_benchmark_args(&args)
+            .expect("plane-channel benchmark args should parse");
+
+        assert_eq!(parsed.case_dir, PathBuf::from("target/cases/channel"));
+        assert_eq!(parsed.fields_dir, PathBuf::from("target/fields/545"));
+        assert_eq!(parsed.options.pressure_drop, 0.6012);
+        assert_eq!(parsed.options.gap, 0.02);
+        assert_eq!(parsed.options.depth, 0.001);
+        assert_eq!(parsed.options.axis, PipeAxis::X);
+        assert_eq!(parsed.pressure_scale, 998.2);
+    }
+
+    #[test]
+    fn external_pipe_benchmark_requires_stored_fields() {
+        let error = parse_pipe_benchmark_args(&[
+            "--pressureDrop".to_string(),
+            "1.6032".to_string(),
+            "--mu".to_string(),
+            "0.001002".to_string(),
+            "--length".to_string(),
+            "1".to_string(),
+            "--diameter".to_string(),
+            "0.02".to_string(),
+        ])
+        .expect_err("pipe post-processing without stored fields must fail");
+
+        assert!(error.contains("requires --fields"));
+    }
 
     #[test]
     fn parses_solver_plan_json_option() {
@@ -4520,24 +7648,13 @@ mod tests {
             "998.2".to_string(),
             "--mu".to_string(),
             "0.001002".to_string(),
-            "--pressureDrop".to_string(),
-            "1.6032".to_string(),
-            "--length".to_string(),
-            "1.0".to_string(),
-            "--diameter".to_string(),
-            "0.02".to_string(),
             "--maxSimpleIterations".to_string(),
             "7".to_string(),
             "--minSimpleIterations".to_string(),
             "3".to_string(),
-            "--simpleTolerance".to_string(),
-            "1e-7".to_string(),
-            "--pressureDropTolerance".to_string(),
-            "0.015".to_string(),
-            "--fieldChangeTolerance".to_string(),
-            "0.005".to_string(),
             "--nNonOrthogonalCorrectors".to_string(),
             "2".to_string(),
+            "--simpleConsistent".to_string(),
             "--pRefCell".to_string(),
             "12".to_string(),
             "--pRefValue".to_string(),
@@ -4550,6 +7667,8 @@ mod tests {
             "target/simple.json".to_string(),
             "--solveReportMarkdown".to_string(),
             "target/simple.md".to_string(),
+            "--writeFinalFields".to_string(),
+            "target/simpleFields/1".to_string(),
         ];
 
         let parsed = parse_solver_args(&args).expect("solver args should parse");
@@ -4559,9 +7678,6 @@ mod tests {
 
         assert_eq!(solve.density, Some(998.2));
         assert_eq!(solve.dynamic_viscosity, Some(0.001002));
-        assert_eq!(solve.pressure_drop, Some(1.6032));
-        assert_eq!(solve.length, Some(1.0));
-        assert_eq!(solve.diameter, Some(0.02));
         assert_eq!(solve.linear_solver, None);
         assert_eq!(solve.momentum_linear_solver, None);
         assert_eq!(solve.pressure_linear_solver, None);
@@ -4573,12 +7689,10 @@ mod tests {
         assert_eq!(solve.pressure_linear_tolerance, None);
         assert_eq!(solve.momentum_max_linear_iterations, None);
         assert_eq!(solve.pressure_max_linear_iterations, None);
-        assert_eq!(solve.max_simple_iterations, 7);
+        assert_eq!(solve.max_simple_iterations, Some(7));
         assert_eq!(solve.min_simple_iterations, Some(3));
-        assert_eq!(solve.simple_tolerance, 1e-7);
-        assert_eq!(solve.pressure_drop_tolerance, Some(0.015));
-        assert_eq!(solve.field_change_tolerance, Some(0.005));
         assert_eq!(solve.non_orthogonal_correctors, Some(2));
+        assert_eq!(solve.simple_consistent, Some(true));
         assert_eq!(solve.pressure_reference_cell, Some(12));
         assert_eq!(solve.pressure_reference_value, Some(101325.0));
         assert_eq!(solve.velocity_relaxation, Some(0.6));
@@ -4588,6 +7702,40 @@ mod tests {
             solve.report_markdown,
             Some(PathBuf::from("target/simple.md"))
         );
+        assert_eq!(
+            solve.write_final_fields,
+            Some(PathBuf::from("target/simpleFields/1"))
+        );
+    }
+
+    #[test]
+    fn parses_laminar_simple_residual_reporting_options() {
+        let args = vec![
+            "--solveLaminarSimple".to_string(),
+            "--solveVerbose".to_string(),
+            "--solveResidualCsv".to_string(),
+            "target/simple-residuals.csv".to_string(),
+            "--solveResidualPlot".to_string(),
+            "target/simple-residuals.png".to_string(),
+            "--solveReportJson".to_string(),
+            "target/simple.json".to_string(),
+        ];
+
+        let parsed = parse_solver_args(&args).expect("solver args should parse");
+        let solve = parsed
+            .laminar_simple_solve
+            .expect("laminar SIMPLE solve args");
+
+        assert!(solve.solve_verbose);
+        assert_eq!(
+            solve.solve_residual_csv,
+            Some(PathBuf::from("target/simple-residuals.csv"))
+        );
+        assert_eq!(
+            solve.solve_residual_plot,
+            Some(PathBuf::from("target/simple-residuals.png"))
+        );
+        assert_eq!(solve.report_json, Some(PathBuf::from("target/simple.json")));
     }
 
     #[test]
@@ -4623,7 +7771,7 @@ mod tests {
         );
         assert_eq!(
             solve.pressure_preconditioner,
-            Some(LaminarSimplePreconditioner::Diagonal)
+            Some(LaminarSimplePreconditioner::IncompleteCholesky)
         );
     }
 
@@ -4684,6 +7832,244 @@ mod tests {
 
         assert_eq!(solve.velocity_relaxation, None);
         assert_eq!(solve.pressure_relaxation, None);
+        assert_eq!(solve.simple_consistent, None);
+    }
+
+    #[test]
+    fn laminar_simple_resolves_without_pipe_benchmark_inputs() {
+        let plan = laminar_simple_test_plan(1000.0, 0.001002);
+        let args = vec![
+            "--solveLaminarSimple".to_string(),
+            "--rho".to_string(),
+            "1000".to_string(),
+            "--mu".to_string(),
+            "0.001002".to_string(),
+        ];
+        let parsed = parse_solver_args(&args).expect("solver args should parse");
+        let solve = parsed
+            .laminar_simple_solve
+            .expect("laminar SIMPLE solve args");
+        let options = resolve_laminar_simple_options(&plan, &solve)
+            .expect("laminar options should resolve without pipeBenchmark");
+
+        assert_eq!(options.density, 1000.0);
+        assert_eq!(options.dynamic_viscosity, 0.001002);
+        assert_eq!(
+            options.momentum_linear_solver,
+            LaminarSimpleLinearSolver::SymGaussSeidel
+        );
+        assert_eq!(
+            options.pressure_linear_solver,
+            LaminarSimpleLinearSolver::Pcg
+        );
+        assert_eq!(options.max_simple_iterations, 100);
+    }
+
+    #[test]
+    fn laminar_simple_rejects_pipe_benchmark_cli_options() {
+        let error = parse_solver_args(&[
+            "--solveLaminarSimple".to_string(),
+            "--pressureDrop".to_string(),
+            "1.6032".to_string(),
+        ])
+        .expect_err("pipe benchmark inputs must stay outside the generic SIMPLE solve");
+
+        assert!(error.contains("Poiseuille solve options require --solvePoiseuille"));
+    }
+
+    #[test]
+    fn laminar_simple_uses_openfoam_ldu_defaults_when_controls_are_absent() {
+        let mut plan = laminar_simple_test_plan(1000.0, 0.001002);
+        plan.numerics
+            .fv_solution
+            .entries
+            .retain(|entry| !matches!(entry.key.as_str(), "tolerance" | "maxIter"));
+        let parsed = parse_solver_args(&["--solveLaminarSimple".to_string()])
+            .expect("solver args should parse");
+        let solve = parsed
+            .laminar_simple_solve
+            .expect("laminar SIMPLE solve args");
+        let options = resolve_laminar_simple_options(&plan, &solve)
+            .expect("OpenFOAM defaults should resolve");
+
+        assert_eq!(options.momentum_linear_tolerance, 1.0e-6);
+        assert_eq!(options.pressure_linear_tolerance, 1.0e-6);
+        assert_eq!(options.momentum_max_linear_iterations, 1_000);
+        assert_eq!(options.pressure_max_linear_iterations, 1_000);
+    }
+
+    #[test]
+    fn laminar_simple_rejects_unimplemented_nonzero_relative_tolerance() {
+        let mut plan = laminar_simple_test_plan(1000.0, 0.001002);
+        plan.numerics
+            .fv_solution
+            .entries
+            .push(ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
+                section: "solvers.U".to_string(),
+                key: "relTol".to_string(),
+                value: "0.1".to_string(),
+            });
+        let parsed = parse_solver_args(&["--solveLaminarSimple".to_string()])
+            .expect("solver args should parse");
+        let solve = parsed
+            .laminar_simple_solve
+            .expect("laminar SIMPLE solve args");
+        let error = resolve_laminar_simple_options(&plan, &solve)
+            .expect_err("non-zero relTol must not be ignored");
+
+        assert!(error.contains("relTol=0.1 is not implemented"));
+    }
+
+    #[test]
+    fn laminar_simple_ignores_case_level_benchmark_toggles() {
+        let mut plan = laminar_simple_test_plan(1000.0, 0.001002);
+        plan.numerics.fv_solution.present = true;
+        plan.numerics.fv_solution.entries.extend([
+            ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
+                section: "SIMPLE".to_string(),
+                key: "pressureDropTolerance".to_string(),
+                value: "0.001".to_string(),
+            },
+            ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
+                section: "SIMPLE".to_string(),
+                key: "fieldChangeTolerance".to_string(),
+                value: "0.001".to_string(),
+            },
+            ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
+                section: "SIMPLE".to_string(),
+                key: "benchmarkConvergence".to_string(),
+                value: "true".to_string(),
+            },
+            ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
+                section: "SIMPLE".to_string(),
+                key: "minSimpleIterations".to_string(),
+                value: "3".to_string(),
+            },
+        ]);
+
+        let args = vec!["--solveLaminarSimple".to_string()];
+        let parsed = parse_solver_args(&args).expect("solver args should parse");
+        let solve = parsed
+            .laminar_simple_solve
+            .expect("laminar SIMPLE solve args");
+        let options =
+            resolve_laminar_simple_options(&plan, &solve).expect("laminar options should resolve");
+
+        assert_eq!(options.min_simple_iterations, 3);
+    }
+
+    fn minimal_laminar_simple_options_for_estimate() -> LaminarSimpleOptions {
+        LaminarSimpleOptions {
+            density: 1000.0,
+            dynamic_viscosity: 0.001,
+            linear_solver: LaminarSimpleLinearSolver::Cg,
+            momentum_linear_solver: LaminarSimpleLinearSolver::Cg,
+            pressure_linear_solver: LaminarSimpleLinearSolver::Cg,
+            momentum_preconditioner: LaminarSimplePreconditioner::None,
+            pressure_preconditioner: LaminarSimplePreconditioner::None,
+            linear_tolerance: 1.0e-10,
+            max_linear_iterations: 10_000,
+            momentum_linear_tolerance: 1.0e-10,
+            pressure_linear_tolerance: 1.0e-10,
+            momentum_max_linear_iterations: 10_000,
+            pressure_max_linear_iterations: 10_000,
+            max_simple_iterations: 100,
+            min_simple_iterations: 1,
+            momentum_residual_control: Some(1.0e-5),
+            pressure_residual_control: Some(1.0e-5),
+            pressure_reference_cell: None,
+            pressure_reference_value: 0.0,
+            non_orthogonal_correctors: 0,
+            simple_consistent: false,
+            velocity_relaxation: 0.7,
+            pressure_relaxation: 0.3,
+            schemes: LaminarSimpleSchemes::default(),
+        }
+    }
+
+    fn build_laminar_simple_iteration_summary(
+        iteration: usize,
+        continuity_after: f64,
+        momentum_norm: f64,
+        pressure_norm: f64,
+    ) -> LaminarSimpleIterationSummary {
+        LaminarSimpleIterationSummary {
+            iteration,
+            continuity_before: ContinuitySummary {
+                l2_norm: continuity_after * 2.0,
+                ..ContinuitySummary::default()
+            },
+            continuity_after: ContinuitySummary {
+                l2_norm: continuity_after,
+                ..ContinuitySummary::default()
+            },
+            pressure_correction_accepted: true,
+            momentum_linear_iterations: 0,
+            momentum_linear_converged: true,
+            momentum_component_linear_converged: [true, true, true],
+            pressure_linear_iterations: 0,
+            pressure_linear_converged: true,
+            pressure_linear_solves: 0,
+            pressure_linear_non_converged_solves: 0,
+            momentum_initial_normalized_residual_norm: momentum_norm,
+            momentum_residual_norm: 0.0,
+            momentum_normalized_residual_norm: momentum_norm,
+            momentum_component_initial_normalized_residual_norms: [momentum_norm, 0.0, 0.0],
+            momentum_component_residual_norms: [0.0, 0.0, 0.0],
+            momentum_component_normalized_residual_norms: [0.0, 0.0, 0.0],
+            momentum_diagonal_min: 0.0,
+            momentum_diagonal_max: 0.0,
+            momentum_h1_min: 0.0,
+            momentum_h1_max: 0.0,
+            pressure_correction_initial_normalized_residual_norm: pressure_norm,
+            pressure_correction_residual_norm: 0.0,
+            pressure_correction_normalized_residual_norm: pressure_norm,
+            residual_control: LaminarSimpleResidualControlSummary::default(),
+            relative_velocity_change_l2: 0.0,
+            relative_pressure_change_l2: 0.0,
+            momentum_update_scale: 0.0,
+            pressure_correction_update_scale: 0.0,
+            adjust_phi_global_flux_before: 0.0,
+            adjust_phi_global_flux_after: 0.0,
+            adjust_phi_adjusted_faces: 0,
+        }
+    }
+
+    #[test]
+    fn estimates_additional_simple_iterations_from_monotone_history() {
+        let options = minimal_laminar_simple_options_for_estimate();
+        let history = vec![
+            build_laminar_simple_iteration_summary(1, 1.0, 1.0e-2, 1.0e-2),
+            build_laminar_simple_iteration_summary(2, 0.5, 5.0e-3, 5.0e-3),
+            build_laminar_simple_iteration_summary(3, 0.25, 2.5e-3, 2.5e-3),
+        ];
+
+        let estimate = estimate_simple_iterations_to_convergence(&history, &options)
+            .expect("iteration estimate should be available");
+
+        assert!(estimate.additional_iterations > 0);
+    }
+
+    #[test]
+    fn estimates_are_not_available_without_decay() {
+        let options = minimal_laminar_simple_options_for_estimate();
+        let history = vec![
+            build_laminar_simple_iteration_summary(1, 1.0, 1.0e-2, 1.0e-2),
+            build_laminar_simple_iteration_summary(2, 1.1, 2.0e-2, 2.0e-2),
+            build_laminar_simple_iteration_summary(3, 1.2, 2.1e-2, 2.1e-2),
+        ];
+
+        assert!(estimate_simple_iterations_to_convergence(&history, &options).is_none());
+    }
+
+    #[test]
+    fn estimate_iterations_to_convergence_requires_decay() {
+        let history = vec![1.0e-2, 5.0e-3, 2.5e-3];
+        let estimate = estimate_iterations_to_convergence(&history, 1.0e-5)
+            .expect("estimate should exist for geometric decay");
+
+        assert_eq!(estimate.geometric_ratio, 0.5);
+        assert!(estimate.additional_iterations >= 1);
     }
 
     #[test]
@@ -4737,14 +8123,279 @@ mod tests {
             Some(250)
         );
         assert_eq!(
-            numerics_dictionary_value(&dictionary, "solvers.p", "solver")
-                .and_then(parse_openfoam_laminar_solver),
-            Some(LaminarSimpleLinearSolver::Pcg)
+            parse_openfoam_laminar_solver(
+                numerics_dictionary_value(&dictionary, "solvers.p", "solver").unwrap()
+            )
+            .unwrap(),
+            LaminarSimpleLinearSolver::Pcg
+        );
+        assert!(parse_openfoam_laminar_solver("smoothSolver").is_err());
+        assert_eq!(
+            parse_openfoam_laminar_solver("symGaussSeidel").unwrap(),
+            LaminarSimpleLinearSolver::SymGaussSeidel
         );
         assert_eq!(
-            numerics_dictionary_value(&dictionary, "solvers.p", "preconditioner")
-                .and_then(parse_openfoam_laminar_preconditioner),
-            Some(LaminarSimplePreconditioner::Diagonal)
+            parse_openfoam_laminar_preconditioner(
+                numerics_dictionary_value(&dictionary, "solvers.p", "preconditioner").unwrap()
+            )
+            .unwrap(),
+            LaminarSimplePreconditioner::IncompleteCholesky
+        );
+        assert!(parse_openfoam_laminar_preconditioner("DILU").is_err());
+    }
+
+    #[test]
+    fn rejects_dictionary_form_for_simple_residual_control() {
+        let dictionary = SolverNumericsDictionaryPlan {
+            present: true,
+            sections: vec![ferrum_mesh::solver_plan::SolverNumericsSectionPlan {
+                path: "SIMPLE.residualControl.U".to_string(),
+                entries: 2,
+            }],
+            entries: Vec::new(),
+        };
+
+        let error = validate_laminar_residual_control_dictionary(&dictionary)
+            .expect_err("nested residualControl must fail");
+
+        assert!(error.contains("single scalar"));
+        assert!(error.contains("SIMPLE.residualControl.U"));
+    }
+
+    #[test]
+    fn rejects_unsolved_fields_in_simple_residual_control() {
+        let dictionary = SolverNumericsDictionaryPlan {
+            present: true,
+            sections: Vec::new(),
+            entries: vec![ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
+                section: "SIMPLE.residualControl".to_string(),
+                key: "T".to_string(),
+                value: "1e-5".to_string(),
+            }],
+        };
+
+        let error = validate_laminar_residual_control_dictionary(&dictionary)
+            .expect_err("unsolved residualControl field must fail");
+
+        assert!(error.contains("supported solved fields are U and p"));
+    }
+
+    fn laminar_simple_test_plan(density: f64, dynamic_viscosity: f64) -> SolverCasePlan {
+        SolverCasePlan {
+            case_dir: PathBuf::from("case"),
+            control: ControlDict {
+                path: PathBuf::from("controlDict"),
+                application: "ferrumSolver".to_string(),
+                start_from: "startTime".to_string(),
+                start_time: Some(0.0),
+                stop_at: "endTime".to_string(),
+                end_time: Some(100.0),
+                delta_t: Some(1.0),
+                write_control: "timeStep".to_string(),
+                write_interval: None,
+            },
+            mesh: SolverMeshPlan {
+                points: 0,
+                cells: 0,
+                faces: 0,
+                internal_faces: 0,
+                boundary_faces: 0,
+                patches: 0,
+                empty_patches: 0,
+                wedge_patches: 0,
+                symmetry_patches: 0,
+                dimensionality: SolverDimensionality::ThreeD,
+                region_meshes: Vec::new(),
+            },
+            fields: SolverFieldPlan { fields: Vec::new() },
+            state: ferrum_mesh::solver_state::SolverStatePlan {
+                fields: Vec::new(),
+                warnings: Vec::new(),
+            },
+            runtime_data: SolverRuntimeData {
+                mesh: SolverRuntimeMeshData {
+                    points: 0,
+                    cells: 0,
+                    faces: 0,
+                    internal_faces: 0,
+                    boundary_faces: 0,
+                    owner: Vec::new(),
+                    neighbour: Vec::new(),
+                    patches: Vec::new(),
+                    face_centres: Vec::new(),
+                    face_area_vectors: Vec::new(),
+                    cell_centres: Vec::new(),
+                    cell_volumes: Vec::new(),
+                    min_face_area: 0.0,
+                    max_face_area: 0.0,
+                    min_cell_volume: 0.0,
+                    max_cell_volume: 0.0,
+                    total_cell_volume: 0.0,
+                    non_positive_cell_volumes: 0,
+                },
+                fields: Vec::new(),
+                warnings: Vec::new(),
+            },
+            properties: SolverPropertiesPlan {
+                dictionaries: Vec::new(),
+                entries: vec![
+                    SolverPropertyEntryPlan {
+                        dictionary: "transportProperties".to_string(),
+                        section: None,
+                        key: "rho".to_string(),
+                        value: format!("{density}"),
+                    },
+                    SolverPropertyEntryPlan {
+                        dictionary: "transportProperties".to_string(),
+                        section: None,
+                        key: "mu".to_string(),
+                        value: format!("{dynamic_viscosity}"),
+                    },
+                ],
+            },
+            numerics: SolverNumericsPlan {
+                fv_schemes: SolverNumericsDictionaryPlan {
+                    present: true,
+                    sections: Vec::new(),
+                    entries: vec![
+                        ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
+                            section: "gradSchemes".to_string(),
+                            key: "default".to_string(),
+                            value: "Gauss linear".to_string(),
+                        },
+                        ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
+                            section: "divSchemes".to_string(),
+                            key: "div(phi,U)".to_string(),
+                            value: "Gauss upwind".to_string(),
+                        },
+                        ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
+                            section: "laplacianSchemes".to_string(),
+                            key: "default".to_string(),
+                            value: "Gauss linear corrected".to_string(),
+                        },
+                        ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
+                            section: "interpolationSchemes".to_string(),
+                            key: "default".to_string(),
+                            value: "linear".to_string(),
+                        },
+                        ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
+                            section: "snGradSchemes".to_string(),
+                            key: "default".to_string(),
+                            value: "corrected".to_string(),
+                        },
+                    ],
+                },
+                fv_solution: SolverNumericsDictionaryPlan {
+                    present: true,
+                    sections: Vec::new(),
+                    entries: vec![
+                        ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
+                            section: "solvers.U".to_string(),
+                            key: "solver".to_string(),
+                            value: "smoothSolver".to_string(),
+                        },
+                        ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
+                            section: "solvers.U".to_string(),
+                            key: "smoother".to_string(),
+                            value: "symGaussSeidel".to_string(),
+                        },
+                        ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
+                            section: "solvers.U".to_string(),
+                            key: "tolerance".to_string(),
+                            value: "1e-10".to_string(),
+                        },
+                        ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
+                            section: "solvers.p".to_string(),
+                            key: "solver".to_string(),
+                            value: "PCG".to_string(),
+                        },
+                        ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
+                            section: "solvers.p".to_string(),
+                            key: "preconditioner".to_string(),
+                            value: "DIC".to_string(),
+                        },
+                        ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
+                            section: "solvers.p".to_string(),
+                            key: "tolerance".to_string(),
+                            value: "1e-10".to_string(),
+                        },
+                    ],
+                },
+            },
+            interfaces: SolverInterfacePlan {
+                registry_available: false,
+                discovered_interfaces: 0,
+                boundary_face_zones: 0,
+                config_present: false,
+                configured_interfaces: 0,
+            },
+            backends: SolverBackendPlan {
+                config_present: false,
+                default: BackendChoice::Cpu,
+                uses_cpu: true,
+                uses_gpu: true,
+                mixed_execution: true,
+                cpu: SolverCpuResourcePlan {
+                    cpus: "auto".to_string(),
+                    cores_per_cpu: "auto".to_string(),
+                    threads: "auto".to_string(),
+                    thread_pinning: "off".to_string(),
+                    numa: "auto".to_string(),
+                },
+                gpu: SolverGpuResourcePlan {
+                    backend: "auto".to_string(),
+                    devices: vec!["auto".to_string()],
+                    multi_gpu: "auto".to_string(),
+                    precision: "f64".to_string(),
+                },
+                stages: Vec::new(),
+            },
+            run: SolverRunPlan {
+                stop_at: "endTime".to_string(),
+                start_time: Some(0.0),
+                end_time: Some(100.0),
+                delta_t: Some(1.0),
+                estimated_steps: Some(100),
+                write_control: "timeStep".to_string(),
+                write_interval: None,
+                estimated_write_events: None,
+                stages: Vec::new(),
+            },
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn parses_laminar_simple_fv_schemes_subset() {
+        assert_eq!(
+            parse_laminar_simple_gradient_scheme("Gauss linear").expect("grad scheme"),
+            LaminarSimpleGradientScheme::GaussLinear
+        );
+        assert_eq!(
+            parse_laminar_simple_convection_scheme("Gauss upwind").expect("upwind scheme"),
+            LaminarSimpleConvectionScheme::GaussUpwind
+        );
+        assert_eq!(
+            parse_laminar_simple_convection_scheme("Gauss linearUpwind grad(U)")
+                .expect("linearUpwind scheme"),
+            LaminarSimpleConvectionScheme::GaussLinearUpwind
+        );
+        assert_eq!(
+            parse_laminar_simple_sn_grad_scheme("corrected").expect("snGrad scheme"),
+            LaminarSimpleSnGradScheme::Corrected
+        );
+        assert_eq!(
+            parse_laminar_simple_laplacian_scheme(
+                "Gauss linear corrected",
+                LaminarSimpleSnGradScheme::Orthogonal,
+            )
+            .expect("laplacian scheme"),
+            LaminarSimpleLaplacianScheme::GaussLinearCorrected
+        );
+        assert!(
+            parse_laminar_simple_convection_scheme("none")
+                .expect_err("default none must not be executable")
+                .contains("divSchemes.div(phi,U)")
         );
     }
 
