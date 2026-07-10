@@ -678,7 +678,7 @@ foreach ($variant in $variants) {
 
     Write-Output "variant $($variant.name): importing into FerrumCFD"
     New-Item -ItemType Directory -Force -Path $caseRoot | Out-Null
-    $importSeconds = Invoke-FerrumCommand "gmshToFerrumFoam" @($meshFile, "-case", $caseRoot) $importLog
+    $importSeconds = Invoke-FerrumCommand "gmshToFerrum" @($meshFile, "-case", $caseRoot) $importLog
     Copy-Item -LiteralPath $sourceSystem -Destination $caseRoot -Recurse -Force
     $caseInputSummary = Write-GmshPipeCaseInputs $caseRoot $variant $meshFile
     $checkSeconds = Invoke-FerrumCommand "checkFerrumMesh" @("-case", $caseRoot) $checkLog

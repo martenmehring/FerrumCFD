@@ -21,9 +21,9 @@ solver completion criteria remain in [docs/solver-roadmap.md](docs/solver-roadma
 ## First Commands
 
 ```powershell
-cargo run -p ferrum-cli --bin ferrum -- initCase examples\membrane_reactor
-cargo run -p ferrum-cli --bin ferrum -- gmshToFoam path\to\mesh.msh -case examples\membrane_reactor
-cargo run -p ferrum-cli --bin ferrum -- checkMesh -case examples\membrane_reactor
+cargo run -p ferrum-cli --bin ferrum -- initFerrumCase examples\membrane_reactor
+cargo run -p ferrum-cli --bin ferrum -- gmshToFerrum path\to\mesh.msh -case examples\membrane_reactor
+cargo run -p ferrum-cli --bin ferrum -- checkFerrumMesh -case examples\membrane_reactor
 cargo run -p ferrum-cli --bin ferrum -- solve -case examples\membrane_reactor --preflight --planJson target\ferrumSolverPlan.json
 ```
 
@@ -31,7 +31,7 @@ Alias binaries are provided too:
 
 ```powershell
 cargo run -p ferrum-cli --bin initFerrumCase -- examples\membrane_reactor
-cargo run -p ferrum-cli --bin gmshToFerrumFoam -- path\to\mesh.msh -case examples\membrane_reactor
+cargo run -p ferrum-cli --bin gmshToFerrum -- path\to\mesh.msh -case examples\membrane_reactor
 cargo run -p ferrum-cli --bin checkFerrumMesh -- -case examples\membrane_reactor
 cargo run -p ferrum-cli --bin splitFerrumMeshRegions -- -case examples\membrane_reactor -cellZones
 cargo run -p ferrum-cli --bin ferrumSolver -- -case examples\membrane_reactor --preflight --planJson target\ferrumSolverPlan.json
@@ -75,14 +75,14 @@ FerrumCFD follows the OpenFOAM mesh workflow:
 Examples:
 
 ```powershell
-gmshToFerrumFoam path\to\mesh2d.msh -case cases\plate2d -emptyPatch frontAndBack
-gmshToFerrumFoam path\to\axisymmetric.msh -case cases\reactor_axi -wedgePatch wedgeMin -wedgePatch wedgeMax
+gmshToFerrum path\to\mesh2d.msh -case cases\plate2d -emptyPatch frontAndBack
+gmshToFerrum path\to\axisymmetric.msh -case cases\reactor_axi -wedgePatch wedgeMin -wedgePatch wedgeMax
 ```
 
 Generic OpenFOAM-compatible patch types can be written with:
 
 ```powershell
-gmshToFerrumFoam path\to\mesh.msh -case cases\mesh -patchType symmetry=symmetryPlane
+gmshToFerrum path\to\mesh.msh -case cases\mesh -patchType symmetry=symmetryPlane
 ```
 
 ## Current Mesh Scope
@@ -217,3 +217,7 @@ The importer currently targets the membrane reactor test mesh shape:
 The importer was first tested with a private membrane reactor mesh generated
 with Gmsh. Mesh files and generated case output are intentionally ignored by
 Git because they can be large and may contain private geometry.
+
+## License
+
+FerrumCFD is licensed under the [MIT License](LICENSE).

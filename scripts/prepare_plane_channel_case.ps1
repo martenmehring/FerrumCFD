@@ -103,9 +103,9 @@ try {
         throw "initFerrumCase failed with exit code $LASTEXITCODE"
     }
 
-    cargo run -p ferrum-cli --bin gmshToFerrumFoam -- $MeshFile -case $CaseRoot -emptyPatch front -emptyPatch back
+    cargo run -p ferrum-cli --bin gmshToFerrum -- $MeshFile -case $CaseRoot -emptyPatch front -emptyPatch back
     if ($LASTEXITCODE -ne 0) {
-        throw "gmshToFerrumFoam failed with exit code $LASTEXITCODE"
+        throw "gmshToFerrum failed with exit code $LASTEXITCODE"
     }
 
     Copy-Item -Path (Join-Path $TemplateRoot "*") -Destination $CaseRoot -Recurse -Force

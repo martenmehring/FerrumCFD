@@ -91,7 +91,7 @@ pub fn run_alias(alias: Alias) -> i32 {
 
 #[derive(Clone, Copy)]
 pub enum Alias {
-    GmshToFerrumFoam,
+    GmshToFerrum,
     CheckFerrumMesh,
     SplitFerrumMeshRegions,
     InitFerrumCase,
@@ -108,7 +108,7 @@ enum CommandMode {
 fn run_command(mode: CommandMode, args: Vec<String>) -> Result<(), String> {
     match mode {
         CommandMode::Ferrum => run_ferrum_subcommand(args),
-        CommandMode::Alias(Alias::GmshToFerrumFoam) => gmsh_to_foam(args),
+        CommandMode::Alias(Alias::GmshToFerrum) => gmsh_to_ferrum(args),
         CommandMode::Alias(Alias::CheckFerrumMesh) => check_mesh(args),
         CommandMode::Alias(Alias::SplitFerrumMeshRegions) => split_mesh_regions(args),
         CommandMode::Alias(Alias::InitFerrumCase) => init_case_command(args),
@@ -126,13 +126,21 @@ fn run_ferrum_subcommand(mut args: Vec<String>) -> Result<(), String> {
 
     let command = args.remove(0);
     match command.as_str() {
-        "gmshToFoam" | "gmshToFerrumFoam" => gmsh_to_foam(args),
-        "checkMesh" | "checkFerrumMesh" => check_mesh(args),
-        "splitMeshRegions" | "splitFerrumMeshRegions" => split_mesh_regions(args),
-        "initCase" | "initFerrumCase" => init_case_command(args),
+        "gmshToFerrum" => gmsh_to_ferrum(args),
+        "checkFerrumMesh" => check_mesh(args),
+        "splitFerrumMeshRegions" => split_mesh_regions(args),
+        "initFerrumCase" => init_case_command(args),
         "solve" | "solver" | "ferrumSolver" => solve_case(args),
         "pipeBenchmark" | "ferrumPipeBenchmark" => pipe_benchmark(args),
         "planeChannelBenchmark" | "ferrumPlaneChannelBenchmark" => plane_channel_benchmark(args),
+        "gmshToFoam" | "gmshToFerrumFoam" => Err(format!(
+            "command '{command}' was replaced by 'gmshToFerrum'"
+        )),
+        "checkMesh" => Err("command 'checkMesh' was replaced by 'checkFerrumMesh'".to_string()),
+        "splitMeshRegions" => {
+            Err("command 'splitMeshRegions' was replaced by 'splitFerrumMeshRegions'".to_string())
+        }
+        "initCase" => Err("command 'initCase' was replaced by 'initFerrumCase'".to_string()),
         other => Err(format!("unknown ferrum command '{other}'")),
     }
 }
@@ -170,13 +178,13 @@ fn init_case_command(args: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
-fn gmsh_to_foam(args: Vec<String>) -> Result<(), String> {
+fn gmsh_to_ferrum(args: Vec<String>) -> Result<(), String> {
     if args.is_empty() || args.iter().any(|arg| is_help(arg)) {
-        print_gmsh_to_foam_usage();
+        print_gmsh_to_ferrum_usage();
         return Ok(());
     }
 
-    let import = parse_gmsh_to_foam_args(&args)?;
+    let import = parse_gmsh_to_ferrum_args(&args)?;
 
     println!("Reading Gmsh mesh: {}", import.mesh_path.display());
     let mesh = read_msh22_ascii(&import.mesh_path).map_err(|error| error.to_string())?;
@@ -2985,17 +2993,17 @@ fn print_openfoam_case_compatibility_warnings(warnings: &[String]) {
         .iter()
         .filter_map(|warning| {
             warning
-                .strip_prefix("openFOAM compatibility: ")
+                .strip_prefix("OpenFOAM compatibility: ")
                 .map(std::string::ToString::to_string)
         })
         .collect();
     if compatibility_warnings.is_empty() {
-        println!("openFOAM compatibility: case layout and required fields look present");
+        println!("OpenFOAM compatibility: case layout and required fields look present");
         return;
     }
 
     println!(
-        "openFOAM compatibility: {} item(s) to check",
+        "OpenFOAM compatibility: {} item(s) to check",
         compatibility_warnings.len()
     );
     for message in compatibility_warnings {
@@ -7118,16 +7126,16 @@ fn validate_case_name(value: &str, label: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
-struct GmshToFoamArgs {
+struct GmshToFerrumArgs {
     mesh_path: PathBuf,
     case_dir: PathBuf,
     options: FoamWriteOptions,
 }
 
-fn parse_gmsh_to_foam_args(args: &[String]) -> Result<GmshToFoamArgs, String> {
+fn parse_gmsh_to_ferrum_args(args: &[String]) -> Result<GmshToFerrumArgs, String> {
     let mesh_path = PathBuf::from(
         args.first()
-            .ok_or_else(|| "gmshToFerrumFoam requires a mesh path".to_string())?,
+            .ok_or_else(|| "gmshToFerrum requires a mesh path".to_string())?,
     );
     let mut case_dir = PathBuf::from(".");
     let mut options = FoamWriteOptions::default();
@@ -7178,11 +7186,11 @@ fn parse_gmsh_to_foam_args(args: &[String]) -> Result<GmshToFoamArgs, String> {
                     index += 3;
                 }
             }
-            other => return Err(format!("unknown gmshToFerrumFoam option '{other}'")),
+            other => return Err(format!("unknown gmshToFerrum option '{other}'")),
         }
     }
 
-    Ok(GmshToFoamArgs {
+    Ok(GmshToFerrumArgs {
         mesh_path,
         case_dir,
         options,
@@ -7225,10 +7233,10 @@ fn print_help() {
     println!("FerrumCFD mesh tools");
     println!();
     println!("usage:");
-    println!("  ferrum initCase <caseDir> [--region <name> ...] [--force]");
-    println!("  ferrum gmshToFoam <mesh.msh> [-case <caseDir>] [patch type options]");
-    println!("  ferrum checkMesh [-case <caseDir>]");
-    println!("  ferrum splitMeshRegions [-case <caseDir>] [-cellZones]");
+    println!("  ferrum initFerrumCase <caseDir> [--region <name> ...] [--force]");
+    println!("  ferrum gmshToFerrum <mesh.msh> [-case <caseDir>] [patch type options]");
+    println!("  ferrum checkFerrumMesh [-case <caseDir>]");
+    println!("  ferrum splitFerrumMeshRegions [-case <caseDir>] [-cellZones]");
     println!("  ferrum solve [-case <caseDir>] [--preflight] [--planJson <file>] [--runnerDryRun]");
     println!("  ferrum pipeBenchmark -case <caseDir> --fields <timeDir> [reference options]");
     println!(
@@ -7237,7 +7245,7 @@ fn print_help() {
     println!();
     println!("aliases:");
     println!("  initFerrumCase <caseDir> [--region <name> ...] [--force]");
-    println!("  gmshToFerrumFoam <mesh.msh> [-case <caseDir>] [patch type options]");
+    println!("  gmshToFerrum <mesh.msh> [-case <caseDir>] [patch type options]");
     println!("  checkFerrumMesh [-case <caseDir>]");
     println!("  splitFerrumMeshRegions [-case <caseDir>] [-cellZones]");
     println!("  ferrumSolver [-case <caseDir>] [--preflight] [--planJson <file>] [--runnerDryRun]");
@@ -7362,8 +7370,8 @@ fn print_solver_usage() {
     );
 }
 
-fn print_gmsh_to_foam_usage() {
-    println!("usage: gmshToFerrumFoam <mesh.msh> [-case <caseDir>] [patch type options]");
+fn print_gmsh_to_ferrum_usage() {
+    println!("usage: gmshToFerrum <mesh.msh> [-case <caseDir>] [patch type options]");
     println!();
     print_patch_type_options();
 }
@@ -7422,8 +7430,8 @@ mod tests {
         parse_laminar_simple_laplacian_scheme, parse_laminar_simple_sn_grad_scheme,
         parse_openfoam_laminar_preconditioner, parse_openfoam_laminar_solver,
         parse_pipe_benchmark_args, parse_plane_channel_benchmark_args, parse_solver_args,
-        resolve_laminar_simple_options, validate_laminar_residual_control_dictionary,
-        write_json_solver_state, write_json_string,
+        resolve_laminar_simple_options, run_ferrum_subcommand,
+        validate_laminar_residual_control_dictionary, write_json_solver_state, write_json_string,
     };
     use ferrum_mesh::backends::BackendChoice;
     use ferrum_mesh::control::ControlDict;
@@ -7444,6 +7452,39 @@ mod tests {
         SolverStateStoragePlan, SolverStateStorageStatus, SolverStateValueKind,
     };
     use std::path::PathBuf;
+
+    #[test]
+    fn ferrum_branded_workflow_commands_are_canonical() {
+        for command in [
+            "initFerrumCase",
+            "gmshToFerrum",
+            "checkFerrumMesh",
+            "splitFerrumMeshRegions",
+        ] {
+            assert!(
+                run_ferrum_subcommand(vec![command.to_string(), "--help".to_string()]).is_ok(),
+                "canonical command {command} should dispatch"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_openfoam_style_command_names_report_their_replacements() {
+        for (legacy, replacement) in [
+            ("initCase", "initFerrumCase"),
+            ("gmshToFoam", "gmshToFerrum"),
+            ("gmshToFerrumFoam", "gmshToFerrum"),
+            ("checkMesh", "checkFerrumMesh"),
+            ("splitMeshRegions", "splitFerrumMeshRegions"),
+        ] {
+            let error = run_ferrum_subcommand(vec![legacy.to_string()])
+                .expect_err("legacy command should not dispatch");
+            assert!(
+                error.contains(replacement),
+                "legacy command {legacy} should point to {replacement}, got {error}"
+            );
+        }
+    }
 
     #[test]
     fn parses_external_pipe_benchmark_options() {
