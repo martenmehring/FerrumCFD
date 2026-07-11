@@ -613,11 +613,12 @@ bounded implementation, use Claude Fable 5 for independent review, run the
 declared numerical and security gates, publish only a Draft PR, and return
 evidence to chat.
 
-The current shared n8n workflow is read-only analysis/review and has not passed
-that coding acceptance gate. Until `F-AUTO-1` is accepted in the orchestrator
-repository, an execution request must report that limitation rather than claim
-that n8n changed FerrumCFD. Read-only roadmap analysis may still use the current
-pinned-SHA workflow.
+The separate roadmap-coding workflow passed its complete live acceptance on
+July 11, 2026; `F-AUTO-1` is therefore satisfied. Its implementation,
+validation, Fable 5 review, cleanup and explicit Draft-PR publication boundary
+remain separate from the read-only analysis workflow. Any future change to
+that boundary must pass the orchestrator repository's acceptance procedure
+again before FerrumCFD uses it.
 
 Only leaf tasks may enter that workflow. The immediate-next-step IDs below are
 epics unless explicitly marked as a leaf. They decompose as follows:
@@ -653,9 +654,9 @@ sequence.
    tutorial-bundle, and canonical `ferrumRun` migration, including removal of
    the public algorithm-specific `ferrumSolver --solveLaminarSimple` path. This
    does not confirm any provisional future module boundary.
-2. **F-AUTO-1 (external dependency):** Build and accept the isolated n8n coding
-   workflow in the AI Dev Orchestrator repository; keep the existing analysis
-   workflow read-only.
+2. **F-AUTO-1 (accepted external dependency):** Keep the accepted isolated n8n
+   coding workflow in the AI Dev Orchestrator repository and preserve the
+   existing analysis workflow as a separate read-only path.
 3. **F-REF-1:** Retrospectively audit the existing source split and two tutorial
    bundles, then complete the OpenFOAM 13 reference maps, selected tutorial
    inventory, source ownership map, and license/provenance review before any
