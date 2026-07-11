@@ -4,6 +4,14 @@ FerrumCFD is an early Rust CFD platform focused on native, backend-aware
 finite-volume solvers and reproducible comparison with OpenFOAM 13 and
 analytical references.
 
+**Current project version:** `0.1.0` (pre-stable).
+
+FerrumCFD is a separate Rust project. OpenFOAM Foundation 13 is an optional
+external interoperability and numerical-validation reference, not an affiliated
+distribution. Checked-in sibling reference cases may be copied to a supported
+Linux machine for independent execution; `ferrumRun` itself does not require an
+OpenFOAM executable.
+
 The first executable application module is `incompressibleFluid`. Its current
 CPU implementation covers steady laminar SIMPLE cases and has validation
 bundles for a 3D circular pipe and a true 2D plane channel.

@@ -7,11 +7,51 @@ cases and an analytical, manufactured, or documented benchmark reference.
 Porous-media, Ergun, and packed-bed development starts only after all seven
 application drivers have passed their readiness gates.
 
+## Project Identity, Version, And Provenance Policy
+
+FerrumCFD is a distinct Rust finite-volume CFD platform. Its native
+architecture, public commands, case format, numerical kernels, backend model,
+and optimization work are defined and maintained within the FerrumCFD project.
+Numerical behavior is
+verified against analytical solutions, published benchmarks, and independently
+executed external reference solvers. Optional OpenFOAM Foundation 13
+interoperability and comparison assets remain isolated from native Ferrum
+architecture and do not imply affiliation or endorsement.
+
+OPENFOAM® is a registered trademark of OpenCFD Ltd. FerrumCFD is a separate
+project and is not affiliated with or endorsed by OpenCFD Ltd or The OpenFOAM
+Foundation. This acknowledgement accompanies releases and interoperability
+documentation without using the mark as a Ferrum product or command name.
+
+The current pre-stable product version is `0.1.0`. Version policy is:
+
+- `0.1.1`-style patch releases contain compatible fixes, security hardening,
+  validation corrections, and documentation/build repairs;
+- `0.2.0`-style minor releases add a development milestone and may include
+  explicitly documented pre-1.0 case, CLI, or library contract changes;
+- pre-releases such as `0.2.0-alpha.1` identify incomplete milestone candidates;
+- `1.0.0` establishes the first supported public CLI, case, library,
+  interoperability, and result/restart contracts;
+- after 1.0, incompatible public contracts require a major version.
+
+Leaf `F-REL-0.1.0` centralizes `version = "0.1.0"` in
+`[workspace.package]`, makes every package inherit it, adds consistent
+`--version` output to public executables, creates `docs/versioning.md`, and
+defines reproducible release/tag gates. A `v0.1.0` tag is created only after
+those gates pass; workflow attempt numbers are never product versions.
+
+Public documentation may describe automated security scanning, including
+Codex Security, as a source of candidate findings. Scanner output still
+requires manual validation and targeted tests. Public project documentation
+does not expose internal implementation-provider or model details.
+
 ## Target Repository Layout
 
-The repository converges on the following OpenFOAM-inspired responsibility
-layout. The names describe Ferrum ownership; they do not permit OpenFOAM
-implementation code to leak into native Ferrum components.
+The repository converges on the following Ferrum-owned responsibility layout.
+External solver layouts may be studied for interoperability and validation, but
+they do not define Ferrum ownership. Third-party implementation code must not be
+incorporated into MIT-licensed native crates without compatible authorization
+and recorded provenance.
 
 ```text
 FerrumCFD/
@@ -125,12 +165,17 @@ map under `docs/reference/openfoam-v13/` that records:
    reusable capability;
 7. the OpenFOAM decomposition, rank communication, reconstruction, and
    multi-region interface path where parallel execution applies;
-8. at least one unchanged official OpenFOAM 13 tutorial execution with logs
-   and reference results stored under `target/reference-audits/`;
-9. a decision table separating behavior to mirror, mathematics to reimplement,
-   formats to support only through interoperability, and features deferred;
+8. at least one unchanged official OpenFOAM 13 tutorial execution from an
+   isolated disposable copy on a separate supported Linux/WSL/CI environment,
+   never in place under `/opt/openfoam13/tutorials`, with logs and reference
+   results stored under `target/reference-audits/`;
+9. a decision table separating externally observable behavior to validate,
+   numerical methods to implement from cited primary references, formats
+   confined to interoperability, and deferred features;
 10. independent mathematical primary references and acceptance observables;
-11. license and provenance notes for source, case, mesh, and benchmark material.
+11. license and provenance notes for source, case, mesh, and benchmark material;
+12. a capability/provenance matrix with columns
+    `Capability | Mathematical reference | Ferrum owner | Ferrum status | External validation | OpenFOAM reference scope | License/provenance decision`.
 
 The currently verified local baseline is OpenFOAM Foundation 13 build
 `13-441953dfbb42` under `/opt/openfoam13`. Its `foamRun` path selects one module
@@ -140,6 +185,18 @@ advances the coupled regions through shared phase and time loops. The
 `decomposePar -allRegions`, `runParallel foamMultiRun`, and
 `reconstructPar -allRegions`; Ferrum must audit that behavior before defining
 its coupled decomposition contract.
+
+The pinned tree contains 54 top-level `incompressibleFluid` entries and 53
+detected runnable case roots identified by `system/controlDict`. The first
+inventory leaf, `F-REF-D1-MODULE-INVENTORY`, records top-level grouping,
+generation, and overlay entries separately from runnable case roots. Of the 53
+case roots, 48 declare `solver incompressibleFluid`; their 53
+`momentumTransport` dictionaries classify 15 as laminar, 35 as RAS, and 3 as
+LES. Coupling, time scheme, fields, and capability gaps are classified per
+runnable case root, not per top-level directory. Auditing every entry does not
+claim that every case is already supported. Each runnable row receives one
+status: `native`, `partial`, `planned`, `interoperability-only`, or
+`out-of-scope`, plus the exact blocking capability and its future driver.
 
 The first audit pass for each driver covers at least these OpenFOAM 13 areas:
 
@@ -173,12 +230,25 @@ derived bundle is excluded from the MIT license scope and carries the required
 upstream license plus a root `THIRD_PARTY_NOTICES` entry. A provenance note by
 itself is not a license grant.
 
+The OpenFOAM sibling cases are validation/interoperability assets.
+`ferrumRun` neither embeds nor requires an OpenFOAM executable. Users may copy a
+sibling case to a supported Linux machine and execute it with their own
+OpenFOAM Foundation 13 installation. Developer validation tooling may
+explicitly invoke a separately installed and pinned OpenFOAM Foundation 13
+environment against disposable case copies below `target/`. FerrumCFD does not
+redistribute the OpenFOAM executable.
+
 Before Driver 2 is accepted, the reference map must contain a frozen inventory
 of all OpenFOAM 13 SIMPLE/SIMPLEC/PISO/PIMPLE tutorials selected for Ferrum's
 incompressible scope. Each selected row has a Ferrum case, an independent
 OpenFOAM v13 case, an analytical/manufactured/benchmark reference, acceptance
 tolerances, and a status. This inventory defines what “all SIMPLE/PIMPLE cases”
-means and prevents silent scope drift.
+means and prevents silent scope drift. Every `native` case and every `partial`
+case whose missing capability belongs to the active driver receives its own
+bounded implementation-and-run leaf; unsupported rows remain explicit instead
+of being silently skipped or forced through the wrong solver. The accepted
+inventory is frozen by version and content hash before `F-D1-GATE`; changing it
+requires a reviewed roadmap amendment rather than a silent dynamic expansion.
 
 The native source split follows a reviewed, acyclic dependency graph:
 
@@ -474,14 +544,14 @@ resident across iterations and reports every unavoidable host transfer.
 Before Driver 2 starts, steady incompressible SIMPLE/SIMPLEC must pass this
 tutorial matrix:
 
-| Order | Case | Primary coverage | Reference |
-| ---: | --- | --- | --- |
-| 1 | `laminarPipe` | 3D internal flow and pressure loss | Hagen-Poiseuille analytical solution |
-| 2 | `planeChannel` | true 2D `empty` handling | Plane-Poiseuille analytical solution |
-| 3 | `couettePoiseuille` | moving wall and combined pressure/shear forcing | Analytical velocity profile |
-| 4 | `lidDrivenCavity` | recirculation and closed-pressure reference | Published benchmark |
-| 5 | `backwardFacingStep` | separation, reattachment, and outlet robustness | Published benchmark |
-| 6 | `axisymmetricPipe` | `wedge` handling | Hagen-Poiseuille analytical solution |
+| Order | Case | Case origin | Primary coverage | Reference |
+| ---: | --- | --- | --- | --- |
+| 1 | `laminarPipe` | project-maintained matched bundle; origin audit pending `F-REF-1` | 3D internal flow and pressure loss | Hagen-Poiseuille analytical solution |
+| 2 | `planeChannel` | project-maintained matched bundle; origin audit pending `F-REF-1` | true 2D `empty` handling | Plane-Poiseuille analytical solution |
+| 3 | `couettePoiseuille` | planned project-authored matched bundle | moving wall and combined pressure/shear forcing | Analytical velocity profile |
+| 4 | `lidDrivenCavity` | planned project-authored matched bundle | recirculation and closed-pressure reference | Published benchmark |
+| 5 | `backwardFacingStep` | planned project-authored matched bundle | separation, reattachment, and outlet robustness | Published benchmark |
+| 6 | `axisymmetricPipe` | planned project-authored matched bundle | `wedge` handling | Hagen-Poiseuille analytical solution |
 
 Every case contains independently runnable `ferrum/` and `openfoam-v13/`
 directories plus `shared/geometry`, `shared/physicalParameters.toml`,
@@ -491,6 +561,12 @@ documented `benchmark/` or manufactured reference. Coarse/medium/fine, skewed,
 and non-orthogonal variants belong to these bundles instead of becoming
 unrelated cases. The same bundle contract applies to every selected physics
 module; it is not special to incompressible flow.
+
+Official `planarCouette`, `planarPoiseuille`, `cavity`, `pitzDailySteady`,
+`cylinder`, and `venturiTube` configurations are classified from their actual
+v13 dictionaries before reuse as references. A similarly named Ferrum case is
+not labelled an unchanged official tutorial when its time scheme, turbulence
+model, geometry, or control algorithm differs.
 
 ## Runner And Multi-Region Milestone
 
@@ -597,36 +673,33 @@ A driver is complete only when:
   explained;
 - case-specific acceptance logic remains outside the generic driver.
 
-## Roadmap Execution Through The Coding-Agent Workflow
+## Automated Engineering Delivery
 
-Editing this roadmap is a planning operation. When the user asks to "work
-through the roadmaps" or gives an equivalent execution instruction, only a
-bounded leaf task is delegated through the separate AI Dev Orchestrator/n8n
-repository; an epic, driver portfolio, or open-ended "continue" request is not
-a valid coding task.
+Editing this roadmap is a planning operation. When the project owner asks to
+"work through the roadmaps" or gives an equivalent execution instruction, only
+a bounded leaf task enters the accepted isolated engineering workflow; an epic
+or complete driver portfolio is decomposed before implementation begins.
 
-The authoritative worktree, branch, model, security, persistence, and Draft-PR
-policy lives in the orchestrator repository and is referenced here as external
-dependency `F-AUTO-1`. FerrumCFD requires that accepted workflow to pin a clean
-`ferrumcfd/main` SHA, isolate the implementation worktree, use Codex for the
-bounded implementation, use Claude Fable 5 for independent review, run the
-declared numerical and security gates, publish only a Draft PR, and return
-evidence to chat.
+The authoritative worktree, branch, security, persistence, independent-review,
+and Draft-PR policy lives in the external delivery system and is referenced
+here as dependency `F-AUTO-1`. It must pin a clean `ferrumcfd/main` SHA, isolate
+the implementation worktree, enforce the bounded path set, run declared
+numerical and security gates, keep implementation and review independent,
+publish only a Draft PR, and return reproducible evidence for approval.
 
-The separate roadmap-coding workflow passed its complete live acceptance on
-July 11, 2026; `F-AUTO-1` is therefore satisfied. Its implementation,
-validation, Fable 5 review, cleanup and explicit Draft-PR publication boundary
-remain separate from the read-only analysis workflow. Any future change to
-that boundary must pass the orchestrator repository's acceptance procedure
-again before FerrumCFD uses it.
+The delivery workflow passed its complete live acceptance on July 11, 2026;
+`F-AUTO-1` is therefore satisfied. Implementation, deterministic validation,
+independent review, cleanup, and explicit Draft-PR publication remain separate
+from read-only analysis. Any change to that boundary requires renewed
+acceptance before FerrumCFD uses it.
 
 Only leaf tasks may enter that workflow. The immediate-next-step IDs below are
 epics unless explicitly marked as a leaf. They decompose as follows:
 
 - reference work: `F-REF-D<driver>-MODULE` and one
   `F-REF-D<driver>-CASE-<case>` per official or analytical case;
-- existing bundle migration: `F-LAYOUT-PARAMS-LAMINARPIPE` and
-  `F-LAYOUT-PARAMS-PLANECHANNEL`, each with its own drift test;
+- existing bundle migration: `F-LAYOUT-PARAMS-LAMINARPIPE-CONTRACT` and
+  `F-LAYOUT-PARAMS-PLANECHANNEL-CONTRACT`, each with its own drift test;
 - Driver 1/2 implementation: one ID per boundary condition, operator,
   SIMPLEC/PISO/PIMPLE behavior, or tutorial case, followed by a separate driver
   gate task;
@@ -650,25 +723,39 @@ sequence.
 
 ## Immediate Next Steps
 
-1. **F-LAYOUT-1:** Merge the already implemented current-layout,
-   tutorial-bundle, and canonical `ferrumRun` migration, including removal of
-   the public algorithm-specific `ferrumSolver --solveLaminarSimple` path. This
-   does not confirm any provisional future module boundary.
-2. **F-AUTO-1 (accepted external dependency):** Keep the accepted isolated n8n
-   coding workflow in the AI Dev Orchestrator repository and preserve the
-   existing analysis workflow as a separate read-only path.
-3. **F-REF-1:** Retrospectively audit the existing source split and two tutorial
-   bundles, then complete the OpenFOAM 13 reference maps, selected tutorial
-   inventory, source ownership map, and license/provenance review before any
-   new module, tutorial, or `src` boundary is implemented.
-4. **F-ARCH-1:** Extract the `incompressibleFluid` module registry and common solver
-   lifecycle from the transitional combined crates with parity tests.
-5. **F-IO-1:** Specify and implement `FerrumFile v1`; isolate OpenFOAM support behind the
-   `openfoamIO` interoperability layer.
-6. **F-D1D2-1:** Complete Driver 1 SIMPLE/SIMPLEC and Driver 2 PISO/PIMPLE on the scalar CPU
-   reference backend for the frozen selected-case inventory.
-7. **F-BACKEND-1:** Accept `ferrumRun` successively on threaded CPU, distributed CPU, one GPU,
-   and multiple GPUs without changing case numerics.
-8. **F-D3D7-1:** Implement Drivers 3 through 7 in the fixed order above, applying the common
-   readiness gate and completing coupled `ferrumMultiRun` before Driver 6.
-9. **F-POROUS-1:** Begin porous-media and packed-bed work only after Driver 7 is complete.
+1. **F-REL-0.1.0 (leaf):** Centralize and expose version `0.1.0`, document
+   SemVer/release gates, and defer tag `v0.1.0` until those gates pass.
+2. **F-POSITIONING-1 (leaf):** Apply the independent-project wording and
+   provider-neutral delivery language across public documentation; retain
+   truthful provenance, licensing, security-scanner, and non-affiliation notes.
+   The bounded audit covers `README.md`, `docs/architecture.md`,
+   `applications/README.md`, `src/README.md`, `CHANGELOG.md`, and tutorial
+   documentation.
+3. **F-LAYOUT-PARAMS-LAMINARPIPE-CONTRACT (maintainer publication gate, not a
+   coding leaf):** Review Draft PR #4; merge only after explicit maintainer
+   approval and required checks, then synchronize `main`. If the publisher
+   identity policy requires a replacement, close #4 only after the replacement
+   Draft PR has reproduced the sealed tree and evidence.
+4. **F-LAYOUT-PARAMS-PLANECHANNEL-CONTRACT (leaf):** Complete the canonical
+   shared parameters and full field/property/mesh/geometry drift contract.
+5. **F-REF-D1-MODULE-INVENTORY (leaf):** Inventory the 54 top-level entries and
+   53 detected runnable case roots, then create the capability/provenance
+   matrix. Select all currently supported cases and record the exact blocker
+   for every deferred case.
+6. **F-ARCH-1:** Extract the `incompressibleFluid` module registry and common
+   solver lifecycle from transitional combined crates with parity tests.
+7. **F-IO-1:** Specify `FerrumFile v1` and isolate OpenFOAM support behind the
+   `openfoamIO` interoperability layer before new permanent case bundles.
+8. **F-D1-CASES (leaf series):** Implement and independently run each remaining
+   selected Driver 1 bundle: Ferrum, external OpenFOAM 13 case, and analytical
+   or documented benchmark reference.
+9. **F-D1-GATE:** Pass the frozen, versioned, hash-bound Driver 1 inventory on
+   the scalar CPU reference backend.
+10. **F-D2-PISO-PIMPLE (leaf series):** Add transient lifecycle capability and
+   execute the selected incompressible PISO/PIMPLE inventory.
+11. **F-BACKEND-1:** After Driver 1/2 scalar correctness, accept `ferrumRun` on
+    threaded CPU, distributed CPU, one GPU, and multiple GPUs without changing
+    case numerics.
+12. **F-D3D7-1:** Implement Drivers 3 through 7 in order, completing coupled
+    `ferrumMultiRun` before Driver 6.
+13. **F-POROUS-1:** Begin porous-media and packed-bed work only after Driver 7.
