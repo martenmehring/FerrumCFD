@@ -15,5 +15,8 @@ runner. That compatibility path overlays only the selected mesh, initial
 fields, and viscosity onto the native OpenFOAM 13 configuration; it is never
 used by the canonical default run.
 
-Ferrum does not parse or execute this case. Shared SI values and comparison
-targets live in `../comparison.toml`.
+Ferrum does not parse or execute this case. Canonical shared SI values live in
+`../shared/physicalParameters.toml`; implementation selection and comparison
+observables live in `../comparison.toml`. Drift tests enforce agreement, but
+OpenFOAM still reads only its native dictionaries, so this case remains
+independently runnable.

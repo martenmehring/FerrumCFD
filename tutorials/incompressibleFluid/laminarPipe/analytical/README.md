@@ -13,8 +13,10 @@ deltaP = 32 * mu * L * meanU / D^2
 Q = pi * R^4 * deltaP / (8 * mu * L)
 ```
 
-The canonical SI inputs are recorded in `../comparison.toml` and the detailed
-legacy benchmark dictionary `pipeBenchmark`. For `D=0.02 m`, `L=1 m`,
+The canonical SI inputs are recorded in `../shared/physicalParameters.toml`.
+The current benchmark scripts independently consume the detailed analytical
+dictionary `pipeBenchmark`; drift tests keep that runtime input aligned with
+the shared comparison metadata. For `D=0.02 m`, `L=1 m`,
 `mu=0.001002 Pa s`, and `meanU=0.02 m/s`, the expected pressure loss is
 `1.6032 Pa`.
 

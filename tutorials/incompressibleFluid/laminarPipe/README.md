@@ -17,12 +17,19 @@ resolution. Regenerate it with:
 powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\generate_laminar_pipe_case.ps1
 ```
 
+The comparison source of truth is the versioned English metadata file
+`shared/physicalParameters.toml`. It records the canonical SI parameters and
+is currently enforced by integration drift tests. `comparison.toml` points to
+that file and retains implementation selection and comparison observables.
+
 The default reference uses `D = 0.02 m`, `L = 1 m`, mean velocity
 `U = 0.02 m/s`, and water near 20 C. FerrumCFD values are SI by default:
 pressure is stored in Pa, length in m, temperature in K, and velocity in m/s.
 Use explicit units only when a value is not SI.
-The analytic inputs are not part of the simulation case. They are stored in
-`tutorials/incompressibleFluid/laminarPipe/analytical/pipeBenchmark` and are consumed only by benchmark scripts.
+The Ferrum and OpenFOAM cases remain independently runnable: current solvers
+and scripts consume their separate runtime dictionaries, while benchmark
+scripts also consume `analytical/pipeBenchmark`. They do not consume the
+shared TOML metadata at runtime.
 
 The inlet velocity boundary is a fully developed parabolic profile. The
 generator scales the discrete inlet values so the patch-integrated flow matches

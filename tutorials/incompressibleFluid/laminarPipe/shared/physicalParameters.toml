@@ -1,0 +1,32 @@
+schema_version = 1
+unit_system = "SI"
+
+[case]
+id = "incompressibleFluid.laminarPipe"
+title = "Laminar circular-pipe flow"
+regime = "laminar"
+
+[geometry]
+length_m = 1.0
+diameter_m = 0.02
+axis = "x"
+
+[fluid]
+reference_temperature_k = 293.15
+density_kg_per_m3 = 998.2
+dynamic_viscosity_pa_s = 0.001002
+kinematic_viscosity_m2_per_s = 1.0038068523342016e-6
+
+[flow]
+mean_velocity_m_per_s = 0.02
+inlet_velocity_profile = "parabolicFullyDeveloped"
+
+[pressure_loss]
+model = "Hagen-Poiseuille"
+delta_p_pa = 1.6032
+minor_losses = false
+
+[provenance]
+description = "Canonical comparison inputs for the laminarPipe FerrumCFD tutorial."
+source = "FerrumCFD laminarPipe benchmark definition"
+reference_temperature_k = 293.15
