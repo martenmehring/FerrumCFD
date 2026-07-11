@@ -33,7 +33,7 @@ tutorials/
       shared/
       ferrum/
       openfoam-v13/
-      analytical/            # optional
+      analytical/            # solution or documented not-applicable decision
       benchmark/             # optional fallback
       comparison.toml
       README.md
@@ -53,10 +53,12 @@ its own native mesh and owns its numerical configuration.
 Small canonical validation meshes may be versioned in each program-specific
 source case so a clean checkout is independently runnable. Regenerated mesh
 variants, time directories, logs, and reports belong below `target/`. An
-`analytical/` directory is added only when a closed-form, semi-analytical, or
-manufactured solution is valid. When no such solution exists, `benchmark/`
-contains a documented independent reference with provenance, units, sampling,
-and tolerances. Empty or invented analytical references are forbidden.
+`analytical/` directory is present in every case bundle. It contains the
+closed-form, semi-analytical, or manufactured solution when one is valid. When
+no useful analytical reference exists, `analytical/README.md` records that
+decision and `benchmark/` contains a documented independent reference with
+provenance, units, sampling, and tolerances. Empty or invented analytical
+references are forbidden.
 
 The first layout migration places the reusable mesh/finite-volume foundation
 under `src/ferrumMesh` and the still-combined implementation package under
@@ -87,9 +89,9 @@ transient execution until those algorithms exist. Existing Ferrum compatibility
 cases without a transport-regime dictionary are treated as laminar; when
 `momentumTransport` or legacy `turbulenceProperties` is present, it must set
 exactly `simulationType laminar`. RAS/LES is rejected instead of silently
-running the wrong kernel. `ferrumSolver --solveLaminarSimple` remains available
-only as a temporary compatibility and low-level benchmark interface during the
-staged split.
+running the wrong kernel. There is no public algorithm-specific executable or
+`--solveLaminarSimple` selector; `ferrumRun` calls the selected module lifecycle
+directly.
 
 Drivers 1 and 2 are separate validation/readiness gates, but both are served
 by the same `incompressibleFluid` module: Driver 1 validates steady
@@ -101,6 +103,13 @@ SIMPLE/SIMPLEC and Driver 2 validates transient PISO/PIMPLE.
 `ferrumMultiRun` owns one coupled case with multiple named regions and one
 module per region. The latter follows OpenFOAM 13 `foamMultiRun`; it is not a
 batch launcher for unrelated cases or parameter sweeps.
+
+Both runners use the same backend-neutral execution context and module kernels.
+After the complete selected SIMPLE/SIMPLEC/PISO/PIMPLE case inventory passes on
+the scalar CPU reference backend, `ferrumRun` is accepted successively on
+multi-threaded CPU, partitioned/distributed CPU, one GPU, and multiple GPUs.
+`ferrumMultiRun` then schedules those accepted kernels over its coupled region
+dependency graph instead of introducing a second compute stack.
 
 A future native control dictionary will express a mapping such as the
 following illustrative form. The actual thermal-fluid and solid-energy module
@@ -278,12 +287,14 @@ ferrumBackends
 This dictionary is parsed and validated as case metadata, but not yet consumed
 by executable solvers.
 
-Nonlinear solver stages must stay backend-selectable from the beginning. A
-Newton-style solver should not be CPU-bound by design: residual evaluation,
-Jacobian assembly, linear correction solves, convergence checks, and batched
-chemistry ODE solves must all be able to target CPU, GPU, or an auto policy.
-This is one of the architectural differences FerrumCFD should preserve over a
-CPU-first OpenFOAM-style implementation.
+Nonlinear solver interfaces and data ownership must stay backend-neutral from
+the beginning. A Newton-style solver should not be CPU-bound by design:
+residual evaluation, Jacobian assembly, linear correction solves, convergence
+checks, and batched chemistry ODE solves must all be able to target CPU, GPU,
+or an auto policy. Actual parallel CPU/GPU kernels are implemented only after
+the selected SIMPLE/SIMPLEC/PISO/PIMPLE correctness matrix passes on the scalar
+CPU reference backend. This preserves a deliberate validation order without
+requiring a later architectural rewrite.
 
 CPU remains a deliberate execution target, not a fallback of last resort. Users
 must be able to keep a solve on CPU when the GPU is needed elsewhere, when a
@@ -470,24 +481,26 @@ terms. Constraint patches such as `empty`, `wedge`, and `symmetryPlane` remain
 solver constraints rather than ordinary diffusive boundary faces. This assembly
 layer must stay separate from the linear solver implementation: equation code
 builds a system, while CPU/GPU backends decide how that system is solved.
-The compatibility command `ferrumSolver --solveScalarDiffusion <field>` is the first executable path
-through that stack: it reads one scalar field, assembles one CPU system, solves
-it with CG or Jacobi, reports residual and wall-clock time, and deliberately
-does not write fields or enter the full CFD time loop.
+The developer utility `ferrum solve --solveScalarDiffusion <field>` is the first
+executable path through that stack: it reads one scalar field, assembles one CPU
+system, solves it with CG or Jacobi, reports residual and wall-clock time, and
+deliberately does not write fields or enter the full CFD time loop. It is not a
+public application solver.
 
-The compatibility command `ferrumSolver --solvePoiseuille` is the first flow benchmark path. It uses the
-same scalar operator for the fully developed axial Stokes balance driven by
-`deltaP/L`, applies wall no-slip as `Ux=0`, compares the resulting volume
-average against Hagen-Poiseuille, and reports timing and residuals. This is a
-controlled bridge toward the later momentum-pressure solver; it is not yet a
-SIMPLE, PISO, or full Navier-Stokes implementation.
+The developer utility `ferrum solve --solvePoiseuille` is the first flow
+benchmark path. It uses the same scalar operator for the fully developed axial
+Stokes balance driven by `deltaP/L`, applies wall no-slip as `Ux=0`, compares
+the resulting volume average against Hagen-Poiseuille, and reports timing and
+residuals. This is a controlled validation utility, not a public application
+solver and not a SIMPLE, PISO, or full Navier-Stokes implementation.
 
-The implementation behind `ferrumRun -solver incompressibleFluid` is currently
-the legacy `ferrumSolver --solveLaminarSimple` bridge. It reads `U`, `p`,
-`transportProperties`, `fvSchemes`, and `fvSolution`, constructs the first flow
-operators on the same runtime `polyMesh` geometry, writes solver reports as
-JSON/Markdown, and can write final `U`/`p` fields into an explicitly selected
-OpenFOAM-like time directory. The current implementation is an executable laminar SIMPLE
+The implementation behind `ferrumRun -solver incompressibleFluid` invokes the
+internal laminar SIMPLE kernel directly. Its temporary physical location in the
+combined compatibility library does not create a second public solver command.
+It reads `U`, `p`, `transportProperties`, `fvSchemes`, and `fvSolution`,
+constructs the first flow operators on the same runtime `polyMesh` geometry,
+writes solver reports as JSON/Markdown, and can write final `U`/`p` fields into
+an explicitly selected OpenFOAM-like time directory. The current implementation is an executable laminar SIMPLE
 development path rather than a production `simpleFoam` replacement: it uses
 OpenFOAM-style equation relaxation and pressure relaxation, continues SIMPLE
 iterations without artificial field clipping, and reports continuity,

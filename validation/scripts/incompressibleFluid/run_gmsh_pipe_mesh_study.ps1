@@ -758,7 +758,7 @@ foreach ($variant in $variants) {
             }
             ferrum = [pscustomobject][ordered]@{
                 preflightStatus = if ($null -ne $comparison) { $comparison.benchmarkStatus.ferrumPreflight } else { "missing" }
-                solveStatus = if ($null -ne $comparison) { $comparison.benchmarkStatus.ferrumSolverComparison } else { "missing" }
+                solveStatus = if ($null -ne $comparison) { $comparison.benchmarkStatus.ferrumRunComparison } else { "missing" }
                 pressureDropFromMeanPa = if ($null -ne $ferrumResult) { $ferrumResult.pressureDropFromMeanPa } else { $null }
                 relativePressureDropErrorToAnalytic = if ($null -ne $ferrumResult) { $ferrumResult.relativePressureDropErrorToAnalytic } else { $null }
                 meanVelocityMps = if ($null -ne $ferrumResult) { $ferrumResult.meanVelocityMps } else { $null }

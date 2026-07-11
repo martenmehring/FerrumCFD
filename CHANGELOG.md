@@ -18,11 +18,12 @@ are distinguished explicitly.
   RAS/LES configuration.
 - Versioned solver-plan JSON as schema 2 and added the effective module plus
   `cli`/`controlDict` selection provenance without overwriting raw case input.
-- Updated solver reports to identify `incompressibleFluid` as the module and
-  record `SIMPLE`, `laminar`, and the internal implementation separately;
-  schema version 2 also preserves `legacySolver=laminarSimple` for migration.
-- Kept `ferrumSolver --solveLaminarSimple` as an explicit temporary
-  compatibility and low-level benchmark interface.
+- Updated schema-version-2 solver reports to identify
+  `solver=incompressibleFluid`, `algorithm=SIMPLE`, and `regime=laminar`.
+- Removed the legacy `ferrumSolver` executable and its algorithm-selection
+  flag. Application execution now enters the same internal SIMPLE kernel only
+  through `ferrumRun -solver incompressibleFluid`; developer-only scalar and
+  Poiseuille utilities remain under `ferrum solve`.
 - Added tracked responsibility boundaries for `ferrumRun`, `ferrumMultiRun`,
   `incompressibleFluid`, mesh/case/post-processing utilities, native I/O,
   OpenFOAM interoperability, finite-volume code, core runtime, and models.
@@ -61,9 +62,11 @@ are distinguished explicitly.
 
 ### First Executable Flow Solver - 2026-07-10
 
-FerrumCFD now has its first independent finite-volume flow solver. The Rust
-`ferrumSolver --solveLaminarSimple` path solves steady, laminar,
-incompressible pressure-velocity systems on the generic runtime mesh. Analytic
+FerrumCFD now has its first independent finite-volume flow solver. In the
+historical 2026-07-10 milestone it was invoked as
+`ferrumSolver --solveLaminarSimple`; the current public command is
+`ferrumRun -solver incompressibleFluid`. The implementation solves steady,
+laminar, incompressible pressure-velocity systems on the generic runtime mesh. Analytic
 relations and OpenFOAM comparison logic remain external benchmark tools and do
 not influence solver convergence or field updates.
 

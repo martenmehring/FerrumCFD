@@ -36,14 +36,14 @@ Ferrum currently solves the source-driven axial Stokes/Poiseuille benchmark on
 CPU and reconstructs pressure loss from mean velocity. This is not yet the full
 SIMPLE-like pressure-velocity solver.
 
-## Laminar SIMPLE Path
+## incompressibleFluid SIMPLE Path
 
-The first `--solveLaminarSimple` benchmark uses the same medium pipe case,
-OpenFOAM-like field files, and SI inputs.
+The first `ferrumRun -solver incompressibleFluid` SIMPLE benchmark uses the
+same medium pipe case, OpenFOAM-like field files, and SI inputs.
 
 | Source | Mean velocity [m/s] | DeltaP from mean [Pa] | Stored p-field deltaP [Pa] | Error to analytic | Solve/wall time [s] |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| FerrumCFD laminarSimple | 0.019989 | 1.602328 | 2.143763 | -0.054% | 22.441697 solve |
+| FerrumCFD incompressibleFluid | 0.019989 | 1.602328 | 2.143763 | -0.054% | 22.441697 solve |
 | OpenFOAM simpleFoam | n/a | 1.6401231 | n/a | 2.303% | 12.7306 wall |
 
 This path is a real finite-volume pressure-velocity assembly bridge, but it is
@@ -188,9 +188,12 @@ Follow-up isolation on 2026-07-09 with the pressure-assembly reports shows:
   diagnostics, and `424` pressure linear iterations, down from the earlier
   diagonal-preconditioned order of `1133` for the same short run.
 
-### SIMPLE Solver Experiments
+### Historical SIMPLE Solver Experiments
 
-Local experiment on the same medium pipe case:
+The commands below are immutable provenance for experiments recorded before
+the public runner migration. They are no longer executable; equivalent new
+runs use `ferrumRun -solver incompressibleFluid` without an algorithm-selection
+flag.
 
 ```powershell
 ferrumSolver -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --solveLaminarSimple --momentumLinearSolver bicgstab --pressureLinearSolver pcg --pressurePreconditioner DIC --maxSimpleIterations 20

@@ -58,7 +58,7 @@ $arguments = @{
     BenchmarkProperties = $BenchmarkProperties
     Mode = $Mode
     OpenFoamSteps = $OpenFoamSteps
-    FerrumSolver = "laminarSimple"
+    FerrumMode = "incompressibleFluid"
     FerrumSimpleIterations = $FerrumSimpleIterations
 }
 if ($SkipOpenFoam) {

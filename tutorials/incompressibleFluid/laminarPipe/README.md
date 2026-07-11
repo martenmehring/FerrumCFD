@@ -95,7 +95,7 @@ Useful checks:
 ```powershell
 checkFerrumMesh -case tutorials\incompressibleFluid\laminarPipe\ferrum\case
 ferrumRun -solver incompressibleFluid -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --runnerDryRun --maxRunnerSteps 2 --planJson target\laminar_pipe_plan.json
-ferrumSolver -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --solvePoiseuille --pressureDrop 1.6032 --mu 0.001002 --length 1 --diameter 0.02 --linearSolver cg
+ferrum solve -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --solvePoiseuille --pressureDrop 1.6032 --mu 0.001002 --length 1 --diameter 0.02 --linearSolver cg
 ferrumRun -solver incompressibleFluid -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --solveTolerance 1e-6 --maxIterations 100 --solveReportJson target\benchmarks\laminar_pipe_laminar_simple.json --solveReportMarkdown target\benchmarks\laminar_pipe_laminar_simple.md
 ferrumRun -solver incompressibleFluid -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --maxSimpleIterations 2 --writeFinalFields target\benchmarks\laminar_pipe_fields\1
 ferrumPipeBenchmark -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --fields target\benchmarks\laminar_pipe_fields\1 --pressureDrop 1.6032 --mu 0.001002 --length 1 --diameter 0.02 --axis x --inletPatch inlet --outletPatch outlet

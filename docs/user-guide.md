@@ -21,7 +21,6 @@ target/debug/gmshToFerrum.exe
 target/debug/checkFerrumMesh.exe
 target/debug/splitFerrumMeshRegions.exe
 target/debug/ferrumRun.exe
-target/debug/ferrumSolver.exe
 target/debug/ferrumPipeBenchmark.exe
 target/debug/ferrumPlaneChannelBenchmark.exe
 ```
@@ -420,9 +419,9 @@ ferrumPipeBenchmark
 ferrumPlaneChannelBenchmark
 ```
 
-`ferrumSolver` remains available as a temporary compatibility interface for
-the prototype scalar and Poiseuille benchmark modes. New case workflows use
-`ferrumRun`.
+Application cases are run only through `ferrumRun`. The combined `ferrum
+solve` subcommand retains developer-only scalar-diffusion and Poiseuille
+equation benchmarks; it is not an application solver entry point.
 
 ## Units Policy
 
@@ -508,7 +507,7 @@ The current local Gmsh pipe mesh-study record is summarized in
 
 `validation\scripts\incompressibleFluid\run_poiseuille_benchmark.ps1` runs OpenFOAM Foundation 13
 `foamRun -solver incompressibleFluid`, runs
-`ferrumSolver --solvePoiseuille`, compares both with Hagen-Poiseuille, and
+`ferrum solve --solvePoiseuille`, compares both with Hagen-Poiseuille, and
 writes `target/benchmarks/laminar_pipe_compare.json` plus
 `target/benchmarks/laminar_pipe_compare.md`. Use `-SkipOpenFoam
 -UseExistingOpenFoamJson` when only the Ferrum side should be rerun against an
@@ -540,13 +539,12 @@ interoperability override. Plan JSON keeps the raw control values and records
 the effective dispatch separately as `dispatch.module` and
 `dispatch.source=cli|controlDict`.
 
-The following low-level compatibility commands remain useful to solver
-developers and validation automation, but they are not the public naming
-contract:
+The following low-level developer commands remain useful to validation
+automation, but they are not application solver entry points:
 
 ```powershell
-ferrumSolver -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --solveScalarDiffusion T --diffusivity 1 --linearSolver cg
-ferrumSolver -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --solvePoiseuille --linearSolver cg
+ferrum solve -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --solveScalarDiffusion T --diffusivity 1 --linearSolver cg
+ferrum solve -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --solvePoiseuille --linearSolver cg
 ```
 
 Equivalent combined command:
@@ -631,7 +629,7 @@ It reads the selected `volScalarField` from `0/`, converts supported
 system, and solves it with `cg` or `jacobi`:
 
 ```powershell
-ferrumSolver -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --solveScalarDiffusion T --diffusivity 1 --linearSolver cg --solveTolerance 1e-8 --maxIterations 20000
+ferrum solve -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --solveScalarDiffusion T --diffusivity 1 --linearSolver cg --solveTolerance 1e-8 --maxIterations 20000
 ```
 
 Supported field boundary types for this path are currently `fixedValue uniform
@@ -652,7 +650,7 @@ benchmark-oriented. `deltaP`, `L`, and `D` must be supplied explicitly;
 `mu` may be explicit or read from `constant/transportProperties`:
 
 ```powershell
-ferrumSolver -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --solvePoiseuille --pressureDrop 1.6032 --mu 0.001002 --length 1 --diameter 0.02 --wallPatch wall --linearSolver cg
+ferrum solve -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --solvePoiseuille --pressureDrop 1.6032 --mu 0.001002 --length 1 --diameter 0.02 --wallPatch wall --linearSolver cg
 ```
 
 The analytical reference is Hagen-Poiseuille:
@@ -721,9 +719,7 @@ ferrumPipeBenchmark -case tutorials\incompressibleFluid\laminarPipe\ferrum\case 
 ```
 
 Solver report schema version 2 records `solver=incompressibleFluid`,
-`algorithm=SIMPLE`, `regime=laminar`, and the internal
-`implementation=laminarSimple` separately. `legacySolver=laminarSimple` is
-retained as an explicit migration field.
+`algorithm=SIMPLE`, and `regime=laminar`.
 
 The first two commands are geometry-independent SIMPLE execution. The third is
 optional external post-processing of stored fields. `--pressureDrop`, `--length`,
@@ -1106,7 +1102,7 @@ consumed by built-in solver code.
   required material models and coefficients are not enforced yet.
 - `ferrumRun` is the public preflight/run dispatcher; `--runnerDryRun`
   previews scheduling only. `--solveScalarDiffusion <field>` and
-  `--solvePoiseuille` remain low-level `ferrumSolver` compatibility modes, and
+  `--solvePoiseuille` remain low-level `ferrum solve` developer utilities, and
   full general CFD time-loop execution is not implemented yet.
 - CPU/GPU backend selection is validated as configuration and not yet
   executable solver behavior.

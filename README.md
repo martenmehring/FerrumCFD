@@ -14,8 +14,7 @@ ferrumRun -solver incompressibleFluid -case <case>
 
 `incompressibleFluid` is the permanent public module name. Laminar flow is a
 model regime, while SIMPLE, SIMPLEC, PISO, and PIMPLE are algorithms selected
-by the case. The older `ferrumSolver --solveLaminarSimple` command remains only
-as a temporary compatibility and low-level benchmark interface.
+by the case. There is no separate algorithm-named solver executable.
 
 ## Quick Start
 
@@ -62,6 +61,12 @@ coupled multi-region runner: one case, several regions, one module per region,
 and a shared phase-oriented coupling loop. Its design includes CPU, GPU, mixed
 CPU/GPU, and multi-GPU resource placement. It is intentionally not a batch or
 parameter-sweep tool.
+
+Both runners share one backend contract. After the selected steady and
+transient incompressible SIMPLE/SIMPLEC/PISO/PIMPLE cases pass on the serial CPU
+reference backend, `ferrumRun` advances through threaded CPU, distributed CPU,
+single-GPU, and multi-GPU acceptance. `ferrumMultiRun` reuses those kernels for
+coupled regions.
 
 ## Documentation
 

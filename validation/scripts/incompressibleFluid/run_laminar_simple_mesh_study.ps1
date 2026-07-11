@@ -202,7 +202,7 @@ foreach ($variant in $variants) {
             OutFile = $compareJson
             ReportFile = $compareReport
             BenchmarkProperties = $BenchmarkProperties
-            FerrumSolver = "laminarSimple"
+            FerrumMode = "incompressibleFluid"
             FerrumSimpleIterations = $FerrumSimpleIterations
         }
         if ($SkipFerrumSolve) {
@@ -229,7 +229,7 @@ foreach ($variant in $variants) {
             mesh = $comparison.mesh
             analytic = $comparison.analytic
             ferrum = [pscustomobject][ordered]@{
-                status = $comparison.benchmarkStatus.ferrumSolverComparison
+                status = $comparison.benchmarkStatus.ferrumRunComparison
                 pressureDropFromOwnerCellsPa = $comparison.comparison.ferrumPressureDropFromOwnerCellsPa
                 relativePressureDropFromOwnerCellsErrorToAnalytic = if ($null -ne $comparison.comparison.ferrumPressureDropFromOwnerCellsPa -and $comparison.analytic.deltaPPa -ne 0.0) {
                     (($comparison.comparison.ferrumPressureDropFromOwnerCellsPa - $comparison.analytic.deltaPPa) / $comparison.analytic.deltaPPa)
@@ -275,7 +275,7 @@ $summary = [pscustomobject][ordered]@{
     studyRoot = $StudyRoot
     openFoamMode = if ($SkipOpenFoam) { "skipped" } else { $Mode }
     openFoamSteps = if ($SkipOpenFoam) { 0 } else { $OpenFoamSteps }
-    ferrumSolver = if ($SkipFerrumSolve) { "skipped" } else { "laminarSimple" }
+    ferrumMode = if ($SkipFerrumSolve) { "skipped" } else { "incompressibleFluid" }
     ferrumSimpleIterations = $FerrumSimpleIterations
     benchmarkProperties = $BenchmarkProperties
     variants = $rowArray

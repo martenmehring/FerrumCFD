@@ -14,8 +14,8 @@ param(
     [switch]$UseFerrumCaseForOpenFoam,
     [switch]$UseExistingOpenFoamJson,
     [switch]$SkipFerrumSolve,
-    [ValidateSet("poiseuille", "laminarSimple")]
-    [string]$FerrumSolver = "poiseuille",
+    [ValidateSet("poiseuille", "incompressibleFluid")]
+    [string]$FerrumMode = "poiseuille",
     [ValidateSet("jacobi", "cg")]
     [string]$FerrumLinearSolver = "cg",
     [double]$FerrumSolveTolerance = 1e-8,
@@ -102,7 +102,7 @@ if ($SkipOpenFoam) {
     & $runOpenFoam @openFoamArgs
 }
 
-Write-Output "running Ferrum/OpenFOAM/analytic $FerrumSolver comparison"
+Write-Output "running Ferrum/OpenFOAM/analytic $FerrumMode comparison"
 $compareArgs = @{
     CaseRoot = $CaseRoot
     OpenFoamJson = $openFoamJsonForCompare
@@ -110,7 +110,7 @@ $compareArgs = @{
     OutFile = $OutFile
     ReportFile = $ReportFile
     BenchmarkProperties = $BenchmarkProperties
-    FerrumSolver = $FerrumSolver
+    FerrumMode = $FerrumMode
     FerrumLinearSolver = $FerrumLinearSolver
     FerrumSolveTolerance = $FerrumSolveTolerance
     FerrumMaxIterations = $FerrumMaxIterations
@@ -121,5 +121,5 @@ if ($SkipFerrumSolve) {
 }
 & $compare @compareArgs
 
-Write-Output "$FerrumSolver benchmark JSON: $OutFile"
-Write-Output "$FerrumSolver benchmark report: $ReportFile"
+Write-Output "$FerrumMode benchmark JSON: $OutFile"
+Write-Output "$FerrumMode benchmark report: $ReportFile"

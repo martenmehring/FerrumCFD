@@ -33,10 +33,6 @@ name = "initFerrumCase"
 path = "src/bin/init_ferrum_case.rs"
 
 [[bin]]
-name = "ferrumSolver"
-path = "src/bin/ferrum_solver.rs"
-
-[[bin]]
 name = "ferrumPipeBenchmark"
 path = "src/bin/ferrum_pipe_benchmark.rs"
 

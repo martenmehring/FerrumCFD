@@ -97,7 +97,6 @@ pub enum Alias {
     SplitFerrumMeshRegions,
     InitFerrumCase,
     FerrumRun,
-    FerrumSolver,
     FerrumPipeBenchmark,
     FerrumPlaneChannelBenchmark,
 }
@@ -115,7 +114,6 @@ fn run_command(mode: CommandMode, args: Vec<String>) -> Result<(), String> {
         CommandMode::Alias(Alias::SplitFerrumMeshRegions) => split_mesh_regions(args),
         CommandMode::Alias(Alias::InitFerrumCase) => init_case_command(args),
         CommandMode::Alias(Alias::FerrumRun) => run_solver_module(args),
-        CommandMode::Alias(Alias::FerrumSolver) => solve_case(args),
         CommandMode::Alias(Alias::FerrumPipeBenchmark) => pipe_benchmark(args),
         CommandMode::Alias(Alias::FerrumPlaneChannelBenchmark) => plane_channel_benchmark(args),
     }
@@ -134,7 +132,7 @@ fn run_ferrum_subcommand(mut args: Vec<String>) -> Result<(), String> {
         "splitFerrumMeshRegions" => split_mesh_regions(args),
         "initFerrumCase" => init_case_command(args),
         "run" | "ferrumRun" => run_solver_module(args),
-        "solve" | "solver" | "ferrumSolver" => solve_case(args),
+        "solve" => solve_case(args),
         "pipeBenchmark" | "ferrumPipeBenchmark" => pipe_benchmark(args),
         "planeChannelBenchmark" | "ferrumPlaneChannelBenchmark" => plane_channel_benchmark(args),
         "gmshToFoam" | "gmshToFerrumFoam" => Err(format!(
@@ -397,7 +395,7 @@ fn run_solver_module(args: Vec<String>) -> Result<(), String> {
 
     let FerrumRunArgs {
         solver,
-        mut forwarded_args,
+        forwarded_args,
         execute,
     } = parse_ferrum_run_args(&args)?;
 
@@ -410,14 +408,15 @@ fn run_solver_module(args: Vec<String>) -> Result<(), String> {
         }
     };
 
-    if execute {
-        forwarded_args.push("--solveLaminarSimple".to_string());
-    }
-
     solve_case_with_contract(
         forwarded_args,
         execute.then_some(("incompressibleFluid", "SIMPLE")),
         Some(dispatch),
+        if execute {
+            SolverInvocation::IncompressibleFluidExecute
+        } else {
+            SolverInvocation::IncompressibleFluidPlanOnly
+        },
     )
 }
 
@@ -481,9 +480,9 @@ fn parse_ferrum_run_args(args: &[String]) -> Result<FerrumRunArgs, String> {
             index += 1;
             continue;
         }
-        if is_legacy_execution_selector(arg) {
+        if is_utility_execution_selector(arg) {
             return Err(format!(
-                "'{arg}' is a legacy execution selector; use 'ferrumRun -solver incompressibleFluid' and configure SIMPLE/PISO/PIMPLE in the case"
+                "'{arg}' is a developer utility selector; use it through 'ferrum solve', not ferrumRun"
             ));
         }
 
@@ -512,7 +511,7 @@ fn parse_ferrum_run_args(args: &[String]) -> Result<FerrumRunArgs, String> {
     })
 }
 
-fn is_legacy_execution_selector(arg: &str) -> bool {
+fn is_utility_execution_selector(arg: &str) -> bool {
     matches!(
         arg,
         "-solveScalarDiffusion"
@@ -523,28 +522,38 @@ fn is_legacy_execution_selector(arg: &str) -> bool {
             | "--solvePoiseuille"
             | "-solve-poiseuille"
             | "--solve-poiseuille"
-            | "-solveLaminarSimple"
-            | "--solveLaminarSimple"
-            | "-solve-laminar-simple"
-            | "--solve-laminar-simple"
     )
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SolverInvocation {
+    Utility,
+    IncompressibleFluidPlanOnly,
+    IncompressibleFluidExecute,
+}
+
 fn solve_case(args: Vec<String>) -> Result<(), String> {
-    solve_case_with_contract(args, None, None)
+    solve_case_with_contract(args, None, None, SolverInvocation::Utility)
 }
 
 fn solve_case_with_contract(
     args: Vec<String>,
     required_module_section: Option<(&str, &str)>,
     dispatch: Option<SolverDispatch>,
+    invocation: SolverInvocation,
 ) -> Result<(), String> {
     if args.iter().any(|arg| is_help(arg)) {
         print_solver_usage();
         return Ok(());
     }
 
-    let options = parse_solver_args(&args)?;
+    let options = match invocation {
+        SolverInvocation::Utility => parse_solver_args(&args)?,
+        SolverInvocation::IncompressibleFluidPlanOnly => {
+            parse_incompressible_fluid_plan_args(&args)?
+        }
+        SolverInvocation::IncompressibleFluidExecute => parse_incompressible_fluid_args(&args)?,
+    };
     let plan = build_solver_case_plan(&options.case_dir).map_err(|error| error.to_string())?;
     if let Some((module, required_section)) = required_module_section {
         validate_module_execution_contract(&plan, module, required_section)?;
@@ -1596,7 +1605,7 @@ fn run_laminar_simple_solve(
         let mut print_iteration = |item: &LaminarSimpleIterationSummary| {
             if !printed_header {
                 println!(
-                    "laminarSimple residual history (OpenFOAM-style initial/final residuals; linear and outer convergence are separate):"
+                    "incompressibleFluid residual history (OpenFOAM-style initial/final residuals; linear and outer convergence are separate):"
                 );
                 printed_header = true;
             }
@@ -1630,7 +1639,7 @@ fn run_laminar_simple_solve(
     let wall_clock_seconds = started.elapsed().as_secs_f64();
 
     println!(
-        "laminarSimple solve: backend=cpu linearSolver={} momentumLinearSolver={} momentumPreconditioner={} pressureLinearSolver={} pressurePreconditioner={} divPhiU=\"{}\" gradP=\"{}\" gradU=\"{}\" laplacian=\"{}\" snGrad=\"{}\" interpolation=\"{}\" pRefCell={} pRefValue={} nonOrthogonalCorrectors={} consistent={} stopReason={} cells={} faces={} simpleIterations={} minSimpleIterations={} converged={} residualControl={} initialContinuityL2={} finalContinuityL2={} momentumInitialResidual={} momentumFinalResidual={} momentumResidualNorm={} pressureInitialResidual={} pressureFinalResidual={} pressureResidualNorm={} momentumLinearIterations={} pressureLinearIterations={} wallClockSeconds={:.6}",
+        "incompressibleFluid solve: backend=cpu linearSolver={} momentumLinearSolver={} momentumPreconditioner={} pressureLinearSolver={} pressurePreconditioner={} divPhiU=\"{}\" gradP=\"{}\" gradU=\"{}\" laplacian=\"{}\" snGrad=\"{}\" interpolation=\"{}\" pRefCell={} pRefValue={} nonOrthogonalCorrectors={} consistent={} stopReason={} cells={} faces={} simpleIterations={} minSimpleIterations={} converged={} residualControl={} initialContinuityL2={} finalContinuityL2={} momentumInitialResidual={} momentumFinalResidual={} momentumResidualNorm={} pressureInitialResidual={} pressureFinalResidual={} pressureResidualNorm={} momentumLinearIterations={} pressureLinearIterations={} wallClockSeconds={:.6}",
         options.linear_solver,
         options.momentum_linear_solver,
         options.momentum_preconditioner,
@@ -1669,7 +1678,7 @@ fn run_laminar_simple_solve(
         wall_clock_seconds
     );
     println!(
-        "laminarSimple residualControl: state={} checked={} satisfied={} U(tolerance={},initial={},satisfied={}) p(tolerance={},initial={},satisfied={})",
+        "incompressibleFluid residualControl: state={} checked={} satisfied={} U(tolerance={},initial={},satisfied={}) p(tolerance={},initial={},satisfied={})",
         residual_control_state(report.residual_control),
         yes_no(report.residual_control.checked),
         yes_no(report.residual_control.satisfied),
@@ -1681,7 +1690,7 @@ fn run_laminar_simple_solve(
         format_optional_bool(report.residual_control.pressure_satisfied),
     );
     println!(
-        "laminarSimple linearSolves: finalMomentumConverged={} finalPressureConverged={} momentumPredictors={} momentumNonConvergedPredictors={} momentumComponentSolves={} momentumComponentNonConvergedSolves={} pressureCorrectionSolves={} pressureCorrectionNonConvergedSolves={} maxMomentumIterationsPerSimple={} maxPressureIterationsPerSimple={} avgMomentumIterationsPerSimple={} avgPressureIterationsPerSimple={}",
+        "incompressibleFluid linearSolves: finalMomentumConverged={} finalPressureConverged={} momentumPredictors={} momentumNonConvergedPredictors={} momentumComponentSolves={} momentumComponentNonConvergedSolves={} pressureCorrectionSolves={} pressureCorrectionNonConvergedSolves={} maxMomentumIterationsPerSimple={} maxPressureIterationsPerSimple={} avgMomentumIterationsPerSimple={} avgPressureIterationsPerSimple={}",
         yes_no(report.linear_solve_summary.final_momentum_linear_converged),
         yes_no(report.linear_solve_summary.final_pressure_linear_converged),
         report.linear_solve_summary.momentum_predictors,
@@ -1714,7 +1723,7 @@ fn run_laminar_simple_solve(
         )
     );
     println!(
-        "laminarSimple fields: velocityMinMagnitude={} velocityMaxMagnitude={} velocityL2={} velocityXMin={} velocityXMax={} velocityYMin={} velocityYMax={} velocityZMin={} velocityZMax={} pressureMin={} pressureMax={} pressureL2={}",
+        "incompressibleFluid fields: velocityMinMagnitude={} velocityMaxMagnitude={} velocityL2={} velocityXMin={} velocityXMax={} velocityYMin={} velocityYMax={} velocityZMin={} velocityZMax={} pressureMin={} pressureMax={} pressureL2={}",
         format_scientific(report.fields.velocity.min_magnitude),
         format_scientific(report.fields.velocity.max_magnitude),
         format_scientific(report.fields.velocity.l2_norm),
@@ -1764,7 +1773,7 @@ fn run_laminar_simple_solve(
                 }
                 Err(error) => {
                     println!(
-                        "laminarSimple residual plot warning: {} (CSV: {})",
+                        "incompressibleFluid residual plot warning: {} (CSV: {})",
                         error,
                         csv_path.display()
                     )
@@ -1773,7 +1782,7 @@ fn run_laminar_simple_solve(
         }
     }
     println!(
-        "laminarSimple operators: phiMin={} phiMax={} phiSumAbs={} gradPL2={} hbyAL2={} divPhiUL2={} velocityFixedValueFaces={} velocityZeroGradientFaces={} velocityInletOutletFaces={} pressureFixedValueFaces={} pressureZeroGradientFaces={}",
+        "incompressibleFluid operators: phiMin={} phiMax={} phiSumAbs={} gradPL2={} hbyAL2={} divPhiUL2={} velocityFixedValueFaces={} velocityZeroGradientFaces={} velocityInletOutletFaces={} pressureFixedValueFaces={} pressureZeroGradientFaces={}",
         format_scientific(report.operator_summary.phi_min),
         format_scientific(report.operator_summary.phi_max),
         format_scientific(report.operator_summary.phi_sum_abs),
@@ -1798,7 +1807,7 @@ fn run_laminar_simple_solve(
             output_dir.display()
         );
     } else {
-        println!("laminarSimple status: no field files written");
+        println!("incompressibleFluid status: no field files written");
     }
 
     if let Some(path) = &solve.report_json {
@@ -2009,7 +2018,7 @@ fn print_laminar_simple_convergence_feedback(
             } else {
                 "iteration budget stopped".to_string()
             };
-            println!("laminarSimple convergence note: {budget_message}.");
+            println!("incompressibleFluid convergence note: {budget_message}.");
 
             if report.history.len() >= 2 {
                 let previous = &report.history[report.history.len() - 2];
@@ -2076,7 +2085,7 @@ fn print_laminar_simple_convergence_feedback(
                 );
             }
             println!(
-                "laminarSimple convergence note: no active convergence criteria (no residualControl in fvSolution)."
+                "incompressibleFluid convergence note: no active convergence criteria (no residualControl in fvSolution)."
             );
             println!(
                 "  to stop early, set SIMPLE.residualControl U/p in system/fvSolution. Benchmark acceptance is evaluated externally."
@@ -2100,17 +2109,17 @@ fn print_laminar_simple_convergence_feedback(
         }
         LaminarSimpleStopReason::MomentumSolverInvalidState => {
             println!(
-                "laminarSimple convergence note: momentum equation linear solve entered invalid state."
+                "incompressibleFluid convergence note: momentum equation linear solve entered invalid state."
             );
         }
         LaminarSimpleStopReason::PressureSolverInvalidState => {
             println!(
-                "laminarSimple convergence note: pressure equation linear solve entered invalid state."
+                "incompressibleFluid convergence note: pressure equation linear solve entered invalid state."
             );
         }
         LaminarSimpleStopReason::SolverInvalidState => {
             println!(
-                "laminarSimple convergence note: solver encountered a non-finite field/state."
+                "incompressibleFluid convergence note: solver encountered a non-finite field/state."
             );
         }
         LaminarSimpleStopReason::Converged => {}
@@ -2851,7 +2860,7 @@ fn validate_laminar_residual_control_dictionary(
         .find(|entry| entry.section == SECTION && entry.key != "U" && entry.key != "p")
     {
         return Err(format!(
-            "fvSolution {SECTION}.{} is not supported by laminarSimple; supported solved fields are U and p",
+            "fvSolution {SECTION}.{} is not supported by incompressibleFluid SIMPLE; supported solved fields are U and p",
             entry.key
         ));
     }
@@ -3295,7 +3304,7 @@ fn print_solver_case_plan(plan: &SolverCasePlan, dispatch: Option<&SolverDispatc
         }
     }
     println!(
-        "solver execution: CPU scalar diffusion, Poiseuille, and laminar SIMPLE kernels are available; GPU equation kernels are planned"
+        "solver execution: the incompressibleFluid steady laminar SIMPLE CPU kernel is available; scalar diffusion and Poiseuille remain developer utilities; GPU equation kernels are planned"
     );
 }
 
@@ -3801,12 +3810,6 @@ fn write_laminar_simple_report_json(
     writeln!(writer, ",")?;
     write_json_key(&mut writer, 2, "regime")?;
     write_json_string(&mut writer, "laminar")?;
-    writeln!(writer, ",")?;
-    write_json_key(&mut writer, 2, "implementation")?;
-    write_json_string(&mut writer, "laminarSimple")?;
-    writeln!(writer, ",")?;
-    write_json_key(&mut writer, 2, "legacySolver")?;
-    write_json_string(&mut writer, "laminarSimple")?;
     writeln!(writer, ",")?;
     write_json_key(&mut writer, 2, "backend")?;
     write_json_string(&mut writer, "cpu")?;
@@ -6766,6 +6769,21 @@ impl std::fmt::Display for ScalarDiffusionLinearSolver {
 }
 
 fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
+    parse_solver_args_for_invocation(args, SolverInvocation::Utility)
+}
+
+fn parse_incompressible_fluid_args(args: &[String]) -> Result<SolverArgs, String> {
+    parse_solver_args_for_invocation(args, SolverInvocation::IncompressibleFluidExecute)
+}
+
+fn parse_incompressible_fluid_plan_args(args: &[String]) -> Result<SolverArgs, String> {
+    parse_solver_args_for_invocation(args, SolverInvocation::IncompressibleFluidPlanOnly)
+}
+
+fn parse_solver_args_for_invocation(
+    args: &[String],
+    invocation: SolverInvocation,
+) -> Result<SolverArgs, String> {
     let mut case_dir = PathBuf::from(".");
     let mut plan_json = None;
     let mut runner_dry_run = false;
@@ -6774,7 +6792,6 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
     let mut scalar_diffusion_option_seen = false;
     let mut poiseuille_solve = false;
     let mut poiseuille_option_seen = false;
-    let mut laminar_simple_solve = false;
     let mut laminar_simple_option_seen = false;
     let mut shared_flow_option_seen = false;
     let mut density = None;
@@ -6867,13 +6884,6 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
             "-solvePoiseuille" | "--solvePoiseuille" | "-solve-poiseuille"
             | "--solve-poiseuille" => {
                 poiseuille_solve = true;
-                index += 1;
-            }
-            "-solveLaminarSimple"
-            | "--solveLaminarSimple"
-            | "-solve-laminar-simple"
-            | "--solve-laminar-simple" => {
-                laminar_simple_solve = true;
                 index += 1;
             }
             "-diffusivity" | "--diffusivity" => {
@@ -7239,7 +7249,7 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
                 laminar_simple_option_seen = true;
                 index += 2;
             }
-            other => return Err(format!("unknown ferrumSolver option '{other}'")),
+            other => return Err(format!("unknown ferrum solve option '{other}'")),
         }
     }
     let scalar_diffusion_solve = scalar_diffusion_field.map(|field| ScalarDiffusionSolveArgs {
@@ -7269,7 +7279,7 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
     } else {
         None
     };
-    let laminar_simple_solve = if laminar_simple_solve {
+    let laminar_simple_solve = if invocation == SolverInvocation::IncompressibleFluidExecute {
         Some(LaminarSimpleSolveArgs {
             density,
             dynamic_viscosity,
@@ -7306,7 +7316,10 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
         return Err("Poiseuille solve options require --solvePoiseuille".to_string());
     }
     if poiseuille_solve.is_none() && laminar_simple_solve.is_none() && shared_flow_option_seen {
-        return Err("--mu requires --solvePoiseuille or --solveLaminarSimple".to_string());
+        return Err(
+            "--mu requires the ferrum solve --solvePoiseuille utility or ferrumRun -solver incompressibleFluid"
+                .to_string(),
+        );
     }
     if (scalar_diffusion_solve.is_some() || poiseuille_solve.is_some())
         && let Some(error) = scalar_diffusion_linear_solver_error
@@ -7314,7 +7327,9 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
         return Err(error);
     }
     if laminar_simple_solve.is_none() && laminar_simple_option_seen {
-        return Err("Laminar SIMPLE solve options require --solveLaminarSimple".to_string());
+        return Err(
+            "incompressible flow options require ferrumRun -solver incompressibleFluid".to_string(),
+        );
     }
     if scalar_diffusion_solve.is_none()
         && poiseuille_solve.is_none()
@@ -7322,7 +7337,7 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
         && linear_solve_option_seen
     {
         return Err(
-            "linear solve options require --solveScalarDiffusion <field>, --solvePoiseuille, or --solveLaminarSimple"
+            "linear solve options require ferrum solve --solveScalarDiffusion <field>, ferrum solve --solvePoiseuille, or ferrumRun -solver incompressibleFluid"
                 .to_string(),
         );
     }
@@ -7331,7 +7346,7 @@ fn parse_solver_args(args: &[String]) -> Result<SolverArgs, String> {
         + laminar_simple_solve.is_some() as usize;
     if executable_solve_count > 1 {
         return Err(
-            "--solveScalarDiffusion, --solvePoiseuille, and --solveLaminarSimple cannot be combined in one command yet"
+            "developer utility solves cannot be combined with an incompressibleFluid application run"
                 .to_string(),
         );
     }
@@ -7614,7 +7629,6 @@ fn print_help() {
     println!("  checkFerrumMesh [-case <caseDir>]");
     println!("  splitFerrumMeshRegions [-case <caseDir>] [-cellZones]");
     println!("  ferrumRun -solver incompressibleFluid [-case <caseDir>] [run options]");
-    println!("  ferrumSolver ...  compatibility interface for prototype and benchmark modes");
     println!("  ferrumPipeBenchmark -case <caseDir> --fields <timeDir> [reference options]");
     println!(
         "  ferrumPlaneChannelBenchmark -case <caseDir> --fields <timeDir> [reference options]"
@@ -7642,6 +7656,29 @@ fn print_ferrum_run_usage() {
         "SIMPLE, SIMPLEC, PISO, PIMPLE, and laminar/turbulent model choices belong in the case, not in the public solver name"
     );
     println!("--preflight and --runnerDryRun inspect the case without executing equations");
+    println!();
+    println!("incompressibleFluid run options:");
+    println!("  --rho <kg/m3>                    override case density");
+    println!("  --mu <Pa.s>                      override case dynamic viscosity");
+    println!("  --linearSolver <name>            override both equation solvers");
+    println!("  --momentumLinearSolver <name>    override the U solver");
+    println!("  --pressureLinearSolver <name>    override the p solver");
+    println!("  --momentumPreconditioner <name>  override the U preconditioner");
+    println!("  --pressurePreconditioner <name>  override the p preconditioner");
+    println!("  --maxSimpleIterations <n>        override the SIMPLE iteration budget");
+    println!("  --minSimpleIterations <n>        set the minimum SIMPLE iterations");
+    println!("  --nNonOrthogonalCorrectors <n>   override pressure correctors");
+    println!("  --simpleConsistent [bool]        select consistent SIMPLE/SIMPLEC behavior");
+    println!("  --pRefCell <n>                   set the pressure reference cell");
+    println!("  --pRefValue <Pa>                 set the pressure reference value");
+    println!("  --velocityRelaxation <v>         override U relaxation");
+    println!("  --pressureRelaxation <v>         override p relaxation");
+    println!("  --solveVerbose                   print per-iteration residuals");
+    println!("  --solveResidualCsv <file>        write residual history CSV");
+    println!("  --solveResidualPlot <file>       render a residual plot");
+    println!("  --solveReportJson <file>         write the solver report as JSON");
+    println!("  --solveReportMarkdown <file>     write the solver report as Markdown");
+    println!("  --writeFinalFields <dir>         write final U and p fields");
 }
 
 fn print_init_case_usage() {
@@ -7660,18 +7697,10 @@ fn print_init_case_usage() {
 
 fn print_solver_usage() {
     println!(
-        "usage: ferrumSolver [-case <caseDir>] [--preflight] [--planJson <file>] [--runnerDryRun] [--maxRunnerSteps <n>] [--solveScalarDiffusion <field>|--solvePoiseuille|--solveLaminarSimple]"
+        "usage: ferrum solve [-case <caseDir>] [--preflight] [--planJson <file>] [--runnerDryRun] [--maxRunnerSteps <n>] [--solveScalarDiffusion <field>|--solvePoiseuille]"
     );
     println!();
-    println!("reads a FerrumCFD/OpenFOAM-like case and prints the solver preflight plan:");
-    println!("  system/controlDict");
-    println!("  system/fvSchemes");
-    println!("  system/fvSolution");
-    println!("  system/ferrumBackends");
-    println!("  constant/polyMesh");
-    println!("  constant/<property dictionaries>");
-    println!("  constant/interfaces");
-    println!("  0/<fields>");
+    println!("developer-only equation and benchmark utilities; application flow uses ferrumRun");
     println!();
     println!("options:");
     println!("  --planJson <file>    also write the solver-neutral plan as JSON");
@@ -7679,82 +7708,20 @@ fn print_solver_usage() {
     println!("  --maxRunnerSteps <n> limit runner dry-run preview steps (default: 3)");
     println!("  --solveScalarDiffusion <field> assemble and solve one CPU scalar diffusion system");
     println!("  --solvePoiseuille    solve a source-driven axial Stokes/Poiseuille benchmark");
-    println!("  --solveLaminarSimple solve the first laminar incompressible SIMPLE path");
     println!(
         "  --diffusivity <v>    scalar diffusion coefficient for --solveScalarDiffusion (default: 1)"
     );
     println!(
         "  --source <v>         uniform volume source for --solveScalarDiffusion (default: 0)"
     );
-    println!(
-        "  --linearSolver <s>   cg, pcg, gaussSeidel, symGaussSeidel, bicgstab, or jacobi for executable solves (default: cg; laminar SIMPLE reads fvSolution)"
-    );
-    println!(
-        "  --momentumLinearSolver <s> override laminar SIMPLE momentum solver (bicgstab, gaussSeidel, symGaussSeidel, cg, pcg, or jacobi)"
-    );
-    println!(
-        "  --pressureLinearSolver <s> override laminar SIMPLE pressure solver (bicgstab, gaussSeidel, symGaussSeidel, cg, pcg, or jacobi)"
-    );
-    println!(
-        "  --momentumPreconditioner <s> override laminar SIMPLE U preconditioner (none, diagonal; DIC requires PCG/SPD)"
-    );
-    println!(
-        "  --pressurePreconditioner <s> override laminar SIMPLE p preconditioner (none, diagonal, DIC/incompleteCholesky)"
-    );
-    println!(
-        "  --momentumSolveTolerance <v> override laminar SIMPLE U solve tolerance (default: --solveTolerance, fvSolution solvers.U.tolerance, or OpenFOAM 1e-6)"
-    );
-    println!(
-        "  --pressureSolveTolerance <v> override laminar SIMPLE p solve tolerance (default: --solveTolerance, fvSolution solvers.p.tolerance, or OpenFOAM 1e-6)"
-    );
-    println!(
-        "  --momentumMaxIterations <n> override laminar SIMPLE U linear iteration cap (default: fvSolution or OpenFOAM 1000)"
-    );
-    println!(
-        "  --pressureMaxIterations <n> override laminar SIMPLE p linear iteration cap (default: fvSolution or OpenFOAM 1000)"
-    );
+    println!("  --linearSolver <s>   cg or jacobi for utility solves");
     println!("  --pressureDrop <Pa>  pressure drop for --solvePoiseuille");
-    println!("  --rho <kg/m3>        density for --solveLaminarSimple");
-    println!("  --mu <Pa.s>          dynamic viscosity for --solvePoiseuille/--solveLaminarSimple");
+    println!("  --mu <Pa.s>          dynamic viscosity for --solvePoiseuille");
     println!("  --length <m>         pipe length for --solvePoiseuille");
     println!("  --diameter <m>       pipe diameter for --solvePoiseuille");
     println!("  --wallPatch <name>   wall patch for --solvePoiseuille (default: wall)");
-    println!(
-        "  --maxSimpleIterations <n> override SIMPLE iteration count (default: controlDict endTime/deltaT)"
-    );
-    println!(
-        "  --minSimpleIterations <n> minimum SIMPLE iterations before convergence (default: 1 for one-step runs, otherwise 2)"
-    );
-    println!(
-        "  --nNonOrthogonalCorrectors <n> override SIMPLE nNonOrthogonalCorrectors (default: fvSolution or 0)"
-    );
-    println!(
-        "  --simpleConsistent [bool] enable OpenFOAM-style SIMPLE consistent rAtU correction (default: fvSolution SIMPLE.consistent or false)"
-    );
-    println!("  --pRefCell <n>       pressure reference cell for closed-pressure cases");
-    println!("  --pRefValue <Pa>     pressure reference value (default: fvSolution or 0)");
-    println!(
-        "  --velocityRelaxation <v> override U relaxation for --solveLaminarSimple (default: fvSolution relaxationFactors.equations.U or no relaxation)"
-    );
-    println!(
-        "  --pressureRelaxation <v> override p relaxation for --solveLaminarSimple (default: fvSolution relaxationFactors.fields.p or no relaxation)"
-    );
-    println!(
-        "  --solveVerbose print per-iteration initial/final residuals and linear/outer convergence"
-    );
-    println!("  --solveResidualCsv <file> write SIMPLE residual history as CSV");
-    println!("  --solveResidualPlot <file> render residual plot image from CSV data");
-    println!("  --solveReportJson <file> write --solveLaminarSimple JSON report");
-    println!("  --solveReportMarkdown <file> write --solveLaminarSimple Markdown report");
-    println!(
-        "  --writeFinalFields <dir> write final U and p fields to an OpenFOAM-like time directory"
-    );
     println!("  --solveTolerance <v> absolute residual tolerance (default: 1e-10)");
     println!("  --maxIterations <n>  linear solver iteration cap (default: 10000)");
-    println!();
-    println!(
-        "CPU scalar diffusion, Poiseuille, and a first laminar SIMPLE path are available; GPU equation kernels are planned"
-    );
 }
 
 fn print_gmsh_to_ferrum_usage() {
@@ -7813,6 +7780,7 @@ mod tests {
         SolverNumericsDictionaryPlan, SolverSelectionSource, estimate_iterations_to_convergence,
         estimate_simple_iterations_to_convergence, numerics_dictionary_number,
         numerics_dictionary_usize, numerics_dictionary_value, parse_ferrum_run_args,
+        parse_incompressible_fluid_args, parse_incompressible_fluid_plan_args,
         parse_laminar_simple_convection_scheme, parse_laminar_simple_gradient_scheme,
         parse_laminar_simple_laplacian_scheme, parse_laminar_simple_sn_grad_scheme,
         parse_openfoam_laminar_preconditioner, parse_openfoam_laminar_solver,
@@ -7875,6 +7843,18 @@ mod tests {
     }
 
     #[test]
+    fn incompressible_plan_only_modes_do_not_select_the_simple_kernel() {
+        for mode in ["--preflight", "--runnerDryRun"] {
+            let parsed = parse_incompressible_fluid_plan_args(&[mode.to_string()])
+                .expect("incompressibleFluid plan-only args should parse");
+
+            assert!(parsed.laminar_simple_solve.is_none(), "mode: {mode}");
+            assert!(parsed.scalar_diffusion_solve.is_none(), "mode: {mode}");
+            assert!(parsed.poiseuille_solve.is_none(), "mode: {mode}");
+        }
+    }
+
+    #[test]
     fn ferrum_run_rejects_duplicate_solver_selection() {
         let error = parse_ferrum_run_args(&[
             "-solver".to_string(),
@@ -7887,15 +7867,23 @@ mod tests {
     }
 
     #[test]
-    fn ferrum_run_rejects_legacy_execution_selector() {
+    fn ferrum_run_rejects_utility_execution_selector() {
         let error = parse_ferrum_run_args(&[
             "-solver".to_string(),
             "incompressibleFluid".to_string(),
-            "--solveLaminarSimple".to_string(),
+            "--solvePoiseuille".to_string(),
         ])
-        .expect_err("legacy solver selector should fail on ferrumRun");
+        .expect_err("developer utility selector should fail on ferrumRun");
 
-        assert!(error.contains("legacy execution selector"));
+        assert!(error.contains("developer utility selector"));
+    }
+
+    #[test]
+    fn removed_simple_selector_is_not_a_utility_mode() {
+        let error = parse_solver_args(&["--solveLaminarSimple".to_string()])
+            .expect_err("removed public selector must stay unavailable");
+
+        assert!(error.contains("unknown ferrum solve option"));
     }
 
     #[test]
@@ -8153,7 +8141,6 @@ mod tests {
     #[test]
     fn parses_laminar_simple_solve_options() {
         let args = vec![
-            "--solveLaminarSimple".to_string(),
             "--rho".to_string(),
             "998.2".to_string(),
             "--mu".to_string(),
@@ -8181,7 +8168,7 @@ mod tests {
             "target/simpleFields/1".to_string(),
         ];
 
-        let parsed = parse_solver_args(&args).expect("solver args should parse");
+        let parsed = parse_incompressible_fluid_args(&args).expect("solver args should parse");
         let solve = parsed
             .laminar_simple_solve
             .expect("laminar SIMPLE solve args");
@@ -8221,7 +8208,6 @@ mod tests {
     #[test]
     fn parses_laminar_simple_residual_reporting_options() {
         let args = vec![
-            "--solveLaminarSimple".to_string(),
             "--solveVerbose".to_string(),
             "--solveResidualCsv".to_string(),
             "target/simple-residuals.csv".to_string(),
@@ -8231,7 +8217,7 @@ mod tests {
             "target/simple.json".to_string(),
         ];
 
-        let parsed = parse_solver_args(&args).expect("solver args should parse");
+        let parsed = parse_incompressible_fluid_args(&args).expect("solver args should parse");
         let solve = parsed
             .laminar_simple_solve
             .expect("laminar SIMPLE solve args");
@@ -8251,7 +8237,6 @@ mod tests {
     #[test]
     fn parses_laminar_simple_split_linear_solvers() {
         let args = vec![
-            "--solveLaminarSimple".to_string(),
             "--linearSolver".to_string(),
             "bicgstab".to_string(),
             "--momentumLinearSolver".to_string(),
@@ -8262,7 +8247,7 @@ mod tests {
             "DIC".to_string(),
         ];
 
-        let parsed = parse_solver_args(&args).expect("solver args should parse");
+        let parsed = parse_incompressible_fluid_args(&args).expect("solver args should parse");
         let solve = parsed
             .laminar_simple_solve
             .expect("laminar SIMPLE solve args");
@@ -8303,7 +8288,6 @@ mod tests {
     #[test]
     fn parses_laminar_simple_split_linear_controls() {
         let args = vec![
-            "--solveLaminarSimple".to_string(),
             "--solveTolerance".to_string(),
             "1e-6".to_string(),
             "--maxIterations".to_string(),
@@ -8318,7 +8302,7 @@ mod tests {
             "400".to_string(),
         ];
 
-        let parsed = parse_solver_args(&args).expect("solver args should parse");
+        let parsed = parse_incompressible_fluid_args(&args).expect("solver args should parse");
         let solve = parsed
             .laminar_simple_solve
             .expect("laminar SIMPLE solve args");
@@ -8333,9 +8317,9 @@ mod tests {
 
     #[test]
     fn parses_laminar_simple_relaxation_as_case_defaults_when_not_overridden() {
-        let args = vec!["--solveLaminarSimple".to_string()];
+        let args = Vec::new();
 
-        let parsed = parse_solver_args(&args).expect("solver args should parse");
+        let parsed = parse_incompressible_fluid_args(&args).expect("solver args should parse");
         let solve = parsed
             .laminar_simple_solve
             .expect("laminar SIMPLE solve args");
@@ -8349,13 +8333,12 @@ mod tests {
     fn laminar_simple_resolves_without_pipe_benchmark_inputs() {
         let plan = laminar_simple_test_plan(1000.0, 0.001002);
         let args = vec![
-            "--solveLaminarSimple".to_string(),
             "--rho".to_string(),
             "1000".to_string(),
             "--mu".to_string(),
             "0.001002".to_string(),
         ];
-        let parsed = parse_solver_args(&args).expect("solver args should parse");
+        let parsed = parse_incompressible_fluid_args(&args).expect("solver args should parse");
         let solve = parsed
             .laminar_simple_solve
             .expect("laminar SIMPLE solve args");
@@ -8377,12 +8360,9 @@ mod tests {
 
     #[test]
     fn laminar_simple_rejects_pipe_benchmark_cli_options() {
-        let error = parse_solver_args(&[
-            "--solveLaminarSimple".to_string(),
-            "--pressureDrop".to_string(),
-            "1.6032".to_string(),
-        ])
-        .expect_err("pipe benchmark inputs must stay outside the generic SIMPLE solve");
+        let error =
+            parse_incompressible_fluid_args(&["--pressureDrop".to_string(), "1.6032".to_string()])
+                .expect_err("pipe benchmark inputs must stay outside the generic SIMPLE solve");
 
         assert!(error.contains("Poiseuille solve options require --solvePoiseuille"));
     }
@@ -8394,8 +8374,7 @@ mod tests {
             .fv_solution
             .entries
             .retain(|entry| !matches!(entry.key.as_str(), "tolerance" | "maxIter"));
-        let parsed = parse_solver_args(&["--solveLaminarSimple".to_string()])
-            .expect("solver args should parse");
+        let parsed = parse_incompressible_fluid_args(&[]).expect("solver args should parse");
         let solve = parsed
             .laminar_simple_solve
             .expect("laminar SIMPLE solve args");
@@ -8419,8 +8398,7 @@ mod tests {
                 key: "relTol".to_string(),
                 value: "0.1".to_string(),
             });
-        let parsed = parse_solver_args(&["--solveLaminarSimple".to_string()])
-            .expect("solver args should parse");
+        let parsed = parse_incompressible_fluid_args(&[]).expect("solver args should parse");
         let solve = parsed
             .laminar_simple_solve
             .expect("laminar SIMPLE solve args");
@@ -8457,8 +8435,8 @@ mod tests {
             },
         ]);
 
-        let args = vec!["--solveLaminarSimple".to_string()];
-        let parsed = parse_solver_args(&args).expect("solver args should parse");
+        let args = Vec::new();
+        let parsed = parse_incompressible_fluid_args(&args).expect("solver args should parse");
         let solve = parsed
             .laminar_simple_solve
             .expect("laminar SIMPLE solve args");
