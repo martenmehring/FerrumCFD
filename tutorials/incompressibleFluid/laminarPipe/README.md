@@ -21,6 +21,11 @@ The default reference uses `D = 0.02 m`, `L = 1 m`, mean velocity
 `U = 0.02 m/s`, and water near 20 C. FerrumCFD values are SI by default:
 pressure is stored in Pa, length in m, temperature in K, and velocity in m/s.
 Use explicit units only when a value is not SI.
+The canonical values and their provenance are recorded in
+`shared/physicalParameters.toml`. `comparison.toml` points to that shared
+contract instead of repeating physical scalar values. This metadata is used by
+comparison tooling and drift tests only: the FerrumCFD and OpenFOAM cases keep
+their own runtime dictionaries and remain independently runnable.
 The analytic inputs are not part of the simulation case. They are stored in
 `tutorials/incompressibleFluid/laminarPipe/analytical/pipeBenchmark` and are consumed only by benchmark scripts.
 
