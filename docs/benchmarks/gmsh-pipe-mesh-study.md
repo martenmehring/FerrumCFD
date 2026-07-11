@@ -9,7 +9,7 @@ converted from kinematic pressure to Pa with `rho = 998.2 kg/m3`.
 Run command:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_gmsh_pipe_mesh_study.ps1 -OpenFoamSteps 1000
+powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_gmsh_pipe_mesh_study.ps1 -OpenFoamSteps 1000
 ```
 
 Reference:

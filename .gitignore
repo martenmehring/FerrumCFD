@@ -11,8 +11,5 @@
 /examples/*/constant/
 /examples/*/system/
 
-# Small canonical examples are intentionally versioned.
-!/examples/laminar_pipe/constant/
-!/examples/laminar_pipe/constant/**
-!/examples/laminar_pipe/system/
-!/examples/laminar_pipe/system/**
+# Curated tutorial bundles are versioned below /tutorials. Generated runs and
+# meshes belong below /target and remain ignored by the rule above.

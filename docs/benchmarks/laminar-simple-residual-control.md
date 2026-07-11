@@ -7,7 +7,7 @@ mesh. It is separate from the Hagen-Poiseuille and OpenFOAM accuracy benchmark.
 
 ## Configuration
 
-The run used an external copy of `examples/laminar_pipe` with:
+The run used an external copy of `tutorials/incompressibleFluid/laminarPipe/ferrum/case` with:
 
 ```text
 SIMPLE

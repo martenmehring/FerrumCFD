@@ -8,7 +8,7 @@ are separate artifacts.
 
 ## Shared Setup
 
-- Gmsh source: `benchmarks/plane_channel/plane_channel.geo`
+- Gmsh source: `tutorials/incompressibleFluid/planeChannel/shared/geometry/plane_channel.geo`
 - shared imported mesh: 2000 hex cells, 100 axial x 20 wall-normal x 1 depth
 - `front` and `back`: OpenFOAM `empty`
 - length: `1 m`
@@ -32,7 +32,10 @@ meanU = deltaP*H^2/(12*mu*L)
 | --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | Analytic | n/a | n/a | n/a | 0.02000000 | 0.0000% | 0.6012000 | 0.0000% | n/a | n/a | n/a |
 | Ferrum release | 545 | yes | U=yes, p=yes | 0.02003293 | +0.1646% | 0.6021898 | +0.1646% | 0.5924641 | -1.4531% | 23.4258 s |
-| OpenFOAM `simpleFoam` | 1000 | no | Ux/Uy/p=yes | 0.02009984 | +0.4992% | 0.6042012 | +0.4992% | 0.5951878 | -1.0000% | 7.7109 s execution / 14.9744 s WSL wall |
+| Historical OpenFOAM `simpleFoam` baseline | 1000 | no | Ux/Uy/p=yes | 0.02009984 | +0.4992% | 0.6042012 | +0.4992% | 0.5951878 | -1.0000% | 7.7109 s execution / 14.9744 s WSL wall |
+
+A full matched OpenFOAM 13 `foamRun -solver incompressibleFluid` plane-channel
+result has not yet replaced that historical row.
 
 Ferrum stopped before its maximum budget of 600 with final outer initial
 residuals `U=9.974217e-6` and `p=4.210363e-8` for tolerances `1e-5`.

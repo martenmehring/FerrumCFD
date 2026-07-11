@@ -12,3 +12,10 @@ dependencies = [
 [[package]]
 name = "ferrum-mesh"
 version = "0.1.0"
+
+[[package]]
+name = "ferrum-run"
+version = "0.1.0"
+dependencies = [
+ "ferrum-cli",
+]

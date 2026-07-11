@@ -1,7 +1,8 @@
 [workspace]
 members = [
-    "crates/ferrum-mesh",
-    "crates/ferrum-cli",
+    "src/ferrumMesh",
+    "applications/legacy/ferrumCli",
+    "applications/solvers/ferrumRun",
 ]
 resolver = "3"
 
@@ -9,4 +10,3 @@ resolver = "3"
 edition = "2024"
 license = "MIT"
 authors = ["FerrumCFD contributors"]
-

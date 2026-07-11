@@ -1,13 +1,214 @@
 # FerrumCFD Solver Roadmap
 
-This roadmap tracks the path from the current executable laminar SIMPLE
-prototype toward a production `simpleFoam`-class incompressible laminar solver
-and later CPU/GPU solver backends.
+This roadmap first completes and broadens the steady laminar incompressible
+foundation, then implements exactly six additional application drivers in a
+fixed order. Every driver is validated with independent Ferrum and OpenFOAM 13
+cases and an analytical, manufactured, or documented benchmark reference.
+Porous-media, Ergun, and packed-bed development starts only after all seven
+application drivers have passed their readiness gates.
+
+## Target Repository Layout
+
+The repository converges on the following OpenFOAM-inspired responsibility
+layout. The names describe Ferrum ownership; they do not permit OpenFOAM
+implementation code to leak into native Ferrum components.
+
+```text
+FerrumCFD/
+|-- applications/
+|   |-- solvers/
+|   |   |-- ferrumRun/              # single-region, CPU and GPU capable
+|   |   `-- ferrumMultiRun/         # coupled multi-region, same backends
+|   |-- modules/
+|   |   |-- incompressibleFluid/      # inspected source confirms name; formal F-REF-1 pending
+|   |   |-- thermalFluid/             # provisional; audit pending
+|   |   |-- speciesTransport/         # provisional; audit pending
+|   |   |-- porousMedia/              # provisional and deferred
+|   |   |-- chemistry/                # provisional; may become a model library
+|   |   `-- ...
+|   `-- utilities/
+|       |-- mesh/
+|       |-- case/
+|       `-- postProcessing/
+|-- src/
+|   |-- ferrumCore/
+|   |-- ferrumMesh/
+|   |-- ferrumFiniteVolume/
+|   |-- ferrumIO/
+|   |-- openfoamIO/                  # interoperability only
+|   `-- ferrumModels/
+|-- tutorials/
+|   |-- incompressibleFluid/
+|   |   |-- laminarPipe/
+|   |   |   |-- shared/
+|   |   |   |   |-- geometry/
+|   |   |   |   `-- physicalParameters.toml
+|   |   |   |-- ferrum/
+|   |   |   |   `-- case/
+|   |   |   |-- openfoam-v13/
+|   |   |   |   `-- case/
+|   |   |   |-- analytical/
+|   |   |   |-- comparison.toml
+|   |   |   `-- README.md
+|   |   `-- planeChannel/            # same complete case bundle
+|   `-- porousMedia/
+|       `-- ergunPressureDrop/        # same bundle, deferred until Driver 7
+|-- validation/
+|-- test/
+|-- docs/
+|-- Cargo.toml
+`-- target/                           # generated and ignored
+```
+
+The tree is a migration target, not permission to create empty architecture
+for its own sake. Each directory becomes executable or gains a narrow ownership
+contract before the next layer depends on it. `applications/solvers` owns only
+dispatch and lifecycle control; physics lives in `applications/modules`, while
+reusable implementation belongs under `src`.
+
+Only `incompressibleFluid` is currently a confirmed permanent module name.
+`thermalFluid`, `speciesTransport`, `porousMedia`, and `chemistry` preserve the
+requested target-tree intent but remain provisional until their OpenFOAM 13 and
+mathematical ownership audits decide whether each is an application module, a
+reusable `ferrumModels` capability, or part of another module. Renaming a
+provisional boundary requires a recorded architecture decision, not guesswork.
+
+Every selected tutorial, including `planeChannel` and later porous-media cases,
+uses the complete `laminarPipe` bundle shape. `shared/physicalParameters.toml`
+is the comparison source of truth but neither implementation depends on it at
+runtime: the Ferrum and OpenFOAM cases remain independently runnable. The
+`analytical/` directory is always present. If no useful closed form exists, its
+README explains why and identifies the manufactured or documented benchmark
+used instead; a sibling `benchmark/` directory may then hold reference data.
+Keeping `analytical/` present even when it contains a documented
+not-applicable decision is a deliberate bundle-consistency policy; it must never
+be presented as evidence that a closed-form solution exists.
+
+The existing `laminarPipe` and `planeChannel` bundles predate this complete
+contract and currently keep some physical inputs in comparison/case files.
+Their retrospective migration must add `shared/physicalParameters.toml`, derive
+or validate both program-specific cases reproducibly, remove duplicated
+authoritative parameters from `comparison.toml`, fail on drift, and record the
+effective parameter hash/provenance in every comparison report.
+`comparison.toml` also records the effective time/coupling classification and
+its evidence (`ddtSchemes`, `consistent`, outer/inner corrector counts); a
+directory or dictionary-section name alone is not accepted as the algorithm
+classification.
+
+## Mandatory OpenFOAM 13 Reference Audit
+
+OpenFOAM Foundation v13 MUST be inspected before every new Ferrum module,
+tutorial, utility, model, boundary condition, dictionary, or `src` component is
+placed or implemented. The already implemented layout and the existing
+`laminarPipe`/`planeChannel` bundles are the sole retrospective `F-REF-1`
+exception. Guessing from executable names or older OpenFOAM releases is not an
+acceptable substitute.
+
+For every selected physics area, first create or update an English reference
+map under `docs/reference/openfoam-v13/` that records:
+
+1. the exact OpenFOAM 13 commit/release, build ID, local source paths, and
+   hashes of the decisive source files inspected;
+2. the relevant `applications/solvers`, `applications/modules`, `src`, and
+   `tutorials` entries and the runtime-selection path through `foamRun` or
+   `foamMultiRun`;
+3. the selected OpenFOAM 13 tutorial inventory and its mapping to Ferrum module
+   and case names;
+4. required fields, dictionaries, models, boundary conditions, finite-volume
+   schemes, utilities, function objects, and validation references;
+5. effective algorithm classification derived from `ddtSchemes`,
+   `consistent`, `nOuterCorrectors`, inner correctors, and the complete control
+   dictionary rather than only from a section label: SIMPLEC may be a
+   consistent SIMPLE case, while PISO may be a transient PIMPLE-configured case
+   with one outer corrector;
+6. the proposed Ferrum ownership location and dependency direction for every
+   reusable capability;
+7. the OpenFOAM decomposition, rank communication, reconstruction, and
+   multi-region interface path where parallel execution applies;
+8. at least one unchanged official OpenFOAM 13 tutorial execution with logs
+   and reference results stored under `target/reference-audits/`;
+9. a decision table separating behavior to mirror, mathematics to reimplement,
+   formats to support only through interoperability, and features deferred;
+10. independent mathematical primary references and acceptance observables;
+11. license and provenance notes for source, case, mesh, and benchmark material.
+
+The currently verified local baseline is OpenFOAM Foundation 13 build
+`13-441953dfbb42` under `/opt/openfoam13`. Its `foamRun` path selects one module
+for one region. Its `foamMultiRun` path selects one module per region and
+advances the coupled regions through shared phase and time loops. The
+`multiRegion/CHT/heatedDuct` reference demonstrates the parallel lifecycle with
+`decomposePar -allRegions`, `runParallel foamMultiRun`, and
+`reconstructPar -allRegions`; Ferrum must audit that behavior before defining
+its coupled decomposition contract.
+
+The first audit pass for each driver covers at least these OpenFOAM 13 areas:
+
+| Driver | Mandatory OpenFOAM 13 reference scope |
+| ---: | --- |
+| 1 | `applications/modules/incompressibleFluid`; planar Poiseuille/Couette, cavity, and steady separated-flow tutorials |
+| 2 | transient `incompressibleFluid` PISO/PIMPLE lifecycle and tutorials |
+| 3 | `fluid`/`isothermalFluid`; buoyant cavity, Benard-cell, and heated-room tutorials |
+| 4 | `multicomponentFluid`; species, chemistry, flame, and reacting-channel tutorials |
+| 5 | `fluid`, `isothermalFluid`, and `shockFluid`; official `fluid/shockTube`, `shockFluid/shockTube`, and `fluid/helmholtzResonance` paths |
+| 6 | `foamMultiRun`, `regionSolvers`, multi-region control, `fluid`, `solid`, and CHT tutorials |
+| 7 | `incompressibleVoF`, `twoPhaseVoFSolver`, `VoFSolver`, and official capillary-rise and dam-break tutorials |
+
+These paths define what must be inspected, not what may be copied or which
+Ferrum module name is automatically correct. The audit confirms or revises the
+provisional module boundaries through a recorded architecture decision.
+`isentropicNozzle` and `staticDroplet` remain useful Ferrum analytical
+acceptance cases, but the current local OpenFOAM 13 tree does not contain
+official tutorial directories with those names; reports must not label them as
+official OpenFOAM tutorials.
+
+The audit is architectural and behavioral reference work, not source copying.
+Ferrum remains MIT-licensed: GPL-licensed OpenFOAM implementation code is not
+copied into Ferrum crates. External OpenFOAM names and formats are confined to
+`openfoamIO`, independently runnable `openfoam-v13` cases, provenance records,
+and comparison tooling.
+
+Every distributed `openfoam-v13` bundle receives an explicit classification:
+either independently authored/generated, or derived from OpenFOAM material. A
+derived bundle is excluded from the MIT license scope and carries the required
+upstream license plus a root `THIRD_PARTY_NOTICES` entry. A provenance note by
+itself is not a license grant.
+
+Before Driver 2 is accepted, the reference map must contain a frozen inventory
+of all OpenFOAM 13 SIMPLE/SIMPLEC/PISO/PIMPLE tutorials selected for Ferrum's
+incompressible scope. Each selected row has a Ferrum case, an independent
+OpenFOAM v13 case, an analytical/manufactured/benchmark reference, acceptance
+tolerances, and a status. This inventory defines what “all SIMPLE/PIMPLE cases”
+means and prevents silent scope drift.
+
+The native source split follows a reviewed, acyclic dependency graph:
+
+- `ferrumCore`: fundamental types, dimensions, registries, errors, execution
+  context, and backend-neutral contracts;
+- `ferrumMesh`: topology, geometry, decomposition, partitions, and interfaces;
+- `ferrumFiniteVolume`: fields, operators, matrices, discretization, and
+  equation assembly;
+- `ferrumIO`: native `FerrumFile` parsing, writing, and case I/O;
+- `openfoamIO`: OpenFOAM import/export adapters only;
+- `ferrumModels`: reusable physical and constitutive models.
+
+Applications may depend on these libraries, but the libraries never depend on
+an application executable. `ferrumIO` owns the native format; `openfoamIO` is
+an optional adapter and must not define native Ferrum semantics.
 
 ## Current Status
 
-`ferrumSolver --solveLaminarSimple` is an executable finite-volume
-pressure-velocity solver prototype. It reads OpenFOAM-like `U`, `p`,
+The canonical public entry point is now
+`ferrumRun -solver incompressibleFluid`. It dispatches the executable
+finite-volume pressure-velocity prototype only for unambiguous steady-state
+laminar cases with exactly one SIMPLE section and no PISO/PIMPLE section.
+Explicit `momentumTransport`/`turbulenceProperties` input must select
+`simulationType laminar`; RAS/LES is not dispatched to the laminar kernel.
+No public algorithm-specific executable or `--solveLaminarSimple` selector is
+retained. Currently only steady laminar SIMPLE executes through
+`ferrumRun -solver incompressibleFluid`. SIMPLEC and future PISO/PIMPLE remain
+case-selected modes behind that same public command; they are not implemented
+yet. The implementation reads
+OpenFOAM-like `U`, `p`,
 `transportProperties`, `fvSchemes`, and `fvSolution`, uses the runtime
 `constant/polyMesh` geometry, runs an uncapped SIMPLE correction path, and
 writes JSON/Markdown reports including pressure-assembly diagnostics for
@@ -26,9 +227,11 @@ and wall-clock solve time was `33.54 s`. This validation is separate from the
 analytic pipe benchmark and is recorded in
 `docs/benchmarks/laminar-simple-residual-control.md`.
 
-For the medium laminar pipe benchmark (`4608` cells, SI units), using the
-matched steady SIMPLE budget OpenFOAM `endTime=100`/`deltaT=1` and Ferrum
-`100` SIMPLE iterations:
+The following medium-pipe table (`4608` cells, SI units) is the historical
+matched `simpleFoam` baseline recorded before the comparison runner migrated
+to OpenFOAM 13 `foamRun -solver incompressibleFluid`. It preserves provenance
+and must not be relabeled as a `foamRun` result. The current module-based
+reference still needs a full matched-budget regeneration.
 
 | Source | DeltaP [Pa] | Error to analytic | Mean U [m/s] | Runtime |
 | --- | ---: | ---: | ---: | ---: |
@@ -37,7 +240,7 @@ matched steady SIMPLE budget OpenFOAM `endTime=100`/`deltaT=1` and Ferrum
 | Ferrum SIMPLE, from mean U | 1.600432 | -0.173% | 0.0199655 | 144.99 s solve |
 | OpenFOAM `simpleFoam`, pressure owner cells | 1.627046 | 1.487% | n/a | 4.21 s execution / 7.85 s driver wall |
 
-This 2026-07-10 rerun uses the same named-patch owner-cell averaging for Ferrum
+This historical 2026-07-10 rerun uses the same named-patch owner-cell averaging for Ferrum
 and OpenFOAM, with no axial-cell ordering assumption or full-length
 extrapolation. `Ferrum SIMPLE, from mean U` is an external benchmark diagnostic:
 it back-calculates pressure loss from the simulated mean velocity with the
@@ -48,7 +251,7 @@ does not yet configure `SIMPLE.residualControl`.
 The solver is therefore promising for the pipe case, but it is not yet a
 production `simpleFoam` replacement.
 
-## Definition Of Done For The First Solver
+## Definition Of Done For Driver 1
 
 The first laminar incompressible solver should be considered ready when it:
 
@@ -151,7 +354,8 @@ Goal: make correctness measurable with analytic and OpenFOAM references.
 Current benchmark:
 
 - medium circular pipe, laminar water, SI units;
-- Ferrum SIMPLE vs OpenFOAM `simpleFoam` vs Hagen-Poiseuille;
+- historical Ferrum SIMPLE vs OpenFOAM `simpleFoam` vs Hagen-Poiseuille, with
+  the current `foamRun -solver incompressibleFluid` regeneration pending;
 - generic solver and pipe-reference diagnostics are separate artifacts;
 - matched steady pseudo-time comparison is available, for example OpenFOAM
   `endTime=100`/`deltaT=1` against Ferrum `100` SIMPLE iterations.
@@ -190,15 +394,17 @@ Next benchmark targets:
 
 ## Milestone 5: Performance And Backend Policy
 
-Goal: make the CPU solver competitive enough to serve as a baseline, then move
-the expensive linear algebra and nonlinear stages onto selectable backends.
+Goal: preserve one numerical contract while scaling both public runners from a
+correct CPU baseline to shared-memory CPUs, distributed partitions, one GPU,
+and multiple GPUs.
 
 Current status:
 
 - Ferrum SIMPLE medium pipe: `144.99 s` solve time in the 2026-07-10
   100-iteration rerun;
-- OpenFOAM `simpleFoam`: `4.21 s` solver execution and `7.85 s` driver
-  wall time in the matched 100-step rerun;
+- historical OpenFOAM `simpleFoam`: `4.21 s` solver execution and `7.85 s`
+  driver wall time in the matched 100-step rerun; do not use this as current
+  `foamRun` performance data;
 - CPU pressure PCG now has an IC(0) incomplete-Cholesky path for OpenFOAM
   `DIC`/`FDIC`, replacing the earlier diagonal-only mapping for pressure;
 - CG/PCG breakdown tests are scale-relative rather than absolute
@@ -213,46 +419,256 @@ Next performance targets:
 - validate IC(0) on medium/fine/skewed pressure matrices and add a true
   nonsymmetric ILU/DILU path for momentum/BiCGStab;
 - reduce repeated allocations in SIMPLE history and operator assembly;
-- add thread/resource controls for CPU solves where the backend supports them;
+- keep fields, operators, equation assembly, convergence criteria, reports, and
+  case semantics independent of execution backend now;
+- defer parallel optimization until the complete selected Driver 1 and Driver 2
+  SIMPLE/SIMPLEC/PISO/PIMPLE case inventory passes on the scalar CPU baseline;
+- then execute the following acceptance phases in order:
+  1. one process and one CPU worker as the correctness reference;
+  2. one process with multiple CPU worker threads and explicit affinity/NUMA
+     policy;
+  3. partitioned multi-process CPU execution on one host, followed by
+     multi-node execution when required;
+  4. one GPU with explicit capability and `f64` checks;
+  5. multiple GPUs on one host with deterministic placement, peer-transfer
+     policy, and conservative halo exchange;
+  6. multi-node CPU/GPU execution with an explicit communication transport;
+- require every phase to run the identical case inputs and numerical schemes,
+  with stated tolerance parity, conservation checks, deterministic regression
+  mode, scaling efficiency, and memory-transfer measurements;
 - keep GPU optional and selectable per stage (`flow`, linear solves,
-  nonlinear/interface/ODE stages), with CPU as a valid choice when GPU is busy
-  or unnecessary.
+  nonlinear/interface/ODE stages), with CPU as a valid choice when GPU is busy,
+  unsupported, or inefficient.
 
-## Milestone 6: Generalization Beyond The Pipe
+Rust threads can use all cores of one shared-memory host without MPI. Rust does
+not remove the distributed-memory problem: multiple processes, multiple nodes,
+and some multi-GPU layouts still require MPI or an equivalent transport. Before
+Phase 3, record an architecture decision comparing a Rust MPI binding with
+UCX/libfabric or a project-owned transport. One-process multi-GPU execution may
+use vendor peer/collective APIs, but cross-node execution still requires a
+network communication layer. No transport choice may leak into finite-volume
+operators or case semantics.
 
-Goal: turn the pipe solver into a reusable laminar CFD foundation.
+The backend-neutral design work completed before parallel implementation must
+provide:
 
-Next physics/application targets:
+- a `SolverModule` lifecycle shared by both runners;
+- an `ExecutionContext` describing backend, resources, precision, affinity,
+  queues, and communicator without exposing vendor APIs to physics modules;
+- a serial `Communicator` plus partitionable mesh and field storage with owned
+  and ghost/halo entities;
+- bulk operator APIs without per-cell or per-face dynamic dispatch;
+- explicit host/device data residency and transfer ownership;
+- separate deterministic and performance-oriented reduction policies;
+- run provenance covering workers, ranks, partitions, devices, precision,
+  transport, and backend versions.
 
-- double-pipe or annular heat-transfer case with constant wall temperature;
-- scalar energy equation and wall heat-flux/Nusselt diagnostics;
-- multiregion mesh handling for membrane-reactor-style cases;
-- interface flux models that allow flow reversal from pressure differences
-  instead of encoding physical direction in mesh metadata;
-- later: species transport, membrane source terms, nonlinear material laws,
-  and optional GPU acceleration for linear, nonlinear, and ODE subproblems.
+Threaded CPU kernels use a bounded worker pool; an asynchronous I/O runtime is
+not treated as numerical CPU parallelism. Distributed acceptance separates
+intra-region halo exchange, global reductions, failure propagation, and restart
+state. GPU acceptance keeps fields, geometry, matrices, and solver state device
+resident across iterations and reports every unavoidable host transfer.
 
-The membrane-reactor case remains a target application, not a hard-coded solver
-assumption. Any pressure reversal, sweep-side backflow, or water transport must
-come from equations and boundary/interface models, not from `flipMap` or fixed
-mesh orientation choices.
+## Milestone 6: Driver 1 Laminar Validation Matrix
+
+Before Driver 2 starts, steady incompressible SIMPLE/SIMPLEC must pass this
+tutorial matrix:
+
+| Order | Case | Primary coverage | Reference |
+| ---: | --- | --- | --- |
+| 1 | `laminarPipe` | 3D internal flow and pressure loss | Hagen-Poiseuille analytical solution |
+| 2 | `planeChannel` | true 2D `empty` handling | Plane-Poiseuille analytical solution |
+| 3 | `couettePoiseuille` | moving wall and combined pressure/shear forcing | Analytical velocity profile |
+| 4 | `lidDrivenCavity` | recirculation and closed-pressure reference | Published benchmark |
+| 5 | `backwardFacingStep` | separation, reattachment, and outlet robustness | Published benchmark |
+| 6 | `axisymmetricPipe` | `wedge` handling | Hagen-Poiseuille analytical solution |
+
+Every case contains independently runnable `ferrum/` and `openfoam-v13/`
+directories plus `shared/geometry`, `shared/physicalParameters.toml`,
+`analytical/`, `comparison.toml`, and an English case README. If no closed form
+is useful, `analytical/README.md` records that decision and the case adds a
+documented `benchmark/` or manufactured reference. Coarse/medium/fine, skewed,
+and non-orthogonal variants belong to these bundles instead of becoming
+unrelated cases. The same bundle contract applies to every selected physics
+module; it is not special to incompressible flow.
+
+## Runner And Multi-Region Milestone
+
+The solver lifecycle must be shared by both public dispatchers:
+
+- `ferrumRun`: one region, one runtime-selected module, and the full CPU,
+  threaded, distributed, GPU, and multi-GPU backend ladder;
+- `ferrumMultiRun`: multiple coupled regions and one module per region, reusing
+  the same execution context, partitions, kernels, and backends.
+
+`ferrumMultiRun` follows OpenFOAM 13 `foamMultiRun` semantics. It is not an
+independent-case batch runner and has no `-solver` option. Region-to-module
+selection comes entirely from the case. It advances regions through one
+capability/dependency graph, applies a global time-step limited by global
+constraints and all active transient regions, and declares convergence only
+after all participating region criteria pass. Mixed steady/transient regions
+are an explicit supported scheduling mode.
+
+Implementation order:
+
+1. extract a module registry and common solver lifecycle while completing
+   `ferrumRun`;
+2. keep `ferrumRun` on the scalar CPU correctness backend until the selected
+   SIMPLE/SIMPLEC/PISO/PIMPLE inventory passes, while making operators and
+   storage backend-neutral;
+3. define a backend-neutral execution context that distinguishes sockets,
+   cores, worker threads, process ranks, domain partitions, GPU devices,
+   memory, and queues while preventing oversubscription;
+4. implement and accept the `ferrumRun` threaded, distributed CPU, single-GPU,
+   and multi-GPU phases from Milestone 5;
+5. implement a deterministic `ferrumMultiRun` CPU scheduler with a
+   capability/dependency graph,
+   rank/partition mapping, halo/ghost exchange, interface barriers, and failure
+   propagation;
+6. add per-region and per-stage CPU/GPU placement, a data-residency/transfer
+   graph, backend capability checks including `f64`, and mixed-backend parity
+   tests;
+7. add multi-GPU placement, deterministic cross-device reductions, and
+   conservative region/partition interface exchange;
+8. require CPU/GPU, mixed-backend, and multi-GPU parity plus
+   mass/energy/species conservation at every coupled interface with stated
+   tolerances.
+
+The lifecycle and backend contracts are established during Drivers 1 and 2 so
+later acceleration does not require an architectural rewrite, but parallel
+kernel implementation starts only after the Driver 1/2 correctness gate.
+`ferrumMultiRun` does not create a second backend stack: it schedules the same
+module kernels over a coupled dependency graph. A working coupled CPU runner
+plus the accepted single-region backend contract is required before Driver 6;
+mixed CPU/GPU and multi-GPU Driver 6 acceptance follows as kernels become
+available. Independent parameter studies use a separate future batch or sweep
+command.
+
+## Application Driver Portfolio
+
+Drivers are implemented and accepted in this fixed order:
+
+| Driver | Application driver | Required first validation cases |
+| ---: | --- | --- |
+| 1 | Steady incompressible SIMPLE/SIMPLEC | Complete laminar matrix above |
+| 2 | Transient incompressible PISO/PIMPLE | `taylorGreenVortex`, `startUpPlaneChannel`, `womersleyPipe` |
+| 3 | Low-Mach thermal/buoyant | `heatedPlaneChannel`, `rayleighBenardConduction`, `differentiallyHeatedCavity` |
+| 4 | Low-Mach reacting flow | `manufacturedAdvectionDiffusionReaction`, `laminarPremixedFlame` |
+| 5 | Compressible flow | `linearAcousticWave`, `sodShockTube`, `isentropicNozzle` |
+| 6 | Multi-region conjugate/reacting | `compositeSlab`, `conjugateHeatedChannel`, `surfaceReactionChannel` |
+| 7 | Immiscible two-phase VOF | `interfaceAdvection`, `staticDroplet`, `capillaryRise`, `damBreak` |
+
+Drivers 1 and 2 are separate readiness gates but share the public
+`incompressibleFluid` module. Steady/transient mode, SIMPLE/SIMPLEC/PISO/PIMPLE,
+and laminar/turbulence selection come from the case rather than executable
+names.
+
+Within each driver, cases are implemented in the listed order. Packed-bed
+geometry, Ergun resistance, porous momentum sources, and pseudo-homogeneous
+reactor models are explicitly outside this seven-driver phase.
+
+Reference selection follows the strongest available independent contract:
+
+- exact or analytical solutions for Taylor-Green decay, start-up channel flow,
+  Womersley flow, acoustic waves, Sod shock tubes, isentropic nozzles,
+  composite slabs, interface advection, Laplace pressure, and capillary
+  equilibrium;
+- analytical or semi-analytical heat-transfer references for heated channels
+  and the subcritical Rayleigh-Benard conduction state;
+- manufactured solutions for coupled transport/reaction and multiregion
+  coupling where a useful closed form is unavailable;
+- documented external benchmarks for cavities, separated flows, flames,
+  conjugate channels, surface reactions, and dam breaks.
+
+## Driver Readiness Gate
+
+A driver is complete only when:
+
+- its Ferrum cases run from a clean checkout with native `FerrumFile` input;
+- each OpenFOAM 13 sibling case runs independently without Ferrum conversion;
+- an analytical or manufactured reference exists wherever mathematically
+  valid;
+- otherwise a benchmark reference records source, units, sampling, and
+  tolerance;
+- the comparison runner produces machine-readable JSON and human-readable
+  Markdown Ferrum/OpenFOAM/reference reports;
+- conservation, residual, field, and runtime diagnostics are regression-tested;
+- mesh or time-step refinement is demonstrated, or non-monotonic behavior is
+  explained;
+- case-specific acceptance logic remains outside the generic driver.
+
+## Roadmap Execution Through The Coding-Agent Workflow
+
+Editing this roadmap is a planning operation. When the user asks to "work
+through the roadmaps" or gives an equivalent execution instruction, only a
+bounded leaf task is delegated through the separate AI Dev Orchestrator/n8n
+repository; an epic, driver portfolio, or open-ended "continue" request is not
+a valid coding task.
+
+The authoritative worktree, branch, model, security, persistence, and Draft-PR
+policy lives in the orchestrator repository and is referenced here as external
+dependency `F-AUTO-1`. FerrumCFD requires that accepted workflow to pin a clean
+`ferrumcfd/main` SHA, isolate the implementation worktree, use Codex for the
+bounded implementation, use Claude Fable 5 for independent review, run the
+declared numerical and security gates, publish only a Draft PR, and return
+evidence to chat.
+
+The separate roadmap-coding workflow passed its complete live acceptance on
+July 11, 2026; `F-AUTO-1` is therefore satisfied. Its implementation,
+validation, Fable 5 review, cleanup and explicit Draft-PR publication boundary
+remain separate from the read-only analysis workflow. Any future change to
+that boundary must pass the orchestrator repository's acceptance procedure
+again before FerrumCFD uses it.
+
+Only leaf tasks may enter that workflow. The immediate-next-step IDs below are
+epics unless explicitly marked as a leaf. They decompose as follows:
+
+- reference work: `F-REF-D<driver>-MODULE` and one
+  `F-REF-D<driver>-CASE-<case>` per official or analytical case;
+- existing bundle migration: `F-LAYOUT-PARAMS-LAMINARPIPE` and
+  `F-LAYOUT-PARAMS-PLANECHANNEL`, each with its own drift test;
+- Driver 1/2 implementation: one ID per boundary condition, operator,
+  SIMPLEC/PISO/PIMPLE behavior, or tutorial case, followed by a separate driver
+  gate task;
+- backend work: `F-BE-THREADS`, `F-BE-PARTITION`, `F-BE-MULTIPROCESS`,
+  `F-BE-MULTINODE`, `F-BE-GPU1`, `F-BE-GPUN`, and
+  `F-BE-MULTINODE-GPU` in that order;
+- Drivers 3-7: separate audit, module/lifecycle, model, individual case, and
+  final readiness-gate tasks for each driver.
+
+A leaf task has one bounded objective, explicit allowed paths, acceptance
+observables, and a finite test command set. Completing a leaf never marks its
+parent epic or driver complete automatically.
+
+## Deferred Phase: Porous Media And Packed Beds
+
+Porous-media, Darcy-Forchheimer/Ergun, packed-bed, pellet, membrane-reactor,
+and pseudo-homogeneous reactor development starts only after Driver 7 passes
+the readiness gate. Architecture may keep generic source and interface
+extension points, but this phase must not displace the seven-driver validation
+sequence.
 
 ## Immediate Next Steps
 
-1. Build the separate 2D plane-Poiseuille case from a Gmsh `.geo`, import the
-   same mesh into Ferrum and OpenFOAM, and keep analytic comparison in an
-   external benchmark report.
-2. Rerun the medium/fine pressure sweep with the new `pressureAssembly`
-   diagnostics and isolate whether the fine-mesh p-owner error starts in
-   `phiHbyA`, pressure source assembly, pressure flux, or boundary
-   contributions.
-3. Validate the projected-distance pressure/laplacian coefficient on the pipe
-   mesh and a deliberately skewed mesh, then decide whether corrected
-   non-orthogonal fluxes need additional pressure loops by default.
-4. Add regression checks for pressure-field deltaP and mean-flow deltaP on the
-   medium pipe case.
-5. Profile the pressure correction solve and identify the first CPU
-   preconditioner improvement.
-6. Add one `wedge` axisymmetric smoke case after the 2D benchmark.
-7. Improve the OpenFOAM mesh/reference setup when an under-1% OpenFOAM pressure
-   loss reference is required.
+1. **F-LAYOUT-1:** Merge the already implemented current-layout,
+   tutorial-bundle, and canonical `ferrumRun` migration, including removal of
+   the public algorithm-specific `ferrumSolver --solveLaminarSimple` path. This
+   does not confirm any provisional future module boundary.
+2. **F-AUTO-1 (accepted external dependency):** Keep the accepted isolated n8n
+   coding workflow in the AI Dev Orchestrator repository and preserve the
+   existing analysis workflow as a separate read-only path.
+3. **F-REF-1:** Retrospectively audit the existing source split and two tutorial
+   bundles, then complete the OpenFOAM 13 reference maps, selected tutorial
+   inventory, source ownership map, and license/provenance review before any
+   new module, tutorial, or `src` boundary is implemented.
+4. **F-ARCH-1:** Extract the `incompressibleFluid` module registry and common solver
+   lifecycle from the transitional combined crates with parity tests.
+5. **F-IO-1:** Specify and implement `FerrumFile v1`; isolate OpenFOAM support behind the
+   `openfoamIO` interoperability layer.
+6. **F-D1D2-1:** Complete Driver 1 SIMPLE/SIMPLEC and Driver 2 PISO/PIMPLE on the scalar CPU
+   reference backend for the frozen selected-case inventory.
+7. **F-BACKEND-1:** Accept `ferrumRun` successively on threaded CPU, distributed CPU, one GPU,
+   and multiple GPUs without changing case numerics.
+8. **F-D3D7-1:** Implement Drivers 3 through 7 in the fixed order above, applying the common
+   readiness gate and completing coupled `ferrumMultiRun` before Driver 6.
+9. **F-POROUS-1:** Begin porous-media and packed-bed work only after Driver 7 is complete.
