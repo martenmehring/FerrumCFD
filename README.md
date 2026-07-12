@@ -73,6 +73,7 @@ coupled regions.
 - [User Guide](docs/user-guide.md)
 - [Architecture](docs/architecture.md)
 - [Solver Roadmap](docs/solver-roadmap.md)
+- [Continuous Integration](docs/development/continuous-integration.md)
 - [Validation Script Policy](docs/development/script-policy.md)
 - [Benchmark Reports](docs/benchmarks)
 - [Changelog](CHANGELOG.md)
