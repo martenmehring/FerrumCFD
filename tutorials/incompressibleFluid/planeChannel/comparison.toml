@@ -5,6 +5,7 @@ readiness_driver = "steadyIncompressible"
 algorithm = "SIMPLE"
 regime = "laminar"
 title = "Laminar plane-channel flow"
+physical_parameters = "shared/physicalParameters.toml"
 
 [implementations]
 ferrum_case = "ferrum/case"

@@ -12,8 +12,9 @@ meanU = deltaP * H^2 / (12 * mu * L)
 deltaP = 12 * mu * L * meanU / H^2
 ```
 
-The canonical SI inputs are recorded in `../comparison.toml` and
-`planeChannelBenchmark`. For `H=0.02 m`, `L=1 m`, `mu=0.001002 Pa s`, and
+The canonical SI inputs are comparison-only metadata recorded in
+`../shared/physicalParameters.toml` and `planeChannelBenchmark`. For `H=0.02
+m`, `L=1 m`, `mu=0.001002 Pa s`, and
 `meanU=0.02 m/s`, the expected pressure loss is `0.6012 Pa`.
 
 The analytical error is external validation data and must not affect the

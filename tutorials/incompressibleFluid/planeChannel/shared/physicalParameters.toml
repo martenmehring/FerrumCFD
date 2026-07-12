@@ -1,0 +1,16 @@
+schema_version = 1
+case_id = "incompressibleFluid.planeChannel"
+title = "Laminar plane-channel flow"
+regime = "laminar"
+provenance = "Canonical SI inputs for the Ferrum/OpenFOAM/analytical comparison"
+length_m = 1.0
+gap_m = 0.02
+depth_m = 0.001
+streamwise_axis = "x"
+wall_normal_axis = "y"
+density_kg_per_m3 = 998.2
+dynamic_viscosity_pa_s = 0.001002
+kinematic_viscosity_m2_per_s = 0.0000010038068523342016
+mean_velocity_m_per_s = 0.02
+pressure_drop_pa = 0.6012
+pressure_drop_formula = "12*mu*L*meanU/H^2"

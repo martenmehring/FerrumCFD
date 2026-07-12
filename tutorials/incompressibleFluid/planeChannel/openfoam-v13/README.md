@@ -9,4 +9,6 @@ Run it from a disposable copy below `target/`. The source mesh is generated
 from `../shared/geometry/plane_channel.geo` and is versioned with the case so a
 clean checkout has a reproducible OpenFOAM input without invoking Ferrum.
 
-Shared SI values and comparison targets live in `../comparison.toml`.
+This native case is independently runnable. Shared SI values live in
+`../shared/physicalParameters.toml` and comparison targets live in
+`../comparison.toml`; neither TOML file is an OpenFOAM runtime dictionary.
