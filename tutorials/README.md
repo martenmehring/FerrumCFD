@@ -1,29 +1,34 @@
 # Tutorials
 
-Tutorials are curated validation bundles grouped by public application module. A
-bundle keeps program-specific cases separate while sharing only neutral
-geometry and physical inputs:
+Tutorials are grouped by public application module. Their user-facing purpose
+is to provide independent Ferrum and OpenFOAM 13 cases beside a mathematical or
+published reference:
 
 ```text
 <module>/<case>/
-  shared/
-  ferrum/
-  openfoam-v13/
-  analytical/       # when mathematically valid
-  benchmark/        # otherwise, when an external reference is needed
-  comparison.toml
+  ferrum/case/
+  openfoam-v13/case/
+  analytical/       # when a useful closed form exists
   README.md
 ```
 
-`ferrum/` and `openfoam-v13/` must each be independently runnable. Small,
-canonical validation meshes may be versioned inside a source case so a clean
-checkout is reproducible. Regenerated mesh variants, solver time directories,
-logs, and comparison reports belong below `target/`.
+`ferrum/case` and `openfoam-v13/case` must each be independently runnable. The
+user chooses which case, mesh, and comparison to execute. A master script is
+not required. Small canonical meshes may be versioned inside either
+program-specific case; generated time directories and logs belong below
+`target/`.
 
-`comparison.toml` records `module`, `readiness_driver`, `algorithm`, and
-`regime` separately. This keeps the shared `incompressibleFluid` module
-distinct from the steady SIMPLE/SIMPLEC and transient PISO/PIMPLE readiness
-drivers.
+`shared/`, `comparison.toml`, benchmark data, and maintainer scripts are
+optional case-specific aids. Neither solver case may depend on shared metadata
+at runtime.
+
+When present, `comparison.toml` records `module`, `readiness_driver`,
+`algorithm`, and `regime` separately. This keeps the shared
+`incompressibleFluid` module distinct from the steady SIMPLE/SIMPLEC and
+transient PISO/PIMPLE readiness drivers.
+
+Stable recorded results live under `docs/benchmarks/`; generated run output
+belongs below `target/`.
 
 Current Driver 1 bundles:
 

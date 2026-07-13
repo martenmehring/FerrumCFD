@@ -1,17 +1,16 @@
-# Plane-channel benchmark
+# Laminar plane-channel flow
 
-This validation bundle keeps three independent implementations or references:
+This tutorial keeps three independent references side by side:
 
-- `ferrum/case` for `ferrumRun -solver incompressibleFluid`;
-- `openfoam-v13/case` for OpenFOAM Foundation 13
-  `foamRun -solver incompressibleFluid`;
-- `analytical/planeChannelBenchmark` for the plane-Poiseuille solution.
+- `ferrum/case` is the independently runnable Ferrum compatibility case;
+- `openfoam-v13/case` is the native OpenFOAM Foundation 13 case;
+- `analytical/` documents the plane-Poiseuille solution.
 
-The geometry is a channel of length `L`, full plate gap `H`, and one thin cell
-in `z`. The `front` and `back` physical surfaces are imported as OpenFOAM
-`empty` patches, so the solver performs a true 2D calculation.
+The channel has length `L`, full plate gap `H`, and one thin cell in `z`.
+`front` and `back` are `empty` patches, so both solver cases represent a true
+two-dimensional calculation.
 
-For plates at `y = +/- H/2`:
+For stationary plates at `y = +/- H/2`:
 
 ```text
 u(y) = deltaP/(2*mu*L) * ((H/2)^2 - y^2)
@@ -19,37 +18,33 @@ meanU = deltaP*H^2/(12*mu*L)
 deltaP = 12*mu*L*meanU/H^2
 ```
 
-The values in `analytical/planeChannelBenchmark` give `deltaP = 0.6012 Pa`.
-Canonical SI inputs are recorded in `shared/physicalParameters.toml`; that file
-is comparison metadata only and is not a runtime dictionary. `comparison.toml`
-links to it and records comparison targets without duplicating the physics.
-Analytic errors and OpenFOAM comparisons belong in external
-JSON/Markdown reports and must not enter the generic SIMPLE convergence
-decision.
+The supplied reference values give `deltaP = 0.6012 Pa` and
+`meanU = 0.02 m/s`.
 
-The Ferrum and OpenFOAM cases are native, independently runnable cases; neither
-reads the shared TOML at runtime. Gmsh-source validation, analytical-dictionary
-semantics, and strict lexical OpenFOAM hardening are explicitly deferred to
-`F-LAYOUT-PARAMS-PLANECHANNEL-GMSH`,
-`F-LAYOUT-PARAMS-PLANECHANNEL-ANALYTICAL`, and
-`F-LAYOUT-PARAMS-PLANECHANNEL-LEXICAL`.
+## Run the cases
 
-Generate the shared Gmsh mesh and prepare the Ferrum case with:
+Run these commands from the repository root.
+
+Ferrum:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\prepare_plane_channel_case.ps1 -GmshExe "C:\path\to\gmsh.exe" -Force
+cargo run --locked -p ferrum-run --bin ferrumRun -- -solver incompressibleFluid -case tutorials\incompressibleFluid\planeChannel\ferrum\case
 ```
 
-The script deliberately requires the Gmsh executable path. It writes generated
-files only below `target`, imports `front` and `back` as `empty`, copies the
-current Ferrum compatibility dictionaries, and runs `checkFerrumMesh`.
+OpenFOAM Foundation 13 on a compatible Linux installation:
 
-Post-process Ferrum fields with:
-
-```powershell
-ferrumPlaneChannelBenchmark -case tutorials\incompressibleFluid\planeChannel\ferrum\case --fields target\benchmarks\plane_channel\ferrum_fields\1 --pressureDrop 0.6012 --mu 0.001002 --length 1 --gap 0.02 --depth 0.001 --outJson target\benchmarks\plane_channel\ferrum_analytic.json --outMarkdown target\benchmarks\plane_channel\ferrum_analytic.md
+```bash
+mkdir -p target
+case_dir="$(mktemp -d target/openfoam-planeChannel.XXXXXX)"
+cp -R tutorials/incompressibleFluid/planeChannel/openfoam-v13/case/. "$case_dir/"
+foamRun -solver incompressibleFluid -case "$case_dir"
 ```
 
-For OpenFOAM incompressible output, pass `--pressureScale 998.2` to convert
-kinematic pressure to Pa before named-patch pressure sampling. The first shared
-mesh result is recorded in `docs/benchmarks/laminar-plane-channel.md`.
+The cases are independent. Neither reads `shared/physicalParameters.toml` or
+`comparison.toml` at runtime. Those files record neutral reference metadata and
+may be useful to maintainers, but users do not need a combined runner or a
+generated shared mesh to execute either case.
+
+Recorded Ferrum, OpenFOAM, and analytical results are listed in
+`docs/benchmarks/laminar-plane-channel.md`. Optional case-generation and
+validation helpers remain developer tools under `validation/scripts/`.

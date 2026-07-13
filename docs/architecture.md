@@ -30,12 +30,11 @@ src/
 tutorials/
   incompressibleFluid/
     <case>/
-      shared/
-      ferrum/
-      openfoam-v13/
-      analytical/            # solution or documented not-applicable decision
-      benchmark/             # optional fallback
-      comparison.toml
+      ferrum/case/
+      openfoam-v13/case/
+      analytical/            # optional when a useful solution exists
+      shared/                # optional neutral inputs
+      comparison.toml        # optional reference mapping
       README.md
 validation/
   scripts/
@@ -44,8 +43,9 @@ docs/
 target/                      # generated and ignored
 ```
 
-Every tutorial is a validation bundle, not one shared runtime case. The
-`ferrum/` and `openfoam-v13/` cases must each run independently. `shared/` may
+Every tutorial presents independent program-specific references, not one
+shared runtime case. The current `ferrum/case` compatibility directory and the
+native `openfoam-v13/case` directory must each run independently. `shared/` may
 contain neutral geometry, units, and physical inputs, but never
 program-specific dictionaries. Each program converts the shared geometry into
 its own native mesh and owns its numerical configuration.
@@ -53,12 +53,11 @@ its own native mesh and owns its numerical configuration.
 Small canonical validation meshes may be versioned in each program-specific
 source case so a clean checkout is independently runnable. Regenerated mesh
 variants, time directories, logs, and reports belong below `target/`. An
-`analytical/` directory is present in every case bundle. It contains the
-closed-form, semi-analytical, or manufactured solution when one is valid. When
-no useful analytical reference exists, `analytical/README.md` records that
-decision and `benchmark/` contains a documented independent reference with
-provenance, units, sampling, and tolerances. Empty or invented analytical
-references are forbidden.
+`analytical/` directory is included only when a useful closed-form,
+semi-analytical, or manufactured solution exists. Otherwise the case README
+identifies an appropriate published benchmark or observable. Empty or invented
+analytical references are forbidden. Stable recorded results belong under
+`docs/benchmarks/`.
 
 The first layout migration places the reusable mesh/finite-volume foundation
 under `src/ferrumMesh` and the still-combined implementation package under

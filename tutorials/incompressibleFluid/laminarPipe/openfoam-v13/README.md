@@ -17,3 +17,7 @@ used by the canonical default run.
 
 Ferrum does not parse or execute this case. Shared SI values and comparison
 targets live in `../comparison.toml`.
+
+Provenance classification: the geometry, mesh, dictionaries, and fields in
+this bundle were independently authored or generated for FerrumCFD comparison;
+they were not copied from an OpenFOAM tutorial or implementation source.

@@ -18,7 +18,5 @@ analytical runtime dictionary. For `H=0.02 m`, `L=1 m`, `mu=0.001002 Pa s`, and
 `meanU=0.02 m/s`, the expected pressure loss is `0.6012 Pa`.
 
 The analytical error is external validation data and must not affect the
-generic SIMPLE convergence decision.
-
-Analytical-dictionary semantics are deferred to
-`F-LAYOUT-PARAMS-PLANECHANNEL-ANALYTICAL`.
+generic SIMPLE convergence decision. This reference is readable on its own and
+does not require a generator or comparison runner.
