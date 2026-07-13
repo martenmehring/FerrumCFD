@@ -12,5 +12,8 @@ clean checkout has a reproducible OpenFOAM input without invoking Ferrum.
 This is a native, independently runnable OpenFOAM case. Canonical SI values
 live in `../shared/physicalParameters.toml`, which is comparison-only metadata
 and is not read by OpenFOAM; comparison targets live in `../comparison.toml`.
-Strict lexical OpenFOAM hardening is deferred to
-`F-LAYOUT-PARAMS-PLANECHANNEL-LEXICAL`.
+No Ferrum conversion or combined runner is required.
+
+Provenance classification: the geometry, mesh, dictionaries, and fields in
+this bundle were independently authored or generated for FerrumCFD comparison;
+they were not copied from an OpenFOAM tutorial or implementation source.
