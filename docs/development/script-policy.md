@@ -20,15 +20,18 @@ its reproducibility or regression coverage exists in a stable Rust command,
 test, or retained reference artifact and that all documentation links have
 been migrated.
 
-## Cleanup Order
+## Maintenance Guidance
 
 1. Make `ferrumRun -solver incompressibleFluid` the only documented solver
    entry point.
-2. Replace the two thin smoke/wrapper scripts with direct Rust commands.
-3. Consolidate pipe validation behind one neutral Rust validation command.
-4. Archive or remove the two source-driven historical Poiseuille studies.
-5. Keep OpenFOAM 13 reference runners and current numerical sweeps until CI or
-   Rust validation tooling reproduces them.
+2. Keep script inventories in development documentation rather than tutorial
+   user workflows.
+3. Remove a thin wrapper only after direct commands preserve its useful
+   behavior and no maintained document depends on it.
+4. Consolidate validation helpers only when doing so reduces real maintenance;
+   no master Rust or PowerShell runner is required.
+5. Archive historical studies when their recorded benchmark evidence is
+   sufficient and the scripts no longer answer an active engineering question.
 
 Generated meshes, time directories, logs, plots, JSON, and Markdown reports
 must stay below `target/`; only source cases, scripts, and stable reference
