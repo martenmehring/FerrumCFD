@@ -20,10 +20,19 @@ deltaP = 12*mu*L*meanU/H^2
 ```
 
 The values in `analytical/planeChannelBenchmark` give `deltaP = 0.6012 Pa`.
-Shared SI inputs and comparison targets are also recorded in
-`comparison.toml`. Analytic errors and OpenFOAM comparisons belong in external
+Canonical SI inputs are recorded in `shared/physicalParameters.toml`; that file
+is comparison metadata only and is not a runtime dictionary. `comparison.toml`
+links to it and records comparison targets without duplicating the physics.
+Analytic errors and OpenFOAM comparisons belong in external
 JSON/Markdown reports and must not enter the generic SIMPLE convergence
 decision.
+
+The Ferrum and OpenFOAM cases are native, independently runnable cases; neither
+reads the shared TOML at runtime. Gmsh-source validation, analytical-dictionary
+semantics, and strict lexical OpenFOAM hardening are explicitly deferred to
+`F-LAYOUT-PARAMS-PLANECHANNEL-GMSH`,
+`F-LAYOUT-PARAMS-PLANECHANNEL-ANALYTICAL`, and
+`F-LAYOUT-PARAMS-PLANECHANNEL-LEXICAL`.
 
 Generate the shared Gmsh mesh and prepare the Ferrum case with:
 
