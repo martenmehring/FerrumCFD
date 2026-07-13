@@ -203,33 +203,11 @@ The importer maps:
 Internal multi-region interfaces are therefore preserved as `faceZones` even
 when they are not external boundary patches.
 
-The repository also contains a small SI pipe `.geo` with two near-wall prism
-layers:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_gmsh_pipe_import.ps1
-```
-
-The script uses `tutorials/incompressibleFluid/laminarPipe/shared/geometry/pipe_prism2.geo`, writes the generated
-`.msh` below `target/gmsh/`, imports it to `target/cases/gmsh_pipe`, and runs
-`checkFerrumMesh`. It finds `gmsh.exe` from `PATH`; pass the trusted installation
-explicitly with `-GmshExe <path-to-gmsh.exe>` when needed. This Gmsh pipe is
-a benchmark fixture for comparing FerrumCFD and OpenFOAM on the same mesh. It
-does not make OpenFOAM part of the normal FerrumCFD workflow.
-
-The older source-driven Poiseuille Gmsh mesh study is retained only to
-reproduce historical benchmark records:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_gmsh_pipe_mesh_study.ps1
-```
-
-It generates `coarse`, `medium`, and `fine` variants from the same `.geo`,
-imports each one into FerrumCFD, writes SI fields and benchmark metadata, runs
-`checkFerrumMesh`, and optionally runs OpenFOAM for the same imported mesh. Use
-`-SkipOpenFoam` for a quick Ferrum-only preparation pass, or increase
-`-OpenFoamSteps` when reproducing that historical OpenFOAM convergence study.
-New pressure-velocity work uses `run_laminar_simple_mesh_study.ps1` instead.
+The repository also contains neutral Gmsh source examples under the tutorial
+bundles. Users may process them directly with Gmsh and `gmshToFerrum`; no
+repository wrapper or combined Ferrum/OpenFOAM workflow is required. Optional
+case-generation, mesh-study, and historical reproduction helpers are
+maintainer tools documented in `docs/development/script-policy.md`.
 
 ## Interface Registry
 
@@ -447,71 +425,26 @@ results back to SI pressure in `Pa` before comparison.
 
 ## Laminar Pipe Benchmark
 
-`tutorials/incompressibleFluid/laminarPipe/ferrum/case` is the first SI pipe simulation case used by the
-benchmark suite. It contains the mesh, fields, material properties, and solver
-dictionaries. The analytical Hagen-Poiseuille reference is separate at
-`tutorials/incompressibleFluid/laminarPipe/analytical/pipeBenchmark`.
-
-Regenerate the versioned medium-resolution case with:
+`tutorials/incompressibleFluid/laminarPipe/` contains three independent
+references: a Ferrum compatibility case, a native OpenFOAM Foundation 13 case,
+and the Hagen-Poiseuille analytical reference. Run either case from the
+repository root:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\generate_laminar_pipe_case.ps1
+cargo run --locked -p ferrum-run --bin ferrumRun -- -solver incompressibleFluid -case tutorials\incompressibleFluid\laminarPipe\ferrum\case
 ```
 
-The inlet velocity is a fully developed parabolic profile. The generator scales
-the discrete patch values so the patch-integrated flow equals
-`U_mean * inlet_area` for each mesh resolution.
-
-Run the OpenFOAM comparison only as a benchmark artifact:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_poiseuille_benchmark.ps1
+```bash
+mkdir -p target
+case_dir="$(mktemp -d target/openfoam-laminarPipe.XXXXXX)"
+cp -R tutorials/incompressibleFluid/laminarPipe/openfoam-v13/case/. "$case_dir/"
+foamRun -solver incompressibleFluid -case "$case_dir"
 ```
 
-The following source-driven Poiseuille convergence commands are historical
-reproducibility tools, not the current solver workflow:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_laminar_pipe_convergence.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_laminar_pipe_convergence.ps1 -OpenFoamSteps 1000
-```
-
-The corresponding historical Gmsh-first study is:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_gmsh_pipe_mesh_study.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_gmsh_pipe_mesh_study.ps1 -OpenFoamSteps 1000
-```
-
-If `gmsh.exe` is not on `PATH`, pass a trusted installation explicitly with
-`-GmshExe <path-to-gmsh.exe>`. FerrumCFD does not auto-execute a same-named
-binary discovered in Downloads.
-
-The historical validation order was:
-
-- generate several Gmsh meshes
-- run OpenFOAM on the imported meshes and compare pressure loss to
-  Hagen-Poiseuille
-- select the converged reference mesh
-- run the FerrumCFD Poiseuille benchmark on exactly that mesh
-- hand the selected mesh to the later pressure-velocity work
-
-Current SIMPLE mesh refinement uses
-`validation/scripts/incompressibleFluid/run_laminar_simple_mesh_study.ps1`.
-The historical generated OpenFOAM cases and reports stay below
-`target/benchmarks/`.
-They are not part of the normal FerrumCFD workflow. Increase `-OpenFoamSteps`
-when fine OpenFOAM cases still have moving SIMPLE residuals.
-The current local Gmsh pipe mesh-study record is summarized in
-`docs/benchmarks/gmsh-pipe-mesh-study.md`.
-
-`validation\scripts\incompressibleFluid\run_poiseuille_benchmark.ps1` runs OpenFOAM Foundation 13
-`foamRun -solver incompressibleFluid`, runs
-`ferrum solve --solvePoiseuille`, compares both with Hagen-Poiseuille, and
-writes `target/benchmarks/laminar_pipe_compare.json` plus
-`target/benchmarks/laminar_pipe_compare.md`. Use `-SkipOpenFoam
--UseExistingOpenFoamJson` when only the Ferrum side should be rerun against an
-existing OpenFOAM result.
+No shared mesh or comparison runner is required. Stable recorded results are
+kept in `docs/benchmarks/laminar-pipe-poiseuille.md`. Mesh generation,
+OpenFOAM comparison, parameter sweeps, and historical reproduction scripts are
+optional maintainer tools listed in `docs/development/script-policy.md`.
 
 ## Solver Selection And Preflight
 
@@ -848,44 +781,16 @@ kinematic incompressible pressure; Ferrum fields remain SI Pa by default. The
 reference `.geo`, case dictionaries, and SI inputs are under
 `tutorials/incompressibleFluid/planeChannel/`.
 
-For the standard pipe benchmark, the automated comparison command is:
+Recorded pipe and plane-channel results are available under `docs/benchmarks`.
+They document maintainer runs and are not a required user workflow. Optional
+comparison, sweep, and reproduction tools remain under `validation/scripts`
+and are indexed in `docs/development/script-policy.md` instead of being part of
+the normal solver instructions.
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_poiseuille_benchmark.ps1 -OpenFoamSteps 200
-powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_laminar_simple_matched_time_benchmark.ps1 -MatchedTimeSeconds 100
-powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_openfoam_laminar_pipe_step_sweep.ps1 -OpenFoamSteps 100,200,400,800,1200 -TargetRelativeError 0.01
-powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_laminar_simple_benchmark.ps1 -SkipOpenFoam -UseExistingOpenFoamJson
-powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_laminar_simple_iteration_sweep.ps1 -SimpleIterations 2,5,10,20,30
-powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_laminar_simple_mesh_study.ps1 -OpenFoamSteps 400 -FerrumSimpleIterations 100
-powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_laminar_simple_pressure_sweep.ps1 -VariantName medium,fine -SimpleIterations 50,100,200
-```
-
-The resulting Markdown tables record Ferrum pressure-loss error, OpenFOAM
-pressure-loss error, Ferrum solve time, OpenFOAM wall time, and the shared SI
-inputs such as `deltaP`, `rho`, `mu`, `L`, and `D`.
-The solver roadmap in `docs/solver-roadmap.md` records the remaining work from
-the current laminar SIMPLE prototype to the first production laminar
-incompressible solver.
-The iteration sweep is Ferrum-only: it fixes
-`minSimpleIterations=maxSimpleIterations`, writes one generic solver report and
-field directory per budget, and then runs the external pipe post-processor.
-Solver convergence and benchmark agreement therefore remain separate artifacts.
-The matched-time benchmark fixes OpenFOAM `endTime=MatchedTimeSeconds` with
-`deltaT=1` and Ferrum `minSimpleIterations=maxSimpleIterations` to the same
-number. For steady SIMPLE solvers this is an equal pseudo-time/iteration budget,
-not a transient physical-time integration.
-The OpenFOAM step sweep answers the inverse question: how many OpenFOAM 13
-`foamRun -solver incompressibleFluid` steady iterations are needed to reach a target analytic
-pressure-loss error. The older 100-1200 step table used axial-slice
-extrapolation; rerun it with the current named-patch owner-cell sampler before
-using it as an acceptance result.
-The laminar SIMPLE mesh study generates coarse, medium, and fine pipe cases and
-runs the current Ferrum SIMPLE path plus OpenFOAM on each. The earlier
-coarse/medium/fine direct-pressure table must also be regenerated after the
-sampler and report-separation change. The pressure-field sweep remains
-Ferrum-only, fixes `minSimpleIterations=maxSimpleIterations`, and now writes a
-generic report plus an external pipe report for every row. Pressure coupling
-still requires validation on fine and deliberately skewed meshes.
+The solver roadmap in `docs/solver-roadmap.md` records the remaining physics,
+case, and backend work. Users can run each Ferrum or OpenFOAM case
+independently and decide which meshes and comparisons are appropriate for their
+own study.
 
 It also checks basic `controlDict` consistency: recognized `startFrom`,
 `stopAt`, and `writeControl` modes, positive finite `deltaT`, valid

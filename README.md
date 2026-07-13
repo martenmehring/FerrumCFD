@@ -80,23 +80,17 @@ coupled regions.
 - [Security Policy](SECURITY.md)
 
 Local tutorial `README.md` files stay beside their cases because they describe
-how that specific validation bundle is structured and reproduced. Project
+the Ferrum compatibility case, native OpenFOAM 13 case, and available reference. Project
 manuals and design documents live under `docs/`. Standard repository metadata
 (`LICENSE`, `CHANGELOG.md`, and `SECURITY.md`) remains at the root for GitHub
 discovery.
 
-## Validation Automation
+## Developer Validation
 
 PowerShell files under `validation/scripts/` are reproducibility and developer
-tools, not public solver commands. For example, the matched Ferrum/OpenFOAM 13
-pipe comparison is run with:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass `
-  -File validation\scripts\incompressibleFluid\run_laminar_simple_matched_time_benchmark.ps1 `
-  -MatchedTimeSeconds 100
-```
-
+tools, not public solver commands or a required tutorial workflow. Their scope
+and retention policy is documented in
+[`docs/development/script-policy.md`](docs/development/script-policy.md).
 Generated meshes, fields, logs, plots, and reports belong below `target/`.
 
 ## License

@@ -54,5 +54,6 @@ metric for this first plane-channel study.
 
 Both solvers reproduce the analytic mean velocity below 1% on the same Gmsh
 mesh. Ferrum is closer in this run (`0.1646%` versus `0.4992%`) but slower than
-OpenFOAM. The next benchmark iteration should automate both runs and add a
-wall-normal velocity-profile norm, not only the volume mean.
+OpenFOAM. This table is a recorded result, not a required combined user
+workflow. Future maintainers may append separately executed results when they
+need additional evidence such as a wall-normal velocity-profile norm.

@@ -6,6 +6,18 @@ are distinguished explicitly.
 
 ## Unreleased
 
+### Focused Tutorial Scope - 2026-07-13
+
+- Simplified the user-facing tutorial contract to an independently runnable
+  Ferrum compatibility case, a native OpenFOAM 13 case, an analytical reference
+  when useful, concise English documentation, and optional recorded results.
+- Kept existing benchmark scripts and contract tests as maintainer tools while
+  removing mandatory master-runner, same-mesh, parameter-hash, and follow-up
+  hardening requirements from the physics roadmap.
+- Marked `laminarPipe` and `planeChannel` as established cases and selected the
+  official OpenFOAM 13 steady laminar `cylinder` tutorial as the next Driver 1
+  compatibility target, beginning with its required limited schemes.
+
 ### OpenFOAM-13-Inspired Layout And Driver Roadmap - 2026-07-11
 
 - Moved reusable implementation code to `src/` and the current combined
