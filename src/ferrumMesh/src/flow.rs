@@ -37,6 +37,7 @@ pub enum LaminarSimpleGradientScheme {
 pub enum LaminarSimpleConvectionScheme {
     GaussUpwind,
     GaussLinearUpwind,
+    BoundedGaussLinearUpwind(LaminarSimpleGradientScheme),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -395,6 +396,29 @@ impl std::fmt::Display for LaminarSimpleConvectionScheme {
         match self {
             Self::GaussUpwind => formatter.write_str("Gauss upwind"),
             Self::GaussLinearUpwind => formatter.write_str("Gauss linearUpwind grad(U)"),
+            Self::BoundedGaussLinearUpwind(_) => {
+                formatter.write_str("bounded Gauss linearUpwind limited")
+            }
+        }
+    }
+}
+
+impl LaminarSimpleConvectionScheme {
+    fn uses_linear_upwind(self) -> bool {
+        matches!(
+            self,
+            Self::GaussLinearUpwind | Self::BoundedGaussLinearUpwind(_)
+        )
+    }
+
+    fn is_bounded(self) -> bool {
+        matches!(self, Self::BoundedGaussLinearUpwind(_))
+    }
+
+    fn gradient_scheme(self, fallback: LaminarSimpleGradientScheme) -> LaminarSimpleGradientScheme {
+        match self {
+            Self::BoundedGaussLinearUpwind(scheme) => scheme,
+            _ => fallback,
         }
     }
 }
@@ -1277,28 +1301,29 @@ fn assemble_momentum_equation(
     let mut components = Vec::with_capacity(3);
     let mut diagonal = Vec::new();
     let mut h1 = Vec::new();
-    let component_gradients = if matches!(
-        options.schemes.div_phi_u,
-        LaminarSimpleConvectionScheme::GaussLinearUpwind
-    ) {
+    let component_gradients = if options.schemes.div_phi_u.uses_linear_upwind() {
+        let gradient_scheme = options
+            .schemes
+            .div_phi_u
+            .gradient_scheme(options.schemes.grad_u);
         Some([
             scalar_gradient(
                 mesh,
                 &old_components[0],
                 &scalar_component_boundary(velocity_boundary, 0),
-                options.schemes.grad_u,
+                gradient_scheme,
             )?,
             scalar_gradient(
                 mesh,
                 &old_components[1],
                 &scalar_component_boundary(velocity_boundary, 1),
-                options.schemes.grad_u,
+                gradient_scheme,
             )?,
             scalar_gradient(
                 mesh,
                 &old_components[2],
                 &scalar_component_boundary(velocity_boundary, 2),
-                options.schemes.grad_u,
+                gradient_scheme,
             )?,
         ])
     } else {
@@ -1993,6 +2018,18 @@ fn assemble_momentum_component_system(
         }
     }
 
+    if convection_scheme.is_bounded() {
+        let net_flux = net_cell_flux(mesh, flux)?;
+        for (cell, cell_flux) in net_flux.into_iter().enumerate() {
+            let correction = checked_product(
+                density,
+                cell_flux,
+                format!("bounded momentum cell {cell} net mass flux"),
+            )?;
+            add_entry(&mut rows[cell], cell, -correction);
+        }
+    }
+
     let matrix_rows = rows
         .into_iter()
         .map(|row| row.into_iter().collect::<Vec<_>>())
@@ -2031,7 +2068,7 @@ fn add_internal_convection(
     scheme: LaminarSimpleConvectionScheme,
 ) {
     add_internal_upwind_convection(rows, owner, neighbour, mass_flux);
-    if matches!(scheme, LaminarSimpleConvectionScheme::GaussLinearUpwind) {
+    if scheme.uses_linear_upwind() {
         let Some(gradient) = old_gradient else {
             return;
         };
@@ -2078,7 +2115,7 @@ fn add_boundary_convection(
 ) {
     add_boundary_upwind_convection(rows, rhs, owner, value, mass_flux);
     if mass_flux >= 0.0
-        && matches!(scheme, LaminarSimpleConvectionScheme::GaussLinearUpwind)
+        && scheme.uses_linear_upwind()
         && let Some(gradient) = old_gradient
     {
         let correction = linear_upwind_scalar_correction(
@@ -2101,7 +2138,7 @@ fn add_boundary_extrapolated_convection(
     scheme: LaminarSimpleConvectionScheme,
 ) {
     add_entry(&mut rows[owner], owner, mass_flux);
-    if matches!(scheme, LaminarSimpleConvectionScheme::GaussLinearUpwind)
+    if scheme.uses_linear_upwind()
         && let Some(gradient) = old_gradient
     {
         let correction = linear_upwind_scalar_correction(
@@ -2561,18 +2598,23 @@ fn vector_convection_divergence(
             mesh.faces
         )));
     }
-    let gradients = if matches!(scheme, LaminarSimpleConvectionScheme::GaussLinearUpwind) {
+    let gradients = if scheme.uses_linear_upwind() {
         Some(vector_component_gradients(
             mesh,
             velocity,
             boundary,
-            gradient_scheme,
+            scheme.gradient_scheme(gradient_scheme),
         )?)
     } else {
         None
     };
     let mut divergence = vec![zero(); mesh.cells];
     for (face_index, phi) in flux.iter().copied().enumerate() {
+        if !phi.is_finite() {
+            return Err(invalid_input(format!(
+                "convection face {face_index} flux must be finite, got {phi}"
+            )));
+        }
         let owner = mesh.owner[face_index];
         let face_velocity = convection_face_vector_value(
             mesh,
@@ -2588,6 +2630,34 @@ fn vector_convection_divergence(
             add_scaled(&mut divergence[neighbour], face_velocity, -phi);
         }
     }
+    if scheme.is_bounded() {
+        let net_flux = net_cell_flux(mesh, flux)?;
+        for cell in 0..mesh.cells {
+            divergence[cell].x -= checked_product(
+                net_flux[cell],
+                velocity[cell].x,
+                format!("bounded convection cell {cell} x correction"),
+            )?;
+            divergence[cell].y -= checked_product(
+                net_flux[cell],
+                velocity[cell].y,
+                format!("bounded convection cell {cell} y correction"),
+            )?;
+            divergence[cell].z -= checked_product(
+                net_flux[cell],
+                velocity[cell].z,
+                format!("bounded convection cell {cell} z correction"),
+            )?;
+            if !divergence[cell].x.is_finite()
+                || !divergence[cell].y.is_finite()
+                || !divergence[cell].z.is_finite()
+            {
+                return Err(invalid_input(format!(
+                    "bounded convection cell {cell} correction overflowed"
+                )));
+            }
+        }
+    }
     Ok(divergence)
 }
 
@@ -2601,10 +2671,25 @@ fn net_cell_flux(mesh: &SolverRuntimeMeshData, flux: &[f64]) -> Result<Vec<f64>>
     }
     let mut net = vec![0.0; mesh.cells];
     for (face_index, phi) in flux.iter().copied().enumerate() {
+        if !phi.is_finite() {
+            return Err(invalid_input(format!(
+                "face {face_index} flux must be finite, got {phi}"
+            )));
+        }
         let owner = mesh.owner[face_index];
         net[owner] += phi;
+        if !net[owner].is_finite() {
+            return Err(invalid_input(format!(
+                "cell {owner} net flux overflowed at face {face_index}"
+            )));
+        }
         if let Some(neighbour) = mesh.neighbour[face_index] {
             net[neighbour] -= phi;
+            if !net[neighbour].is_finite() {
+                return Err(invalid_input(format!(
+                    "cell {neighbour} net flux overflowed at face {face_index}"
+                )));
+            }
         }
     }
     Ok(net)
@@ -3632,7 +3717,7 @@ fn convection_face_vector_value(
     gradients: Option<&[Vec<Point3>; 3]>,
 ) -> Point3 {
     let upwind = upwind_face_vector_value(mesh, velocity, boundary, face_index, flux);
-    if !matches!(scheme, LaminarSimpleConvectionScheme::GaussLinearUpwind) {
+    if !scheme.uses_linear_upwind() {
         return upwind;
     }
     let Some(gradients) = gradients else {
@@ -4406,8 +4491,8 @@ mod tests {
         net_cell_flux, non_orthogonal_pressure_flux_correction, normalized_residual_norm,
         pressure_correction_flux, reciprocal_momentum_diagonal, relax_scalar_component_equation,
         scalar_component_boundary, scalar_gradient, solve_laminar_simple, split_components,
-        subtract_face_fluxes, upwind_face_vector_value, vector_face_treatments,
-        velocity_from_hby_a,
+        subtract_face_fluxes, upwind_face_vector_value, vector_convection_divergence,
+        vector_face_treatments, velocity_from_hby_a, zero,
     };
     use crate::Point3;
 
@@ -4884,6 +4969,169 @@ mod tests {
         );
         assert_close(linear_upwind.rhs[0], upwind.rhs[0] - 2.0);
         assert_close(linear_upwind.rhs[1], upwind.rhs[1] - 4.0);
+    }
+
+    #[test]
+    fn bounded_linear_upwind_matches_unbounded_for_divergence_free_flux() {
+        let runtime = two_cell_runtime();
+        let boundary = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
+        let flux = vec![1.0, -1.0, 1.0];
+        let source = vec![0.0, 0.0];
+        let old_values = vec![5.0, 3.0];
+        let old_gradient = vec![point(4.0, 0.0, 0.0); 2];
+        let unbounded = assemble_momentum_component_system(
+            &runtime.mesh,
+            1.0,
+            2.0,
+            &flux,
+            &source,
+            &boundary,
+            &old_values,
+            Some(&old_gradient),
+            LaminarSimpleConvectionScheme::GaussLinearUpwind,
+        )
+        .expect("unbounded system");
+        let bounded = assemble_momentum_component_system(
+            &runtime.mesh,
+            1.0,
+            2.0,
+            &flux,
+            &source,
+            &boundary,
+            &old_values,
+            Some(&old_gradient),
+            LaminarSimpleConvectionScheme::BoundedGaussLinearUpwind(
+                LaminarSimpleGradientScheme::GaussLinear,
+            ),
+        )
+        .expect("bounded system");
+
+        assert_eq!(bounded.matrix.row_offsets(), unbounded.matrix.row_offsets());
+        assert_eq!(bounded.matrix.col_indices(), unbounded.matrix.col_indices());
+        assert_eq!(bounded.matrix.values(), unbounded.matrix.values());
+        assert_eq!(bounded.rhs, unbounded.rhs);
+
+        let velocity = vec![point(5.0, 1.0, -2.0), point(3.0, 4.0, 6.0)];
+        let vector_boundary = vec![VectorFaceTreatment::ZeroGradient; runtime.mesh.faces];
+        let unbounded_divergence = vector_convection_divergence(
+            &runtime.mesh,
+            &velocity,
+            &vector_boundary,
+            &flux,
+            LaminarSimpleConvectionScheme::GaussLinearUpwind,
+            LaminarSimpleGradientScheme::GaussLinear,
+        )
+        .expect("unbounded divergence");
+        let bounded_divergence = vector_convection_divergence(
+            &runtime.mesh,
+            &velocity,
+            &vector_boundary,
+            &flux,
+            LaminarSimpleConvectionScheme::BoundedGaussLinearUpwind(
+                LaminarSimpleGradientScheme::GaussLinear,
+            ),
+            LaminarSimpleGradientScheme::GaussLinear,
+        )
+        .expect("bounded divergence");
+        for cell in 0..runtime.mesh.cells {
+            assert_eq!(bounded_divergence[cell].x, unbounded_divergence[cell].x);
+            assert_eq!(bounded_divergence[cell].y, unbounded_divergence[cell].y);
+            assert_eq!(bounded_divergence[cell].z, unbounded_divergence[cell].z);
+        }
+    }
+
+    #[test]
+    fn bounded_correction_has_analytic_nonconservative_deltas_and_neutralizes_constants() {
+        let runtime = two_cell_runtime();
+        let scalar_boundary = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
+        let vector_boundary = vec![VectorFaceTreatment::ZeroGradient; runtime.mesh.faces];
+        let flux = vec![1.0, -2.0, 3.0];
+        let source = vec![0.0, 0.0];
+        let old_values = vec![5.0, 3.0];
+        let old_gradient = vec![zero(); 2];
+        let unbounded = assemble_momentum_component_system(
+            &runtime.mesh,
+            0.0,
+            1.0,
+            &flux,
+            &source,
+            &scalar_boundary,
+            &old_values,
+            Some(&old_gradient),
+            LaminarSimpleConvectionScheme::GaussLinearUpwind,
+        )
+        .expect("unbounded system");
+        let bounded_scheme = LaminarSimpleConvectionScheme::BoundedGaussLinearUpwind(
+            LaminarSimpleGradientScheme::GaussLinear,
+        );
+        let bounded = assemble_momentum_component_system(
+            &runtime.mesh,
+            0.0,
+            1.0,
+            &flux,
+            &source,
+            &scalar_boundary,
+            &old_values,
+            Some(&old_gradient),
+            bounded_scheme,
+        )
+        .expect("bounded system");
+        let unbounded_diagonal = unbounded.matrix.diagonal().expect("unbounded diagonal");
+        let bounded_diagonal = bounded.matrix.diagonal().expect("bounded diagonal");
+        assert_eq!(bounded_diagonal[0] - unbounded_diagonal[0], 1.0);
+        assert_eq!(bounded_diagonal[1] - unbounded_diagonal[1], -2.0);
+        assert_eq!(bounded.rhs, unbounded.rhs);
+
+        let velocity = vec![point(5.0, 1.0, -2.0), point(3.0, 4.0, 6.0)];
+        let unbounded_divergence = vector_convection_divergence(
+            &runtime.mesh,
+            &velocity,
+            &vector_boundary,
+            &flux,
+            LaminarSimpleConvectionScheme::GaussLinearUpwind,
+            LaminarSimpleGradientScheme::GaussLinear,
+        )
+        .expect("unbounded divergence");
+        let bounded_divergence = vector_convection_divergence(
+            &runtime.mesh,
+            &velocity,
+            &vector_boundary,
+            &flux,
+            bounded_scheme,
+            LaminarSimpleGradientScheme::GaussLinear,
+        )
+        .expect("bounded divergence");
+        let net = [-1.0, 2.0];
+        for cell in 0..2 {
+            assert_eq!(
+                bounded_divergence[cell].x - unbounded_divergence[cell].x,
+                -net[cell] * velocity[cell].x
+            );
+            assert_eq!(
+                bounded_divergence[cell].y - unbounded_divergence[cell].y,
+                -net[cell] * velocity[cell].y
+            );
+            assert_eq!(
+                bounded_divergence[cell].z - unbounded_divergence[cell].z,
+                -net[cell] * velocity[cell].z
+            );
+        }
+
+        let constant = vec![point(7.0, -3.0, 2.0); 2];
+        let neutralized = vector_convection_divergence(
+            &runtime.mesh,
+            &constant,
+            &vector_boundary,
+            &flux,
+            bounded_scheme,
+            LaminarSimpleGradientScheme::GaussLinear,
+        )
+        .expect("constant bounded divergence");
+        for value in neutralized {
+            assert_eq!(value.x, 0.0);
+            assert_eq!(value.y, 0.0);
+            assert_eq!(value.z, 0.0);
+        }
     }
 
     #[test]
