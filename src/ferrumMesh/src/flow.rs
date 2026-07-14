@@ -27,9 +27,10 @@ pub enum LaminarSimplePreconditioner {
     IncompleteCholesky,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub enum LaminarSimpleGradientScheme {
     GaussLinear,
+    CellLimitedGaussLinear(f64),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,6 +57,20 @@ pub enum LaminarSimpleLaplacianScheme {
     GaussLinearOrthogonal,
     GaussLinearUncorrected,
 }
+
+impl PartialEq for LaminarSimpleGradientScheme {
+    fn eq(&self, other: &Self) -> bool {
+        match (*self, *other) {
+            (Self::GaussLinear, Self::GaussLinear) => true,
+            (Self::CellLimitedGaussLinear(left), Self::CellLimitedGaussLinear(right)) => {
+                left.to_bits() == right.to_bits()
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for LaminarSimpleGradientScheme {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LaminarSimpleSchemes {
@@ -368,6 +383,9 @@ impl std::fmt::Display for LaminarSimpleGradientScheme {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::GaussLinear => formatter.write_str("Gauss linear"),
+            Self::CellLimitedGaussLinear(coefficient) => {
+                write!(formatter, "cellLimited Gauss linear {coefficient}")
+            }
         }
     }
 }
@@ -2477,7 +2495,7 @@ fn scalar_gradient(
     mesh: &SolverRuntimeMeshData,
     values: &[f64],
     boundary: &[ScalarFaceTreatment],
-    _scheme: LaminarSimpleGradientScheme,
+    scheme: LaminarSimpleGradientScheme,
 ) -> Result<Vec<Point3>> {
     if values.len() != mesh.cells {
         return Err(invalid_input(format!(
@@ -2486,22 +2504,46 @@ fn scalar_gradient(
             values.len()
         )));
     }
+    if boundary.len() != mesh.faces {
+        return Err(invalid_input(format!(
+            "scalar gradient expected {} boundary treatments, got {}",
+            mesh.faces,
+            boundary.len()
+        )));
+    }
+    for (cell, value) in values.iter().copied().enumerate() {
+        require_finite(value, format!("scalar gradient cell {cell} value"))?;
+    }
     let mut gradient = vec![zero(); mesh.cells];
     for face_index in 0..mesh.faces {
         let owner = mesh.owner[face_index];
-        let face_value = face_scalar_value(mesh, values, boundary, face_index);
+        let face_value = face_scalar_value(mesh, values, boundary, face_index)?;
         let area = mesh.face_area_vectors[face_index];
-        add_scaled(&mut gradient[owner], area, face_value);
+        checked_add_scaled(&mut gradient[owner], area, face_value, face_index, owner)?;
         if let Some(neighbour) = mesh.neighbour[face_index] {
-            add_scaled(&mut gradient[neighbour], area, -face_value);
+            checked_add_scaled(
+                &mut gradient[neighbour],
+                area,
+                -face_value,
+                face_index,
+                neighbour,
+            )?;
         }
     }
-    for (value, volume) in gradient.iter_mut().zip(&mesh.cell_volumes) {
-        if *volume > f64::EPSILON {
-            scale(value, 1.0 / volume);
+    for (cell, (value, volume)) in gradient.iter_mut().zip(&mesh.cell_volumes).enumerate() {
+        if !volume.is_finite() || *volume <= f64::EPSILON {
+            return Err(invalid_input(format!(
+                "scalar gradient cell {cell} has non-positive or non-finite volume {volume}"
+            )));
+        }
+        checked_scale(value, 1.0 / volume, format!("scalar gradient cell {cell}"))?;
+    }
+    match scheme {
+        LaminarSimpleGradientScheme::GaussLinear => Ok(gradient),
+        LaminarSimpleGradientScheme::CellLimitedGaussLinear(coefficient) => {
+            limit_scalar_gradient(mesh, values, boundary, gradient, coefficient)
         }
     }
-    Ok(gradient)
 }
 
 fn vector_convection_divergence(
@@ -3625,19 +3667,298 @@ fn face_scalar_value(
     values: &[f64],
     boundary: &[ScalarFaceTreatment],
     face_index: usize,
-) -> f64 {
+) -> Result<f64> {
     let owner = mesh.owner[face_index];
     if let Some(neighbour) = mesh.neighbour[face_index] {
-        return 0.5 * (values[owner] + values[neighbour]);
+        let weight = gauss_linear_owner_weight(mesh, owner, neighbour, face_index)?;
+        let owner_part = checked_product(
+            weight,
+            values[owner],
+            format!("internal face {face_index} owner interpolation"),
+        )?;
+        let neighbour_part = checked_product(
+            1.0 - weight,
+            values[neighbour],
+            format!("internal face {face_index} neighbour interpolation"),
+        )?;
+        return require_finite(
+            owner_part + neighbour_part,
+            format!("internal face {face_index} interpolated value"),
+        );
     }
-    match boundary[face_index] {
+    let value = match boundary[face_index] {
         ScalarFaceTreatment::FixedValue(value) => value,
         ScalarFaceTreatment::FixedGradient(gradient) => {
-            values[owner] + gradient * boundary_normal_distance(mesh, owner, face_index)
+            let distance = boundary_normal_distance(mesh, owner, face_index);
+            require_finite(
+                distance,
+                format!("boundary face {face_index} normal distance"),
+            )?;
+            let increment = checked_product(
+                gradient,
+                distance,
+                format!("boundary face {face_index} fixed-gradient extrapolation"),
+            )?;
+            require_finite(
+                values[owner] + increment,
+                format!("boundary face {face_index} fixed-gradient value"),
+            )?
         }
         ScalarFaceTreatment::InletOutlet(value) => value,
         ScalarFaceTreatment::ZeroGradient | ScalarFaceTreatment::Constraint => values[owner],
+    };
+    require_finite(value, format!("boundary face {face_index} effective value"))
+}
+
+const V_GREAT: f64 = f64::MAX / 10.0;
+
+fn gauss_linear_owner_weight(
+    mesh: &SolverRuntimeMeshData,
+    owner: usize,
+    neighbour: usize,
+    face_index: usize,
+) -> Result<f64> {
+    let face = mesh.face_centres[face_index];
+    let owner_delta = checked_delta(
+        face,
+        mesh.cell_centres[owner],
+        format!("internal face {face_index} owner-centre delta"),
+    )?;
+    let neighbour_delta = checked_delta(
+        mesh.cell_centres[neighbour],
+        face,
+        format!("internal face {face_index} neighbour-centre delta"),
+    )?;
+    let area = mesh.face_area_vectors[face_index];
+    require_finite_point(area, format!("internal face {face_index} area vector"))?;
+    let sfd_owner = checked_dot(
+        area,
+        owner_delta,
+        format!("internal face {face_index} projected owner distance"),
+    )?
+    .abs();
+    let sfd_neighbour = checked_dot(
+        area,
+        neighbour_delta,
+        format!("internal face {face_index} projected neighbour distance"),
+    )?
+    .abs();
+    let projected_sum = require_finite(
+        sfd_owner + sfd_neighbour,
+        format!("internal face {face_index} projected distance sum"),
+    )?;
+
+    let weight = if sfd_neighbour / V_GREAT < projected_sum {
+        sfd_neighbour / projected_sum
+    } else {
+        let owner_distance = checked_magnitude(
+            owner_delta,
+            format!("internal face {face_index} Euclidean owner distance"),
+        )?;
+        let neighbour_distance = checked_magnitude(
+            neighbour_delta,
+            format!("internal face {face_index} Euclidean neighbour distance"),
+        )?;
+        let distance_sum = require_finite(
+            owner_distance + neighbour_distance,
+            format!("internal face {face_index} Euclidean distance sum"),
+        )?;
+        if distance_sum <= 0.0 {
+            return Err(invalid_input(format!(
+                "internal face {face_index} has zero projected and Euclidean centre distance"
+            )));
+        }
+        neighbour_distance / distance_sum
+    };
+    let weight = require_finite(weight, format!("internal face {face_index} linear weight"))?;
+    if !(0.0..=1.0).contains(&weight) {
+        return Err(invalid_input(format!(
+            "internal face {face_index} linear weight {weight} is outside [0, 1]"
+        )));
     }
+    Ok(weight)
+}
+
+fn limit_scalar_gradient(
+    mesh: &SolverRuntimeMeshData,
+    values: &[f64],
+    boundary: &[ScalarFaceTreatment],
+    mut gradient: Vec<Point3>,
+    coefficient: f64,
+) -> Result<Vec<Point3>> {
+    if !coefficient.is_finite() || !(0.0..=1.0).contains(&coefficient) {
+        return Err(invalid_input(format!(
+            "cellLimited gradient coefficient must be finite and in [0, 1], got {coefficient}"
+        )));
+    }
+    if coefficient == 0.0 {
+        return Ok(gradient);
+    }
+
+    let mut minima = values.to_vec();
+    let mut maxima = values.to_vec();
+    for face_index in 0..mesh.faces {
+        let owner = mesh.owner[face_index];
+        if let Some(neighbour) = mesh.neighbour[face_index] {
+            minima[owner] = minima[owner].min(values[neighbour]);
+            maxima[owner] = maxima[owner].max(values[neighbour]);
+            minima[neighbour] = minima[neighbour].min(values[owner]);
+            maxima[neighbour] = maxima[neighbour].max(values[owner]);
+        } else {
+            let boundary_value = face_scalar_value(mesh, values, boundary, face_index)?;
+            minima[owner] = minima[owner].min(boundary_value);
+            maxima[owner] = maxima[owner].max(boundary_value);
+        }
+    }
+
+    for cell in 0..mesh.cells {
+        let maximum_delta = checked_subtraction(
+            maxima[cell],
+            values[cell],
+            format!("cellLimited cell {cell} maximum extrema delta"),
+        )?;
+        let minimum_delta = checked_subtraction(
+            minima[cell],
+            values[cell],
+            format!("cellLimited cell {cell} minimum extrema delta"),
+        )?;
+        let span = checked_subtraction(
+            maxima[cell],
+            minima[cell],
+            format!("cellLimited cell {cell} extrema span"),
+        )?;
+        let widening = if coefficient == 1.0 {
+            0.0
+        } else {
+            let widening_numerator = checked_product(
+                span,
+                1.0 - coefficient,
+                format!("cellLimited cell {cell} widening numerator"),
+            )?;
+            require_finite(
+                widening_numerator / coefficient,
+                format!("cellLimited cell {cell} widening term"),
+            )?
+        };
+        let widened_maximum = require_finite(
+            maximum_delta + widening,
+            format!("cellLimited cell {cell} widened maximum delta"),
+        )?;
+        let widened_minimum = require_finite(
+            minimum_delta - widening,
+            format!("cellLimited cell {cell} widened minimum delta"),
+        )?;
+        let mut limiter: f64 = 1.0;
+
+        for face_index in 0..mesh.faces {
+            if mesh.owner[face_index] != cell && mesh.neighbour[face_index] != Some(cell) {
+                continue;
+            }
+            let delta = checked_delta(
+                mesh.face_centres[face_index],
+                mesh.cell_centres[cell],
+                format!("cellLimited cell {cell} face {face_index} centre delta"),
+            )?;
+            let extrapolation = checked_dot(
+                gradient[cell],
+                delta,
+                format!("cellLimited cell {cell} face {face_index} extrapolation"),
+            )?;
+            let ratio = if extrapolation > widened_maximum && extrapolation > 0.0 {
+                widened_maximum / extrapolation
+            } else if extrapolation < widened_minimum && extrapolation < 0.0 {
+                widened_minimum / extrapolation
+            } else {
+                1.0
+            };
+            let ratio = require_finite(
+                ratio,
+                format!("cellLimited cell {cell} face {face_index} limiter ratio"),
+            )?;
+            limiter = limiter.min(ratio.clamp(0.0, 1.0));
+            require_finite(limiter, format!("cellLimited cell {cell} final limiter"))?;
+        }
+        checked_scale(
+            &mut gradient[cell],
+            limiter,
+            format!("cellLimited cell {cell} limited gradient"),
+        )?;
+    }
+    Ok(gradient)
+}
+
+fn require_finite(value: f64, context: String) -> Result<f64> {
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(invalid_input(format!("{context} is non-finite ({value})")))
+    }
+}
+
+fn require_finite_point(value: Point3, context: String) -> Result<Point3> {
+    require_finite(value.x, format!("{context} x component"))?;
+    require_finite(value.y, format!("{context} y component"))?;
+    require_finite(value.z, format!("{context} z component"))?;
+    Ok(value)
+}
+
+fn checked_subtraction(left: f64, right: f64, context: String) -> Result<f64> {
+    require_finite(left, format!("{context} left operand"))?;
+    require_finite(right, format!("{context} right operand"))?;
+    require_finite(left - right, context)
+}
+
+fn checked_product(left: f64, right: f64, context: String) -> Result<f64> {
+    require_finite(left, format!("{context} left operand"))?;
+    require_finite(right, format!("{context} right operand"))?;
+    require_finite(left * right, context)
+}
+
+fn checked_delta(left: Point3, right: Point3, context: String) -> Result<Point3> {
+    require_finite_point(left, format!("{context} left point"))?;
+    require_finite_point(right, format!("{context} right point"))?;
+    Ok(Point3 {
+        x: checked_subtraction(left.x, right.x, format!("{context} x component"))?,
+        y: checked_subtraction(left.y, right.y, format!("{context} y component"))?,
+        z: checked_subtraction(left.z, right.z, format!("{context} z component"))?,
+    })
+}
+
+fn checked_dot(left: Point3, right: Point3, context: String) -> Result<f64> {
+    let x = checked_product(left.x, right.x, format!("{context} x product"))?;
+    let y = checked_product(left.y, right.y, format!("{context} y product"))?;
+    let z = checked_product(left.z, right.z, format!("{context} z product"))?;
+    let xy = require_finite(x + y, format!("{context} x-y sum"))?;
+    require_finite(xy + z, context)
+}
+
+fn checked_magnitude(value: Point3, context: String) -> Result<f64> {
+    require_finite_point(value, context.clone())?;
+    require_finite(value.x.hypot(value.y).hypot(value.z), context)
+}
+
+fn checked_add_scaled(
+    target: &mut Point3,
+    value: Point3,
+    scale_value: f64,
+    face_index: usize,
+    cell: usize,
+) -> Result<()> {
+    let context = format!("scalar gradient face {face_index} cell {cell} accumulation");
+    let x = checked_product(value.x, scale_value, format!("{context} x product"))?;
+    let y = checked_product(value.y, scale_value, format!("{context} y product"))?;
+    let z = checked_product(value.z, scale_value, format!("{context} z product"))?;
+    target.x = require_finite(target.x + x, format!("{context} x sum"))?;
+    target.y = require_finite(target.y + y, format!("{context} y sum"))?;
+    target.z = require_finite(target.z + z, format!("{context} z sum"))?;
+    Ok(())
+}
+
+fn checked_scale(value: &mut Point3, factor: f64, context: String) -> Result<()> {
+    value.x = checked_product(value.x, factor, format!("{context} x component"))?;
+    value.y = checked_product(value.y, factor, format!("{context} y component"))?;
+    value.z = checked_product(value.z, factor, format!("{context} z component"))?;
+    Ok(())
 }
 
 fn scalar_component_boundary(
@@ -4009,12 +4330,6 @@ fn add_scaled(target: &mut Point3, value: Point3, scale_value: f64) {
     target.z += value.z * scale_value;
 }
 
-fn scale(value: &mut Point3, scale_value: f64) {
-    value.x *= scale_value;
-    value.y *= scale_value;
-    value.z *= scale_value;
-}
-
 fn average(left: Point3, right: Point3) -> Point3 {
     Point3 {
         x: 0.5 * (left.x + right.x),
@@ -4087,11 +4402,12 @@ mod tests {
         assemble_momentum_component_system, assemble_momentum_equation,
         assemble_variable_scalar_component_system, compute_face_flux, compute_phi_hby_a,
         consistent_reciprocal_momentum_diagonal, constrained_pressure_treatments,
-        face_diffusion_coefficient, hby_a_from_predicted_velocity, net_cell_flux,
-        non_orthogonal_pressure_flux_correction, normalized_residual_norm,
+        face_diffusion_coefficient, hby_a_from_predicted_velocity, limit_scalar_gradient,
+        net_cell_flux, non_orthogonal_pressure_flux_correction, normalized_residual_norm,
         pressure_correction_flux, reciprocal_momentum_diagonal, relax_scalar_component_equation,
-        scalar_component_boundary, solve_laminar_simple, split_components, subtract_face_fluxes,
-        upwind_face_vector_value, vector_face_treatments, velocity_from_hby_a,
+        scalar_component_boundary, scalar_gradient, solve_laminar_simple, split_components,
+        subtract_face_fluxes, upwind_face_vector_value, vector_face_treatments,
+        velocity_from_hby_a,
     };
     use crate::Point3;
 
@@ -4170,6 +4486,198 @@ mod tests {
         .expect("coefficient");
 
         assert_close(coefficient, 2.0);
+    }
+
+    #[test]
+    fn gauss_linear_interpolation_uses_projected_geometry_weights() {
+        let mut runtime = two_cell_runtime();
+        let boundary = vec![
+            ScalarFaceTreatment::ZeroGradient,
+            ScalarFaceTreatment::ZeroGradient,
+            ScalarFaceTreatment::ZeroGradient,
+        ];
+
+        let midpoint = scalar_gradient(
+            &runtime.mesh,
+            &[2.0, 10.0],
+            &boundary,
+            LaminarSimpleGradientScheme::GaussLinear,
+        )
+        .expect("midpoint gradient");
+        assert_close(midpoint[0].x, 8.0);
+        assert_close(midpoint[1].x, 8.0);
+
+        runtime.mesh.face_centres[0].x = 0.4;
+
+        let gradient = scalar_gradient(
+            &runtime.mesh,
+            &[2.0, 10.0],
+            &boundary,
+            LaminarSimpleGradientScheme::GaussLinear,
+        )
+        .expect("geometry-weighted gradient");
+
+        // The internal face value is 0.7*2 + 0.3*10 = 4.4, rather than 6.0.
+        assert_close(gradient[0].x, 4.8);
+        assert_close(gradient[1].x, 11.2);
+
+        runtime.mesh.face_area_vectors[0] = point(0.0, 1.0, 0.0);
+        let euclidean_fallback = scalar_gradient(
+            &runtime.mesh,
+            &[2.0, 10.0],
+            &boundary,
+            LaminarSimpleGradientScheme::GaussLinear,
+        )
+        .expect("Euclidean fallback gradient");
+        assert_close(euclidean_fallback[0].y, 8.8);
+        assert_close(euclidean_fallback[1].y, -8.8);
+    }
+
+    #[test]
+    fn cell_limited_gradient_removes_local_overshoot() {
+        let mesh = three_cell_line_mesh();
+        let boundary = vec![
+            ScalarFaceTreatment::ZeroGradient,
+            ScalarFaceTreatment::ZeroGradient,
+            ScalarFaceTreatment::ZeroGradient,
+            ScalarFaceTreatment::ZeroGradient,
+        ];
+        let values = [0.0, 1.0, 1.0];
+        let raw = scalar_gradient(
+            &mesh,
+            &values,
+            &boundary,
+            LaminarSimpleGradientScheme::GaussLinear,
+        )
+        .expect("raw gradient");
+        let limited = scalar_gradient(
+            &mesh,
+            &values,
+            &boundary,
+            LaminarSimpleGradientScheme::CellLimitedGaussLinear(1.0),
+        )
+        .expect("limited gradient");
+
+        assert!(raw[1].x > 0.0);
+        assert_close(limited[1].x, 0.0);
+        let extrapolated = values[1] + limited[1].x * 0.5;
+        assert!((0.0..=1.0).contains(&extrapolated));
+    }
+
+    #[test]
+    fn cell_limited_zero_and_tiny_coefficients_are_stable() {
+        let runtime = two_cell_runtime();
+        let boundary = vec![
+            ScalarFaceTreatment::ZeroGradient,
+            ScalarFaceTreatment::ZeroGradient,
+            ScalarFaceTreatment::ZeroGradient,
+        ];
+        let raw = vec![point(3.0, -2.0, 1.0), point(-4.0, 5.0, -6.0)];
+        let unchanged =
+            limit_scalar_gradient(&runtime.mesh, &[1.0, 1.0], &boundary, raw.clone(), 0.0)
+                .expect("k=0 must bypass limiting");
+        for (actual, expected) in unchanged.iter().zip(&raw) {
+            assert_close(actual.x, expected.x);
+            assert_close(actual.y, expected.y);
+            assert_close(actual.z, expected.z);
+        }
+
+        let tiny = limit_scalar_gradient(
+            &runtime.mesh,
+            &[1.0, 1.0],
+            &boundary,
+            raw,
+            f64::from_bits(1),
+        )
+        .expect("subnormal k with zero extrema span must remain finite");
+        assert!(
+            tiny.iter()
+                .all(|value| value.x.is_finite() && value.y.is_finite() && value.z.is_finite())
+        );
+
+        let line_mesh = three_cell_line_mesh();
+        let line_boundary = vec![ScalarFaceTreatment::ZeroGradient; 4];
+        let nearly_one = f64::from_bits(1.0f64.to_bits() - 1);
+        let stable_widening = limit_scalar_gradient(
+            &line_mesh,
+            &[-f64::MAX / 2.0, 0.0, f64::MAX / 2.0],
+            &line_boundary,
+            vec![point(0.0, 0.0, 0.0); 3],
+            nearly_one,
+        )
+        .expect("finite symmetric widening must not overflow an intermediate quotient");
+        assert!(
+            stable_widening
+                .iter()
+                .all(|value| value.x == 0.0 && value.y == 0.0 && value.z == 0.0)
+        );
+    }
+
+    #[test]
+    fn gradient_guards_non_finite_and_overflowing_arithmetic() {
+        let runtime = two_cell_runtime();
+        let boundary = vec![
+            ScalarFaceTreatment::ZeroGradient,
+            ScalarFaceTreatment::ZeroGradient,
+            ScalarFaceTreatment::ZeroGradient,
+        ];
+        assert!(
+            scalar_gradient(
+                &runtime.mesh,
+                &[f64::NAN, 0.0],
+                &boundary,
+                LaminarSimpleGradientScheme::GaussLinear,
+            )
+            .is_err()
+        );
+
+        let mut infinite = two_cell_runtime();
+        infinite.mesh.face_centres[0].x = f64::INFINITY;
+        assert!(
+            scalar_gradient(
+                &infinite.mesh,
+                &[0.0, 1.0],
+                &boundary,
+                LaminarSimpleGradientScheme::GaussLinear,
+            )
+            .is_err()
+        );
+
+        let mut subtraction_overflow = two_cell_runtime();
+        subtraction_overflow.mesh.face_centres[0].x = f64::MAX;
+        subtraction_overflow.mesh.cell_centres[0].x = -f64::MAX;
+        assert!(
+            scalar_gradient(
+                &subtraction_overflow.mesh,
+                &[0.0, 1.0],
+                &boundary,
+                LaminarSimpleGradientScheme::GaussLinear,
+            )
+            .is_err()
+        );
+
+        let widening_overflow = limit_scalar_gradient(
+            &runtime.mesh,
+            &[-f64::MAX / 2.0, f64::MAX / 2.0],
+            &boundary,
+            vec![point(0.0, 0.0, 0.0); 2],
+            f64::from_bits(1),
+        )
+        .expect_err("finite extrema whose widening overflows must be rejected");
+        assert!(widening_overflow.to_string().contains("widening"));
+
+        let mut extrapolation_mesh = two_cell_runtime().mesh;
+        extrapolation_mesh.face_centres[0] = point(1.0, 1.0, 1.0);
+        extrapolation_mesh.cell_centres[0] = point(0.0, 0.0, 0.0);
+        let extrapolation_overflow = limit_scalar_gradient(
+            &extrapolation_mesh,
+            &[0.0, 1.0],
+            &boundary,
+            vec![point(f64::MAX, f64::MAX, f64::MAX), point(0.0, 0.0, 0.0)],
+            1.0,
+        )
+        .expect_err("overflowing extrapolation must be rejected");
+        assert!(extrapolation_overflow.to_string().contains("extrapolation"));
     }
 
     #[test]
@@ -5067,6 +5575,43 @@ mod tests {
                 },
             ],
             warnings: Vec::new(),
+        }
+    }
+
+    fn three_cell_line_mesh() -> SolverRuntimeMeshData {
+        SolverRuntimeMeshData {
+            points: 0,
+            cells: 3,
+            faces: 4,
+            internal_faces: 2,
+            boundary_faces: 2,
+            owner: vec![0, 1, 0, 2],
+            neighbour: vec![Some(1), Some(2), None, None],
+            patches: Vec::new(),
+            face_centres: vec![
+                point(1.0, 0.0, 0.0),
+                point(2.0, 0.0, 0.0),
+                point(0.0, 0.0, 0.0),
+                point(3.0, 0.0, 0.0),
+            ],
+            face_area_vectors: vec![
+                point(1.0, 0.0, 0.0),
+                point(1.0, 0.0, 0.0),
+                point(-1.0, 0.0, 0.0),
+                point(1.0, 0.0, 0.0),
+            ],
+            cell_centres: vec![
+                point(0.5, 0.0, 0.0),
+                point(1.5, 0.0, 0.0),
+                point(2.5, 0.0, 0.0),
+            ],
+            cell_volumes: vec![1.0; 3],
+            min_face_area: 1.0,
+            max_face_area: 1.0,
+            min_cell_volume: 1.0,
+            max_cell_volume: 1.0,
+            total_cell_volume: 3.0,
+            non_positive_cell_volumes: 0,
         }
     }
 
