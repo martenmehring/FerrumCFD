@@ -2607,19 +2607,12 @@ fn resolve_laminar_simple_schemes(plan: &SolverCasePlan) -> Result<LaminarSimple
         })
         .and_then(|value| parse_laminar_simple_laplacian_scheme(value, sn_grad))?;
 
+    let grad_p = resolved_gradient_scheme_value(plan, "grad(p)", Some("default"))?;
+    let grad_u = resolved_gradient_scheme_value(plan, "grad(U)", Some("default"))?;
+
     Ok(LaminarSimpleSchemes {
-        grad_p: parse_laminar_simple_gradient_scheme(required_fv_scheme(
-            plan,
-            "gradSchemes",
-            "grad(p)",
-            Some("default"),
-        )?)?,
-        grad_u: parse_laminar_simple_gradient_scheme(required_fv_scheme(
-            plan,
-            "gradSchemes",
-            "grad(U)",
-            Some("default"),
-        )?)?,
+        grad_p: parse_laminar_simple_gradient_scheme(&grad_p)?,
+        grad_u: parse_laminar_simple_gradient_scheme(&grad_u)?,
         div_phi_u: parse_laminar_simple_convection_scheme(required_fv_scheme(
             plan,
             "divSchemes",
@@ -2663,11 +2656,130 @@ fn parse_laminar_simple_gradient_scheme(
     let tokens = normalized_scheme_tokens(value);
     if scheme_tokens_are(&tokens, &["gauss", "linear"]) {
         Ok(LaminarSimpleGradientScheme::GaussLinear)
+    } else if tokens.len() == 4
+        && scheme_token_is(&tokens, 0, "celllimited")
+        && scheme_token_is(&tokens, 1, "gauss")
+        && scheme_token_is(&tokens, 2, "linear")
+    {
+        let coefficient = tokens[3].parse::<f64>().map_err(|_| {
+            format!(
+                "cellLimited Gauss linear coefficient must be finite and in [0, 1], got '{}'",
+                tokens[3]
+            )
+        })?;
+        if !coefficient.is_finite() || !(0.0..=1.0).contains(&coefficient) {
+            return Err(format!(
+                "cellLimited Gauss linear coefficient must be finite and in [0, 1], got '{}'",
+                tokens[3]
+            ));
+        }
+        let coefficient = if coefficient == 0.0 { 0.0 } else { coefficient };
+        Ok(LaminarSimpleGradientScheme::CellLimitedGaussLinear(
+            coefficient,
+        ))
     } else {
         Err(format!(
-            "unsupported laminar SIMPLE grad scheme '{value}'; currently supported: Gauss linear"
+            "unsupported laminar SIMPLE grad scheme '{value}'; currently supported: Gauss linear or cellLimited Gauss linear k"
         ))
     }
+}
+
+fn resolved_gradient_scheme_value(
+    plan: &SolverCasePlan,
+    key: &str,
+    fallback_key: Option<&str>,
+) -> Result<String, String> {
+    let section = "gradSchemes";
+    let selected_key = if dictionary_entry_count(&plan.numerics.fv_schemes, section, key) > 0 {
+        key
+    } else if let Some(fallback) = fallback_key
+        && dictionary_entry_count(&plan.numerics.fv_schemes, section, fallback) > 0
+    {
+        fallback
+    } else {
+        return Err(match fallback_key {
+            Some(fallback) => format!("fvSchemes {section} requires {key} or {fallback}"),
+            None => format!("fvSchemes {section} requires {key}"),
+        });
+    };
+
+    let mut current = selected_key.to_string();
+    let mut visited = Vec::new();
+    loop {
+        if visited.iter().any(|seen| seen == &current) {
+            visited.push(current);
+            return Err(format!(
+                "fvSchemes gradSchemes alias cycle: {}",
+                visited.join(" -> ")
+            ));
+        }
+        visited.push(current.clone());
+        let matches = plan
+            .numerics
+            .fv_schemes
+            .entries
+            .iter()
+            .filter(|entry| entry.section == section && entry.key == current)
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            return Err(format!(
+                "fvSchemes gradSchemes alias '${current}' references a missing entry"
+            ));
+        }
+        if matches.len() != 1 {
+            return Err(format!(
+                "fvSchemes gradSchemes entry '{current}' must be unique, found {}",
+                matches.len()
+            ));
+        }
+
+        let value = matches[0].value.trim().trim_end_matches(';').trim();
+        if !value.contains('$') {
+            return Ok(value.to_string());
+        }
+        let tokens = value.split_whitespace().collect::<Vec<_>>();
+        if tokens.len() != 1 {
+            return Err(format!(
+                "fvSchemes gradSchemes alias in '{current}' must be one token, got '{}'",
+                matches[0].value
+            ));
+        }
+        let token = tokens[0];
+        let Some(reference) = token.strip_prefix('$') else {
+            return Err(format!(
+                "fvSchemes gradSchemes entry '{current}' contains an embedded alias '{token}'"
+            ));
+        };
+        if reference.is_empty() {
+            return Err(format!(
+                "fvSchemes gradSchemes entry '{current}' contains a bare '$' alias"
+            ));
+        }
+        if reference.contains('$')
+            || reference.contains('.')
+            || reference.contains('/')
+            || reference.contains(':')
+            || reference.contains('{')
+            || reference.contains('}')
+        {
+            return Err(format!(
+                "fvSchemes gradSchemes alias '{token}' in '{current}' is not an exact same-section reference"
+            ));
+        }
+        current = reference.to_string();
+    }
+}
+
+fn dictionary_entry_count(
+    dictionary: &SolverNumericsDictionaryPlan,
+    section: &str,
+    key: &str,
+) -> usize {
+    dictionary
+        .entries
+        .iter()
+        .filter(|entry| entry.section == section && entry.key == key)
+        .count()
 }
 
 fn parse_laminar_simple_convection_scheme(
@@ -7785,9 +7897,10 @@ mod tests {
         parse_laminar_simple_laplacian_scheme, parse_laminar_simple_sn_grad_scheme,
         parse_openfoam_laminar_preconditioner, parse_openfoam_laminar_solver,
         parse_pipe_benchmark_args, parse_plane_channel_benchmark_args, parse_solver_args,
-        resolve_laminar_simple_options, resolve_solver_dispatch, run_ferrum_subcommand,
-        validate_laminar_residual_control_dictionary, validate_module_execution_contract,
-        write_json_solver_state, write_json_string, write_solver_plan_json,
+        resolve_laminar_simple_options, resolve_solver_dispatch, resolved_gradient_scheme_value,
+        run_ferrum_subcommand, validate_laminar_residual_control_dictionary,
+        validate_module_execution_contract, write_json_solver_state, write_json_string,
+        write_solver_plan_json,
     };
     use ferrum_mesh::backends::BackendChoice;
     use ferrum_mesh::control::ControlDict;
@@ -7800,8 +7913,8 @@ mod tests {
     use ferrum_mesh::solver_plan::{
         SolverBackendPlan, SolverCasePlan, SolverCpuResourcePlan, SolverDimensionality,
         SolverFieldPlan, SolverGpuResourcePlan, SolverInterfacePlan, SolverMeshPlan,
-        SolverNumericsPlan, SolverPropertiesPlan, SolverPropertyDictionaryPlan,
-        SolverPropertyEntryPlan, SolverRunPlan,
+        SolverNumericsEntryPlan, SolverNumericsPlan, SolverPropertiesPlan,
+        SolverPropertyDictionaryPlan, SolverPropertyEntryPlan, SolverRunPlan,
     };
     use ferrum_mesh::solver_state::{
         SolverStateCpuBufferPlan, SolverStateCpuBufferStatus, SolverStateFieldKind,
@@ -8981,6 +9094,15 @@ mod tests {
             LaminarSimpleGradientScheme::GaussLinear
         );
         assert_eq!(
+            parse_laminar_simple_gradient_scheme("cellLimited Gauss linear 0.5")
+                .expect("limited grad scheme"),
+            LaminarSimpleGradientScheme::CellLimitedGaussLinear(0.5)
+        );
+        assert_eq!(
+            LaminarSimpleGradientScheme::CellLimitedGaussLinear(0.5).to_string(),
+            "cellLimited Gauss linear 0.5"
+        );
+        assert_eq!(
             parse_laminar_simple_convection_scheme("Gauss upwind").expect("upwind scheme"),
             LaminarSimpleConvectionScheme::GaussUpwind
         );
@@ -9006,6 +9128,108 @@ mod tests {
                 .expect_err("default none must not be executable")
                 .contains("divSchemes.div(phi,U)")
         );
+    }
+
+    #[test]
+    fn gradient_scheme_parser_rejects_invalid_coefficients_and_arity() {
+        for value in [
+            "cellLimited Gauss linear",
+            "cellLimited Gauss linear 0.5 trailing",
+            "cellLimited Gauss linear -0.1",
+            "cellLimited Gauss linear 1.1",
+            "cellLimited Gauss linear NaN",
+            "cellLimited Gauss linear inf",
+            "cellLimited Gauss cubic 0.5",
+        ] {
+            assert!(
+                parse_laminar_simple_gradient_scheme(value).is_err(),
+                "'{value}' must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn gradient_scheme_aliases_are_exact_unique_and_same_section() {
+        let mut passing = laminar_simple_test_plan(1.0, 1.0);
+        passing
+            .numerics
+            .fv_schemes
+            .entries
+            .push(SolverNumericsEntryPlan {
+                section: "gradSchemes".to_string(),
+                key: "cylinderGradient".to_string(),
+                value: "cellLimited Gauss linear 1".to_string(),
+            });
+        passing
+            .numerics
+            .fv_schemes
+            .entries
+            .iter_mut()
+            .find(|entry| entry.section == "gradSchemes" && entry.key == "default")
+            .expect("default gradient")
+            .value = "$cylinderGradient".to_string();
+        assert_eq!(
+            resolved_gradient_scheme_value(&passing, "grad(U)", Some("default"))
+                .expect("same-section alias"),
+            "cellLimited Gauss linear 1"
+        );
+
+        for reference in [
+            "$missing",
+            "$default extra",
+            "Gauss$default",
+            "$",
+            "$divSchemes.default",
+            "${default}",
+        ] {
+            let mut plan = laminar_simple_test_plan(1.0, 1.0);
+            plan.numerics
+                .fv_schemes
+                .entries
+                .iter_mut()
+                .find(|entry| entry.section == "gradSchemes" && entry.key == "default")
+                .expect("default gradient")
+                .value = reference.to_string();
+            assert!(
+                resolved_gradient_scheme_value(&plan, "grad(U)", Some("default")).is_err(),
+                "unsupported reference '{reference}' must fail"
+            );
+        }
+
+        let mut duplicate = laminar_simple_test_plan(1.0, 1.0);
+        duplicate
+            .numerics
+            .fv_schemes
+            .entries
+            .push(SolverNumericsEntryPlan {
+                section: "gradSchemes".to_string(),
+                key: "default".to_string(),
+                value: "Gauss linear".to_string(),
+            });
+        assert!(resolved_gradient_scheme_value(&duplicate, "grad(U)", Some("default")).is_err());
+
+        let mut cyclic = laminar_simple_test_plan(1.0, 1.0);
+        cyclic
+            .numerics
+            .fv_schemes
+            .entries
+            .iter_mut()
+            .find(|entry| entry.section == "gradSchemes" && entry.key == "default")
+            .expect("default gradient")
+            .value = "$a".to_string();
+        cyclic.numerics.fv_schemes.entries.extend([
+            SolverNumericsEntryPlan {
+                section: "gradSchemes".to_string(),
+                key: "a".to_string(),
+                value: "$b".to_string(),
+            },
+            SolverNumericsEntryPlan {
+                section: "gradSchemes".to_string(),
+                key: "b".to_string(),
+                value: "$a".to_string(),
+            },
+        ]);
+        assert!(resolved_gradient_scheme_value(&cyclic, "grad(U)", Some("default")).is_err());
     }
 
     #[test]
