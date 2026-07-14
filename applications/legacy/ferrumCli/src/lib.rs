@@ -2613,12 +2613,7 @@ fn resolve_laminar_simple_schemes(plan: &SolverCasePlan) -> Result<LaminarSimple
     Ok(LaminarSimpleSchemes {
         grad_p: parse_laminar_simple_gradient_scheme(&grad_p)?,
         grad_u: parse_laminar_simple_gradient_scheme(&grad_u)?,
-        div_phi_u: parse_laminar_simple_convection_scheme(required_fv_scheme(
-            plan,
-            "divSchemes",
-            "div(phi,U)",
-            Some("default"),
-        )?)?,
+        div_phi_u: resolve_laminar_simple_convection_scheme(plan)?,
         laplacian,
         interpolation: parse_laminar_simple_interpolation_scheme(required_fv_scheme(
             plan,
@@ -2786,21 +2781,34 @@ fn parse_laminar_simple_convection_scheme(
     value: &str,
 ) -> Result<LaminarSimpleConvectionScheme, String> {
     let tokens = normalized_scheme_tokens(value);
-    let tokens = strip_bounded_scheme_prefix(&tokens);
-    if scheme_tokens_are(tokens, &["gauss", "upwind"]) {
+    if scheme_tokens_are(&tokens, &["gauss", "upwind"]) {
         Ok(LaminarSimpleConvectionScheme::GaussUpwind)
-    } else if scheme_token_is(tokens, 0, "gauss") && scheme_token_is(tokens, 1, "linearupwind") {
+    } else if scheme_tokens_are(&tokens, &["gauss", "linearupwind", "grad(u)"]) {
         Ok(LaminarSimpleConvectionScheme::GaussLinearUpwind)
-    } else if scheme_tokens_are(tokens, &["none"]) {
+    } else if scheme_tokens_are(&tokens, &["none"]) {
         Err(
             "laminar SIMPLE requires divSchemes.div(phi,U); divSchemes default none is not executable"
                 .to_string(),
         )
     } else {
         Err(format!(
-            "unsupported laminar SIMPLE div(phi,U) scheme '{value}'; currently supported: Gauss upwind or Gauss linearUpwind grad(U)"
+            "unsupported laminar SIMPLE div(phi,U) scheme '{value}'; currently supported: Gauss upwind, Gauss linearUpwind grad(U), or bounded Gauss linearUpwind limited"
         ))
     }
+}
+
+fn resolve_laminar_simple_convection_scheme(
+    plan: &SolverCasePlan,
+) -> Result<LaminarSimpleConvectionScheme, String> {
+    let value = required_fv_scheme(plan, "divSchemes", "div(phi,U)", Some("default"))?;
+    let tokens = normalized_scheme_tokens(value);
+    if scheme_tokens_are(&tokens, &["bounded", "gauss", "linearupwind", "limited"]) {
+        let limited = resolved_gradient_scheme_value(plan, "limited", None)?;
+        return Ok(LaminarSimpleConvectionScheme::BoundedGaussLinearUpwind(
+            parse_laminar_simple_gradient_scheme(&limited)?,
+        ));
+    }
+    parse_laminar_simple_convection_scheme(value)
 }
 
 fn parse_laminar_simple_interpolation_scheme(
@@ -2836,9 +2844,8 @@ fn parse_laminar_simple_laplacian_scheme(
     sn_grad: LaminarSimpleSnGradScheme,
 ) -> Result<LaminarSimpleLaplacianScheme, String> {
     let tokens = normalized_scheme_tokens(value);
-    let tokens = strip_bounded_scheme_prefix(&tokens);
-    if !scheme_token_is(tokens, 0, "gauss")
-        || !scheme_token_is(tokens, 1, "linear")
+    if !scheme_token_is(&tokens, 0, "gauss")
+        || !scheme_token_is(&tokens, 1, "linear")
         || tokens.len() > 3
     {
         return Err(format!(
@@ -2875,14 +2882,6 @@ fn normalized_scheme_tokens(value: &str) -> Vec<String> {
         .map(|token| token.trim_matches(';').to_ascii_lowercase())
         .filter(|token| !token.is_empty())
         .collect()
-}
-
-fn strip_bounded_scheme_prefix(tokens: &[String]) -> &[String] {
-    if tokens.first().is_some_and(|token| token == "bounded") {
-        &tokens[1..]
-    } else {
-        tokens
-    }
 }
 
 fn scheme_tokens_are(tokens: &[String], expected: &[&str]) -> bool {
@@ -7897,10 +7896,10 @@ mod tests {
         parse_laminar_simple_laplacian_scheme, parse_laminar_simple_sn_grad_scheme,
         parse_openfoam_laminar_preconditioner, parse_openfoam_laminar_solver,
         parse_pipe_benchmark_args, parse_plane_channel_benchmark_args, parse_solver_args,
-        resolve_laminar_simple_options, resolve_solver_dispatch, resolved_gradient_scheme_value,
-        run_ferrum_subcommand, validate_laminar_residual_control_dictionary,
-        validate_module_execution_contract, write_json_solver_state, write_json_string,
-        write_solver_plan_json,
+        resolve_laminar_simple_convection_scheme, resolve_laminar_simple_options,
+        resolve_solver_dispatch, resolved_gradient_scheme_value, run_ferrum_subcommand,
+        validate_laminar_residual_control_dictionary, validate_module_execution_contract,
+        write_json_solver_state, write_json_string, write_solver_plan_json,
     };
     use ferrum_mesh::backends::BackendChoice;
     use ferrum_mesh::control::ControlDict;
@@ -9128,6 +9127,102 @@ mod tests {
                 .expect_err("default none must not be executable")
                 .contains("divSchemes.div(phi,U)")
         );
+    }
+
+    #[test]
+    fn bounded_linear_upwind_syntax_is_exact_and_canonical() {
+        let mut plan = laminar_simple_test_plan(1.0, 1.0);
+        plan.numerics
+            .fv_schemes
+            .entries
+            .iter_mut()
+            .find(|entry| entry.section == "divSchemes" && entry.key == "div(phi,U)")
+            .expect("div scheme")
+            .value = "bounded Gauss linearUpwind limited".to_string();
+        plan.numerics
+            .fv_schemes
+            .entries
+            .push(SolverNumericsEntryPlan {
+                section: "gradSchemes".to_string(),
+                key: "limited".to_string(),
+                value: "cellLimited Gauss linear 1".to_string(),
+            });
+        let scheme = resolve_laminar_simple_convection_scheme(&plan).expect("bounded scheme");
+        assert_eq!(scheme.to_string(), "bounded Gauss linearUpwind limited");
+
+        for invalid in [
+            "bounded Gauss linearUpwind",
+            "bounded Gauss linearUpwind limited trailing",
+            "bounded Gauss upwind",
+        ] {
+            plan.numerics
+                .fv_schemes
+                .entries
+                .iter_mut()
+                .find(|entry| entry.section == "divSchemes" && entry.key == "div(phi,U)")
+                .expect("div scheme")
+                .value = invalid.to_string();
+            assert!(resolve_laminar_simple_convection_scheme(&plan).is_err());
+        }
+
+        assert!(
+            parse_laminar_simple_laplacian_scheme(
+                "bounded Gauss linear corrected",
+                LaminarSimpleSnGradScheme::Corrected,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn bounded_limited_gradient_requires_a_valid_unique_reference() {
+        let mut plan = laminar_simple_test_plan(1.0, 1.0);
+        plan.numerics
+            .fv_schemes
+            .entries
+            .iter_mut()
+            .find(|entry| entry.section == "divSchemes" && entry.key == "div(phi,U)")
+            .expect("div scheme")
+            .value = "bounded Gauss linearUpwind limited".to_string();
+        assert!(resolve_laminar_simple_convection_scheme(&plan).is_err());
+
+        plan.numerics
+            .fv_schemes
+            .entries
+            .push(SolverNumericsEntryPlan {
+                section: "gradSchemes".to_string(),
+                key: "limited".to_string(),
+                value: "$selected".to_string(),
+            });
+        plan.numerics
+            .fv_schemes
+            .entries
+            .push(SolverNumericsEntryPlan {
+                section: "gradSchemes".to_string(),
+                key: "selected".to_string(),
+                value: "cellLimited Gauss linear 0.5".to_string(),
+            });
+        assert!(resolve_laminar_simple_convection_scheme(&plan).is_ok());
+
+        for invalid in ["$missing", "$limited", "$selected extra", "Gauss cubic"] {
+            plan.numerics
+                .fv_schemes
+                .entries
+                .iter_mut()
+                .find(|entry| entry.section == "gradSchemes" && entry.key == "limited")
+                .expect("limited gradient")
+                .value = invalid.to_string();
+            assert!(resolve_laminar_simple_convection_scheme(&plan).is_err());
+        }
+        plan.numerics
+            .fv_schemes
+            .entries
+            .push(SolverNumericsEntryPlan {
+                section: "gradSchemes".to_string(),
+                key: "limited".to_string(),
+                value: "Gauss linear".to_string(),
+            });
+        assert!(resolve_laminar_simple_convection_scheme(&plan).is_err());
     }
 
     #[test]
