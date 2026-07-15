@@ -35,7 +35,9 @@ Current Driver 1 bundles:
 - `incompressibleFluid/laminarPipe`: 3D circular-pipe flow with the
   Hagen-Poiseuille analytical reference;
 - `incompressibleFluid/planeChannel`: true 2D plane-Poiseuille flow with
-  `empty` front/back patches and an analytical reference.
+  `empty` front/back patches and an analytical reference;
+- `incompressibleFluid/cylinder`: steady Re=1 flow around a cylinder, with an
+  OpenFOAM Foundation 13 documented numerical benchmark.
 
 Drivers 1 and 2 both use the `incompressibleFluid` module while validating
 different coupling algorithms. The remaining Driver 1 cases and Drivers 2
