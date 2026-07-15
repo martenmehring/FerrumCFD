@@ -1184,7 +1184,7 @@ fn print_laminar_simple_convergence_feedback(
                 "incompressibleFluid convergence note: no active convergence criteria (no residualControl in fvSolution)."
             );
             println!(
-                "  to stop early, set SIMPLE.residualControl U/p in system/fvSolution. Benchmark acceptance is evaluated externally."
+                "  to stop early, set SIMPLE.residualControl U/p in system/fvSolution. Solution acceptance is evaluated externally."
             );
             if options.max_simple_iterations > 1 {
                 println!(
@@ -6818,7 +6818,7 @@ fn print_solver_usage() {
         "usage: ferrum solve [-case <caseDir>] [--preflight] [--planJson <file>] [--runnerDryRun] [--maxRunnerSteps <n>] [--solveScalarDiffusion <field>]"
     );
     println!();
-    println!("developer-only equation and benchmark utilities; application flow uses ferrumRun");
+    println!("developer-only scalar-diffusion equation utility; application flow uses ferrumRun");
     println!();
     println!("options:");
     println!("  --planJson <file>    also write the solver-neutral plan as JSON");
@@ -7275,7 +7275,7 @@ mod tests {
     }
 
     #[test]
-    fn laminar_simple_resolves_without_pipe_benchmark_inputs() {
+    fn laminar_simple_resolves_from_standard_fluid_inputs() {
         let plan = laminar_simple_test_plan(1000.0, 0.001002);
         let args = vec![
             "--rho".to_string(),
@@ -7345,7 +7345,7 @@ mod tests {
     }
 
     #[test]
-    fn laminar_simple_ignores_case_level_benchmark_toggles() {
+    fn laminar_simple_ignores_unsupported_case_level_keys() {
         let mut plan = laminar_simple_test_plan(1000.0, 0.001002);
         plan.numerics.fv_solution.present = true;
         plan.numerics.fv_solution.entries.extend([
@@ -7361,7 +7361,7 @@ mod tests {
             },
             ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
                 section: "SIMPLE".to_string(),
-                key: "benchmarkConvergence".to_string(),
+                key: "unsupportedCaseOption".to_string(),
                 value: "true".to_string(),
             },
             ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
