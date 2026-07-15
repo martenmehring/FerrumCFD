@@ -31,11 +31,3 @@ path = "src/bin/split_ferrum_mesh_regions.rs"
 [[bin]]
 name = "initFerrumCase"
 path = "src/bin/init_ferrum_case.rs"
-
-[[bin]]
-name = "ferrumPipeBenchmark"
-path = "src/bin/ferrum_pipe_benchmark.rs"
-
-[[bin]]
-name = "ferrumPlaneChannelBenchmark"
-path = "src/bin/ferrum_plane_channel_benchmark.rs"
