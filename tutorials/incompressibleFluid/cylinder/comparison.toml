@@ -1,0 +1,35 @@
+schema_version = 2
+case_id = "incompressibleFluid.cylinder.re1"
+module = "incompressibleFluid"
+readiness_driver = "steadyIncompressible"
+algorithm = "SIMPLE"
+regime = "laminar"
+title = "Two-dimensional Re=1 cylinder flow"
+
+[implementations]
+ferrum_case = "ferrum/case"
+openfoam_v13_case = "openfoam-v13/case"
+
+[reference]
+kind = "documented-benchmark"
+source = "OpenFOAM Foundation 13 package 20260407, build 13-441953dfbb42, official tutorials/incompressibleFluid/cylinder"
+mesh_cells = 5388
+iterations = 5000
+
+[physics]
+unit_system = "SI"
+diameter_m = 0.001
+inlet_speed_m_per_s = 0.015
+kinematic_viscosity_m2_per_s = 1.5e-5
+reynolds_number = 1.0
+
+[observables]
+names = ["drag_coefficient", "lift_coefficient", "local_continuity", "global_continuity"]
+reference_values = [10.6558580, 4.6316142e-11, 2.200139e-10, -1.2322084e-11]
+
+[tolerances]
+drag_coefficient_relative = 0.15
+lift_coefficient_absolute = 1.0e-6
+local_continuity_absolute = 1.0e-6
+global_continuity_absolute = 1.0e-6
+justification = "The checked-in 48-cell smoke mesh is intentionally much coarser than the 5388-cell documented reference; drag uses an engineering regression band, while symmetry and continuity use absolute near-zero checks."
