@@ -65,8 +65,8 @@ use ferrum_mesh::solver_state::{
     SolverStateFieldKind, SolverStatePlan, build_solver_state_plan, materialize_cpu_buffer,
 };
 
-const OPENFOAM_DEFAULT_LDU_TOLERANCE: f64 = 1.0e-6;
-const OPENFOAM_DEFAULT_LDU_MAX_ITERATIONS: usize = 1_000;
+const FERRUM_DEFAULT_LDU_TOLERANCE: f64 = 1.0e-6;
+const FERRUM_DEFAULT_LDU_MAX_ITERATIONS: usize = 1_000;
 
 pub fn run_ferrum() -> i32 {
     let args = env::args().skip(1).collect::<Vec<_>>();
@@ -1605,7 +1605,7 @@ fn run_laminar_simple_solve(
         let mut print_iteration = |item: &LaminarSimpleIterationSummary| {
             if !printed_header {
                 println!(
-                    "incompressibleFluid residual history (OpenFOAM-style initial/final residuals; linear and outer convergence are separate):"
+                    "incompressibleFluid residual history (Ferrum initial/final residuals; linear and outer convergence are separate):"
                 );
                 printed_header = true;
             }
@@ -2466,30 +2466,30 @@ fn resolve_laminar_simple_options(
     let linear_tolerance = solve
         .linear_tolerance
         .or(momentum_case_tolerance)
-        .unwrap_or(OPENFOAM_DEFAULT_LDU_TOLERANCE);
+        .unwrap_or(FERRUM_DEFAULT_LDU_TOLERANCE);
     let max_linear_iterations = solve
         .max_linear_iterations
-        .unwrap_or(OPENFOAM_DEFAULT_LDU_MAX_ITERATIONS);
+        .unwrap_or(FERRUM_DEFAULT_LDU_MAX_ITERATIONS);
     let momentum_linear_tolerance = solve
         .momentum_linear_tolerance
         .or(solve.linear_tolerance)
         .or(momentum_case_tolerance)
-        .unwrap_or(OPENFOAM_DEFAULT_LDU_TOLERANCE);
+        .unwrap_or(FERRUM_DEFAULT_LDU_TOLERANCE);
     let pressure_linear_tolerance = solve
         .pressure_linear_tolerance
         .or(solve.linear_tolerance)
         .or(pressure_case_tolerance)
-        .unwrap_or(OPENFOAM_DEFAULT_LDU_TOLERANCE);
+        .unwrap_or(FERRUM_DEFAULT_LDU_TOLERANCE);
     let momentum_max_linear_iterations = solve
         .momentum_max_linear_iterations
         .or(solve.max_linear_iterations)
         .or(momentum_case_max_iterations)
-        .unwrap_or(OPENFOAM_DEFAULT_LDU_MAX_ITERATIONS);
+        .unwrap_or(FERRUM_DEFAULT_LDU_MAX_ITERATIONS);
     let pressure_max_linear_iterations = solve
         .pressure_max_linear_iterations
         .or(solve.max_linear_iterations)
         .or(pressure_case_max_iterations)
-        .unwrap_or(OPENFOAM_DEFAULT_LDU_MAX_ITERATIONS);
+        .unwrap_or(FERRUM_DEFAULT_LDU_MAX_ITERATIONS);
     let momentum_linear_solver = match solve.momentum_linear_solver.or(solve.linear_solver) {
         Some(solver) => solver,
         None => required_fv_solution_laminar_solver(plan, "solvers.U")?,
@@ -8480,7 +8480,7 @@ mod tests {
     }
 
     #[test]
-    fn laminar_simple_uses_openfoam_ldu_defaults_when_controls_are_absent() {
+    fn laminar_simple_uses_ferrum_ldu_defaults_when_controls_are_absent() {
         let mut plan = laminar_simple_test_plan(1000.0, 0.001002);
         plan.numerics
             .fv_solution

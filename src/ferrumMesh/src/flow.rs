@@ -1433,7 +1433,7 @@ fn solve_scalar_system(
     let initial_values = initial.unwrap_or(&zero_initial);
     let initial_ax = matrix.matvec(initial_values)?;
     let normalisation_factor =
-        openfoam_normalisation_factor(matrix, rhs, initial_values, &initial_ax)?;
+        ldu_l1_residual_normalisation_factor(matrix, rhs, initial_values, &initial_ax)?;
     let initial_residual = rhs
         .iter()
         .zip(&initial_ax)
@@ -1454,7 +1454,7 @@ fn solve_scalar_system(
     }
 
     // Ferrum's current CSR kernels stop on L2. This conservative conversion
-    // guarantees the OpenFOAM L1-normalised tolerance before reporting success.
+    // guarantees the LDU L1-normalised residual tolerance before reporting success.
     let component_count = rhs.len().max(1) as f64;
     let solver_tolerance = tolerance * normalisation_factor / component_count.sqrt();
     let report = match solver {
@@ -1535,7 +1535,7 @@ fn solve_scalar_system(
     })
 }
 
-fn openfoam_normalisation_factor(
+fn ldu_l1_residual_normalisation_factor(
     matrix: &CsrMatrix,
     source: &[f64],
     solution: &[f64],
@@ -1543,7 +1543,7 @@ fn openfoam_normalisation_factor(
 ) -> Result<f64> {
     if source.len() != matrix.rows() || matrix_solution.len() != matrix.rows() {
         return Err(invalid_input(format!(
-            "OpenFOAM residual normalisation expected {} source and matrix-product entries, got {} and {}",
+            "LDU L1 residual normalisation expected {} source and matrix-product entries, got {} and {}",
             matrix.rows(),
             source.len(),
             matrix_solution.len()
@@ -1551,7 +1551,7 @@ fn openfoam_normalisation_factor(
     }
     if solution.len() != matrix.cols() {
         return Err(invalid_input(format!(
-            "OpenFOAM residual normalisation expected {} solution entries, got {}",
+            "LDU L1 residual normalisation expected {} solution entries, got {}",
             matrix.cols(),
             solution.len()
         )));
@@ -1573,7 +1573,7 @@ fn openfoam_normalisation_factor(
 
     if !factor.is_finite() {
         return Err(invalid_input(
-            "OpenFOAM residual normalisation factor is not finite".to_string(),
+            "LDU L1 residual normalisation factor is not finite".to_string(),
         ));
     }
     Ok(factor.max(1.0e-20))
@@ -5695,7 +5695,7 @@ mod tests {
     }
 
     #[test]
-    fn residual_control_uses_strict_openfoam_absolute_tolerance() {
+    fn residual_control_uses_strict_absolute_tolerance() {
         let mut options = minimal_laminar_options();
         options.momentum_residual_control = Some(1.0e-3);
 
@@ -5717,9 +5717,13 @@ mod tests {
         let solution = [0.0, 0.0];
         let matrix_solution = matrix.matvec(&solution).expect("matrix product");
 
-        let factor =
-            super::openfoam_normalisation_factor(&matrix, &source, &solution, &matrix_solution)
-                .expect("normalisation factor");
+        let factor = super::ldu_l1_residual_normalisation_factor(
+            &matrix,
+            &source,
+            &solution,
+            &matrix_solution,
+        )
+        .expect("normalisation factor");
         let residual = source
             .iter()
             .zip(matrix_solution)
