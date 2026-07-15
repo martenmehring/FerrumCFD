@@ -20,7 +20,7 @@ use ferrum_mesh::diffusion::{
 };
 use ferrum_mesh::fields::{
     FieldBoundaryValidationSummary, FieldFile, FieldValueSummary, InitialFieldSet,
-    read_fields_from_directory, read_initial_fields, validate_initial_field_boundaries,
+    read_initial_fields, validate_initial_field_boundaries,
 };
 use ferrum_mesh::flow::{
     ContinuitySummary, FaceFluxDiagnosticSummary, FlowBoundarySummary, FlowOperatorSummary,
@@ -41,12 +41,6 @@ use ferrum_mesh::linear::{
     linear_solver_capabilities,
 };
 use ferrum_mesh::patches::{PatchValidationSummary, validate_case_patches};
-use ferrum_mesh::poiseuille::{
-    LaminarPipeBenchmarkOptions, LaminarPipeBenchmarkSummary, LaminarPlaneChannelBenchmarkOptions,
-    LaminarPlaneChannelBenchmarkSummary, PipeAxis, PoiseuilleOptions, poiseuille_diffusion_options,
-    poiseuille_reference, summarize_laminar_pipe_solution,
-    summarize_laminar_plane_channel_solution, summarize_poiseuille_solution,
-};
 use ferrum_mesh::regions::{
     InterfaceRegistrySummary, InterfaceSummary, build_interface_registry,
     read_region_mesh_summaries, split_regions_by_cell_zones,
@@ -61,9 +55,7 @@ use ferrum_mesh::solver_plan::{
     SolverNumericsDictionaryPlan, SolverNumericsPlan, SolverPropertiesPlan, SolverRunPlan,
     build_solver_case_plan,
 };
-use ferrum_mesh::solver_state::{
-    SolverStateFieldKind, SolverStatePlan, build_solver_state_plan, materialize_cpu_buffer,
-};
+use ferrum_mesh::solver_state::SolverStatePlan;
 
 const FERRUM_DEFAULT_LDU_TOLERANCE: f64 = 1.0e-6;
 const FERRUM_DEFAULT_LDU_MAX_ITERATIONS: usize = 1_000;
@@ -97,8 +89,6 @@ pub enum Alias {
     SplitFerrumMeshRegions,
     InitFerrumCase,
     FerrumRun,
-    FerrumPipeBenchmark,
-    FerrumPlaneChannelBenchmark,
 }
 
 enum CommandMode {
@@ -114,8 +104,6 @@ fn run_command(mode: CommandMode, args: Vec<String>) -> Result<(), String> {
         CommandMode::Alias(Alias::SplitFerrumMeshRegions) => split_mesh_regions(args),
         CommandMode::Alias(Alias::InitFerrumCase) => init_case_command(args),
         CommandMode::Alias(Alias::FerrumRun) => run_solver_module(args),
-        CommandMode::Alias(Alias::FerrumPipeBenchmark) => pipe_benchmark(args),
-        CommandMode::Alias(Alias::FerrumPlaneChannelBenchmark) => plane_channel_benchmark(args),
     }
 }
 
@@ -133,8 +121,6 @@ fn run_ferrum_subcommand(mut args: Vec<String>) -> Result<(), String> {
         "initFerrumCase" => init_case_command(args),
         "run" | "ferrumRun" => run_solver_module(args),
         "solve" => solve_case(args),
-        "pipeBenchmark" | "ferrumPipeBenchmark" => pipe_benchmark(args),
-        "planeChannelBenchmark" | "ferrumPlaneChannelBenchmark" => plane_channel_benchmark(args),
         "gmshToFoam" | "gmshToFerrumFoam" => Err(format!(
             "command '{command}' was replaced by 'gmshToFerrum'"
         )),
@@ -518,10 +504,6 @@ fn is_utility_execution_selector(arg: &str) -> bool {
             | "--solveScalarDiffusion"
             | "-solve-scalar-diffusion"
             | "--solve-scalar-diffusion"
-            | "-solvePoiseuille"
-            | "--solvePoiseuille"
-            | "-solve-poiseuille"
-            | "--solve-poiseuille"
     )
 }
 
@@ -570,9 +552,6 @@ fn solve_case_with_contract(
     }
     if let Some(solve) = &options.scalar_diffusion_solve {
         run_scalar_diffusion_solve(&plan, solve)?;
-    }
-    if let Some(solve) = &options.poiseuille_solve {
-        run_poiseuille_solve(&plan, solve)?;
     }
     if let Some(solve) = &options.laminar_simple_solve {
         run_laminar_simple_solve(&plan, solve)?;
@@ -707,889 +686,6 @@ fn validate_laminar_transport_regime(plan: &SolverCasePlan) -> Result<(), String
     }
 
     Ok(())
-}
-
-fn run_poiseuille_solve(plan: &SolverCasePlan, solve: &PoiseuilleSolveArgs) -> Result<(), String> {
-    let options = resolve_poiseuille_options(plan, solve)?;
-    let reference = poiseuille_reference(&options).map_err(|error| error.to_string())?;
-    let diffusion_options =
-        poiseuille_diffusion_options(&options).map_err(|error| error.to_string())?;
-    let system = assemble_scalar_diffusion_system(&plan.runtime_data.mesh, &diffusion_options)
-        .map_err(|error| error.to_string())?;
-
-    let started = Instant::now();
-    let report = match solve.linear_solver {
-        ScalarDiffusionLinearSolver::Cg => conjugate_gradient_solve(
-            &system.matrix,
-            &system.rhs,
-            None,
-            ConjugateGradientOptions {
-                max_iterations: solve.max_iterations,
-                tolerance: solve.tolerance,
-            },
-        ),
-        ScalarDiffusionLinearSolver::Jacobi => jacobi_solve(
-            &system.matrix,
-            &system.rhs,
-            None,
-            JacobiOptions {
-                max_iterations: solve.max_iterations,
-                tolerance: solve.tolerance,
-                omega: 1.0,
-            },
-        ),
-    }
-    .map_err(|error| error.to_string())?;
-    let wall_clock_seconds = started.elapsed().as_secs_f64();
-    let summary =
-        summarize_poiseuille_solution(&plan.runtime_data.mesh, &report.solution, &options)
-            .map_err(|error| error.to_string())?;
-
-    println!(
-        "poiseuille solve: backend=cpu linearSolver={} cells={} nnz={} pressureDrop={} dynamicViscosity={} length={} diameter={} source={} wallPatches={} iterations={} converged={} residualNorm={} wallClockSeconds={:.6}",
-        solve.linear_solver,
-        system.stats.cells,
-        system.matrix.nnz(),
-        format_scientific(options.pressure_drop),
-        format_scientific(options.dynamic_viscosity),
-        format_scientific(options.length),
-        format_scientific(options.diameter),
-        format_scientific(reference.source),
-        options.wall_patches.join(","),
-        report.iterations,
-        yes_no(report.converged),
-        format_scientific(report.residual_norm),
-        wall_clock_seconds
-    );
-    println!(
-        "poiseuille result: meanVelocity={} analyticMeanVelocity={} relativeMeanVelocityError={} flowRate={} analyticFlowRate={} pressureDropFromMean={} minVelocity={} maxVelocity={}",
-        format_scientific(summary.mean_velocity),
-        format_scientific(summary.analytic_mean_velocity),
-        format_scientific(summary.relative_mean_velocity_error),
-        format_scientific(summary.flow_rate),
-        format_scientific(summary.analytic_flow_rate),
-        format_scientific(summary.pressure_drop_from_mean),
-        format_scientific(summary.min_velocity),
-        format_scientific(summary.max_velocity)
-    );
-    println!("poiseuille status: no field files written");
-
-    Ok(())
-}
-
-#[derive(Debug)]
-struct PipeBenchmarkArgs {
-    case_dir: PathBuf,
-    fields_dir: PathBuf,
-    options: LaminarPipeBenchmarkOptions,
-    out_json: Option<PathBuf>,
-    out_markdown: Option<PathBuf>,
-}
-
-fn pipe_benchmark(args: Vec<String>) -> Result<(), String> {
-    if args.is_empty() || args.iter().any(|arg| is_help(arg)) {
-        print_pipe_benchmark_usage();
-        return Ok(());
-    }
-    let args = parse_pipe_benchmark_args(&args)?;
-    let (plan, velocity, pressure) = read_benchmark_fields(&args.case_dir, &args.fields_dir)?;
-    let summary = summarize_laminar_pipe_solution(
-        &plan.runtime_data.mesh,
-        &velocity,
-        &pressure,
-        &args.options,
-    )
-    .map_err(|error| error.to_string())?;
-
-    println!(
-        "pipeBenchmark result: meanVelocity={} analyticMeanVelocity={} relativeMeanVelocityError={} flowRate={} analyticFlowRate={} pressureDropFromMean={} relativePressureDropFromMeanError={} pressureDropFromOwnerCells={} relativePressureDropFromOwnerCellsError={} minVelocity={} maxVelocity={}",
-        format_scientific(summary.mean_velocity),
-        format_scientific(summary.analytic_mean_velocity),
-        format_scientific(summary.relative_mean_velocity_error),
-        format_scientific(summary.flow_rate),
-        format_scientific(summary.analytic_flow_rate),
-        format_scientific(summary.pressure_drop_from_mean),
-        format_scientific(summary.relative_pressure_drop_from_mean_error),
-        format_scientific(summary.pressure_drop_from_owner_cells),
-        format_scientific(summary.relative_pressure_drop_from_owner_cells_error),
-        format_scientific(summary.min_velocity),
-        format_scientific(summary.max_velocity),
-    );
-
-    if let Some(path) = &args.out_json {
-        write_pipe_benchmark_json(&args, &summary, path).map_err(|error| {
-            format!(
-                "could not write pipe benchmark JSON to {} ({error})",
-                path.display()
-            )
-        })?;
-        println!("wrote pipe benchmark json: {}", path.display());
-    }
-    if let Some(path) = &args.out_markdown {
-        write_pipe_benchmark_markdown(&args, &summary, path).map_err(|error| {
-            format!(
-                "could not write pipe benchmark Markdown to {} ({error})",
-                path.display()
-            )
-        })?;
-        println!("wrote pipe benchmark markdown: {}", path.display());
-    }
-    Ok(())
-}
-
-fn read_benchmark_fields(
-    case_dir: &Path,
-    fields_dir: &Path,
-) -> Result<(SolverCasePlan, Vec<Point3>, Vec<f64>), String> {
-    let plan = build_solver_case_plan(case_dir).map_err(|error| error.to_string())?;
-    let fields =
-        read_fields_from_directory(case_dir, fields_dir).map_err(|error| error.to_string())?;
-    let state = build_solver_state_plan(case_dir, &fields);
-    let velocity_values = benchmark_field_buffer(&state, "U", SolverStateFieldKind::VolVector)?;
-    let pressure = benchmark_field_buffer(&state, "p", SolverStateFieldKind::VolScalar)?;
-    if velocity_values.len() % 3 != 0 {
-        return Err(format!(
-            "benchmark U field has {} scalar values, expected a multiple of 3",
-            velocity_values.len()
-        ));
-    }
-    let velocity = velocity_values
-        .chunks_exact(3)
-        .map(|value| Point3 {
-            x: value[0],
-            y: value[1],
-            z: value[2],
-        })
-        .collect::<Vec<_>>();
-    Ok((plan, velocity, pressure))
-}
-
-fn benchmark_field_buffer(
-    state: &SolverStatePlan,
-    name: &str,
-    kind: SolverStateFieldKind,
-) -> Result<Vec<f64>, String> {
-    let available = state
-        .fields
-        .iter()
-        .map(|field| {
-            format!(
-                "{}:class={}:kind={}",
-                field.name,
-                field.class_name.as_deref().unwrap_or("missing"),
-                field.kind
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let field = state
-        .fields
-        .iter()
-        .find(|field| field.region.is_none() && field.name == name && field.kind == kind)
-        .ok_or_else(|| {
-            format!(
-                "benchmark field '{name}' with kind {kind} was not found; parsed fields: [{}]",
-                available
-            )
-        })?;
-    materialize_cpu_buffer(field).ok_or_else(|| {
-        format!(
-            "benchmark field '{name}' could not be materialized ({})",
-            field.cpu_buffer.status
-        )
-    })
-}
-
-fn parse_pipe_benchmark_args(args: &[String]) -> Result<PipeBenchmarkArgs, String> {
-    let mut case_dir = PathBuf::from(".");
-    let mut fields_dir = None;
-    let mut pressure_drop = None;
-    let mut dynamic_viscosity = None;
-    let mut length = None;
-    let mut diameter = None;
-    let mut inlet_patch = "inlet".to_string();
-    let mut outlet_patch = "outlet".to_string();
-    let mut axis = PipeAxis::X;
-    let mut out_json = None;
-    let mut out_markdown = None;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "-case" | "--case" => {
-                case_dir = PathBuf::from(
-                    args.get(index + 1)
-                        .ok_or_else(|| "-case requires a directory".to_string())?,
-                );
-                index += 2;
-            }
-            "-fields" | "--fields" => {
-                fields_dir =
-                    Some(PathBuf::from(args.get(index + 1).ok_or_else(|| {
-                        "--fields requires a time/field directory".to_string()
-                    })?));
-                index += 2;
-            }
-            "-pressureDrop" | "--pressureDrop" | "-pressure-drop" | "--pressure-drop" => {
-                pressure_drop = Some(parse_positive_f64_arg(
-                    "--pressureDrop",
-                    args.get(index + 1)
-                        .ok_or_else(|| "--pressureDrop requires Pa".to_string())?,
-                )?);
-                index += 2;
-            }
-            "-mu" | "--mu" => {
-                dynamic_viscosity = Some(parse_positive_f64_arg(
-                    "--mu",
-                    args.get(index + 1)
-                        .ok_or_else(|| "--mu requires Pa s".to_string())?,
-                )?);
-                index += 2;
-            }
-            "-length" | "--length" => {
-                length = Some(parse_positive_f64_arg(
-                    "--length",
-                    args.get(index + 1)
-                        .ok_or_else(|| "--length requires m".to_string())?,
-                )?);
-                index += 2;
-            }
-            "-diameter" | "--diameter" => {
-                diameter = Some(parse_positive_f64_arg(
-                    "--diameter",
-                    args.get(index + 1)
-                        .ok_or_else(|| "--diameter requires m".to_string())?,
-                )?);
-                index += 2;
-            }
-            "-inletPatch" | "--inletPatch" | "-inlet-patch" | "--inlet-patch" => {
-                inlet_patch = required_non_empty_arg(args, index, "--inletPatch")?;
-                index += 2;
-            }
-            "-outletPatch" | "--outletPatch" | "-outlet-patch" | "--outlet-patch" => {
-                outlet_patch = required_non_empty_arg(args, index, "--outletPatch")?;
-                index += 2;
-            }
-            "-axis" | "--axis" => {
-                axis = match args
-                    .get(index + 1)
-                    .ok_or_else(|| "--axis requires x, y, or z".to_string())?
-                    .to_ascii_lowercase()
-                    .as_str()
-                {
-                    "x" => PipeAxis::X,
-                    "y" => PipeAxis::Y,
-                    "z" => PipeAxis::Z,
-                    other => return Err(format!("invalid --axis '{other}'; expected x, y, or z")),
-                };
-                index += 2;
-            }
-            "-outJson" | "--outJson" | "-out-json" | "--out-json" => {
-                out_json = Some(PathBuf::from(
-                    args.get(index + 1)
-                        .ok_or_else(|| "--outJson requires a file".to_string())?,
-                ));
-                index += 2;
-            }
-            "-outMarkdown" | "--outMarkdown" | "-out-markdown" | "--out-markdown" => {
-                out_markdown =
-                    Some(PathBuf::from(args.get(index + 1).ok_or_else(|| {
-                        "--outMarkdown requires a file".to_string()
-                    })?));
-                index += 2;
-            }
-            other => return Err(format!("unknown ferrumPipeBenchmark option '{other}'")),
-        }
-    }
-
-    Ok(PipeBenchmarkArgs {
-        case_dir,
-        fields_dir: fields_dir
-            .ok_or_else(|| "ferrumPipeBenchmark requires --fields".to_string())?,
-        options: LaminarPipeBenchmarkOptions {
-            pressure_drop: pressure_drop
-                .ok_or_else(|| "ferrumPipeBenchmark requires --pressureDrop".to_string())?,
-            dynamic_viscosity: dynamic_viscosity
-                .ok_or_else(|| "ferrumPipeBenchmark requires --mu".to_string())?,
-            length: length.ok_or_else(|| "ferrumPipeBenchmark requires --length".to_string())?,
-            diameter: diameter
-                .ok_or_else(|| "ferrumPipeBenchmark requires --diameter".to_string())?,
-            inlet_patch,
-            outlet_patch,
-            axis,
-        },
-        out_json,
-        out_markdown,
-    })
-}
-
-fn required_non_empty_arg(args: &[String], index: usize, flag: &str) -> Result<String, String> {
-    let value = args
-        .get(index + 1)
-        .ok_or_else(|| format!("{flag} requires a value"))?;
-    if value.trim().is_empty() {
-        return Err(format!("{flag} must not be empty"));
-    }
-    Ok(value.to_string())
-}
-
-fn write_pipe_benchmark_json(
-    args: &PipeBenchmarkArgs,
-    summary: &LaminarPipeBenchmarkSummary,
-    path: &Path,
-) -> std::io::Result<()> {
-    ensure_parent_dir(path)?;
-    let mut writer = BufWriter::new(File::create(path)?);
-    writeln!(writer, "{{")?;
-    write_json_string_field(&mut writer, 2, "benchmark", "laminarPipeHagenPoiseuille")?;
-    writeln!(writer, ",")?;
-    write_json_string_field(
-        &mut writer,
-        2,
-        "caseDir",
-        &args.case_dir.display().to_string(),
-    )?;
-    writeln!(writer, ",")?;
-    write_json_string_field(
-        &mut writer,
-        2,
-        "fieldsDir",
-        &args.fields_dir.display().to_string(),
-    )?;
-    writeln!(writer, ",")?;
-    write_json_key(&mut writer, 2, "inputs")?;
-    writeln!(writer, "{{")?;
-    write_json_key(&mut writer, 4, "pressureDrop")?;
-    write_json_optional_number(&mut writer, Some(args.options.pressure_drop))?;
-    writeln!(writer, ",")?;
-    write_json_key(&mut writer, 4, "dynamicViscosity")?;
-    write_json_optional_number(&mut writer, Some(args.options.dynamic_viscosity))?;
-    writeln!(writer, ",")?;
-    write_json_key(&mut writer, 4, "length")?;
-    write_json_optional_number(&mut writer, Some(args.options.length))?;
-    writeln!(writer, ",")?;
-    write_json_key(&mut writer, 4, "diameter")?;
-    write_json_optional_number(&mut writer, Some(args.options.diameter))?;
-    writeln!(writer, ",")?;
-    write_json_string_field(&mut writer, 4, "inletPatch", &args.options.inlet_patch)?;
-    writeln!(writer, ",")?;
-    write_json_string_field(&mut writer, 4, "outletPatch", &args.options.outlet_patch)?;
-    writeln!(writer, ",")?;
-    write_json_string_field(&mut writer, 4, "axis", pipe_axis_name(args.options.axis))?;
-    writeln!(writer)?;
-    write_indent(&mut writer, 2)?;
-    writeln!(writer, "}},")?;
-    write_json_key(&mut writer, 2, "solution")?;
-    writeln!(writer, "{{")?;
-    write_pipe_benchmark_summary_json(&mut writer, summary)?;
-    writeln!(writer)?;
-    write_indent(&mut writer, 2)?;
-    writeln!(writer, "}}")?;
-    writeln!(writer, "}}")?;
-    writer.flush()
-}
-
-fn write_pipe_benchmark_summary_json(
-    writer: &mut impl Write,
-    summary: &LaminarPipeBenchmarkSummary,
-) -> std::io::Result<()> {
-    let values = [
-        ("minVelocity", summary.min_velocity),
-        ("maxVelocity", summary.max_velocity),
-        ("meanVelocity", summary.mean_velocity),
-        ("flowRate", summary.flow_rate),
-        ("analyticMeanVelocity", summary.analytic_mean_velocity),
-        ("analyticFlowRate", summary.analytic_flow_rate),
-        ("pressureDropFromMean", summary.pressure_drop_from_mean),
-        (
-            "pressureDropFromOwnerCells",
-            summary.pressure_drop_from_owner_cells,
-        ),
-        (
-            "relativeMeanVelocityError",
-            summary.relative_mean_velocity_error,
-        ),
-        (
-            "relativePressureDropFromMeanError",
-            summary.relative_pressure_drop_from_mean_error,
-        ),
-        (
-            "relativePressureDropFromOwnerCellsError",
-            summary.relative_pressure_drop_from_owner_cells_error,
-        ),
-    ];
-    for (index, (key, value)) in values.iter().enumerate() {
-        write_json_key(writer, 4, key)?;
-        write_json_optional_number(writer, Some(*value))?;
-        if index + 1 != values.len() {
-            writeln!(writer, ",")?;
-        }
-    }
-    Ok(())
-}
-
-fn write_pipe_benchmark_markdown(
-    args: &PipeBenchmarkArgs,
-    summary: &LaminarPipeBenchmarkSummary,
-    path: &Path,
-) -> std::io::Result<()> {
-    ensure_parent_dir(path)?;
-    let mut writer = BufWriter::new(File::create(path)?);
-    writeln!(writer, "# Laminar Pipe Benchmark")?;
-    writeln!(writer)?;
-    writeln!(writer, "Case: `{}`", args.case_dir.display())?;
-    writeln!(writer, "Fields: `{}`", args.fields_dir.display())?;
-    writeln!(writer)?;
-    writeln!(writer, "| Quantity | Value |")?;
-    writeln!(writer, "| --- | ---: |")?;
-    writeln!(writer, "| Axis | {} |", pipe_axis_name(args.options.axis))?;
-    writeln!(
-        writer,
-        "| Analytic deltaP [Pa] | {} |",
-        format_scientific(args.options.pressure_drop)
-    )?;
-    writeln!(
-        writer,
-        "| Mean velocity [m/s] | {} |",
-        format_scientific(summary.mean_velocity)
-    )?;
-    writeln!(
-        writer,
-        "| Analytic mean velocity [m/s] | {} |",
-        format_scientific(summary.analytic_mean_velocity)
-    )?;
-    writeln!(
-        writer,
-        "| Mean velocity error | {} |",
-        format_percent(summary.relative_mean_velocity_error)
-    )?;
-    writeln!(
-        writer,
-        "| DeltaP from mean velocity [Pa] | {} |",
-        format_scientific(summary.pressure_drop_from_mean)
-    )?;
-    writeln!(
-        writer,
-        "| DeltaP from owner cells [Pa] | {} |",
-        format_scientific(summary.pressure_drop_from_owner_cells)
-    )?;
-    writeln!(
-        writer,
-        "| Owner-cell deltaP error | {} |",
-        format_percent(summary.relative_pressure_drop_from_owner_cells_error)
-    )?;
-    writer.flush()
-}
-
-#[derive(Debug)]
-struct PlaneChannelBenchmarkArgs {
-    case_dir: PathBuf,
-    fields_dir: PathBuf,
-    options: LaminarPlaneChannelBenchmarkOptions,
-    pressure_scale: f64,
-    out_json: Option<PathBuf>,
-    out_markdown: Option<PathBuf>,
-}
-
-fn plane_channel_benchmark(args: Vec<String>) -> Result<(), String> {
-    if args.is_empty() || args.iter().any(|arg| is_help(arg)) {
-        print_plane_channel_benchmark_usage();
-        return Ok(());
-    }
-    let args = parse_plane_channel_benchmark_args(&args)?;
-    let (plan, velocity, mut pressure) = read_benchmark_fields(&args.case_dir, &args.fields_dir)?;
-    for value in &mut pressure {
-        *value *= args.pressure_scale;
-    }
-    let summary = summarize_laminar_plane_channel_solution(
-        &plan.runtime_data.mesh,
-        &velocity,
-        &pressure,
-        &args.options,
-    )
-    .map_err(|error| error.to_string())?;
-
-    println!(
-        "planeChannelBenchmark result: meanVelocity={} analyticMeanVelocity={} relativeMeanVelocityError={} flowRate={} flowRatePerUnitDepth={} pressureDropFromMean={} relativePressureDropFromMeanError={} pressureDropFromOwnerCells={} relativePressureDropFromOwnerCellsError={} minVelocity={} maxVelocity={}",
-        format_scientific(summary.mean_velocity),
-        format_scientific(summary.analytic_mean_velocity),
-        format_scientific(summary.relative_mean_velocity_error),
-        format_scientific(summary.flow_rate),
-        format_scientific(summary.flow_rate_per_unit_depth),
-        format_scientific(summary.pressure_drop_from_mean),
-        format_scientific(summary.relative_pressure_drop_from_mean_error),
-        format_scientific(summary.pressure_drop_from_owner_cells),
-        format_scientific(summary.relative_pressure_drop_from_owner_cells_error),
-        format_scientific(summary.min_velocity),
-        format_scientific(summary.max_velocity),
-    );
-
-    if let Some(path) = &args.out_json {
-        write_plane_channel_benchmark_json(&args, &summary, path).map_err(|error| {
-            format!(
-                "could not write plane-channel benchmark JSON to {} ({error})",
-                path.display()
-            )
-        })?;
-        println!("wrote plane-channel benchmark json: {}", path.display());
-    }
-    if let Some(path) = &args.out_markdown {
-        write_plane_channel_benchmark_markdown(&args, &summary, path).map_err(|error| {
-            format!(
-                "could not write plane-channel benchmark Markdown to {} ({error})",
-                path.display()
-            )
-        })?;
-        println!("wrote plane-channel benchmark markdown: {}", path.display());
-    }
-    Ok(())
-}
-
-fn parse_plane_channel_benchmark_args(
-    args: &[String],
-) -> Result<PlaneChannelBenchmarkArgs, String> {
-    let mut case_dir = PathBuf::from(".");
-    let mut fields_dir = None;
-    let mut pressure_drop = None;
-    let mut dynamic_viscosity = None;
-    let mut length = None;
-    let mut gap = None;
-    let mut depth = None;
-    let mut inlet_patch = "inlet".to_string();
-    let mut outlet_patch = "outlet".to_string();
-    let mut axis = PipeAxis::X;
-    let mut pressure_scale = 1.0;
-    let mut out_json = None;
-    let mut out_markdown = None;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "-case" | "--case" => {
-                case_dir = PathBuf::from(
-                    args.get(index + 1)
-                        .ok_or_else(|| "-case requires a directory".to_string())?,
-                );
-                index += 2;
-            }
-            "-fields" | "--fields" => {
-                fields_dir =
-                    Some(PathBuf::from(args.get(index + 1).ok_or_else(|| {
-                        "--fields requires a time/field directory".to_string()
-                    })?));
-                index += 2;
-            }
-            "-pressureDrop" | "--pressureDrop" | "-pressure-drop" | "--pressure-drop" => {
-                pressure_drop = Some(parse_positive_f64_arg(
-                    "--pressureDrop",
-                    args.get(index + 1)
-                        .ok_or_else(|| "--pressureDrop requires Pa".to_string())?,
-                )?);
-                index += 2;
-            }
-            "-mu" | "--mu" => {
-                dynamic_viscosity = Some(parse_positive_f64_arg(
-                    "--mu",
-                    args.get(index + 1)
-                        .ok_or_else(|| "--mu requires Pa s".to_string())?,
-                )?);
-                index += 2;
-            }
-            "-length" | "--length" => {
-                length = Some(parse_positive_f64_arg(
-                    "--length",
-                    args.get(index + 1)
-                        .ok_or_else(|| "--length requires m".to_string())?,
-                )?);
-                index += 2;
-            }
-            "-gap" | "--gap" => {
-                gap = Some(parse_positive_f64_arg(
-                    "--gap",
-                    args.get(index + 1)
-                        .ok_or_else(|| "--gap requires m".to_string())?,
-                )?);
-                index += 2;
-            }
-            "-depth" | "--depth" => {
-                depth = Some(parse_positive_f64_arg(
-                    "--depth",
-                    args.get(index + 1)
-                        .ok_or_else(|| "--depth requires m".to_string())?,
-                )?);
-                index += 2;
-            }
-            "-inletPatch" | "--inletPatch" | "-inlet-patch" | "--inlet-patch" => {
-                inlet_patch = required_non_empty_arg(args, index, "--inletPatch")?;
-                index += 2;
-            }
-            "-outletPatch" | "--outletPatch" | "-outlet-patch" | "--outlet-patch" => {
-                outlet_patch = required_non_empty_arg(args, index, "--outletPatch")?;
-                index += 2;
-            }
-            "-axis" | "--axis" => {
-                axis = parse_pipe_axis(
-                    args.get(index + 1)
-                        .ok_or_else(|| "--axis requires x, y, or z".to_string())?,
-                )?;
-                index += 2;
-            }
-            "-pressureScale" | "--pressureScale" | "-pressure-scale" | "--pressure-scale" => {
-                pressure_scale = parse_positive_f64_arg(
-                    "--pressureScale",
-                    args.get(index + 1)
-                        .ok_or_else(|| "--pressureScale requires a positive factor".to_string())?,
-                )?;
-                index += 2;
-            }
-            "-outJson" | "--outJson" | "-out-json" | "--out-json" => {
-                out_json = Some(PathBuf::from(
-                    args.get(index + 1)
-                        .ok_or_else(|| "--outJson requires a file".to_string())?,
-                ));
-                index += 2;
-            }
-            "-outMarkdown" | "--outMarkdown" | "-out-markdown" | "--out-markdown" => {
-                out_markdown =
-                    Some(PathBuf::from(args.get(index + 1).ok_or_else(|| {
-                        "--outMarkdown requires a file".to_string()
-                    })?));
-                index += 2;
-            }
-            other => {
-                return Err(format!(
-                    "unknown ferrumPlaneChannelBenchmark option '{other}'"
-                ));
-            }
-        }
-    }
-
-    Ok(PlaneChannelBenchmarkArgs {
-        case_dir,
-        fields_dir: fields_dir
-            .ok_or_else(|| "ferrumPlaneChannelBenchmark requires --fields".to_string())?,
-        options: LaminarPlaneChannelBenchmarkOptions {
-            pressure_drop: pressure_drop
-                .ok_or_else(|| "ferrumPlaneChannelBenchmark requires --pressureDrop".to_string())?,
-            dynamic_viscosity: dynamic_viscosity
-                .ok_or_else(|| "ferrumPlaneChannelBenchmark requires --mu".to_string())?,
-            length: length
-                .ok_or_else(|| "ferrumPlaneChannelBenchmark requires --length".to_string())?,
-            gap: gap.ok_or_else(|| "ferrumPlaneChannelBenchmark requires --gap".to_string())?,
-            depth: depth
-                .ok_or_else(|| "ferrumPlaneChannelBenchmark requires --depth".to_string())?,
-            inlet_patch,
-            outlet_patch,
-            axis,
-        },
-        pressure_scale,
-        out_json,
-        out_markdown,
-    })
-}
-
-fn parse_pipe_axis(value: &str) -> Result<PipeAxis, String> {
-    match value.to_ascii_lowercase().as_str() {
-        "x" => Ok(PipeAxis::X),
-        "y" => Ok(PipeAxis::Y),
-        "z" => Ok(PipeAxis::Z),
-        other => Err(format!("invalid --axis '{other}'; expected x, y, or z")),
-    }
-}
-
-fn write_plane_channel_benchmark_json(
-    args: &PlaneChannelBenchmarkArgs,
-    summary: &LaminarPlaneChannelBenchmarkSummary,
-    path: &Path,
-) -> std::io::Result<()> {
-    ensure_parent_dir(path)?;
-    let mut writer = BufWriter::new(File::create(path)?);
-    writeln!(writer, "{{")?;
-    write_json_string_field(&mut writer, 2, "benchmark", "laminarPlanePoiseuille")?;
-    writeln!(writer, ",")?;
-    write_json_string_field(
-        &mut writer,
-        2,
-        "caseDir",
-        &args.case_dir.display().to_string(),
-    )?;
-    writeln!(writer, ",")?;
-    write_json_string_field(
-        &mut writer,
-        2,
-        "fieldsDir",
-        &args.fields_dir.display().to_string(),
-    )?;
-    writeln!(writer, ",")?;
-    write_json_key(&mut writer, 2, "inputs")?;
-    writeln!(writer, "{{")?;
-    for (key, value) in [
-        ("pressureDrop", args.options.pressure_drop),
-        ("dynamicViscosity", args.options.dynamic_viscosity),
-        ("length", args.options.length),
-        ("gap", args.options.gap),
-        ("depth", args.options.depth),
-        ("pressureScale", args.pressure_scale),
-    ]
-    .iter()
-    {
-        write_json_key(&mut writer, 4, key)?;
-        write_json_optional_number(&mut writer, Some(*value))?;
-        writeln!(writer, ",")?;
-    }
-    write_json_string_field(&mut writer, 4, "inletPatch", &args.options.inlet_patch)?;
-    writeln!(writer, ",")?;
-    write_json_string_field(&mut writer, 4, "outletPatch", &args.options.outlet_patch)?;
-    writeln!(writer, ",")?;
-    write_json_string_field(&mut writer, 4, "axis", pipe_axis_name(args.options.axis))?;
-    writeln!(writer)?;
-    write_indent(&mut writer, 2)?;
-    writeln!(writer, "}},")?;
-    write_json_key(&mut writer, 2, "solution")?;
-    writeln!(writer, "{{")?;
-    let values = [
-        ("minVelocity", summary.min_velocity),
-        ("maxVelocity", summary.max_velocity),
-        ("meanVelocity", summary.mean_velocity),
-        ("flowRate", summary.flow_rate),
-        ("flowRatePerUnitDepth", summary.flow_rate_per_unit_depth),
-        ("analyticMeanVelocity", summary.analytic_mean_velocity),
-        ("analyticFlowRate", summary.analytic_flow_rate),
-        (
-            "analyticFlowRatePerUnitDepth",
-            summary.analytic_flow_rate_per_unit_depth,
-        ),
-        ("pressureDropFromMean", summary.pressure_drop_from_mean),
-        (
-            "pressureDropFromOwnerCells",
-            summary.pressure_drop_from_owner_cells,
-        ),
-        (
-            "relativeMeanVelocityError",
-            summary.relative_mean_velocity_error,
-        ),
-        (
-            "relativePressureDropFromMeanError",
-            summary.relative_pressure_drop_from_mean_error,
-        ),
-        (
-            "relativePressureDropFromOwnerCellsError",
-            summary.relative_pressure_drop_from_owner_cells_error,
-        ),
-    ];
-    for (index, (key, value)) in values.iter().enumerate() {
-        write_json_key(&mut writer, 4, key)?;
-        write_json_optional_number(&mut writer, Some(*value))?;
-        if index + 1 != values.len() {
-            writeln!(writer, ",")?;
-        }
-    }
-    writeln!(writer)?;
-    write_indent(&mut writer, 2)?;
-    writeln!(writer, "}}")?;
-    writeln!(writer, "}}")?;
-    writer.flush()
-}
-
-fn write_plane_channel_benchmark_markdown(
-    args: &PlaneChannelBenchmarkArgs,
-    summary: &LaminarPlaneChannelBenchmarkSummary,
-    path: &Path,
-) -> std::io::Result<()> {
-    ensure_parent_dir(path)?;
-    let mut writer = BufWriter::new(File::create(path)?);
-    writeln!(writer, "# Laminar Plane-Channel Benchmark")?;
-    writeln!(writer)?;
-    writeln!(writer, "Case: `{}`", args.case_dir.display())?;
-    writeln!(writer, "Fields: `{}`", args.fields_dir.display())?;
-    writeln!(writer)?;
-    writeln!(writer, "| Quantity | Value |")?;
-    writeln!(writer, "| --- | ---: |")?;
-    writeln!(writer, "| Axis | {} |", pipe_axis_name(args.options.axis))?;
-    writeln!(
-        writer,
-        "| Analytic deltaP [Pa] | {} |",
-        format_scientific(args.options.pressure_drop)
-    )?;
-    writeln!(
-        writer,
-        "| Mean velocity [m/s] | {} |",
-        format_scientific(summary.mean_velocity)
-    )?;
-    writeln!(
-        writer,
-        "| Analytic mean velocity [m/s] | {} |",
-        format_scientific(summary.analytic_mean_velocity)
-    )?;
-    writeln!(
-        writer,
-        "| Mean velocity error | {} |",
-        format_percent(summary.relative_mean_velocity_error)
-    )?;
-    writeln!(
-        writer,
-        "| DeltaP from mean velocity [Pa] | {} |",
-        format_scientific(summary.pressure_drop_from_mean)
-    )?;
-    writeln!(
-        writer,
-        "| DeltaP from mean velocity error | {} |",
-        format_percent(summary.relative_pressure_drop_from_mean_error)
-    )?;
-    writeln!(
-        writer,
-        "| DeltaP from owner cells [Pa] | {} |",
-        format_scientific(summary.pressure_drop_from_owner_cells)
-    )?;
-    writeln!(
-        writer,
-        "| Owner-cell deltaP error | {} |",
-        format_percent(summary.relative_pressure_drop_from_owner_cells_error)
-    )?;
-    writeln!(
-        writer,
-        "| Flow rate per unit depth [m2/s] | {} |",
-        format_scientific(summary.flow_rate_per_unit_depth)
-    )?;
-    writer.flush()
-}
-
-fn pipe_axis_name(axis: PipeAxis) -> &'static str {
-    match axis {
-        PipeAxis::X => "x",
-        PipeAxis::Y => "y",
-        PipeAxis::Z => "z",
-    }
-}
-
-fn resolve_poiseuille_options(
-    plan: &SolverCasePlan,
-    solve: &PoiseuilleSolveArgs,
-) -> Result<PoiseuilleOptions, String> {
-    let pressure_drop = solve
-        .pressure_drop
-        .ok_or_else(|| "Poiseuille solve requires --pressureDrop".to_string())?;
-    let dynamic_viscosity = solve
-        .dynamic_viscosity
-        .or_else(|| property_number(plan, "transportProperties", None, "mu"))
-        .ok_or_else(|| "Poiseuille solve requires --mu or transportProperties.mu".to_string())?;
-    let length = solve
-        .length
-        .ok_or_else(|| "Poiseuille solve requires --length".to_string())?;
-    let diameter = solve
-        .diameter
-        .ok_or_else(|| "Poiseuille solve requires --diameter".to_string())?;
-    let wall_patches = if solve.wall_patches.is_empty() {
-        vec!["wall".to_string()]
-    } else {
-        solve.wall_patches.clone()
-    };
-
-    Ok(PoiseuilleOptions {
-        pressure_drop,
-        dynamic_viscosity,
-        length,
-        diameter,
-        wall_patches,
-    })
 }
 
 fn run_laminar_simple_solve(
@@ -3415,7 +2511,7 @@ fn print_solver_case_plan(plan: &SolverCasePlan, dispatch: Option<&SolverDispatc
         }
     }
     println!(
-        "solver execution: the incompressibleFluid steady laminar SIMPLE CPU kernel is available; scalar diffusion and Poiseuille remain developer utilities; GPU equation kernels are planned"
+        "solver execution: the incompressibleFluid steady laminar SIMPLE CPU kernel is available; scalar diffusion remains a developer utility; GPU equation kernels are planned"
     );
 }
 
@@ -6801,7 +5897,6 @@ struct SolverArgs {
     runner_dry_run: bool,
     max_runner_steps: usize,
     scalar_diffusion_solve: Option<ScalarDiffusionSolveArgs>,
-    poiseuille_solve: Option<PoiseuilleSolveArgs>,
     laminar_simple_solve: Option<LaminarSimpleSolveArgs>,
 }
 
@@ -6810,18 +5905,6 @@ struct ScalarDiffusionSolveArgs {
     field: String,
     diffusivity: f64,
     source: f64,
-    linear_solver: ScalarDiffusionLinearSolver,
-    tolerance: f64,
-    max_iterations: usize,
-}
-
-#[derive(Debug)]
-struct PoiseuilleSolveArgs {
-    pressure_drop: Option<f64>,
-    dynamic_viscosity: Option<f64>,
-    length: Option<f64>,
-    diameter: Option<f64>,
-    wall_patches: Vec<String>,
     linear_solver: ScalarDiffusionLinearSolver,
     tolerance: f64,
     max_iterations: usize,
@@ -6901,16 +5984,10 @@ fn parse_solver_args_for_invocation(
     let mut max_runner_steps = SolverRunnerDryRunOptions::default().max_steps;
     let mut scalar_diffusion_field = None;
     let mut scalar_diffusion_option_seen = false;
-    let mut poiseuille_solve = false;
-    let mut poiseuille_option_seen = false;
     let mut laminar_simple_option_seen = false;
     let mut shared_flow_option_seen = false;
     let mut density = None;
-    let mut pressure_drop = None;
     let mut dynamic_viscosity = None;
-    let mut length = None;
-    let mut diameter = None;
-    let mut wall_patches = Vec::new();
     let mut linear_solve_option_seen = false;
     let mut laminar_linear_solver = None;
     let mut momentum_linear_solver = None;
@@ -6992,11 +6069,6 @@ fn parse_solver_args_for_invocation(
                 scalar_diffusion_field = Some(field.to_string());
                 index += 2;
             }
-            "-solvePoiseuille" | "--solvePoiseuille" | "-solve-poiseuille"
-            | "--solve-poiseuille" => {
-                poiseuille_solve = true;
-                index += 1;
-            }
             "-diffusivity" | "--diffusivity" => {
                 let value = args
                     .get(index + 1)
@@ -7013,14 +6085,6 @@ fn parse_solver_args_for_invocation(
                 scalar_diffusion_option_seen = true;
                 index += 2;
             }
-            "-pressureDrop" | "--pressureDrop" | "-pressure-drop" | "--pressure-drop" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    "--pressureDrop requires a positive pressure drop in Pa".to_string()
-                })?;
-                pressure_drop = Some(parse_positive_f64_arg("--pressureDrop", value)?);
-                poiseuille_option_seen = true;
-                index += 2;
-            }
             "-rho" | "--rho" => {
                 let value = args
                     .get(index + 1)
@@ -7035,33 +6099,6 @@ fn parse_solver_args_for_invocation(
                 })?;
                 dynamic_viscosity = Some(parse_positive_f64_arg("--mu", value)?);
                 shared_flow_option_seen = true;
-                index += 2;
-            }
-            "-length" | "--length" => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| "--length requires a positive pipe length in m".to_string())?;
-                length = Some(parse_positive_f64_arg("--length", value)?);
-                poiseuille_option_seen = true;
-                index += 2;
-            }
-            "-diameter" | "--diameter" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    "--diameter requires a positive pipe diameter in m".to_string()
-                })?;
-                diameter = Some(parse_positive_f64_arg("--diameter", value)?);
-                poiseuille_option_seen = true;
-                index += 2;
-            }
-            "-wallPatch" | "--wallPatch" | "-wall-patch" | "--wall-patch" => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| "--wallPatch requires a patch name".to_string())?;
-                if value.trim().is_empty() {
-                    return Err("--wallPatch patch name must not be empty".to_string());
-                }
-                wall_patches.push(value.to_string());
-                poiseuille_option_seen = true;
                 index += 2;
             }
             "-linearSolver" | "--linearSolver" | "-linear-solver" | "--linear-solver" => {
@@ -7376,20 +6413,6 @@ fn parse_solver_args_for_invocation(
             "scalar diffusion solve options require --solveScalarDiffusion <field>".to_string(),
         );
     }
-    let poiseuille_solve = if poiseuille_solve {
-        Some(PoiseuilleSolveArgs {
-            pressure_drop,
-            dynamic_viscosity,
-            length,
-            diameter,
-            wall_patches,
-            linear_solver: scalar_diffusion_linear_solver,
-            tolerance: scalar_diffusion_tolerance,
-            max_iterations: scalar_diffusion_max_iterations,
-        })
-    } else {
-        None
-    };
     let laminar_simple_solve = if invocation == SolverInvocation::IncompressibleFluidExecute {
         Some(LaminarSimpleSolveArgs {
             density,
@@ -7423,16 +6446,10 @@ fn parse_solver_args_for_invocation(
     } else {
         None
     };
-    if poiseuille_solve.is_none() && poiseuille_option_seen {
-        return Err("Poiseuille solve options require --solvePoiseuille".to_string());
+    if laminar_simple_solve.is_none() && shared_flow_option_seen {
+        return Err("--mu requires ferrumRun -solver incompressibleFluid".to_string());
     }
-    if poiseuille_solve.is_none() && laminar_simple_solve.is_none() && shared_flow_option_seen {
-        return Err(
-            "--mu requires the ferrum solve --solvePoiseuille utility or ferrumRun -solver incompressibleFluid"
-                .to_string(),
-        );
-    }
-    if (scalar_diffusion_solve.is_some() || poiseuille_solve.is_some())
+    if scalar_diffusion_solve.is_some()
         && let Some(error) = scalar_diffusion_linear_solver_error
     {
         return Err(error);
@@ -7443,18 +6460,16 @@ fn parse_solver_args_for_invocation(
         );
     }
     if scalar_diffusion_solve.is_none()
-        && poiseuille_solve.is_none()
         && laminar_simple_solve.is_none()
         && linear_solve_option_seen
     {
         return Err(
-            "linear solve options require ferrum solve --solveScalarDiffusion <field>, ferrum solve --solvePoiseuille, or ferrumRun -solver incompressibleFluid"
+            "linear solve options require ferrum solve --solveScalarDiffusion <field>, or ferrumRun -solver incompressibleFluid"
                 .to_string(),
         );
     }
-    let executable_solve_count = scalar_diffusion_solve.is_some() as usize
-        + poiseuille_solve.is_some() as usize
-        + laminar_simple_solve.is_some() as usize;
+    let executable_solve_count =
+        scalar_diffusion_solve.is_some() as usize + laminar_simple_solve.is_some() as usize;
     if executable_solve_count > 1 {
         return Err(
             "developer utility solves cannot be combined with an incompressibleFluid application run"
@@ -7467,7 +6482,6 @@ fn parse_solver_args_for_invocation(
         runner_dry_run,
         max_runner_steps,
         scalar_diffusion_solve,
-        poiseuille_solve,
         laminar_simple_solve,
     })
 }
@@ -7729,10 +6743,6 @@ fn print_help() {
     println!("  ferrum splitFerrumMeshRegions [-case <caseDir>] [-cellZones]");
     println!("  ferrum run -solver incompressibleFluid [-case <caseDir>] [run options]");
     println!("  ferrum solve [-case <caseDir>] [--preflight] [--planJson <file>] [--runnerDryRun]");
-    println!("  ferrum pipeBenchmark -case <caseDir> --fields <timeDir> [reference options]");
-    println!(
-        "  ferrum planeChannelBenchmark -case <caseDir> --fields <timeDir> [reference options]"
-    );
     println!();
     println!("aliases:");
     println!("  initFerrumCase <caseDir> [--region <name> ...] [--force]");
@@ -7740,10 +6750,7 @@ fn print_help() {
     println!("  checkFerrumMesh [-case <caseDir>]");
     println!("  splitFerrumMeshRegions [-case <caseDir>] [-cellZones]");
     println!("  ferrumRun -solver incompressibleFluid [-case <caseDir>] [run options]");
-    println!("  ferrumPipeBenchmark -case <caseDir> --fields <timeDir> [reference options]");
-    println!(
-        "  ferrumPlaneChannelBenchmark -case <caseDir> --fields <timeDir> [reference options]"
-    );
+
     println!();
     print_patch_type_options();
 }
@@ -7808,7 +6815,7 @@ fn print_init_case_usage() {
 
 fn print_solver_usage() {
     println!(
-        "usage: ferrum solve [-case <caseDir>] [--preflight] [--planJson <file>] [--runnerDryRun] [--maxRunnerSteps <n>] [--solveScalarDiffusion <field>|--solvePoiseuille]"
+        "usage: ferrum solve [-case <caseDir>] [--preflight] [--planJson <file>] [--runnerDryRun] [--maxRunnerSteps <n>] [--solveScalarDiffusion <field>]"
     );
     println!();
     println!("developer-only equation and benchmark utilities; application flow uses ferrumRun");
@@ -7818,19 +6825,7 @@ fn print_solver_usage() {
     println!("  --runnerDryRun       preview the future solver runner without solving equations");
     println!("  --maxRunnerSteps <n> limit runner dry-run preview steps (default: 3)");
     println!("  --solveScalarDiffusion <field> assemble and solve one CPU scalar diffusion system");
-    println!("  --solvePoiseuille    solve a source-driven axial Stokes/Poiseuille benchmark");
-    println!(
-        "  --diffusivity <v>    scalar diffusion coefficient for --solveScalarDiffusion (default: 1)"
-    );
-    println!(
-        "  --source <v>         uniform volume source for --solveScalarDiffusion (default: 0)"
-    );
-    println!("  --linearSolver <s>   cg or jacobi for utility solves");
-    println!("  --pressureDrop <Pa>  pressure drop for --solvePoiseuille");
-    println!("  --mu <Pa.s>          dynamic viscosity for --solvePoiseuille");
-    println!("  --length <m>         pipe length for --solvePoiseuille");
-    println!("  --diameter <m>       pipe diameter for --solvePoiseuille");
-    println!("  --wallPatch <name>   wall patch for --solvePoiseuille (default: wall)");
+
     println!("  --solveTolerance <v> absolute residual tolerance (default: 1e-10)");
     println!("  --maxIterations <n>  linear solver iteration cap (default: 10000)");
 }
@@ -7839,33 +6834,6 @@ fn print_gmsh_to_ferrum_usage() {
     println!("usage: gmshToFerrum <mesh.msh> [-case <caseDir>] [patch type options]");
     println!();
     print_patch_type_options();
-}
-
-fn print_pipe_benchmark_usage() {
-    println!(
-        "usage: ferrumPipeBenchmark -case <caseDir> --fields <timeDir> --pressureDrop <Pa> --mu <Pa.s> --length <m> --diameter <m> [options]"
-    );
-    println!();
-    println!("post-processes stored U/p fields outside the generic SIMPLE solver");
-    println!("  --axis <x|y|z>       axial velocity component (default: x)");
-    println!("  --inletPatch <name>  inlet patch for pressure sampling (default: inlet)");
-    println!("  --outletPatch <name> outlet patch for pressure sampling (default: outlet)");
-    println!("  --outJson <file>     write benchmark JSON");
-    println!("  --outMarkdown <file> write benchmark Markdown");
-}
-
-fn print_plane_channel_benchmark_usage() {
-    println!(
-        "usage: ferrumPlaneChannelBenchmark -case <caseDir> --fields <timeDir> --pressureDrop <Pa> --mu <Pa.s> --length <m> --gap <m> --depth <m> [options]"
-    );
-    println!();
-    println!("post-processes stored U/p fields outside the generic SIMPLE solver");
-    println!("  --axis <x|y|z>       axial velocity component (default: x)");
-    println!("  --inletPatch <name>  inlet patch for pressure sampling (default: inlet)");
-    println!("  --outletPatch <name> outlet patch for pressure sampling (default: outlet)");
-    println!("  --pressureScale <v>  multiply stored p before SI comparison (default: 1)");
-    println!("  --outJson <file>     write benchmark JSON");
-    println!("  --outMarkdown <file> write benchmark Markdown");
 }
 
 fn print_patch_type_options() {
@@ -7894,8 +6862,7 @@ mod tests {
         parse_incompressible_fluid_args, parse_incompressible_fluid_plan_args,
         parse_laminar_simple_convection_scheme, parse_laminar_simple_gradient_scheme,
         parse_laminar_simple_laplacian_scheme, parse_laminar_simple_sn_grad_scheme,
-        parse_openfoam_laminar_preconditioner, parse_openfoam_laminar_solver,
-        parse_pipe_benchmark_args, parse_plane_channel_benchmark_args, parse_solver_args,
+        parse_openfoam_laminar_preconditioner, parse_openfoam_laminar_solver, parse_solver_args,
         resolve_laminar_simple_convection_scheme, resolve_laminar_simple_options,
         resolve_solver_dispatch, resolved_gradient_scheme_value, run_ferrum_subcommand,
         validate_laminar_residual_control_dictionary, validate_module_execution_contract,
@@ -7907,7 +6874,6 @@ mod tests {
         LaminarSimpleConvectionScheme, LaminarSimpleGradientScheme, LaminarSimpleLaplacianScheme,
         LaminarSimpleLinearSolver, LaminarSimplePreconditioner, LaminarSimpleSnGradScheme,
     };
-    use ferrum_mesh::poiseuille::PipeAxis;
     use ferrum_mesh::runtime::{SolverRuntimeData, SolverRuntimeMeshData};
     use ferrum_mesh::solver_plan::{
         SolverBackendPlan, SolverCasePlan, SolverCpuResourcePlan, SolverDimensionality,
@@ -7962,7 +6928,6 @@ mod tests {
 
             assert!(parsed.laminar_simple_solve.is_none(), "mode: {mode}");
             assert!(parsed.scalar_diffusion_solve.is_none(), "mode: {mode}");
-            assert!(parsed.poiseuille_solve.is_none(), "mode: {mode}");
         }
     }
 
@@ -7976,18 +6941,6 @@ mod tests {
         .expect_err("duplicate solver selection should fail");
 
         assert!(error.contains("only once"));
-    }
-
-    #[test]
-    fn ferrum_run_rejects_utility_execution_selector() {
-        let error = parse_ferrum_run_args(&[
-            "-solver".to_string(),
-            "incompressibleFluid".to_string(),
-            "--solvePoiseuille".to_string(),
-        ])
-        .expect_err("developer utility selector should fail on ferrumRun");
-
-        assert!(error.contains("developer utility selector"));
     }
 
     #[test]
@@ -8053,97 +7006,6 @@ mod tests {
                 "legacy command {legacy} should point to {replacement}, got {error}"
             );
         }
-    }
-
-    #[test]
-    fn parses_external_pipe_benchmark_options() {
-        let args = vec![
-            "-case".to_string(),
-            "examples/pipe".to_string(),
-            "--fields".to_string(),
-            "target/fields/100".to_string(),
-            "--pressureDrop".to_string(),
-            "1.6032".to_string(),
-            "--mu".to_string(),
-            "0.001002".to_string(),
-            "--length".to_string(),
-            "1".to_string(),
-            "--diameter".to_string(),
-            "0.02".to_string(),
-            "--axis".to_string(),
-            "z".to_string(),
-            "--inletPatch".to_string(),
-            "feed".to_string(),
-            "--outletPatch".to_string(),
-            "product".to_string(),
-            "--outJson".to_string(),
-            "target/pipe.json".to_string(),
-        ];
-
-        let parsed = parse_pipe_benchmark_args(&args).expect("pipe benchmark args should parse");
-
-        assert_eq!(parsed.case_dir, PathBuf::from("examples/pipe"));
-        assert_eq!(parsed.fields_dir, PathBuf::from("target/fields/100"));
-        assert_eq!(parsed.options.pressure_drop, 1.6032);
-        assert_eq!(parsed.options.dynamic_viscosity, 0.001002);
-        assert_eq!(parsed.options.length, 1.0);
-        assert_eq!(parsed.options.diameter, 0.02);
-        assert_eq!(parsed.options.axis, PipeAxis::Z);
-        assert_eq!(parsed.options.inlet_patch, "feed");
-        assert_eq!(parsed.options.outlet_patch, "product");
-        assert_eq!(parsed.out_json, Some(PathBuf::from("target/pipe.json")));
-    }
-
-    #[test]
-    fn parses_external_plane_channel_benchmark_options() {
-        let args = vec![
-            "-case".to_string(),
-            "target/cases/channel".to_string(),
-            "--fields".to_string(),
-            "target/fields/545".to_string(),
-            "--pressureDrop".to_string(),
-            "0.6012".to_string(),
-            "--mu".to_string(),
-            "0.001002".to_string(),
-            "--length".to_string(),
-            "1".to_string(),
-            "--gap".to_string(),
-            "0.02".to_string(),
-            "--depth".to_string(),
-            "0.001".to_string(),
-            "--axis".to_string(),
-            "x".to_string(),
-            "--pressureScale".to_string(),
-            "998.2".to_string(),
-        ];
-
-        let parsed = parse_plane_channel_benchmark_args(&args)
-            .expect("plane-channel benchmark args should parse");
-
-        assert_eq!(parsed.case_dir, PathBuf::from("target/cases/channel"));
-        assert_eq!(parsed.fields_dir, PathBuf::from("target/fields/545"));
-        assert_eq!(parsed.options.pressure_drop, 0.6012);
-        assert_eq!(parsed.options.gap, 0.02);
-        assert_eq!(parsed.options.depth, 0.001);
-        assert_eq!(parsed.options.axis, PipeAxis::X);
-        assert_eq!(parsed.pressure_scale, 998.2);
-    }
-
-    #[test]
-    fn external_pipe_benchmark_requires_stored_fields() {
-        let error = parse_pipe_benchmark_args(&[
-            "--pressureDrop".to_string(),
-            "1.6032".to_string(),
-            "--mu".to_string(),
-            "0.001002".to_string(),
-            "--length".to_string(),
-            "1".to_string(),
-            "--diameter".to_string(),
-            "0.02".to_string(),
-        ])
-        .expect_err("pipe post-processing without stored fields must fail");
-
-        assert!(error.contains("requires --fields"));
     }
 
     #[test]
@@ -8219,35 +7081,6 @@ mod tests {
             parse_solver_args(&args).expect_err("diffusivity without solve field should fail");
 
         assert!(error.contains("--solveScalarDiffusion"));
-    }
-
-    #[test]
-    fn parses_poiseuille_solve_options() {
-        let args = vec![
-            "--solvePoiseuille".to_string(),
-            "--pressureDrop".to_string(),
-            "1.6032".to_string(),
-            "--mu".to_string(),
-            "0.001002".to_string(),
-            "--length".to_string(),
-            "1.0".to_string(),
-            "--diameter".to_string(),
-            "0.02".to_string(),
-            "--wallPatch".to_string(),
-            "pipeWall".to_string(),
-            "--linearSolver".to_string(),
-            "cg".to_string(),
-        ];
-
-        let parsed = parse_solver_args(&args).expect("solver args should parse");
-        let solve = parsed.poiseuille_solve.expect("poiseuille solve args");
-
-        assert_eq!(solve.pressure_drop, Some(1.6032));
-        assert_eq!(solve.dynamic_viscosity, Some(0.001002));
-        assert_eq!(solve.length, Some(1.0));
-        assert_eq!(solve.diameter, Some(0.02));
-        assert_eq!(solve.wall_patches, vec!["pipeWall"]);
-        assert_eq!(solve.linear_solver, ScalarDiffusionLinearSolver::Cg);
     }
 
     #[test]
@@ -8455,7 +7288,7 @@ mod tests {
             .laminar_simple_solve
             .expect("laminar SIMPLE solve args");
         let options = resolve_laminar_simple_options(&plan, &solve)
-            .expect("laminar options should resolve without pipeBenchmark");
+            .expect("laminar options should resolve from incompressible inputs");
 
         assert_eq!(options.density, 1000.0);
         assert_eq!(options.dynamic_viscosity, 0.001002);
@@ -8468,15 +7301,6 @@ mod tests {
             LaminarSimpleLinearSolver::Pcg
         );
         assert_eq!(options.max_simple_iterations, 100);
-    }
-
-    #[test]
-    fn laminar_simple_rejects_pipe_benchmark_cli_options() {
-        let error =
-            parse_incompressible_fluid_args(&["--pressureDrop".to_string(), "1.6032".to_string()])
-                .expect_err("pipe benchmark inputs must stay outside the generic SIMPLE solve");
-
-        assert!(error.contains("Poiseuille solve options require --solvePoiseuille"));
     }
 
     #[test]
@@ -9325,19 +8149,6 @@ mod tests {
             },
         ]);
         assert!(resolved_gradient_scheme_value(&cyclic, "grad(U)", Some("default")).is_err());
-    }
-
-    #[test]
-    fn rejects_mixed_executable_solves() {
-        let args = vec![
-            "--solveScalarDiffusion".to_string(),
-            "T".to_string(),
-            "--solvePoiseuille".to_string(),
-        ];
-
-        let error = parse_solver_args(&args).expect_err("mixed executable solves should fail");
-
-        assert!(error.contains("cannot be combined"));
     }
 
     #[test]
