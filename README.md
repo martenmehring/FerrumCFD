@@ -126,3 +126,5 @@ Generated meshes, fields, logs, plots, and reports belong below `target/`.
 ## License
 
 FerrumCFD is licensed under the [MIT License](LICENSE).
+External validation tools, compatibility formats, and tutorial provenance are
+documented in [Third-party notices](THIRD_PARTY_NOTICES.md).

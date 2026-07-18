@@ -15,9 +15,12 @@ runner. That compatibility path overlays only the selected mesh, initial
 fields, and viscosity onto the native OpenFOAM 13 configuration; it is never
 used by the canonical default run.
 
-Ferrum does not parse or execute this case. Shared SI values and comparison
-targets live in `../comparison.toml`.
+Ferrum does not parse or execute this case. Canonical SI values live in
+`../shared/physicalParameters.toml`, which is comparison-only metadata and is
+not read by OpenFOAM; comparison targets live in `../comparison.toml`.
 
 Provenance classification: the geometry, mesh, dictionaries, and fields in
-this bundle were independently authored or generated for FerrumCFD comparison;
-they were not copied from an OpenFOAM tutorial or implementation source.
+this bundle were newly authored or generated for FerrumCFD comparison while
+using the documented OpenFOAM file formats and the stated reference parameters.
+Required OpenFOAM names and generated headers remain in this external sibling
+case. See the repository's `THIRD_PARTY_NOTICES.md`.

@@ -33,8 +33,10 @@ foamRun -solver incompressibleFluid -case "$case_dir"
 The behavioral reference is the official
 `tutorials/incompressibleFluid/cylinder` case installed by OpenFOAM Foundation
 13 package `20260407`, build `13-441953dfbb42`. The dictionaries and mesh in
-this repository were authored independently; no upstream case text, mesh data,
-or GPL implementation source is copied here.
+this repository were newly authored or generated for FerrumCFD while using the
+documented OpenFOAM file formats and the stated external reference parameters.
+OpenFOAM names and generated format headers are retained only where the sibling
+case requires them. See the repository's `THIRD_PARTY_NOTICES.md`.
 
 The official 5388-cell run records, after 5000 iterations, `Re=1`, final
 `Cd=10.6558580`, `Cl=4.6316142e-11`, final local continuity `2.200139e-10`, and
