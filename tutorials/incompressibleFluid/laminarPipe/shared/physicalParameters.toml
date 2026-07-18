@@ -1,0 +1,17 @@
+schema_version = 1
+id = "incompressibleFluid.laminarPipe"
+title = "Laminar circular-pipe flow"
+regime = "laminar"
+provenance = "Hagen-Poiseuille: deltaP = 32*mu*L*meanU/D^2"
+length_m = 1.0
+diameter_m = 0.02
+axis = "x"
+reference_temperature_k = 293.15
+density_kg_per_m3 = 998.2
+dynamic_viscosity_pa_s = 0.001002
+kinematic_viscosity_m2_per_s = 1.0038068513323983e-6
+mean_velocity_m_per_s = 0.02
+inlet_velocity_profile = "parabolicFullyDeveloped"
+pressure_loss_model = "Hagen-Poiseuille"
+pressure_drop_pa = 1.6032
+minor_losses = false

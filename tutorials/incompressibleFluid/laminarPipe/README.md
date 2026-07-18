@@ -10,6 +10,9 @@ The supplied case represents steady laminar water flow through a straight
 circular pipe. Its default reference uses `D = 0.02 m`, `L = 1 m`, mean
 velocity `0.02 m/s`, and dynamic viscosity `0.001002 Pa s`. Ferrum stores
 pressure in Pa; the incompressible OpenFOAM case stores kinematic pressure.
+The canonical SI inputs are defined once in
+`shared/physicalParameters.toml`; `comparison.toml` links that file instead of
+duplicating the physical values.
 
 For pipe radius `R`, length `L`, dynamic viscosity `mu`, and pressure loss
 `deltaP`:

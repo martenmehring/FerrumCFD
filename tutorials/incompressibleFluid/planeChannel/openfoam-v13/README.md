@@ -15,5 +15,7 @@ and is not read by OpenFOAM; comparison targets live in `../comparison.toml`.
 No Ferrum conversion or combined runner is required.
 
 Provenance classification: the geometry, mesh, dictionaries, and fields in
-this bundle were independently authored or generated for FerrumCFD comparison;
-they were not copied from an OpenFOAM tutorial or implementation source.
+this bundle were newly authored or generated for FerrumCFD comparison while
+using the documented OpenFOAM file formats and the stated reference parameters.
+Required OpenFOAM names and generated headers remain in this external sibling
+case. See the repository's `THIRD_PARTY_NOTICES.md`.
