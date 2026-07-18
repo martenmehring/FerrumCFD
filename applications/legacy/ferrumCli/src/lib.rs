@@ -4,7 +4,6 @@ use std::env;
 use std::fs::File;
 use std::io::{BufWriter, Error, ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use case::{InitCaseOptions, init_case};
@@ -1384,67 +1383,14 @@ fn write_laminar_simple_residual_plot(csv_path: &Path, plot_path: &Path) -> std:
         .extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"));
-    if wants_svg {
-        return write_laminar_simple_residual_plot_svg(csv_path, plot_path);
+    if !wants_svg {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "native residual plots require an output path with the .svg extension",
+        ));
     }
 
-    let python = locate_python_interpreter().ok_or_else(|| {
-        Error::new(
-            ErrorKind::NotFound,
-            "python is required to generate the residual plot, but could not be found",
-        )
-    })?;
-    ensure_parent_dir(plot_path)?;
-
-    const SCRIPT: &str = r#"
-import csv
-import sys
-
-import matplotlib.pyplot as plt
-
-from pathlib import Path
-
-csv_path = Path(sys.argv[1])
-plot_path = Path(sys.argv[2])
-
-with csv_path.open("r", newline="") as handle:
-    rows = list(csv.DictReader(handle))
-
-if not rows:
-    raise RuntimeError("no residual history rows in CSV")
-
-iterations = [float(row["iteration"]) for row in rows]
-momentum = [float(row["momentumInitialResidualNormalized"]) for row in rows]
-pressure = [float(row["pressureInitialResidualNormalized"]) for row in rows]
-continuity = [float(row["continuityAfterL2"]) for row in rows]
-
-plt.figure(figsize=(8, 5))
-plt.plot(iterations, continuity, label="Continuity L2")
-plt.plot(iterations, momentum, label="U initial residual")
-plt.plot(iterations, pressure, label="p initial residual")
-plt.yscale("log")
-plt.xlabel("SIMPLE iteration")
-plt.ylabel("Residual / Continuity metric")
-plt.legend()
-plt.grid(True, which="both", alpha=0.25)
-plt.tight_layout()
-plt.savefig(plot_path, dpi=150)
-"#;
-
-    let status = Command::new(python)
-        .arg("-c")
-        .arg(SCRIPT)
-        .arg(csv_path)
-        .arg(plot_path)
-        .status()?;
-
-    if !status.success() {
-        return Err(Error::other(format!(
-            "python plotting failed with status {status}"
-        )));
-    }
-
-    Ok(())
+    write_laminar_simple_residual_plot_svg(csv_path, plot_path)
 }
 
 fn write_laminar_simple_residual_plot_svg(
@@ -1666,17 +1612,6 @@ fn write_laminar_simple_residual_plot_svg(
     ensure_parent_dir(plot_path)?;
     std::fs::write(plot_path, svg)?;
     Ok(())
-}
-
-fn locate_python_interpreter() -> Option<&'static str> {
-    ["python", "python3"].into_iter().find(|command| {
-        Command::new(command)
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
-    })
 }
 
 fn resolve_laminar_simple_options(
@@ -7159,9 +7094,9 @@ fn parse_solver_args_for_invocation(
             | "--solveResidualPlot"
             | "-solve-residual-plot"
             | "--solve-residual-plot" => {
-                let path = args.get(index + 1).ok_or_else(|| {
-                    "--solveResidualPlot requires an output image path".to_string()
-                })?;
+                let path = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--solveResidualPlot requires an output SVG path".to_string())?;
                 solve_residual_plot = Some(PathBuf::from(path));
                 laminar_simple_option_seen = true;
                 index += 2;
@@ -7601,7 +7536,7 @@ fn print_ferrum_run_usage() {
     println!("  --pressureRelaxation <v>         override p relaxation");
     println!("  --solveVerbose                   print per-iteration residuals");
     println!("  --solveResidualCsv <file>        write residual history CSV");
-    println!("  --solveResidualPlot <file>       render a residual plot");
+    println!("  --solveResidualPlot <file.svg>   render a native residual SVG");
     println!("  --profileGamg                    profile GAMG phases and levels (diagnostic)");
     println!("  --solveReportJson <file>         write the solver report as JSON");
     println!("  --solveReportMarkdown <file>     write the solver report as Markdown");
@@ -7676,7 +7611,8 @@ mod tests {
         resolve_laminar_simple_convection_scheme, resolve_laminar_simple_options,
         resolve_solver_dispatch, resolved_gradient_scheme_value, run_ferrum_subcommand,
         validate_laminar_residual_control_dictionary, validate_module_execution_contract,
-        write_json_solver_state, write_json_string, write_solver_plan_json,
+        write_json_solver_state, write_json_string, write_laminar_simple_residual_plot,
+        write_solver_plan_json,
     };
     use ferrum_mesh::backends::BackendChoice;
     use ferrum_mesh::control::ControlDict;
@@ -7698,6 +7634,7 @@ mod tests {
         SolverStateFieldPlan, SolverStateInternalFieldPlan, SolverStatePlan,
         SolverStateStoragePlan, SolverStateStorageStatus, SolverStateValueKind,
     };
+    use std::io::ErrorKind;
     use std::path::PathBuf;
 
     #[test]
@@ -7993,7 +7930,7 @@ mod tests {
             "--solveResidualCsv".to_string(),
             "target/simple-residuals.csv".to_string(),
             "--solveResidualPlot".to_string(),
-            "target/simple-residuals.png".to_string(),
+            "target/simple-residuals.svg".to_string(),
             "--solveReportJson".to_string(),
             "target/simple.json".to_string(),
         ];
@@ -8010,9 +7947,92 @@ mod tests {
         );
         assert_eq!(
             solve.solve_residual_plot,
-            Some(PathBuf::from("target/simple-residuals.png"))
+            Some(PathBuf::from("target/simple-residuals.svg"))
         );
         assert_eq!(solve.report_json, Some(PathBuf::from("target/simple.json")));
+    }
+
+    #[test]
+    fn writes_laminar_simple_residual_plot_as_native_svg() {
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after Unix epoch")
+                .as_nanos()
+        );
+        let csv_path = std::env::temp_dir().join(format!("ferrum-residuals-{unique}.csv"));
+        let svg_path = std::env::temp_dir().join(format!("ferrum-residuals-{unique}.svg"));
+        std::fs::write(
+            &csv_path,
+            "iteration,unused,continuityAfterL2,momentumInitialResidualNormalized,unused,unused,pressureInitialResidualNormalized,unused,unused\n1,0,1e-4,1e-3,0,0,1e-2,0,0\n",
+        )
+        .expect("residual CSV fixture should be written");
+
+        write_laminar_simple_residual_plot(&csv_path, &svg_path)
+            .expect("native SVG residual plot should be written");
+        let svg = std::fs::read_to_string(&svg_path).expect("SVG should be readable");
+
+        let _ = std::fs::remove_file(&csv_path);
+        let _ = std::fs::remove_file(&svg_path);
+
+        assert!(svg.starts_with("<svg"));
+        assert!(svg.contains("U initial residual"));
+        assert!(svg.contains("p initial residual"));
+        assert!(svg.contains("Continuity L2"));
+    }
+
+    #[test]
+    fn accepts_mixed_case_svg_residual_plot_extension() {
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after Unix epoch")
+                .as_nanos()
+        );
+        let csv_path = std::env::temp_dir().join(format!("ferrum-residuals-{unique}.csv"));
+        let svg_path = std::env::temp_dir().join(format!("ferrum-residuals-{unique}.SVG"));
+        std::fs::write(
+            &csv_path,
+            "iteration,unused,continuityAfterL2,momentumInitialResidualNormalized,unused,unused,pressureInitialResidualNormalized,unused,unused\n1,0,1e-4,1e-3,0,0,1e-2,0,0\n",
+        )
+        .expect("residual CSV fixture should be written");
+
+        write_laminar_simple_residual_plot(&csv_path, &svg_path)
+            .expect("mixed-case SVG extension should use native rendering");
+        let svg = std::fs::read_to_string(&svg_path).expect("SVG should be readable");
+
+        let _ = std::fs::remove_file(&csv_path);
+        let _ = std::fs::remove_file(&svg_path);
+
+        assert!(svg.starts_with("<svg"));
+    }
+
+    #[test]
+    fn rejects_non_svg_residual_plot_without_creating_output() {
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after Unix epoch")
+                .as_nanos()
+        );
+        let csv_path = std::env::temp_dir().join(format!("ferrum-residuals-{unique}.csv"));
+        let png_path = std::env::temp_dir().join(format!("ferrum-residuals-{unique}.png"));
+
+        let error = write_laminar_simple_residual_plot(&csv_path, &png_path)
+            .expect_err("non-SVG residual plots must be rejected");
+
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "native residual plots require an output path with the .svg extension"
+        );
+        assert!(!png_path.exists());
     }
 
     #[test]
