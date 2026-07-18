@@ -4,7 +4,6 @@ use std::env;
 use std::fs::File;
 use std::io::{BufWriter, Error, ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use case::{InitCaseOptions, init_case};
@@ -37,8 +36,8 @@ use ferrum_mesh::geometry::{GeometrySummary, summarize_case_geometry};
 use ferrum_mesh::gmsh::read_msh22_ascii;
 use ferrum_mesh::interfaces::{read_interface_config, validate_interface_config};
 use ferrum_mesh::linear::{
-    ConjugateGradientOptions, JacobiOptions, conjugate_gradient_solve, jacobi_solve,
-    linear_solver_capabilities,
+    ConjugateGradientOptions, GamgAgglomerator, GamgKernelTiming, GamgOptions, GamgSmoother,
+    JacobiOptions, conjugate_gradient_solve, jacobi_solve, linear_solver_capabilities,
 };
 use ferrum_mesh::patches::{PatchValidationSummary, validate_case_patches};
 use ferrum_mesh::regions::{
@@ -773,6 +772,26 @@ fn run_laminar_simple_solve(
         report.total_pressure_linear_iterations,
         wall_clock_seconds
     );
+    if let Some(gamg) = options.pressure_gamg_options {
+        println!(
+            "incompressibleFluid pressureGAMG: agglomerator={} smoother={} cacheAgglomeration={} nCellsInCoarsestLevel={} mergeLevels={} minIter={} maxIter={} tolerance={} relTol={} nPreSweeps={} nPostSweeps={} nFinestSweeps={} interpolateCorrection={} scaleCorrection={} directSolveCoarsest={}",
+            gamg.agglomerator,
+            gamg.smoother,
+            yes_no(gamg.cache_agglomeration),
+            gamg.n_cells_in_coarsest_level,
+            gamg.merge_levels,
+            gamg.min_iterations,
+            gamg.max_iterations,
+            format_scientific(gamg.tolerance),
+            format_scientific(gamg.relative_tolerance),
+            gamg.n_pre_sweeps,
+            gamg.n_post_sweeps,
+            gamg.n_finest_sweeps,
+            yes_no(gamg.interpolate_correction),
+            yes_no(gamg.scale_correction),
+            yes_no(gamg.direct_solve_coarsest),
+        );
+    }
     println!(
         "incompressibleFluid residualControl: state={} checked={} satisfied={} U(tolerance={},initial={},satisfied={}) p(tolerance={},initial={},satisfied={})",
         residual_control_state(report.residual_control),
@@ -784,6 +803,14 @@ fn run_laminar_simple_solve(
         format_optional_scientific(options.pressure_residual_control),
         format_scientific(report.final_pressure_correction_initial_normalized_residual_norm),
         format_optional_bool(report.residual_control.pressure_satisfied),
+    );
+    println!(
+        "incompressibleFluid outerConvergence: status={} configured={} evaluated={} converged={} reason={}",
+        outer_convergence_status(&report),
+        yes_no(report.residual_control.configured),
+        yes_no(report.residual_control.checked),
+        yes_no(report.converged),
+        report.stop_reason,
     );
     println!(
         "incompressibleFluid linearSolves: finalMomentumConverged={} finalPressureConverged={} momentumPredictors={} momentumNonConvergedPredictors={} momentumComponentSolves={} momentumComponentNonConvergedSolves={} pressureCorrectionSolves={} pressureCorrectionNonConvergedSolves={} maxMomentumIterationsPerSimple={} maxPressureIterationsPerSimple={} avgMomentumIterationsPerSimple={} avgPressureIterationsPerSimple={}",
@@ -818,6 +845,84 @@ fn run_laminar_simple_solve(
                 .average_pressure_linear_iterations_per_simple,
         )
     );
+    println!(
+        "incompressibleFluid timing: solverTotalSeconds={:.6} driverMeasuredSeconds={:.6} setupSeconds={:.6} iterationSetupSeconds={:.6} operatorEvaluationSeconds={:.6} momentumAssemblySeconds={:.6} momentumGradientSeconds={:.6} momentumMatrixFillSeconds={:.6} momentumLinearSolveSeconds={:.6} pressureCouplingSetupSeconds={:.6} pressureAssemblySeconds={:.6} pressureLinearSolveSeconds={:.6} fieldCorrectionSeconds={:.6} finalizationSeconds={:.6} otherSolverWorkSeconds={:.6}",
+        report.timing.solver_total_seconds,
+        wall_clock_seconds,
+        report.timing.setup_seconds,
+        report.timing.iteration_setup_seconds,
+        report.timing.operator_evaluation_seconds,
+        report.timing.momentum_assembly_seconds,
+        report.timing.momentum_gradient_seconds,
+        report.timing.momentum_matrix_fill_seconds,
+        report.timing.momentum_linear_solve_seconds,
+        report.timing.pressure_coupling_setup_seconds,
+        report.timing.pressure_assembly_seconds,
+        report.timing.pressure_linear_solve_seconds,
+        report.timing.field_correction_seconds,
+        report.timing.finalization_seconds,
+        report.timing.other_solver_work_seconds,
+    );
+    if options.pressure_linear_solver == LaminarSimpleLinearSolver::Pcg {
+        println!(
+            "incompressibleFluid pressurePcgKernel: totalSeconds={:.6} preconditionerUpdateSeconds={:.6} matrixVectorSeconds={:.6} preconditionerApplicationSeconds={:.6} vectorOperationSeconds={:.6} otherSeconds={:.6} matrixVectorProducts={} preconditionerApplications={}",
+            report.timing.pressure_pcg_total_seconds,
+            report.timing.pressure_preconditioner_update_seconds,
+            report.timing.pressure_matrix_vector_seconds,
+            report.timing.pressure_preconditioner_application_seconds,
+            report.timing.pressure_vector_operation_seconds,
+            report.timing.pressure_pcg_other_seconds,
+            report.timing.pressure_matrix_vector_products,
+            report.timing.pressure_preconditioner_applications,
+        );
+    }
+    if let Some(profile) = &report.timing.pressure_gamg_profile {
+        println!(
+            "incompressibleFluid pressureGamgProfile: totalSeconds={:.6} hierarchyBuildSeconds={:.6} hierarchyRebuildSeconds={:.6} matrixRefreshSeconds={:.6} finestResidualSeconds={:.6} vCycleSeconds={:.6} restrictionSeconds={:.6} prolongationSeconds={:.6} smoothingSeconds={:.6} scalingSeconds={:.6} coarseResidualSeconds={:.6} correctionSeconds={:.6} coarsestSolveSeconds={:.6} vCycleOtherSeconds={:.6} otherSeconds={:.6} solves={} vCycles={} levels={}",
+            profile.total_seconds,
+            profile.hierarchy_build_seconds,
+            profile.hierarchy_rebuild_seconds,
+            profile.matrix_refresh_seconds,
+            profile.finest_residual_seconds,
+            profile.v_cycle_seconds,
+            profile.restriction_seconds(),
+            profile.prolongation_seconds(),
+            profile.smoothing_seconds(),
+            profile.scaling_seconds(),
+            profile.coarse_residual_seconds(),
+            profile.correction_seconds(),
+            profile.coarsest_solve_seconds(),
+            profile.v_cycle_other_seconds(),
+            profile.other_seconds,
+            profile.solves,
+            profile.v_cycles,
+            profile.levels.len(),
+        );
+        for level in &profile.levels {
+            println!(
+                "incompressibleFluid pressureGamgLevel: level={} cells={} nonzeros={} matrixRefreshSeconds={:.6} restrictionSeconds={:.6} prolongationSeconds={:.6} smoothingSeconds={:.6} scalingSeconds={:.6} residualSeconds={:.6} correctionSeconds={:.6} coarsestSolveSeconds={:.6} restrictionCalls={} prolongationCalls={} smoothingCalls={} smoothingSweeps={} scalingCalls={} residualEvaluations={} correctionUpdates={} coarsestSolves={}",
+                level.level,
+                level.cells,
+                level.nonzeros,
+                level.matrix_refresh_seconds,
+                level.restriction_seconds,
+                level.prolongation_seconds,
+                level.smoothing_seconds,
+                level.scaling_seconds,
+                level.residual_seconds,
+                level.correction_seconds,
+                level.coarsest_solve_seconds,
+                level.restriction_calls,
+                level.prolongation_calls,
+                level.smoothing_calls,
+                level.smoothing_sweeps,
+                level.scaling_calls,
+                level.residual_evaluations,
+                level.correction_updates,
+                level.coarsest_solves,
+            );
+        }
+    }
     println!(
         "incompressibleFluid fields: velocityMinMagnitude={} velocityMaxMagnitude={} velocityL2={} velocityXMin={} velocityXMax={} velocityYMin={} velocityYMax={} velocityZMin={} velocityZMax={} pressureMin={} pressureMax={} pressureL2={}",
         format_scientific(report.fields.velocity.min_magnitude),
@@ -1100,11 +1205,29 @@ fn print_laminar_simple_convergence_feedback(
     options: &LaminarSimpleOptions,
 ) {
     if report.converged {
+        println!(
+            "incompressibleFluid SIMPLE outer convergence: CONVERGED after {} iteration(s); all configured residualControl criteria are satisfied.",
+            report.simple_iterations
+        );
         return;
     }
 
     match report.stop_reason {
         LaminarSimpleStopReason::MaxIterationsReached => {
+            println!("incompressibleFluid SIMPLE outer convergence: NOT REACHED.");
+            println!(
+                "  reason: maximum SIMPLE iteration count reached before all configured residualControl criteria were satisfied."
+            );
+            print_outer_residual_comparison(
+                "U",
+                report.final_momentum_initial_normalized_residual_norm,
+                options.momentum_residual_control,
+            );
+            print_outer_residual_comparison(
+                "p",
+                report.final_pressure_correction_initial_normalized_residual_norm,
+                options.pressure_residual_control,
+            );
             let reached_budget = options.max_simple_iterations == report.simple_iterations;
             let budget_message = if reached_budget {
                 format!(
@@ -1159,6 +1282,10 @@ fn print_laminar_simple_convergence_feedback(
             }
         }
         LaminarSimpleStopReason::ConvergenceCriteriaNotConfigured => {
+            println!("incompressibleFluid SIMPLE outer convergence: NOT EVALUATED.");
+            println!(
+                "  reason: residualControl is not configured in system/fvSolution; the run stopped at its configured iteration limit."
+            );
             if report.simple_iterations > 0
                 && let (Some(momentum), Some(pressure)) = (
                     report
@@ -1222,6 +1349,22 @@ fn print_laminar_simple_convergence_feedback(
     }
 }
 
+fn print_outer_residual_comparison(field: &str, initial_residual: f64, tolerance: Option<f64>) {
+    match tolerance {
+        Some(tolerance) => println!(
+            "  {field}: initialResidual={} {} tolerance={}",
+            format_scientific(initial_residual),
+            if initial_residual < tolerance {
+                "<"
+            } else {
+                ">="
+            },
+            format_scientific(tolerance),
+        ),
+        None => println!("  {field}: residualControl not configured"),
+    }
+}
+
 fn residual_ratio(previous: f64, latest: f64) -> Option<f64> {
     if !previous.is_finite() || !latest.is_finite() || previous.abs() <= f64::EPSILON {
         return None;
@@ -1240,67 +1383,14 @@ fn write_laminar_simple_residual_plot(csv_path: &Path, plot_path: &Path) -> std:
         .extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"));
-    if wants_svg {
-        return write_laminar_simple_residual_plot_svg(csv_path, plot_path);
+    if !wants_svg {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "native residual plots require an output path with the .svg extension",
+        ));
     }
 
-    let python = locate_python_interpreter().ok_or_else(|| {
-        Error::new(
-            ErrorKind::NotFound,
-            "python is required to generate the residual plot, but could not be found",
-        )
-    })?;
-    ensure_parent_dir(plot_path)?;
-
-    const SCRIPT: &str = r#"
-import csv
-import sys
-
-import matplotlib.pyplot as plt
-
-from pathlib import Path
-
-csv_path = Path(sys.argv[1])
-plot_path = Path(sys.argv[2])
-
-with csv_path.open("r", newline="") as handle:
-    rows = list(csv.DictReader(handle))
-
-if not rows:
-    raise RuntimeError("no residual history rows in CSV")
-
-iterations = [float(row["iteration"]) for row in rows]
-momentum = [float(row["momentumInitialResidualNormalized"]) for row in rows]
-pressure = [float(row["pressureInitialResidualNormalized"]) for row in rows]
-continuity = [float(row["continuityAfterL2"]) for row in rows]
-
-plt.figure(figsize=(8, 5))
-plt.plot(iterations, continuity, label="Continuity L2")
-plt.plot(iterations, momentum, label="U initial residual")
-plt.plot(iterations, pressure, label="p initial residual")
-plt.yscale("log")
-plt.xlabel("SIMPLE iteration")
-plt.ylabel("Residual / Continuity metric")
-plt.legend()
-plt.grid(True, which="both", alpha=0.25)
-plt.tight_layout()
-plt.savefig(plot_path, dpi=150)
-"#;
-
-    let status = Command::new(python)
-        .arg("-c")
-        .arg(SCRIPT)
-        .arg(csv_path)
-        .arg(plot_path)
-        .status()?;
-
-    if !status.success() {
-        return Err(Error::other(format!(
-            "python plotting failed with status {status}"
-        )));
-    }
-
-    Ok(())
+    write_laminar_simple_residual_plot_svg(csv_path, plot_path)
 }
 
 fn write_laminar_simple_residual_plot_svg(
@@ -1524,17 +1614,6 @@ fn write_laminar_simple_residual_plot_svg(
     Ok(())
 }
 
-fn locate_python_interpreter() -> Option<&'static str> {
-    ["python", "python3"].into_iter().find(|command| {
-        Command::new(command)
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
-    })
-}
-
 fn resolve_laminar_simple_options(
     plan: &SolverCasePlan,
     solve: &LaminarSimpleSolveArgs,
@@ -1594,8 +1673,25 @@ fn resolve_laminar_simple_options(
         Some(solver) => solver,
         None => required_fv_solution_laminar_solver(plan, "solvers.p")?,
     };
+    if momentum_linear_solver == LaminarSimpleLinearSolver::Gamg {
+        return Err(
+            "GAMG is implemented for the symmetric SIMPLE pressure equation only; select a nonsymmetric momentum solver in solvers.U"
+                .to_string(),
+        );
+    }
+    if solve.profile_gamg && pressure_linear_solver != LaminarSimpleLinearSolver::Gamg {
+        return Err("--profileGamg requires solvers.p.solver GAMG".to_string());
+    }
     validate_openfoam_linear_controls(plan, "solvers.U", momentum_linear_solver)?;
     validate_openfoam_linear_controls(plan, "solvers.p", pressure_linear_solver)?;
+    let pressure_gamg_options = if pressure_linear_solver == LaminarSimpleLinearSolver::Gamg {
+        let mut options = openfoam_gamg_options(plan, "solvers.p")?;
+        options.max_iterations = pressure_max_linear_iterations;
+        options.tolerance = pressure_linear_tolerance;
+        Some(options)
+    } else {
+        None
+    };
     let linear_solver = solve.linear_solver.unwrap_or(momentum_linear_solver);
     let momentum_preconditioner = resolve_laminar_preconditioner(
         plan,
@@ -1653,6 +1749,8 @@ fn resolve_laminar_simple_options(
         pressure_linear_solver,
         momentum_preconditioner,
         pressure_preconditioner,
+        pressure_gamg_options,
+        profile_gamg: solve.profile_gamg,
         linear_tolerance,
         max_linear_iterations,
         momentum_linear_tolerance,
@@ -2110,6 +2208,89 @@ fn required_fv_solution_laminar_solver(
     parse_openfoam_laminar_solver(value)
 }
 
+fn openfoam_gamg_options(plan: &SolverCasePlan, section: &str) -> Result<GamgOptions, String> {
+    let smoother = numerics_dictionary_value(&plan.numerics.fv_solution, section, "smoother")
+        .ok_or_else(|| format!("fvSolution {section} GAMG requires a smoother entry"))?;
+    let smoother = match smoother.trim().trim_end_matches(';') {
+        "GaussSeidel" | "gaussSeidel" => GamgSmoother::GaussSeidel,
+        "symGaussSeidel" => GamgSmoother::SymGaussSeidel,
+        other => {
+            return Err(format!(
+                "unsupported fvSolution {section} GAMG smoother '{other}'; the matrix foundation supports GaussSeidel and symGaussSeidel"
+            ));
+        }
+    };
+    let agglomerator = match numerics_dictionary_value(
+        &plan.numerics.fv_solution,
+        section,
+        "agglomerator",
+    )
+    .map(|value| value.trim().trim_end_matches(';'))
+    .unwrap_or("faceAreaPair")
+    {
+        "algebraicPair" => GamgAgglomerator::AlgebraicPair,
+        "faceAreaPair" => GamgAgglomerator::FaceAreaPair,
+        other => {
+            return Err(format!(
+                "unsupported fvSolution {section} GAMG agglomerator '{other}'; no agglomerator fallback was applied"
+            ));
+        }
+    };
+
+    let mut options = GamgOptions {
+        agglomerator,
+        smoother,
+        ..GamgOptions::default()
+    };
+    options.max_iterations =
+        fv_solution_usize(plan, section, "maxIter")?.unwrap_or(FERRUM_DEFAULT_LDU_MAX_ITERATIONS);
+    options.min_iterations = fv_solution_usize(plan, section, "minIter")?.unwrap_or(0);
+    options.tolerance =
+        fv_solution_number(plan, section, "tolerance")?.unwrap_or(FERRUM_DEFAULT_LDU_TOLERANCE);
+    options.relative_tolerance = fv_solution_number(plan, section, "relTol")?.unwrap_or(0.0);
+    options.cache_agglomeration =
+        fv_solution_bool(plan, section, "cacheAgglomeration")?.unwrap_or(true);
+    options.n_cells_in_coarsest_level =
+        fv_solution_usize(plan, section, "nCellsInCoarsestLevel")?.unwrap_or(10);
+    options.merge_levels = fv_solution_usize(plan, section, "mergeLevels")?.unwrap_or(1);
+    options.n_pre_sweeps = fv_solution_usize(plan, section, "nPreSweeps")?.unwrap_or(0);
+    options.pre_sweeps_level_multiplier =
+        fv_solution_usize(plan, section, "preSweepsLevelMultiplier")?.unwrap_or(1);
+    options.max_pre_sweeps = fv_solution_usize(plan, section, "maxPreSweeps")?.unwrap_or(4);
+    options.n_post_sweeps = fv_solution_usize(plan, section, "nPostSweeps")?.unwrap_or(2);
+    options.post_sweeps_level_multiplier =
+        fv_solution_usize(plan, section, "postSweepsLevelMultiplier")?.unwrap_or(1);
+    options.max_post_sweeps = fv_solution_usize(plan, section, "maxPostSweeps")?.unwrap_or(4);
+    options.n_finest_sweeps = fv_solution_usize(plan, section, "nFinestSweeps")?.unwrap_or(2);
+    options.interpolate_correction =
+        fv_solution_bool(plan, section, "interpolateCorrection")?.unwrap_or(false);
+    options.scale_correction = fv_solution_bool(plan, section, "scaleCorrection")?.unwrap_or(true);
+    options.direct_solve_coarsest =
+        fv_solution_bool(plan, section, "directSolveCoarsest")?.unwrap_or(false);
+
+    if !options.tolerance.is_finite() || options.tolerance < 0.0 {
+        return Err(format!(
+            "fvSolution {section}.tolerance must be finite and non-negative, got {}",
+            options.tolerance
+        ));
+    }
+    if !options.relative_tolerance.is_finite() || options.relative_tolerance < 0.0 {
+        return Err(format!(
+            "fvSolution {section}.relTol must be finite and non-negative, got {}",
+            options.relative_tolerance
+        ));
+    }
+    if options.n_cells_in_coarsest_level == 0 {
+        return Err(format!(
+            "fvSolution {section}.nCellsInCoarsestLevel must be positive"
+        ));
+    }
+    if options.merge_levels == 0 {
+        return Err(format!("fvSolution {section}.mergeLevels must be positive"));
+    }
+    Ok(options)
+}
+
 fn resolve_laminar_preconditioner(
     plan: &SolverCasePlan,
     section: &str,
@@ -2136,6 +2317,10 @@ fn validate_openfoam_linear_controls(
     section: &str,
     solver: LaminarSimpleLinearSolver,
 ) -> Result<(), String> {
+    if solver == LaminarSimpleLinearSolver::Gamg {
+        openfoam_gamg_options(plan, section)?;
+        return Ok(());
+    }
     if let Some(relative_tolerance) = fv_solution_number(plan, section, "relTol")?
         && relative_tolerance != 0.0
     {
@@ -2251,6 +2436,7 @@ fn parse_openfoam_laminar_solver(value: &str) -> Result<LaminarSimpleLinearSolve
                 .to_string(),
         ),
         "PCG" | "pcg" => Ok(LaminarSimpleLinearSolver::Pcg),
+        "GAMG" | "gamg" => Ok(LaminarSimpleLinearSolver::Gamg),
         "CG" | "cg" => Ok(LaminarSimpleLinearSolver::Cg),
         "Jacobi" | "jacobi" => Ok(LaminarSimpleLinearSolver::Jacobi),
         other => Err(format!(
@@ -2541,7 +2727,7 @@ fn print_openfoam_case_compatibility_warnings(warnings: &[String]) {
 fn print_linear_solver_capabilities() {
     let capabilities = linear_solver_capabilities();
     println!(
-        "linear solvers: cpuCsr={} cpuJacobi={} cpuGaussSeidel={} cpuSymGaussSeidel={} cpuCg={} cpuPcg={} cpuBiCgStab={} cpuDiagonalPreconditioner={} cpuIncompleteCholeskyPreconditioner={} gpuLinearSolvers={}",
+        "linear solvers: cpuCsr={} cpuJacobi={} cpuGaussSeidel={} cpuSymGaussSeidel={} cpuCg={} cpuPcg={} cpuBiCgStab={} cpuGamg={} cpuDiagonalPreconditioner={} cpuIncompleteCholeskyPreconditioner={} gpuLinearSolvers={}",
         yes_no(capabilities.cpu_csr),
         yes_no(capabilities.cpu_jacobi),
         yes_no(capabilities.cpu_gauss_seidel),
@@ -2549,6 +2735,7 @@ fn print_linear_solver_capabilities() {
         yes_no(capabilities.cpu_conjugate_gradient),
         yes_no(capabilities.cpu_preconditioned_conjugate_gradient),
         yes_no(capabilities.cpu_bicgstab),
+        yes_no(capabilities.cpu_gamg),
         yes_no(capabilities.cpu_diagonal_preconditioner),
         yes_no(capabilities.cpu_incomplete_cholesky_preconditioner),
         yes_no(capabilities.gpu_linear_solvers)
@@ -3114,6 +3301,8 @@ fn write_laminar_simple_report_json(
     writeln!(writer)?;
     write_indent(&mut writer, 2)?;
     writeln!(writer, "}},")?;
+    write_json_outer_convergence(&mut writer, report)?;
+    writeln!(writer, ",")?;
     write_json_residual_control_summary(
         &mut writer,
         options,
@@ -3123,6 +3312,8 @@ fn write_laminar_simple_report_json(
     )?;
     writeln!(writer, ",")?;
     write_json_linear_solve_summary(&mut writer, &report.linear_solve_summary)?;
+    writeln!(writer, ",")?;
+    write_json_laminar_simple_timing_summary(&mut writer, report, wall_clock_seconds)?;
     writeln!(writer, ",")?;
     write_json_key(&mut writer, 2, "continuity")?;
     writeln!(writer, "{{")?;
@@ -3147,6 +3338,235 @@ fn write_laminar_simple_report_json(
     writeln!(writer, "}}")?;
 
     writer.flush()
+}
+
+fn write_json_outer_convergence(
+    writer: &mut impl Write,
+    report: &LaminarSimpleReport,
+) -> std::io::Result<()> {
+    write_json_key(writer, 2, "outerConvergence")?;
+    writeln!(writer, "{{")?;
+    write_json_key(writer, 4, "status")?;
+    write_json_string(writer, outer_convergence_status(report))?;
+    writeln!(writer, ",")?;
+    write_json_bool_field(writer, 4, "configured", report.residual_control.configured)?;
+    writeln!(writer, ",")?;
+    write_json_bool_field(writer, 4, "evaluated", report.residual_control.checked)?;
+    writeln!(writer, ",")?;
+    write_json_bool_field(writer, 4, "converged", report.converged)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "reason")?;
+    write_json_string(writer, &report.stop_reason.to_string())?;
+    writeln!(writer)?;
+    write_indent(writer, 2)?;
+    write!(writer, "}}")
+}
+
+fn write_json_laminar_simple_timing_summary(
+    writer: &mut impl Write,
+    report: &LaminarSimpleReport,
+    driver_measured_seconds: f64,
+) -> std::io::Result<()> {
+    write_json_key(writer, 2, "timing")?;
+    writeln!(writer, "{{")?;
+    let fields = [
+        ("solverTotalSeconds", report.timing.solver_total_seconds),
+        ("driverMeasuredSeconds", driver_measured_seconds),
+        ("setupSeconds", report.timing.setup_seconds),
+        (
+            "iterationSetupSeconds",
+            report.timing.iteration_setup_seconds,
+        ),
+        (
+            "operatorEvaluationSeconds",
+            report.timing.operator_evaluation_seconds,
+        ),
+        (
+            "momentumAssemblySeconds",
+            report.timing.momentum_assembly_seconds,
+        ),
+        (
+            "momentumGradientSeconds",
+            report.timing.momentum_gradient_seconds,
+        ),
+        (
+            "momentumMatrixFillSeconds",
+            report.timing.momentum_matrix_fill_seconds,
+        ),
+        (
+            "momentumLinearSolveSeconds",
+            report.timing.momentum_linear_solve_seconds,
+        ),
+        (
+            "pressureCouplingSetupSeconds",
+            report.timing.pressure_coupling_setup_seconds,
+        ),
+        (
+            "pressureAssemblySeconds",
+            report.timing.pressure_assembly_seconds,
+        ),
+        (
+            "pressureLinearSolveSeconds",
+            report.timing.pressure_linear_solve_seconds,
+        ),
+        (
+            "pressurePcgTotalSeconds",
+            report.timing.pressure_pcg_total_seconds,
+        ),
+        (
+            "pressurePreconditionerUpdateSeconds",
+            report.timing.pressure_preconditioner_update_seconds,
+        ),
+        (
+            "pressureMatrixVectorSeconds",
+            report.timing.pressure_matrix_vector_seconds,
+        ),
+        (
+            "pressurePreconditionerApplicationSeconds",
+            report.timing.pressure_preconditioner_application_seconds,
+        ),
+        (
+            "pressureVectorOperationSeconds",
+            report.timing.pressure_vector_operation_seconds,
+        ),
+        (
+            "pressurePcgOtherSeconds",
+            report.timing.pressure_pcg_other_seconds,
+        ),
+        (
+            "pressureMatrixVectorProducts",
+            report.timing.pressure_matrix_vector_products as f64,
+        ),
+        (
+            "pressurePreconditionerApplications",
+            report.timing.pressure_preconditioner_applications as f64,
+        ),
+        (
+            "fieldCorrectionSeconds",
+            report.timing.field_correction_seconds,
+        ),
+        ("finalizationSeconds", report.timing.finalization_seconds),
+        (
+            "otherSolverWorkSeconds",
+            report.timing.other_solver_work_seconds,
+        ),
+    ];
+    for (name, value) in fields {
+        write_json_key(writer, 4, name)?;
+        write_json_optional_number(writer, Some(value))?;
+        writeln!(writer, ",")?;
+    }
+    write_json_gamg_profile(writer, 4, report.timing.pressure_gamg_profile.as_ref())?;
+    writeln!(writer)?;
+    write_indent(writer, 2)?;
+    write!(writer, "}}")
+}
+
+fn write_json_gamg_profile(
+    writer: &mut impl Write,
+    indent: usize,
+    profile: Option<&GamgKernelTiming>,
+) -> std::io::Result<()> {
+    write_json_key(writer, indent, "pressureGamgProfile")?;
+    let Some(profile) = profile else {
+        return write!(writer, "null");
+    };
+    writeln!(writer, "{{")?;
+    let nested = indent + 2;
+    let seconds = [
+        ("totalSeconds", profile.total_seconds),
+        ("hierarchyBuildSeconds", profile.hierarchy_build_seconds),
+        ("hierarchyRebuildSeconds", profile.hierarchy_rebuild_seconds),
+        ("matrixRefreshSeconds", profile.matrix_refresh_seconds),
+        ("finestResidualSeconds", profile.finest_residual_seconds),
+        ("vCycleSeconds", profile.v_cycle_seconds),
+        ("restrictionSeconds", profile.restriction_seconds()),
+        ("prolongationSeconds", profile.prolongation_seconds()),
+        ("smoothingSeconds", profile.smoothing_seconds()),
+        ("scalingSeconds", profile.scaling_seconds()),
+        ("coarseResidualSeconds", profile.coarse_residual_seconds()),
+        ("correctionSeconds", profile.correction_seconds()),
+        ("coarsestSolveSeconds", profile.coarsest_solve_seconds()),
+        ("vCycleOtherSeconds", profile.v_cycle_other_seconds()),
+        ("otherSeconds", profile.other_seconds),
+    ];
+    for (name, value) in seconds {
+        write_json_key(writer, nested, name)?;
+        write_json_optional_number(writer, Some(value))?;
+        writeln!(writer, ",")?;
+    }
+    let counters = [
+        ("hierarchyBuilds", profile.hierarchy_builds),
+        ("hierarchyRebuilds", profile.hierarchy_rebuilds),
+        ("matrixRefreshes", profile.matrix_refreshes),
+        (
+            "finestResidualEvaluations",
+            profile.finest_residual_evaluations,
+        ),
+        ("solves", profile.solves),
+        ("vCycles", profile.v_cycles),
+    ];
+    for (name, value) in counters {
+        write_json_number_field(writer, nested, name, value)?;
+        writeln!(writer, ",")?;
+    }
+    write_json_key(writer, nested, "levels")?;
+    writeln!(writer, "[")?;
+    for (index, level) in profile.levels.iter().enumerate() {
+        let level_indent = nested + 2;
+        write_indent(writer, level_indent)?;
+        writeln!(writer, "{{")?;
+        write_json_number_field(writer, level_indent + 2, "level", level.level)?;
+        writeln!(writer, ",")?;
+        write_json_number_field(writer, level_indent + 2, "cells", level.cells)?;
+        writeln!(writer, ",")?;
+        write_json_number_field(writer, level_indent + 2, "nonzeros", level.nonzeros)?;
+        writeln!(writer, ",")?;
+        let level_seconds = [
+            ("matrixRefreshSeconds", level.matrix_refresh_seconds),
+            ("restrictionSeconds", level.restriction_seconds),
+            ("prolongationSeconds", level.prolongation_seconds),
+            ("smoothingSeconds", level.smoothing_seconds),
+            ("scalingSeconds", level.scaling_seconds),
+            ("residualSeconds", level.residual_seconds),
+            ("correctionSeconds", level.correction_seconds),
+            ("coarsestSolveSeconds", level.coarsest_solve_seconds),
+        ];
+        for (name, value) in level_seconds {
+            write_json_key(writer, level_indent + 2, name)?;
+            write_json_optional_number(writer, Some(value))?;
+            writeln!(writer, ",")?;
+        }
+        let level_counters = [
+            ("matrixRefreshes", level.matrix_refreshes),
+            ("restrictionCalls", level.restriction_calls),
+            ("prolongationCalls", level.prolongation_calls),
+            ("smoothingCalls", level.smoothing_calls),
+            ("smoothingSweeps", level.smoothing_sweeps),
+            ("scalingCalls", level.scaling_calls),
+            ("residualEvaluations", level.residual_evaluations),
+            ("correctionUpdates", level.correction_updates),
+            ("coarsestSolves", level.coarsest_solves),
+        ];
+        for (counter_index, (name, value)) in level_counters.iter().enumerate() {
+            write_json_number_field(writer, level_indent + 2, name, *value)?;
+            if counter_index + 1 < level_counters.len() {
+                writeln!(writer, ",")?;
+            } else {
+                writeln!(writer)?;
+            }
+        }
+        write_indent(writer, level_indent)?;
+        if index + 1 < profile.levels.len() {
+            writeln!(writer, "}},")?;
+        } else {
+            writeln!(writer, "}}")?;
+        }
+    }
+    write_indent(writer, nested)?;
+    writeln!(writer, "]")?;
+    write_indent(writer, indent)?;
+    write!(writer, "}}")
 }
 
 fn write_json_residual_control_summary(
@@ -3235,6 +3655,10 @@ fn write_json_laminar_simple_options(
         &options.pressure_preconditioner.to_string(),
     )?;
     writeln!(writer, ",")?;
+    write_json_pressure_gamg_options(writer, 4, options.pressure_gamg_options)?;
+    writeln!(writer, ",")?;
+    write_json_bool_field(writer, 4, "profileGamg", options.profile_gamg)?;
+    writeln!(writer, ",")?;
     write_json_key(writer, 4, "density")?;
     write_json_optional_number(writer, Some(options.density))?;
     writeln!(writer, ",")?;
@@ -3318,6 +3742,96 @@ fn write_json_laminar_simple_options(
     write_json_laminar_simple_schemes(writer, 4, &options.schemes)?;
     writeln!(writer)?;
     write_indent(writer, 2)?;
+    write!(writer, "}}")
+}
+
+fn write_json_pressure_gamg_options(
+    writer: &mut impl Write,
+    indent: usize,
+    options: Option<GamgOptions>,
+) -> std::io::Result<()> {
+    write_json_key(writer, indent, "pressureGamg")?;
+    let Some(options) = options else {
+        return write!(writer, "null");
+    };
+    writeln!(writer, "{{")?;
+    let nested = indent + 2;
+    write_json_string_field(
+        writer,
+        nested,
+        "agglomerator",
+        &options.agglomerator.to_string(),
+    )?;
+    writeln!(writer, ",")?;
+    write_json_string_field(writer, nested, "smoother", &options.smoother.to_string())?;
+    writeln!(writer, ",")?;
+    write_json_bool_field(
+        writer,
+        nested,
+        "cacheAgglomeration",
+        options.cache_agglomeration,
+    )?;
+    writeln!(writer, ",")?;
+    write_json_number_field(
+        writer,
+        nested,
+        "nCellsInCoarsestLevel",
+        options.n_cells_in_coarsest_level,
+    )?;
+    writeln!(writer, ",")?;
+    write_json_number_field(writer, nested, "mergeLevels", options.merge_levels)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(writer, nested, "minIter", options.min_iterations)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(writer, nested, "maxIter", options.max_iterations)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, nested, "tolerance")?;
+    write_json_optional_number(writer, Some(options.tolerance))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, nested, "relTol")?;
+    write_json_optional_number(writer, Some(options.relative_tolerance))?;
+    writeln!(writer, ",")?;
+    write_json_number_field(writer, nested, "nPreSweeps", options.n_pre_sweeps)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(
+        writer,
+        nested,
+        "preSweepsLevelMultiplier",
+        options.pre_sweeps_level_multiplier,
+    )?;
+    writeln!(writer, ",")?;
+    write_json_number_field(writer, nested, "maxPreSweeps", options.max_pre_sweeps)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(writer, nested, "nPostSweeps", options.n_post_sweeps)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(
+        writer,
+        nested,
+        "postSweepsLevelMultiplier",
+        options.post_sweeps_level_multiplier,
+    )?;
+    writeln!(writer, ",")?;
+    write_json_number_field(writer, nested, "maxPostSweeps", options.max_post_sweeps)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(writer, nested, "nFinestSweeps", options.n_finest_sweeps)?;
+    writeln!(writer, ",")?;
+    write_json_bool_field(
+        writer,
+        nested,
+        "interpolateCorrection",
+        options.interpolate_correction,
+    )?;
+    writeln!(writer, ",")?;
+    write_json_bool_field(writer, nested, "scaleCorrection", options.scale_correction)?;
+    writeln!(writer, ",")?;
+    write_json_bool_field(
+        writer,
+        nested,
+        "directSolveCoarsest",
+        options.direct_solve_coarsest,
+    )?;
+    writeln!(writer)?;
+    write_indent(writer, indent)?;
     write!(writer, "}}")
 }
 
@@ -3943,6 +4457,68 @@ fn write_json_laminar_simple_history(
     write!(writer, "]")
 }
 
+fn write_markdown_gamg_profile(
+    writer: &mut impl Write,
+    profile: &GamgKernelTiming,
+) -> std::io::Result<()> {
+    writeln!(writer)?;
+    writeln!(writer, "## Pressure GAMG Cycle Profile")?;
+    writeln!(writer)?;
+    writeln!(writer, "| Quantity | Value |")?;
+    writeln!(writer, "| --- | ---: |")?;
+    let seconds = [
+        ("Profiled GAMG total [s]", profile.total_seconds),
+        ("Hierarchy build [s]", profile.hierarchy_build_seconds),
+        ("Hierarchy rebuild [s]", profile.hierarchy_rebuild_seconds),
+        ("Matrix refresh [s]", profile.matrix_refresh_seconds),
+        ("Finest residual [s]", profile.finest_residual_seconds),
+        ("V-cycles [s]", profile.v_cycle_seconds),
+        ("Restriction [s]", profile.restriction_seconds()),
+        ("Prolongation [s]", profile.prolongation_seconds()),
+        ("Smoothing [s]", profile.smoothing_seconds()),
+        ("Scaling [s]", profile.scaling_seconds()),
+        ("Coarse residual [s]", profile.coarse_residual_seconds()),
+        ("Correction work [s]", profile.correction_seconds()),
+        ("Coarsest solve [s]", profile.coarsest_solve_seconds()),
+        ("Other V-cycle work [s]", profile.v_cycle_other_seconds()),
+        ("Other profiled work [s]", profile.other_seconds),
+    ];
+    for (quantity, value) in seconds {
+        writeln!(writer, "| {quantity} | {} |", format_scientific(value))?;
+    }
+    writeln!(writer, "| Pressure solves | {} |", profile.solves)?;
+    writeln!(writer, "| V-cycles | {} |", profile.v_cycles)?;
+    writeln!(writer, "| Levels | {} |", profile.levels.len())?;
+    writeln!(writer)?;
+    writeln!(
+        writer,
+        "| Level | Cells | NNZ | Refresh [s] | Restrict [s] | Prolong [s] | Smooth [s] | Scale [s] | Residual [s] | Correction [s] | Coarsest [s] | Smooth sweeps |"
+    )?;
+    writeln!(
+        writer,
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+    )?;
+    for level in &profile.levels {
+        writeln!(
+            writer,
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            level.level,
+            level.cells,
+            level.nonzeros,
+            format_scientific(level.matrix_refresh_seconds),
+            format_scientific(level.restriction_seconds),
+            format_scientific(level.prolongation_seconds),
+            format_scientific(level.smoothing_seconds),
+            format_scientific(level.scaling_seconds),
+            format_scientific(level.residual_seconds),
+            format_scientific(level.correction_seconds),
+            format_scientific(level.coarsest_solve_seconds),
+            level.smoothing_sweeps,
+        )?;
+    }
+    Ok(())
+}
+
 fn write_laminar_simple_report_markdown(
     plan: &SolverCasePlan,
     options: &LaminarSimpleOptions,
@@ -4018,6 +4594,45 @@ fn write_laminar_simple_report_markdown(
         "| Pressure max linear iterations | {} |",
         options.pressure_max_linear_iterations
     )?;
+    if let Some(gamg) = options.pressure_gamg_options {
+        writeln!(writer, "| GAMG agglomerator | {} |", gamg.agglomerator)?;
+        writeln!(writer, "| GAMG smoother | {} |", gamg.smoother)?;
+        writeln!(
+            writer,
+            "| GAMG cache agglomeration | {} |",
+            yes_no(gamg.cache_agglomeration)
+        )?;
+        writeln!(
+            writer,
+            "| GAMG cells in coarsest level | {} |",
+            gamg.n_cells_in_coarsest_level
+        )?;
+        writeln!(writer, "| GAMG merge levels | {} |", gamg.merge_levels)?;
+        writeln!(writer, "| GAMG min iterations | {} |", gamg.min_iterations)?;
+        writeln!(
+            writer,
+            "| GAMG relative tolerance | {} |",
+            format_scientific(gamg.relative_tolerance)
+        )?;
+        writeln!(writer, "| GAMG pre sweeps | {} |", gamg.n_pre_sweeps)?;
+        writeln!(writer, "| GAMG post sweeps | {} |", gamg.n_post_sweeps)?;
+        writeln!(writer, "| GAMG finest sweeps | {} |", gamg.n_finest_sweeps)?;
+        writeln!(
+            writer,
+            "| GAMG interpolate correction | {} |",
+            yes_no(gamg.interpolate_correction)
+        )?;
+        writeln!(
+            writer,
+            "| GAMG scale correction | {} |",
+            yes_no(gamg.scale_correction)
+        )?;
+        writeln!(
+            writer,
+            "| GAMG direct coarsest solve | {} |",
+            yes_no(gamg.direct_solve_coarsest)
+        )?;
+    }
     writeln!(
         writer,
         "| Min SIMPLE iterations | {} |",
@@ -4086,6 +4701,16 @@ fn write_laminar_simple_report_markdown(
     )?;
     writeln!(writer, "| Converged | {} |", yes_no(report.converged))?;
     writeln!(writer, "| Stop reason | {} |", report.stop_reason)?;
+    writeln!(
+        writer,
+        "| Outer convergence status | {} |",
+        outer_convergence_status(report)
+    )?;
+    writeln!(
+        writer,
+        "| Outer convergence evaluated | {} |",
+        yes_no(report.residual_control.checked)
+    )?;
     writeln!(
         writer,
         "| residualControl state | {} |",
@@ -4186,6 +4811,101 @@ fn write_laminar_simple_report_markdown(
         "| Pressure L2 norm | {} |",
         format_scientific(report.fields.pressure.l2_norm)
     )?;
+    writeln!(writer)?;
+    writeln!(writer, "## Timing Profile")?;
+    writeln!(writer)?;
+    writeln!(writer, "| Phase | Seconds |")?;
+    writeln!(writer, "| --- | ---: |")?;
+    let timing_rows = [
+        ("Solver total", report.timing.solver_total_seconds),
+        ("Driver measured", wall_clock_seconds),
+        ("Setup", report.timing.setup_seconds),
+        ("Iteration setup", report.timing.iteration_setup_seconds),
+        (
+            "Operator evaluation",
+            report.timing.operator_evaluation_seconds,
+        ),
+        (
+            "Momentum matrix assembly",
+            report.timing.momentum_assembly_seconds,
+        ),
+        (
+            "Momentum gradient reconstruction",
+            report.timing.momentum_gradient_seconds,
+        ),
+        (
+            "Momentum matrix fill",
+            report.timing.momentum_matrix_fill_seconds,
+        ),
+        (
+            "Momentum linear solves",
+            report.timing.momentum_linear_solve_seconds,
+        ),
+        (
+            "Pressure coupling setup",
+            report.timing.pressure_coupling_setup_seconds,
+        ),
+        (
+            "Pressure matrix assembly",
+            report.timing.pressure_assembly_seconds,
+        ),
+        (
+            "Pressure linear solves",
+            report.timing.pressure_linear_solve_seconds,
+        ),
+        ("Field correction", report.timing.field_correction_seconds),
+        ("Finalization", report.timing.finalization_seconds),
+        ("Other solver work", report.timing.other_solver_work_seconds),
+    ];
+    for (phase, seconds) in timing_rows {
+        writeln!(writer, "| {phase} | {} |", format_scientific(seconds))?;
+    }
+    if options.pressure_linear_solver == LaminarSimpleLinearSolver::Pcg {
+        writeln!(writer)?;
+        writeln!(writer, "## Pressure PCG Kernel Profile")?;
+        writeln!(writer)?;
+        writeln!(writer, "| Quantity | Value |")?;
+        writeln!(writer, "| --- | ---: |")?;
+        let pressure_kernel_rows = [
+            ("PCG total [s]", report.timing.pressure_pcg_total_seconds),
+            (
+                "Preconditioner update [s]",
+                report.timing.pressure_preconditioner_update_seconds,
+            ),
+            (
+                "Matrix-vector products [s]",
+                report.timing.pressure_matrix_vector_seconds,
+            ),
+            (
+                "Preconditioner applications [s]",
+                report.timing.pressure_preconditioner_application_seconds,
+            ),
+            (
+                "Vector operations [s]",
+                report.timing.pressure_vector_operation_seconds,
+            ),
+            (
+                "Other PCG work [s]",
+                report.timing.pressure_pcg_other_seconds,
+            ),
+        ];
+        for (quantity, value) in pressure_kernel_rows {
+            writeln!(writer, "| {quantity} | {} |", format_scientific(value))?;
+        }
+        writeln!(
+            writer,
+            "| Matrix-vector product calls | {} |",
+            report.timing.pressure_matrix_vector_products
+        )?;
+        writeln!(
+            writer,
+            "| Preconditioner application calls | {} |",
+            report.timing.pressure_preconditioner_applications
+        )?;
+    }
+    if let Some(profile) = &report.timing.pressure_gamg_profile {
+        write_markdown_gamg_profile(&mut writer, profile)?;
+    }
     writeln!(writer)?;
     writeln!(writer, "## Linear Solve Profile")?;
     writeln!(writer)?;
@@ -5718,6 +6438,21 @@ fn residual_control_state(summary: LaminarSimpleResidualControlSummary) -> &'sta
     }
 }
 
+fn outer_convergence_status(report: &LaminarSimpleReport) -> &'static str {
+    outer_convergence_status_for_reason(report.stop_reason)
+}
+
+fn outer_convergence_status_for_reason(reason: LaminarSimpleStopReason) -> &'static str {
+    match reason {
+        LaminarSimpleStopReason::Converged => "converged",
+        LaminarSimpleStopReason::ConvergenceCriteriaNotConfigured => "not-evaluated",
+        LaminarSimpleStopReason::MaxIterationsReached => "not-reached",
+        LaminarSimpleStopReason::MomentumSolverInvalidState
+        | LaminarSimpleStopReason::PressureSolverInvalidState
+        | LaminarSimpleStopReason::SolverInvalidState => "invalid",
+    }
+}
+
 fn print_initial_fields(fields: &InitialFieldSet) {
     if fields.fields.is_empty() {
         println!("initial fields: none");
@@ -5933,6 +6668,7 @@ struct LaminarSimpleSolveArgs {
     simple_consistent: Option<bool>,
     velocity_relaxation: Option<f64>,
     pressure_relaxation: Option<f64>,
+    profile_gamg: bool,
     solve_verbose: bool,
     solve_residual_csv: Option<PathBuf>,
     solve_residual_plot: Option<PathBuf>,
@@ -6014,6 +6750,7 @@ fn parse_solver_args_for_invocation(
     let mut simple_consistent = None;
     let mut velocity_relaxation = None;
     let mut pressure_relaxation = None;
+    let mut profile_gamg = false;
     let mut solve_verbose = false;
     let mut solve_residual_csv = None;
     let mut solve_residual_plot = None;
@@ -6134,7 +6871,7 @@ fn parse_solver_args_for_invocation(
             | "-pressure-linear-solver"
             | "--pressure-linear-solver" => {
                 let value = args.get(index + 1).ok_or_else(|| {
-                    "--pressureLinearSolver requires 'bicgstab', 'gaussSeidel', 'cg', 'pcg', or 'jacobi'"
+                    "--pressureLinearSolver requires 'bicgstab', 'gaussSeidel', 'symGaussSeidel', 'cg', 'pcg', 'GAMG', or 'jacobi'"
                         .to_string()
                 })?;
                 pressure_linear_solver = Some(parse_laminar_simple_linear_solver(value)?);
@@ -6357,12 +7094,17 @@ fn parse_solver_args_for_invocation(
             | "--solveResidualPlot"
             | "-solve-residual-plot"
             | "--solve-residual-plot" => {
-                let path = args.get(index + 1).ok_or_else(|| {
-                    "--solveResidualPlot requires an output image path".to_string()
-                })?;
+                let path = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--solveResidualPlot requires an output SVG path".to_string())?;
                 solve_residual_plot = Some(PathBuf::from(path));
                 laminar_simple_option_seen = true;
                 index += 2;
+            }
+            "-profileGamg" | "--profileGamg" | "-profile-gamg" | "--profile-gamg" => {
+                profile_gamg = true;
+                laminar_simple_option_seen = true;
+                index += 1;
             }
             "-solveReportJson"
             | "--solveReportJson"
@@ -6436,6 +7178,7 @@ fn parse_solver_args_for_invocation(
             simple_consistent,
             velocity_relaxation,
             pressure_relaxation,
+            profile_gamg,
             solve_verbose,
             solve_residual_csv,
             solve_residual_plot,
@@ -6793,7 +7536,8 @@ fn print_ferrum_run_usage() {
     println!("  --pressureRelaxation <v>         override p relaxation");
     println!("  --solveVerbose                   print per-iteration residuals");
     println!("  --solveResidualCsv <file>        write residual history CSV");
-    println!("  --solveResidualPlot <file>       render a residual plot");
+    println!("  --solveResidualPlot <file.svg>   render a native residual SVG");
+    println!("  --profileGamg                    profile GAMG phases and levels (diagnostic)");
     println!("  --solveReportJson <file>         write the solver report as JSON");
     println!("  --solveReportMarkdown <file>     write the solver report as Markdown");
     println!("  --writeFinalFields <dir>         write final U and p fields");
@@ -6858,7 +7602,8 @@ mod tests {
         LaminarSimpleResidualControlSummary, LaminarSimpleSchemes, ScalarDiffusionLinearSolver,
         SolverNumericsDictionaryPlan, SolverSelectionSource, estimate_iterations_to_convergence,
         estimate_simple_iterations_to_convergence, numerics_dictionary_number,
-        numerics_dictionary_usize, numerics_dictionary_value, parse_ferrum_run_args,
+        numerics_dictionary_usize, numerics_dictionary_value, openfoam_gamg_options,
+        outer_convergence_status_for_reason, parse_ferrum_run_args,
         parse_incompressible_fluid_args, parse_incompressible_fluid_plan_args,
         parse_laminar_simple_convection_scheme, parse_laminar_simple_gradient_scheme,
         parse_laminar_simple_laplacian_scheme, parse_laminar_simple_sn_grad_scheme,
@@ -6866,14 +7611,17 @@ mod tests {
         resolve_laminar_simple_convection_scheme, resolve_laminar_simple_options,
         resolve_solver_dispatch, resolved_gradient_scheme_value, run_ferrum_subcommand,
         validate_laminar_residual_control_dictionary, validate_module_execution_contract,
-        write_json_solver_state, write_json_string, write_solver_plan_json,
+        write_json_solver_state, write_json_string, write_laminar_simple_residual_plot,
+        write_solver_plan_json,
     };
     use ferrum_mesh::backends::BackendChoice;
     use ferrum_mesh::control::ControlDict;
     use ferrum_mesh::flow::{
         LaminarSimpleConvectionScheme, LaminarSimpleGradientScheme, LaminarSimpleLaplacianScheme,
         LaminarSimpleLinearSolver, LaminarSimplePreconditioner, LaminarSimpleSnGradScheme,
+        LaminarSimpleStopReason,
     };
+    use ferrum_mesh::linear::{GamgAgglomerator, GamgSmoother};
     use ferrum_mesh::runtime::{SolverRuntimeData, SolverRuntimeMeshData};
     use ferrum_mesh::solver_plan::{
         SolverBackendPlan, SolverCasePlan, SolverCpuResourcePlan, SolverDimensionality,
@@ -6886,7 +7634,30 @@ mod tests {
         SolverStateFieldPlan, SolverStateInternalFieldPlan, SolverStatePlan,
         SolverStateStoragePlan, SolverStateStorageStatus, SolverStateValueKind,
     };
+    use std::io::ErrorKind;
     use std::path::PathBuf;
+
+    #[test]
+    fn outer_convergence_status_distinguishes_missing_and_unmet_criteria() {
+        assert_eq!(
+            outer_convergence_status_for_reason(LaminarSimpleStopReason::Converged),
+            "converged"
+        );
+        assert_eq!(
+            outer_convergence_status_for_reason(
+                LaminarSimpleStopReason::ConvergenceCriteriaNotConfigured,
+            ),
+            "not-evaluated"
+        );
+        assert_eq!(
+            outer_convergence_status_for_reason(LaminarSimpleStopReason::MaxIterationsReached),
+            "not-reached"
+        );
+        assert_eq!(
+            outer_convergence_status_for_reason(LaminarSimpleStopReason::SolverInvalidState),
+            "invalid"
+        );
+    }
 
     #[test]
     fn parses_canonical_ferrum_run_module() {
@@ -7105,6 +7876,7 @@ mod tests {
             "0.6".to_string(),
             "--pressureRelaxation".to_string(),
             "0.2".to_string(),
+            "--profileGamg".to_string(),
             "--solveReportJson".to_string(),
             "target/simple.json".to_string(),
             "--solveReportMarkdown".to_string(),
@@ -7139,6 +7911,7 @@ mod tests {
         assert_eq!(solve.pressure_reference_value, Some(101325.0));
         assert_eq!(solve.velocity_relaxation, Some(0.6));
         assert_eq!(solve.pressure_relaxation, Some(0.2));
+        assert!(solve.profile_gamg);
         assert_eq!(solve.report_json, Some(PathBuf::from("target/simple.json")));
         assert_eq!(
             solve.report_markdown,
@@ -7157,7 +7930,7 @@ mod tests {
             "--solveResidualCsv".to_string(),
             "target/simple-residuals.csv".to_string(),
             "--solveResidualPlot".to_string(),
-            "target/simple-residuals.png".to_string(),
+            "target/simple-residuals.svg".to_string(),
             "--solveReportJson".to_string(),
             "target/simple.json".to_string(),
         ];
@@ -7174,9 +7947,92 @@ mod tests {
         );
         assert_eq!(
             solve.solve_residual_plot,
-            Some(PathBuf::from("target/simple-residuals.png"))
+            Some(PathBuf::from("target/simple-residuals.svg"))
         );
         assert_eq!(solve.report_json, Some(PathBuf::from("target/simple.json")));
+    }
+
+    #[test]
+    fn writes_laminar_simple_residual_plot_as_native_svg() {
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after Unix epoch")
+                .as_nanos()
+        );
+        let csv_path = std::env::temp_dir().join(format!("ferrum-residuals-{unique}.csv"));
+        let svg_path = std::env::temp_dir().join(format!("ferrum-residuals-{unique}.svg"));
+        std::fs::write(
+            &csv_path,
+            "iteration,unused,continuityAfterL2,momentumInitialResidualNormalized,unused,unused,pressureInitialResidualNormalized,unused,unused\n1,0,1e-4,1e-3,0,0,1e-2,0,0\n",
+        )
+        .expect("residual CSV fixture should be written");
+
+        write_laminar_simple_residual_plot(&csv_path, &svg_path)
+            .expect("native SVG residual plot should be written");
+        let svg = std::fs::read_to_string(&svg_path).expect("SVG should be readable");
+
+        let _ = std::fs::remove_file(&csv_path);
+        let _ = std::fs::remove_file(&svg_path);
+
+        assert!(svg.starts_with("<svg"));
+        assert!(svg.contains("U initial residual"));
+        assert!(svg.contains("p initial residual"));
+        assert!(svg.contains("Continuity L2"));
+    }
+
+    #[test]
+    fn accepts_mixed_case_svg_residual_plot_extension() {
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after Unix epoch")
+                .as_nanos()
+        );
+        let csv_path = std::env::temp_dir().join(format!("ferrum-residuals-{unique}.csv"));
+        let svg_path = std::env::temp_dir().join(format!("ferrum-residuals-{unique}.SVG"));
+        std::fs::write(
+            &csv_path,
+            "iteration,unused,continuityAfterL2,momentumInitialResidualNormalized,unused,unused,pressureInitialResidualNormalized,unused,unused\n1,0,1e-4,1e-3,0,0,1e-2,0,0\n",
+        )
+        .expect("residual CSV fixture should be written");
+
+        write_laminar_simple_residual_plot(&csv_path, &svg_path)
+            .expect("mixed-case SVG extension should use native rendering");
+        let svg = std::fs::read_to_string(&svg_path).expect("SVG should be readable");
+
+        let _ = std::fs::remove_file(&csv_path);
+        let _ = std::fs::remove_file(&svg_path);
+
+        assert!(svg.starts_with("<svg"));
+    }
+
+    #[test]
+    fn rejects_non_svg_residual_plot_without_creating_output() {
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after Unix epoch")
+                .as_nanos()
+        );
+        let csv_path = std::env::temp_dir().join(format!("ferrum-residuals-{unique}.csv"));
+        let png_path = std::env::temp_dir().join(format!("ferrum-residuals-{unique}.png"));
+
+        let error = write_laminar_simple_residual_plot(&csv_path, &png_path)
+            .expect_err("non-SVG residual plots must be rejected");
+
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "native residual plots require an output path with the .svg extension"
+        );
+        assert!(!png_path.exists());
     }
 
     #[test]
@@ -7391,6 +8247,8 @@ mod tests {
             pressure_linear_solver: LaminarSimpleLinearSolver::Cg,
             momentum_preconditioner: LaminarSimplePreconditioner::None,
             pressure_preconditioner: LaminarSimplePreconditioner::None,
+            pressure_gamg_options: None,
+            profile_gamg: false,
             linear_tolerance: 1.0e-10,
             max_linear_iterations: 10_000,
             momentum_linear_tolerance: 1.0e-10,
@@ -7559,6 +8417,10 @@ mod tests {
             LaminarSimpleLinearSolver::SymGaussSeidel
         );
         assert_eq!(
+            parse_openfoam_laminar_solver("GAMG").unwrap(),
+            LaminarSimpleLinearSolver::Gamg
+        );
+        assert_eq!(
             parse_openfoam_laminar_preconditioner(
                 numerics_dictionary_value(&dictionary, "solvers.p", "preconditioner").unwrap()
             )
@@ -7566,6 +8428,220 @@ mod tests {
             LaminarSimplePreconditioner::IncompleteCholesky
         );
         assert!(parse_openfoam_laminar_preconditioner("DILU").is_err());
+    }
+
+    #[test]
+    fn maps_openfoam_gamg_dictionary_controls_without_substitution() {
+        let mut plan = laminar_simple_test_plan(998.2, 1.002e-3);
+        plan.numerics
+            .fv_solution
+            .entries
+            .retain(|entry| entry.section != "solvers.p");
+        for (key, value) in [
+            ("solver", "GAMG"),
+            ("smoother", "symGaussSeidel"),
+            ("agglomerator", "algebraicPair"),
+            ("maxIter", "73"),
+            ("minIter", "2"),
+            ("tolerance", "2e-9"),
+            ("relTol", "0.075"),
+            ("cacheAgglomeration", "false"),
+            ("nCellsInCoarsestLevel", "12"),
+            ("mergeLevels", "1"),
+            ("nPreSweeps", "1"),
+            ("preSweepsLevelMultiplier", "2"),
+            ("maxPreSweeps", "5"),
+            ("nPostSweeps", "3"),
+            ("postSweepsLevelMultiplier", "2"),
+            ("maxPostSweeps", "6"),
+            ("nFinestSweeps", "4"),
+            ("interpolateCorrection", "false"),
+            ("scaleCorrection", "false"),
+            ("directSolveCoarsest", "true"),
+        ] {
+            plan.numerics
+                .fv_solution
+                .entries
+                .push(SolverNumericsEntryPlan {
+                    section: "solvers.p".to_string(),
+                    key: key.to_string(),
+                    value: value.to_string(),
+                });
+        }
+
+        let options = openfoam_gamg_options(&plan, "solvers.p").expect("GAMG controls should map");
+
+        assert_eq!(options.agglomerator, GamgAgglomerator::AlgebraicPair);
+        assert_eq!(options.smoother, GamgSmoother::SymGaussSeidel);
+        assert_eq!(options.max_iterations, 73);
+        assert_eq!(options.min_iterations, 2);
+        assert_eq!(options.tolerance, 2.0e-9);
+        assert_eq!(options.relative_tolerance, 0.075);
+        assert!(!options.cache_agglomeration);
+        assert_eq!(options.n_cells_in_coarsest_level, 12);
+        assert_eq!(options.merge_levels, 1);
+        assert_eq!(options.n_pre_sweeps, 1);
+        assert_eq!(options.pre_sweeps_level_multiplier, 2);
+        assert_eq!(options.max_pre_sweeps, 5);
+        assert_eq!(options.n_post_sweeps, 3);
+        assert_eq!(options.post_sweeps_level_multiplier, 2);
+        assert_eq!(options.max_post_sweeps, 6);
+        assert_eq!(options.n_finest_sweeps, 4);
+        assert!(!options.interpolate_correction);
+        assert!(!options.scale_correction);
+        assert!(options.direct_solve_coarsest);
+    }
+
+    #[test]
+    fn resolves_gamg_pressure_controls_into_simple_runtime_options() {
+        let mut plan = laminar_simple_test_plan(998.2, 1.002e-3);
+        plan.numerics
+            .fv_solution
+            .entries
+            .retain(|entry| entry.section != "solvers.p");
+        for (key, value) in [
+            ("solver", "GAMG"),
+            ("smoother", "symGaussSeidel"),
+            ("agglomerator", "faceAreaPair"),
+            ("maxIter", "73"),
+            ("minIter", "2"),
+            ("tolerance", "2e-9"),
+            ("relTol", "0.075"),
+            ("cacheAgglomeration", "true"),
+            ("nCellsInCoarsestLevel", "12"),
+            ("mergeLevels", "1"),
+            ("nPreSweeps", "1"),
+            ("nPostSweeps", "3"),
+            ("nFinestSweeps", "4"),
+        ] {
+            plan.numerics
+                .fv_solution
+                .entries
+                .push(SolverNumericsEntryPlan {
+                    section: "solvers.p".to_string(),
+                    key: key.to_string(),
+                    value: value.to_string(),
+                });
+        }
+        let parsed = parse_incompressible_fluid_args(&[
+            "--pressureSolveTolerance".to_string(),
+            "5e-9".to_string(),
+            "--pressureMaxIterations".to_string(),
+            "41".to_string(),
+            "--profileGamg".to_string(),
+        ])
+        .expect("solver args should parse");
+        let solve = parsed
+            .laminar_simple_solve
+            .expect("laminar SIMPLE solve args");
+
+        let options = resolve_laminar_simple_options(&plan, &solve)
+            .expect("GAMG pressure options should resolve");
+        let gamg = options
+            .pressure_gamg_options
+            .expect("resolved pressure GAMG controls");
+
+        assert_eq!(
+            options.pressure_linear_solver,
+            LaminarSimpleLinearSolver::Gamg
+        );
+        assert_eq!(
+            options.pressure_preconditioner,
+            LaminarSimplePreconditioner::None
+        );
+        assert_eq!(options.pressure_linear_tolerance, 5.0e-9);
+        assert_eq!(options.pressure_max_linear_iterations, 41);
+        assert!(options.profile_gamg);
+        assert_eq!(gamg.agglomerator, GamgAgglomerator::FaceAreaPair);
+        assert_eq!(gamg.smoother, GamgSmoother::SymGaussSeidel);
+        assert_eq!(gamg.tolerance, 5.0e-9);
+        assert_eq!(gamg.max_iterations, 41);
+        assert_eq!(gamg.min_iterations, 2);
+        assert_eq!(gamg.relative_tolerance, 0.075);
+        assert_eq!(gamg.n_cells_in_coarsest_level, 12);
+        assert_eq!(gamg.n_pre_sweeps, 1);
+        assert_eq!(gamg.n_post_sweeps, 3);
+        assert_eq!(gamg.n_finest_sweeps, 4);
+    }
+
+    #[test]
+    fn rejects_gamg_profile_without_gamg_pressure_solver() {
+        let plan = laminar_simple_test_plan(998.2, 1.002e-3);
+        let parsed = parse_incompressible_fluid_args(&["--profileGamg".to_string()])
+            .expect("solver args should parse");
+        let solve = parsed
+            .laminar_simple_solve
+            .expect("laminar SIMPLE solve args");
+
+        let error = resolve_laminar_simple_options(&plan, &solve)
+            .expect_err("profiling PCG as GAMG must fail");
+
+        assert!(error.contains("requires solvers.p.solver GAMG"));
+    }
+
+    #[test]
+    fn rejects_gamg_for_nonsymmetric_simple_momentum_equation() {
+        let mut plan = laminar_simple_test_plan(998.2, 1.002e-3);
+        let momentum_solver = plan
+            .numerics
+            .fv_solution
+            .entries
+            .iter_mut()
+            .find(|entry| entry.section == "solvers.U" && entry.key == "solver")
+            .expect("momentum solver entry");
+        momentum_solver.value = "GAMG".to_string();
+        let parsed = parse_incompressible_fluid_args(&[]).expect("solver args should parse");
+        let solve = parsed
+            .laminar_simple_solve
+            .expect("laminar SIMPLE solve args");
+
+        let error = resolve_laminar_simple_options(&plan, &solve)
+            .expect_err("momentum GAMG must be rejected");
+
+        assert!(error.contains("symmetric SIMPLE pressure equation only"));
+        assert!(error.contains("nonsymmetric momentum solver"));
+    }
+
+    #[test]
+    fn rejects_incomplete_or_unknown_gamg_controls_without_fallback() {
+        let mut plan = laminar_simple_test_plan(998.2, 1.002e-3);
+        plan.numerics
+            .fv_solution
+            .entries
+            .retain(|entry| entry.section != "solvers.p");
+        plan.numerics
+            .fv_solution
+            .entries
+            .push(SolverNumericsEntryPlan {
+                section: "solvers.p".to_string(),
+                key: "solver".to_string(),
+                value: "GAMG".to_string(),
+            });
+
+        let missing_smoother =
+            openfoam_gamg_options(&plan, "solvers.p").expect_err("GAMG without smoother must fail");
+        assert!(missing_smoother.contains("requires a smoother"));
+
+        plan.numerics
+            .fv_solution
+            .entries
+            .push(SolverNumericsEntryPlan {
+                section: "solvers.p".to_string(),
+                key: "smoother".to_string(),
+                value: "GaussSeidel".to_string(),
+            });
+        plan.numerics
+            .fv_solution
+            .entries
+            .push(SolverNumericsEntryPlan {
+                section: "solvers.p".to_string(),
+                key: "agglomerator".to_string(),
+                value: "unknownPair".to_string(),
+            });
+
+        let unknown_agglomerator = openfoam_gamg_options(&plan, "solvers.p")
+            .expect_err("unknown GAMG agglomerator must fail");
+        assert!(unknown_agglomerator.contains("no agglomerator fallback was applied"));
     }
 
     #[test]

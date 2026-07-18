@@ -21,8 +21,6 @@ target/debug/gmshToFerrum.exe
 target/debug/checkFerrumMesh.exe
 target/debug/splitFerrumMeshRegions.exe
 target/debug/ferrumRun.exe
-target/debug/ferrumPipeBenchmark.exe
-target/debug/ferrumPlaneChannelBenchmark.exe
 ```
 
 During development, commands can also be run through Cargo:
@@ -393,8 +391,6 @@ gmshToFerrum
 checkFerrumMesh
 splitFerrumMeshRegions
 ferrumRun
-ferrumPipeBenchmark
-ferrumPlaneChannelBenchmark
 ```
 
 Application cases are run only through `ferrumRun`. The combined `ferrum
@@ -542,7 +538,7 @@ are the handoff point for the future CPU/GPU equation kernels.
 
 FerrumCFD also contains the first executable CPU linear algebra foundation:
 CSR matrices, matrix-vector products, residual calculation, Jacobi,
-Gauss-Seidel, conjugate gradient, preconditioned-CG, and BiCGStab. The
+Gauss-Seidel, conjugate gradient, preconditioned-CG, BiCGStab, and GAMG. The
 preflight reports these as CPU linear-solver capabilities. They are the
 solve-side substrate for the scalar diffusion and laminar flow assemblies
 described below, but they are not yet driven by a complete CFD time-loop.
@@ -648,17 +644,33 @@ Current practical command:
 ```powershell
 ferrumRun -solver incompressibleFluid -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --solveTolerance 1e-6 --maxIterations 100 --solveReportJson target\benchmarks\laminar_pipe_laminar_simple.json --solveReportMarkdown target\benchmarks\laminar_pipe_laminar_simple.md
 ferrumRun -solver incompressibleFluid -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --maxSimpleIterations 2 --writeFinalFields target\benchmarks\laminar_pipe_fields\1
-ferrumPipeBenchmark -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --fields target\benchmarks\laminar_pipe_fields\1 --pressureDrop 1.6032 --mu 0.001002 --length 1 --diameter 0.02 --axis x --inletPatch inlet --outletPatch outlet --outJson target\benchmarks\laminar_pipe_fields\1.pipe.json
 ```
 
 Solver report schema version 2 records `solver=incompressibleFluid`,
-`algorithm=SIMPLE`, and `regime=laminar`.
+`algorithm=SIMPLE`, and `regime=laminar`. Its additive `timing` object separates
+solver total, driver measurement, setup, operator evaluation, momentum
+assembly, momentum gradient reconstruction, momentum matrix fill, momentum
+solve, pressure-coupling setup, pressure assembly/solve, field correction,
+finalization, and remaining solver work. These timings measure the executable
+solver only; they never include Cargo compilation.
 
-The first two commands are geometry-independent SIMPLE execution. The third is
-optional external post-processing of stored fields. `--pressureDrop`, `--length`,
-`--diameter`, `--axis`, and the sampling patch names are intentionally rejected
-by the generic `incompressibleFluid` execution path; they belong only to
-`ferrumPipeBenchmark`.
+For reproducible CPU performance measurements of both validated flow cases:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_cpu_performance_baseline.ps1
+```
+
+The script builds `target\release\ferrumRun.exe` once, performs one warmup and
+five measured runs per case, and writes median timing plus numerical regression
+observables below `target\benchmarks\cpu_performance_baseline\fixed`. Use
+`-RunProfile converged` for the external residual-control profiles. It is validation
+automation, not part of the public solver interface.
+
+Both commands are geometry-independent SIMPLE execution. Analytic formulas,
+OpenFOAM comparisons, and geometry-specific field integration remain external
+validation work under `validation/` and `target/benchmarks`. Parameters such as
+pipe length, diameter, analytic pressure loss, and sampling patch names are
+intentionally rejected by the generic `incompressibleFluid` execution path.
 
 The generic `--linearSolver` value is still accepted, but the laminar SIMPLE
 path can also split the linear solver choice and linear controls by equation:
@@ -688,6 +700,55 @@ broad overrides for both equations. If present, OpenFOAM-style
 early-convergence criteria. Ferrum follows the OpenFOAM Foundation 13 steady
 SIMPLE form, where each field entry is one absolute scalar tolerance:
 
+GAMG is selectable for the symmetric pressure equation directly in
+`system/fvSolution`:
+
+```text
+solvers
+{
+    p
+    {
+        solver GAMG;
+        smoother symGaussSeidel;
+        tolerance 1e-10;
+        relTol 0;
+        cacheAgglomeration true;
+        agglomerator faceAreaPair;
+        nCellsInCoarsestLevel 10;
+        mergeLevels 1;
+        nPreSweeps 0;
+        nPostSweeps 2;
+        nFinestSweeps 2;
+        interpolateCorrection false;
+        scaleCorrection true;
+        directSolveCoarsest false;
+    }
+}
+```
+
+Ferrum reads `minIter`, `maxIter`, the pre/post sweep level multipliers and
+maximums, and all controls shown above. If `agglomerator` is omitted,
+OpenFOAM's `faceAreaPair` default is used. `faceAreaPair` consumes the runtime
+mesh geometry; `algebraicPair` uses pressure-matrix connection strengths.
+`mergeLevels` currently must be `1`, and `interpolateCorrection` currently
+must be `false`; other values produce an explicit error. GAMG cannot be chosen
+for `solvers.U`. There is no PCG fallback. JSON and Markdown solve reports
+record the effective controls under `options.pressureGamg`.
+
+For a release diagnostic of the selected GAMG pressure path, add
+`--profileGamg` and write a normal solve report:
+
+```powershell
+ferrumRun -solver incompressibleFluid -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --profileGamg --solveReportJson target\benchmarks\gamg-profile.json --solveReportMarkdown target\benchmarks\gamg-profile.md
+```
+
+The flag is valid only when `solvers.p.solver` resolves to `GAMG`. It is not an
+`fvSolution` entry and changes no cycle or stopping control. Console, JSON, and
+Markdown output split the pressure time into hierarchy, residual, V-cycle,
+transfer, smoothing, scaling, correction, and coarsest-solve phases and list
+cells, nonzeros, calls, and sweeps for every level. Omitting the flag keeps the
+unprofiled execution path.
+
 ```text
 SIMPLE
 {
@@ -709,9 +770,12 @@ solves. The linear-solver final residual and convergence flag remain separate
 from this outer SIMPLE decision.
 
 If `tolerance` or `maxIter` is absent, the SIMPLE path uses the OpenFOAM 13
-`lduMatrix::solver` defaults `1e-6` and `1000`. Non-zero `relTol`, non-zero
-`minIter`, and `smoothSolver nSweeps` values other than `1` are rejected for
-now instead of being ignored or replaced silently.
+`lduMatrix::solver` defaults `1e-6` and `1000`. GAMG applies `relTol` to the
+OpenFOAM-normalized LDU L1 residual and honors `minIter`. Its internal L2 stop
+limit is conservatively translated, and Ferrum rechecks the strict L1 criterion
+before reporting convergence. Other current linear solvers reject non-zero `relTol` and
+`minIter`; `smoothSolver nSweeps` values other than `1` are also rejected
+instead of being ignored or replaced silently.
 
 Without `--maxSimpleIterations`, Ferrum uses the positive iteration count
 derived from `controlDict` (`endTime - startTime` divided by `deltaT`). When
@@ -720,8 +784,10 @@ two SIMPLE iterations before convergence can be accepted. `endTime` or
 `--maxSimpleIterations` is the maximum budget; all configured
 `SIMPLE.residualControl` field tolerances permit an earlier stop. Continuity is
 reported as a diagnostic and is not an undocumented extra stopping criterion.
-Without `residualControl`, the solver runs to `--maxSimpleIterations` and reports
-`converged=false` with `convergence-criteria-not-configured`. Hagen-Poiseuille
+Without `residualControl`, the solver runs to `--maxSimpleIterations`, reports
+`converged=false`, and records outer convergence as `not-evaluated` with stop
+reason `ConvergenceCriteriaNotConfigured`. Configured criteria that are not met
+within the budget report `not-reached`. Hagen-Poiseuille
 error, OpenFOAM comparison, and matched-time acceptance are evaluated by the
 external benchmark scripts; they cannot stop, cap, roll back, or force a flow
 direction in the generic solver. `minSimpleIterations` can still be set as a
@@ -749,8 +815,8 @@ iterations per SIMPLE step, and final linear-solver convergence flags. The
 iteration history, CSV, console, JSON, and Markdown outputs distinguish each
 field's OpenFOAM-normalized initial residual from its final linear residual and
 show the outer `residualControl` state independently.
-`ferrumPipeBenchmark` writes a different JSON/Markdown report containing mean
-axial velocity, Hagen-Poiseuille values, and named-patch pressure loss. Ferrum
+The top-level JSON `outerConvergence` object records `status`, `configured`,
+`evaluated`, `converged`, and `reason`. Ferrum
 sets `converged=true` when the configured outer `SIMPLE.residualControl`
 criteria are checked and satisfied. Linear convergence remains explicitly
 reported through the corresponding `SolverPerformance`-style fields. The pressure
@@ -773,13 +839,11 @@ solver path does not cap finite `U`, `p`, or `phi` updates and does not roll
 back a finite SIMPLE step; non-finite values are treated as numerical failure.
 True nonsymmetric ILU/DILU preconditioning is still solver-development work.
 
-`ferrumPlaneChannelBenchmark` provides the same external separation for a 2D
-parallel-plate case. It reads stored `U`/`p`, applies
-`meanU = deltaP*H^2/(12*mu*L)`, and writes JSON/Markdown without changing the
-simulation. Use `--pressureScale <rho>` only when post-processing OpenFOAM's
-kinematic incompressible pressure; Ferrum fields remain SI Pa by default. The
-reference `.geo`, case dictionaries, and SI inputs are under
-`tutorials/incompressibleFluid/planeChannel/`.
+The 2D parallel-plate validation uses the same separation. External processing
+of stored `U`/`p` applies `meanU = deltaP*H^2/(12*mu*L)` without changing the
+simulation. OpenFOAM's kinematic incompressible pressure must be multiplied by
+`rho`; Ferrum fields remain SI Pa. The reference `.geo`, case dictionaries,
+and SI inputs are under `tutorials/incompressibleFluid/planeChannel/`.
 
 Recorded pipe and plane-channel results are available under `docs/benchmarks`.
 They document maintainer runs and are not a required user workflow. Optional

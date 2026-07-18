@@ -7,6 +7,7 @@ param(
     [string]$Mode = "Auto",
     [int]$EndTime = 200,
     [int]$WriteInterval = 0,
+    [switch]$UseFerrumOverlayNumerics,
     [switch]$RequireOpenFoam
 )
 
@@ -35,6 +36,9 @@ if (!(Test-Path -LiteralPath $OpenFoamTemplate -PathType Container)) {
 }
 if (!(Test-Path -LiteralPath $SourceCaseRoot -PathType Container)) {
     throw "source case was not found: $SourceCaseRoot"
+}
+if ($UseFerrumOverlayNumerics -and !$UseFerrumOverlay) {
+    throw "UseFerrumOverlayNumerics requires FerrumOverlayCaseRoot"
 }
 
 function Format-F64([double]$Value) {
@@ -492,7 +496,8 @@ runTimeModifiable false;
 "@
 
 foreach ($dictionaryName in @("fvSchemes", "fvSolution")) {
-    $sourceDictionary = Join-Path $OpenFoamTemplate "system\$dictionaryName"
+    $numericsRoot = if ($UseFerrumOverlayNumerics) { $SourceCaseRoot } else { $OpenFoamTemplate }
+    $sourceDictionary = Join-Path $numericsRoot "system\$dictionaryName"
     if (!(Test-Path -LiteralPath $sourceDictionary -PathType Leaf)) {
         throw "OpenFOAM 13 source case requires dictionary: $sourceDictionary"
     }
@@ -579,10 +584,21 @@ if ($null -ne $latestTime) {
 }
 
 $timing = Read-LastFoamTiming $logPath
+$timeEntries = if (Test-Path -LiteralPath $logPath) {
+    @(Select-String -Path $logPath -Pattern '^Time = ')
+} else {
+    @()
+}
+$simpleConverged = if (Test-Path -LiteralPath $logPath) {
+    $null -ne (Select-String -Path $logPath -Pattern 'SIMPLE solution converged' | Select-Object -First 1)
+} else {
+    $false
+}
 $result = [ordered]@{
     case = "laminar_pipe"
     sourceCase = $SourceCaseRoot
     ferrumOverlay = $UseFerrumOverlay
+    ferrumOverlayNumerics = [bool]$UseFerrumOverlayNumerics
     generatedCase = $WorkDir
     status = $status
     units = [ordered]@{
@@ -613,7 +629,8 @@ $result = [ordered]@{
         endTime = $EndTime
         deltaT = 1
         writeInterval = $WriteInterval
-        simulatedSteps = $EndTime
+        simulatedSteps = $timeEntries.Count
+        converged = $simpleConverged
     }
     openFoam = [ordered]@{
         available = $null -ne $selectedMode
