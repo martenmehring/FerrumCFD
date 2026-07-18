@@ -4,9 +4,11 @@ Benchmark records from 2026-07-08 through 2026-07-10 with WSL OpenFOAM.
 All FerrumCFD-facing values are SI. OpenFOAM incompressible pressure is
 converted from kinematic pressure to Pa with `rho = 998.2 kg/m3`.
 
-The 2026-07-10 pipeline separates generic SIMPLE reports from
-`ferrumPipeBenchmark` output and samples named inlet/outlet patch owner cells
-for both Ferrum and OpenFOAM. Older tables below that use axial-slice
+The 2026-07-10 pipeline separated generic SIMPLE reports from output produced
+by the then-current `ferrumPipeBenchmark` post-processor and sampled named
+inlet/outlet patch owner cells for both Ferrum and OpenFOAM. That product binary
+was later removed; current analytical and OpenFOAM post-processing remains
+external validation tooling. Older tables below that use axial-slice
 extrapolation are retained as historical records and must not be mixed with the
 current direct-pressure comparison.
 

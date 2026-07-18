@@ -1,0 +1,55 @@
+FoamFile
+{
+    version 2.0;
+    format ascii;
+    class dictionary;
+    location "system";
+    object fvSolution;
+}
+
+solvers
+{
+    p
+    {
+        solver GAMG;
+        smoother symGaussSeidel;
+        tolerance 1e-10;
+        relTol 0;
+        maxIter 1000;
+        minIter 0;
+        cacheAgglomeration true;
+        agglomerator faceAreaPair;
+        nCellsInCoarsestLevel 10;
+        mergeLevels 1;
+        nPreSweeps 0;
+        preSweepsLevelMultiplier 1;
+        maxPreSweeps 4;
+        nPostSweeps 2;
+        postSweepsLevelMultiplier 1;
+        maxPostSweeps 4;
+        nFinestSweeps 2;
+        interpolateCorrection false;
+        scaleCorrection true;
+        directSolveCoarsest false;
+    }
+    U { solver smoothSolver; smoother symGaussSeidel; tolerance 1e-10; relTol 0; }
+    T { solver smoothSolver; smoother symGaussSeidel; tolerance 1e-10; relTol 0; }
+}
+
+SIMPLE
+{
+    nNonOrthogonalCorrectors 0;
+    consistent false;
+}
+
+relaxationFactors
+{
+    fields
+    {
+        p 0.3;
+    }
+    equations
+    {
+        U 0.7;
+    }
+}

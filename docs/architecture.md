@@ -467,11 +467,36 @@ operations run.
 
 The first executable solver foundation is CPU linear algebra: CSR matrices,
 matrix-vector products, residuals, Jacobi, conjugate gradient,
-preconditioned-CG, and BiCGStab. This is the minimal substrate used by the
-first scalar Poisson/diffusion and laminar flow assemblies from runtime mesh
-geometry. It should remain a small backend-neutral contract so later GPU
-implementations can provide the same operations without changing the equation
-assembly layer.
+preconditioned-CG, BiCGStab, and a reusable GAMG hierarchy and V-cycle. This is
+the minimal substrate used by the first scalar
+Poisson/diffusion and laminar flow assemblies from runtime mesh geometry. It
+should remain a small backend-neutral contract so later GPU implementations
+can provide the same operations without changing the equation assembly layer.
+The SIMPLE pressure path supports GAMG on symmetric pressure CSR systems with
+explicit `algebraicPair` or mesh-geometric `faceAreaPair`. The latter derives
+its initial weights from runtime face-area vectors and sums weights while
+coarsening. One hierarchy is retained per pressure topology; matrix values are
+refreshed for each pressure equation. Case-level `tolerance` and `relTol`
+retain OpenFOAM's normalized LDU L1-residual meaning: the GAMG core receives a
+conservative absolute L2 limit, and the reporting layer checks the strict L1
+criteria before it marks the linear solve converged. GAMG remains invalid for the
+nonsymmetric momentum equation, and unsupported controls fail without
+substituting PCG or another agglomerator.
+
+GAMG cycle profiling is an explicit diagnostic path selected with
+`--profileGamg`; it is not a case-dictionary control and does not alter the
+equation, convergence criteria, cycle controls, or solver selection. The normal
+path performs no per-phase clock reads. The profiled path executes the same
+operation order and reports hierarchy build/refresh, finest residual, V-cycle,
+restriction, prolongation, smoothing, scaling, coarse residual, correction, and
+coarsest-solve time, including per-level work counts. Profile parity is tested
+against the unprofiled solve with bit-identical fields and residuals.
+
+Each GAMG level caches the unique CSR diagonal slot for every row. The smoother
+uses those slots to traverse the entries before and after the diagonal in the
+same CSR order instead of searching for the diagonal during every sweep. GAMG
+therefore requires exactly one diagonal entry per matrix row and rejects an
+invalid layout explicitly; it does not substitute another smoother.
 
 The first equation assembly layer is scalar diffusion/Poisson on CPU. It
 converts runtime mesh geometry into a CSR system with internal face coupling,
@@ -529,10 +554,12 @@ Only OpenFOAM-style residual controls can mark the generic solver converged.
 Hagen-Poiseuille acceptance, OpenFOAM comparison, and matched-time decisions
 belong to the external benchmark scripts and never alter SIMPLE convergence.
 The SIMPLE options/report types contain no pipe diameter, pipe length, named
-inlet/outlet reference, pressure-loss target, or analytic solution. The separate
-`ferrumPipeBenchmark` binary reads already written `U`/`p` fields and adds those
-case-specific diagnostics. Reference input is stored under `benchmarks/`, not
-inside a simulation case's `constant/` directory.
+inlet/outlet reference, pressure-loss target, or analytic solution. External
+validation tooling may read already written `U`/`p` fields and add those
+case-specific diagnostics without changing solver behavior. Validation profiles
+and reference inputs are stored under `validation/`; generated comparison
+artifacts remain under `target/benchmarks`, never inside a simulation case's
+`constant/` directory.
 The production-readiness plan for this solver lives in
 `docs/solver-roadmap.md`; it tracks the remaining numerical, boundary-condition,
 scheme, benchmark, performance, and generalization work.
@@ -542,8 +569,14 @@ scheme, benchmark, performance, and generalization work.
 explicit `bicgstab` remains available for nonsymmetric momentum experiments.
 OpenFOAM `DIC`/`FDIC` on pressure PCG maps to IC(0). `DILU` is rejected until a
 true nonsymmetric ILU/DILU preconditioner exists; Ferrum never substitutes a
-diagonal preconditioner silently. CLI flags remain explicit experiment
-overrides. Solver execution also requires `system/fvSchemes` and
+diagonal preconditioner silently. The selected pressure PCG path shares the
+mesh-dependent CSR pattern, reuses matrix/RHS and PCG work storage, and retains
+the IC(0) symbolic structure while refactoring its numerical values for each
+pressure equation. The OpenFOAM-normalized scalar-solve reporting layer also
+retains its zero-initial, matrix-product, and residual buffers across momentum
+and pressure equations. A topology, workspace, or preconditioner mismatch is an
+error, not a fallback. CLI flags remain explicit experiment overrides. Solver
+execution also requires `system/fvSchemes` and
 `system/fvSolution` instead of inventing a missing case configuration.
 Absent `tolerance` and `maxIter` entries use the OpenFOAM 13
 `lduMatrix::solver` defaults (`1e-6` and `1000`). Ferrum currently supports the

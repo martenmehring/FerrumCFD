@@ -212,6 +212,16 @@ and wall-clock solve time was `33.54 s`. This validation is separate from the
 analytic pipe benchmark and is recorded in
 `docs/benchmarks/laminar-simple-residual-control.md`.
 
+The current 2026-07-17 external convergence profiles reproduce the pipe stop at
+iteration `207` (`U=9.986584e-4`, `p=2.618382e-5`) in `15.95 s` and converge
+the plane channel at iteration `545` (`U=9.974216e-6`, `p=4.210369e-8`) in
+`8.16 s`. Both outer solves report `converged=true`, and every recorded
+momentum-component and pressure linear solve converged. A run without
+`residualControl` is reported as `not-evaluated`; configured criteria exhausted
+at the iteration budget are reported as `not-reached`. The current performance
+and external accuracy evidence is recorded in
+`docs/benchmarks/cpu-performance-foundation.md`.
+
 The following medium-pipe table (`4608` cells, SI units) is the historical
 matched `simpleFoam` baseline recorded before the comparison runner migrated
 to OpenFOAM 13 `foamRun -solver incompressibleFluid`. It preserves provenance
@@ -387,11 +397,137 @@ Current status:
   terminated prematurely;
 - backend policy already supports CPU/GPU/auto declarations and resource
   metadata, but executable GPU equation kernels are still future work.
+- solver report schema version 2 now includes additive phase timings for setup,
+  momentum matrix assembly, momentum linear solves, pressure matrix assembly,
+  pressure linear solves, finalization, and remaining solver work;
+- `run_cpu_performance_baseline.ps1` builds `ferrumRun` once in release mode,
+  excludes compilation and warmup runs from medians, and executes the existing
+  `laminarPipe` and `planeChannel` cases as independent regressions.
+- The first 2026-07-16 release diagnostic identified redundant per-iteration
+  convection diagnostics. Deferring that diagnostic operator to finalization
+  reduced the pipe from `64.75 s` to `16.64 s` and the plane channel from
+  `1134.82 s` to `354.95 s`, with identical SIMPLE/linear iteration counts,
+  continuity, residuals, and field norms. This is one measured run per case,
+  retained as diagnostic provenance rather than a stable median claim.
+- mesh-dependent momentum CSR sparsity is now built once and shared by all
+  component matrices. Splitting the old assembly timer showed that matrix fill
+  itself was small and that repeated scalar-gradient geometry dominated it;
+- mesh-dependent scalar-gradient interpolation weights, boundary distances, and
+  inverse cell volumes are now cached once;
+- pressure matrices now share mesh-dependent CSR topology and reuse coefficient
+  and right-hand-side storage. Pressure reference elimination updates that
+  storage in place;
+- pressure PCG reuses work vectors, while IC(0) builds its symbolic dependency
+  structure once and only refactors numerical values for each equation;
+- one scalar-solve workspace now retains the outer zero-initial, matrix-product,
+  and residual vectors across momentum and pressure equations. The pressure
+  corrector also reuses its stored solution as the next iterate without a
+  separate full-field clone;
+- a deterministic pressure-matrix integration gate covers `13,824`-row medium,
+  `38,912`-row fine, and `12,288`-row/`56.31 deg` skewed conservative systems.
+  Reused and fresh PCG/IC(0) solves agree exactly, with true relative residuals
+  below `1.7e-9`;
+- opt-in PCG kernel profiling now reaches the normal SIMPLE console, JSON, and
+  Markdown reports and the external performance driver. Release measurements
+  on the accepted matrices put IC(0) applications at `52.6%` to `55.1%` of the
+  PCG kernel; current SIMPLE cases put them at about `45.8%` to `47.6%` through
+  convergence. IC(0) numerical refactorization remains below `1%` throughout.
+  All fixed-work and converged numerical reports remain exactly equal to their
+  pre-profile counterparts after removing only timing and case-path fields;
+- IC(0) backward dependencies now use one contiguous offset/entry layout
+  instead of one nested vector per row, preserving exact traversal and
+  arithmetic order. On the `38,912`-row gate this removes about `622.6 kB` of
+  row metadata plus thousands of small allocations. Three alternating
+  same-process release diagnostics measured `1.0749x`, `1.1159x`, and
+  `1.1630x` application speedups with bit-identical output. Sequential
+  full-case batches remained host-load-sensitive, so no new end-to-end speedup
+  is claimed;
+- the current fixed-work release gate (one warmup plus five measured runs) has
+  medians of `2.2228 s` for 10 pipe iterations and `8.1320 s` for 500 channel
+  iterations. This is `29.13x` and `139.55x` faster than the original recorded
+  basis. Host load was more variable than during the preceding checkpoint, but
+  all numerical reports remained byte-identical after timing fields were
+  removed;
+- opt-in GAMG cycle profiling now reports hierarchy, residual, transfer,
+  smoothing, scaling, correction, and coarsest-solve time for every level. It
+  identified repeated diagonal lookup in symmetric Gauss-Seidel as the bounded
+  hot path. Reusing the hierarchy's diagonal slots preserves CSR operation
+  order and reduced five-run median solver time from `9.6535 s` to `9.2245 s`
+  for the pipe and from `9.0066 s` to `8.1576 s` for the channel, with identical
+  SIMPLE counts, V-cycle counts, residuals, continuity, and field summaries;
+- pressure solves still dominate both convergence-profile runs: the pipe
+  converges in `15.95 s` at iteration `207`, and the channel in `8.16 s` at
+  iteration `545`. Both preserve the previous iteration counts and final
+  numerical observables exactly.
+
+### Performance Foundation - Scalar CPU
+
+This work starts only after the selected numerical cases are correct enough to
+act as regressions. It changes storage and execution mechanics, not equations,
+boundary conditions, convergence criteria, or case semantics.
+
+Acceptance criteria for every scalar-CPU optimization:
+
+- use the release executable directly; record build time separately;
+- run at least one warmup and five measured runs, reporting the median;
+- preserve convergence state, SIMPLE and linear-iteration observables, final
+  continuity, residuals, and field summaries within stated tolerances on both
+  `laminarPipe` and `planeChannel`;
+- reject pipe-only, channel-only, analytical, or benchmark-specific branches in
+  the generic `incompressibleFluid` solver;
+- change one bounded hot path at a time and retain before/after JSON evidence;
+- accept a performance claim only when it improves both cases or when a
+  documented mesh/solver characteristic explains a neutral result;
+- keep current OpenFOAM 13 comparisons external to Ferrum case semantics and
+  run them with matched hardware, process/thread counts, schemes, stopping
+  criteria, and clearly separated solver/process wall times.
+
+The first optimization sequence is tracked as follows:
+
+1. completed: establish release baselines and phase profiles;
+2. completed: remove redundant diagnostic operator evaluations from the SIMPLE
+   hot path;
+3. completed: precompute and share mesh-dependent momentum CSR sparsity;
+4. completed: cache mesh-dependent scalar-gradient geometry;
+5. completed: reuse pressure CSR topology, matrix values, and right-hand sides;
+6. completed: reuse pressure PCG work vectors and IC(0) symbolic/factor storage;
+7. completed: remove the remaining outer scalar-solve residual/matvec allocations
+   and avoidable full-field clones from the SIMPLE hot path;
+8. completed: validate reusable PCG/IC(0) on medium, fine, and deliberately skewed
+   pressure matrices;
+9. completed: split pressure-kernel time into IC(0) refactorization,
+   matrix-vector, preconditioner-application, and vector-update phases;
+10. completed: flatten repeated IC(0) backward-application dependencies while
+    preserving floating-point operation order;
+11. completed: establish the matrix-level OpenFOAM-compatible GAMG pressure
+    foundation with reusable hierarchy storage, algebraic-pair agglomeration,
+    V-cycles, dictionary-control mapping, and explicit unsupported-control
+    errors while retaining PCG/IC(0) as a selectable solver;
+12. completed: connect GAMG to the symmetric SIMPLE pressure path with
+    mesh-geometric `faceAreaPair`, per-equation runtime controls, reusable
+    pressure hierarchy ownership, explicit momentum rejection, and the
+    two-case numerical/performance gate. Both cases converge, but the first
+    paired release diagnostic is slower than PCG/IC(0), so no GAMG speedup is
+    claimed;
+13. completed: profile GAMG hierarchy refresh and every V-cycle phase, identify
+    smoothing as the dominant phase, and reuse cached diagonal slots in the
+    Gauss-Seidel smoother while preserving floating-point operation order;
+14. validate DILU/ILU for nonsymmetric momentum systems;
+15. add further in-place history, residual, and reporting operations only where
+    measurement shows material cost;
+16. rerun the two-case gate after every step, then proceed to threaded CPU work.
+
+n8n may build, execute, collect artifacts, compare tolerances, and reject a
+regression. It must not combine several numerical or storage optimizations into
+one unattended change. Each optimization remains a bounded reviewed task with
+its own before/after evidence.
 
 Next performance targets:
 
-- profile pressure solve cost and matrix assembly cost separately;
-- validate IC(0) on medium/fine/skewed pressure matrices and add a true
+- retain the completed per-level GAMG profile and cached-diagonal smoother. A
+  further GAMG performance leaf must first isolate the remaining row-kernel
+  cost; it must not tune case tolerances or cycle counts as a shortcut;
+- retain the completed medium/fine/skewed IC(0) gate and add a true
   nonsymmetric ILU/DILU path for momentum/BiCGStab;
 - reduce repeated allocations in SIMPLE history and operator assembly;
 - keep fields, operators, equation assembly, convergence criteria, reports, and
@@ -582,16 +718,16 @@ The authoritative worktree, branch, model, security, persistence, and Draft-PR
 policy lives in the orchestrator repository and is referenced here as external
 dependency `F-AUTO-1`. FerrumCFD requires that accepted workflow to pin a clean
 `ferrumcfd/main` SHA, isolate the implementation worktree, use Codex for the
-bounded implementation, use Claude Fable 5 for independent review, run the
-declared numerical and security gates, publish only a Draft PR, and return
-evidence to chat.
+bounded implementation, run an independent secondary review plus the declared
+numerical and Codex Security gates, publish only a Draft PR, and return evidence
+to chat.
 
 The separate roadmap-coding workflow passed its complete live acceptance on
 July 11, 2026; `F-AUTO-1` is therefore satisfied. Its implementation,
-validation, Fable 5 review, cleanup and explicit Draft-PR publication boundary
-remain separate from the read-only analysis workflow. Any future change to
-that boundary must pass the orchestrator repository's acceptance procedure
-again before FerrumCFD uses it.
+validation, independent review, cleanup and explicit Draft-PR publication
+boundary remain separate from the read-only analysis workflow. Any future
+change to that boundary must pass the orchestrator repository's acceptance
+procedure again before FerrumCFD uses it.
 
 Only leaf tasks may enter that workflow. The immediate-next-step IDs below are
 epics unless explicitly marked as a leaf. They decompose as follows:
@@ -622,6 +758,19 @@ extension points, but this phase must not displace the seven-driver validation
 sequence.
 
 ## Immediate Next Steps
+
+Completed 2026-07-17: **F-PERF-GAMG-SIMPLE-INTEGRATION** connects
+OpenFOAM-compatible `faceAreaPair` and reusable GAMG hierarchy storage to the
+symmetric pressure equation. Pipe and channel reach the same outer iteration
+counts as PCG with all linear solves converged. The paired one-run performance
+gate is slower, so GAMG remains opt-in and no speedup is claimed.
+
+Completed 2026-07-17: **F-PERF-GAMG-CYCLE-PROFILE** adds opt-in aggregate and
+per-level timing without changing case semantics. Smoothing was the dominant
+phase. Reusing the existing unique diagonal-slot layout reduced controlled
+five-run median solver time by `4.44%` for the pipe and `9.43%` for the channel
+with identical numerical observables. PCG/IC(0) remains the default; GAMG
+remains explicitly selectable.
 
 1. **F-D1-CYLINDER-LIMITED-SCHEMES:** Implement and regression-test the two
    finite-volume scheme capabilities required by the selected official

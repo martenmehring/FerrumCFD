@@ -6,6 +6,17 @@ are distinguished explicitly.
 
 ## Unreleased
 
+### Native Rust Residual Plots - 2026-07-18
+
+- Replaced the optional Python/Matplotlib residual-plot subprocess with the
+  existing native Rust SVG renderer.
+- Kept residual CSV output and case-insensitive `.svg` output while returning a
+  clear input error for unsupported image extensions.
+- Added focused regressions for native SVG output, mixed-case extensions, and
+  rejection of non-SVG paths without creating an output file.
+- Removed Python and Matplotlib from the FerrumCFD runtime boundary; neither is
+  a project requirement.
+
 ### Focused Tutorial Scope - 2026-07-13
 
 - Simplified the user-facing tutorial contract to an independently runnable
