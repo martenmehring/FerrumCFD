@@ -718,16 +718,16 @@ The authoritative worktree, branch, model, security, persistence, and Draft-PR
 policy lives in the orchestrator repository and is referenced here as external
 dependency `F-AUTO-1`. FerrumCFD requires that accepted workflow to pin a clean
 `ferrumcfd/main` SHA, isolate the implementation worktree, use Codex for the
-bounded implementation, use Claude Fable 5 for independent review, run the
-declared numerical and security gates, publish only a Draft PR, and return
-evidence to chat.
+bounded implementation, run an independent secondary review plus the declared
+numerical and Codex Security gates, publish only a Draft PR, and return evidence
+to chat.
 
 The separate roadmap-coding workflow passed its complete live acceptance on
 July 11, 2026; `F-AUTO-1` is therefore satisfied. Its implementation,
-validation, Fable 5 review, cleanup and explicit Draft-PR publication boundary
-remain separate from the read-only analysis workflow. Any future change to
-that boundary must pass the orchestrator repository's acceptance procedure
-again before FerrumCFD uses it.
+validation, independent review, cleanup and explicit Draft-PR publication
+boundary remain separate from the read-only analysis workflow. Any future
+change to that boundary must pass the orchestrator repository's acceptance
+procedure again before FerrumCFD uses it.
 
 Only leaf tasks may enter that workflow. The immediate-next-step IDs below are
 epics unless explicitly marked as a leaf. They decompose as follows:
