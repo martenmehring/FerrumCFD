@@ -1,6 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Lines};
+use std::io::Read;
 use std::path::Path;
 
 use crate::{
@@ -8,12 +8,52 @@ use crate::{
 };
 
 pub fn read_msh22_ascii(path: &Path) -> Result<Mesh> {
-    let file = File::open(path)?;
-    let mut reader = LineReader::new(BufReader::new(file).lines());
+    read_msh22_ascii_with_limits(path, GmshReadLimits::default())
+}
+
+/// Resource limits applied while reading an untrusted Gmsh 2.2 ASCII file.
+#[derive(Clone, Copy, Debug)]
+pub struct GmshReadLimits {
+    pub max_input_bytes: u64,
+    pub max_physical_names: usize,
+    pub max_physical_name_bytes: usize,
+    pub max_nodes: usize,
+    /// Limits only the `Point3` vector; the sparse lookup grows fallibly per
+    /// validated record and is population-bounded by `max_nodes` and `max_input_bytes`.
+    pub max_node_point_storage_bytes: usize,
+}
+
+impl Default for GmshReadLimits {
+    fn default() -> Self {
+        Self {
+            max_input_bytes: 1024 * 1024 * 1024,
+            max_physical_names: 1_000_000,
+            max_physical_name_bytes: 64 * 1024 * 1024,
+            max_nodes: 100_000_000,
+            max_node_point_storage_bytes: 1024 * 1024 * 1024,
+        }
+    }
+}
+
+/// Reads a Gmsh 2.2 ASCII file using caller-supplied finite resource limits.
+pub fn read_msh22_ascii_with_limits(path: &Path, limits: GmshReadLimits) -> Result<Mesh> {
+    let mut file = File::open(path)?;
+    let mut input = String::new();
+    (&mut file)
+        .take(limits.max_input_bytes)
+        .read_to_string(&mut input)?;
+    let mut extra = [0u8; 1];
+    if file.read(&mut extra)? != 0 {
+        return Err(MeshError::InvalidInput(format!(
+            "Gmsh input exceeds size limit {}",
+            limits.max_input_bytes
+        )));
+    }
+    let mut reader = LineReader::new(&input);
 
     let mut physical_names = Vec::new();
     let mut points = Vec::new();
-    let mut node_id_to_index: Vec<Option<usize>> = Vec::new();
+    let mut node_id_to_index = HashMap::new();
     let mut cells = Vec::new();
     let mut boundary_faces = Vec::new();
     let mut unsupported = BTreeMap::<i32, usize>::new();
@@ -21,9 +61,9 @@ pub fn read_msh22_ascii(path: &Path) -> Result<Mesh> {
     while let Some(line) = reader.next_optional()? {
         match line.trim() {
             "$MeshFormat" => read_mesh_format(&mut reader)?,
-            "$PhysicalNames" => physical_names = read_physical_names(&mut reader)?,
+            "$PhysicalNames" => physical_names = read_physical_names(&mut reader, limits)?,
             "$Nodes" => {
-                let loaded = read_nodes(&mut reader)?;
+                let loaded = read_nodes(&mut reader, limits)?;
                 node_id_to_index = loaded.node_id_to_index;
                 points = loaded.points;
             }
@@ -52,7 +92,7 @@ pub fn read_msh22_ascii(path: &Path) -> Result<Mesh> {
     })
 }
 
-fn read_mesh_format<R: BufRead>(reader: &mut LineReader<R>) -> Result<()> {
+fn read_mesh_format(reader: &mut LineReader<'_>) -> Result<()> {
     let line = reader.next_required("expected mesh format line")?;
     let parts: Vec<_> = line.split_whitespace().collect();
     if parts.len() < 3 {
@@ -73,20 +113,53 @@ fn read_mesh_format<R: BufRead>(reader: &mut LineReader<R>) -> Result<()> {
     reader.expect_marker("$EndMeshFormat")
 }
 
-fn read_physical_names<R: BufRead>(reader: &mut LineReader<R>) -> Result<Vec<PhysicalName>> {
+fn read_physical_names(
+    reader: &mut LineReader<'_>,
+    limits: GmshReadLimits,
+) -> Result<Vec<PhysicalName>> {
     let count = reader.parse_count("expected physical-name count")?;
-    let mut names = Vec::with_capacity(count);
+    validate_count(reader, count, limits.max_physical_names, "physical-name")?;
+    checked_storage_bytes::<PhysicalName>(reader, count, "physical-name table")?;
+    let mut names = Vec::new();
+    let mut name_bytes = 0usize;
 
     for _ in 0..count {
         let line = reader.next_required("expected physical-name entry")?;
-        names.push(parse_physical_name(&line, reader.line_number())?);
+        let parsed = parse_physical_name(line, reader.line_number())?;
+        name_bytes = name_bytes
+            .checked_add(parsed.name.len())
+            .ok_or_else(|| reader.parse_error("physical-name text byte count overflows"))?;
+        if name_bytes > limits.max_physical_name_bytes {
+            return Err(reader.parse_error(format!(
+                "physical-name text exceeds limit {}",
+                limits.max_physical_name_bytes
+            )));
+        }
+        let mut name = String::new();
+        name.try_reserve_exact(parsed.name.len())
+            .map_err(|_| reader.parse_error("could not reserve physical-name text storage"))?;
+        name.push_str(parsed.name);
+        names
+            .try_reserve(1)
+            .map_err(|_| reader.parse_error("could not grow physical-name table"))?;
+        names.push(PhysicalName {
+            dim: parsed.dim,
+            tag: parsed.tag,
+            name,
+        });
     }
 
     reader.expect_marker("$EndPhysicalNames")?;
     Ok(names)
 }
 
-fn parse_physical_name(line: &str, line_number: usize) -> Result<PhysicalName> {
+struct ParsedPhysicalName<'a> {
+    dim: u8,
+    tag: i32,
+    name: &'a str,
+}
+
+fn parse_physical_name(line: &str, line_number: usize) -> Result<ParsedPhysicalName<'_>> {
     let quote_start = line.find('"').ok_or_else(|| MeshError::Parse {
         line: line_number,
         message: "physical name is missing opening quote".to_string(),
@@ -105,20 +178,28 @@ fn parse_physical_name(line: &str, line_number: usize) -> Result<PhysicalName> {
     let mut fields = line[..quote_start].split_whitespace();
     let dim = parse_u8(fields.next(), line_number, "physical dimension")?;
     let tag = parse_i32(fields.next(), line_number, "physical tag")?;
-    let name = line[quote_start + 1..quote_end].to_string();
+    let name = &line[quote_start + 1..quote_end];
 
-    Ok(PhysicalName { dim, tag, name })
+    Ok(ParsedPhysicalName { dim, tag, name })
 }
 
 struct LoadedNodes {
     points: Vec<Point3>,
-    node_id_to_index: Vec<Option<usize>>,
+    node_id_to_index: HashMap<usize, usize>,
 }
 
-fn read_nodes<R: BufRead>(reader: &mut LineReader<R>) -> Result<LoadedNodes> {
+fn read_nodes(reader: &mut LineReader<'_>, limits: GmshReadLimits) -> Result<LoadedNodes> {
     let count = reader.parse_count("expected node count")?;
-    let mut points = Vec::with_capacity(count);
-    let mut node_id_to_index = vec![None; count + 1];
+    validate_count(reader, count, limits.max_nodes, "node")?;
+    let storage_bytes = checked_node_storage_bytes(reader, count)?;
+    if storage_bytes > limits.max_node_point_storage_bytes {
+        return Err(reader.parse_error(format!(
+            "node point storage {storage_bytes} bytes exceeds limit {}",
+            limits.max_node_point_storage_bytes
+        )));
+    }
+    let mut points = Vec::new();
+    let mut node_id_to_index = HashMap::new();
 
     for _ in 0..count {
         let line = reader.next_required("expected node entry")?;
@@ -129,10 +210,16 @@ fn read_nodes<R: BufRead>(reader: &mut LineReader<R>) -> Result<LoadedNodes> {
         let z = parse_f64(fields.next(), reader.line_number(), "node z")?;
         let index = points.len();
 
-        if node_id >= node_id_to_index.len() {
-            node_id_to_index.resize(node_id + 1, None);
+        if node_id_to_index.contains_key(&node_id) {
+            return Err(reader.parse_error(format!("duplicate node id {node_id}")));
         }
-        node_id_to_index[node_id] = Some(index);
+        points
+            .try_reserve(1)
+            .map_err(|_| reader.parse_error("could not grow node point storage"))?;
+        node_id_to_index
+            .try_reserve(1)
+            .map_err(|_| reader.parse_error("could not grow node lookup storage"))?;
+        node_id_to_index.insert(node_id, index);
         points.push(Point3 { x, y, z });
     }
 
@@ -149,9 +236,9 @@ struct LoadedElements {
     unsupported: BTreeMap<i32, usize>,
 }
 
-fn read_elements<R: BufRead>(
-    reader: &mut LineReader<R>,
-    node_id_to_index: &[Option<usize>],
+fn read_elements(
+    reader: &mut LineReader<'_>,
+    node_id_to_index: &HashMap<usize, usize>,
 ) -> Result<LoadedElements> {
     let count = reader.parse_count("expected element count")?;
     let mut cells = Vec::new();
@@ -244,10 +331,10 @@ fn read_elements<R: BufRead>(
     })
 }
 
-fn read_element_nodes<R: BufRead>(
+fn read_element_nodes(
     node_ids: &[i64],
-    node_id_to_index: &[Option<usize>],
-    reader: &LineReader<R>,
+    node_id_to_index: &HashMap<usize, usize>,
+    reader: &LineReader<'_>,
 ) -> Result<Vec<usize>> {
     node_ids
         .iter()
@@ -255,17 +342,19 @@ fn read_element_nodes<R: BufRead>(
         .collect()
 }
 
-fn node_index(node_id: i64, node_id_to_index: &[Option<usize>], line: usize) -> Result<usize> {
-    if node_id < 0 {
-        return Err(MeshError::Parse {
-            line,
-            message: format!("negative node id {node_id}"),
-        });
-    }
+fn node_index(
+    node_id: i64,
+    node_id_to_index: &HashMap<usize, usize>,
+    line: usize,
+) -> Result<usize> {
+    let node_id = usize::try_from(node_id).map_err(|_| MeshError::Parse {
+        line,
+        message: format!("negative or unrepresentable node id {node_id}"),
+    })?;
 
     node_id_to_index
-        .get(node_id as usize)
-        .and_then(|index| *index)
+        .get(&node_id)
+        .copied()
         .ok_or_else(|| MeshError::Parse {
             line,
             message: format!("unknown node id {node_id}"),
@@ -324,16 +413,20 @@ fn parse_f64(value: Option<&str>, line: usize, label: &str) -> Result<f64> {
         })
 }
 
-struct LineReader<R: BufRead> {
-    lines: Lines<R>,
+struct LineReader<'a> {
+    input: &'a str,
+    offset: usize,
     line_number: usize,
+    remaining_bytes: usize,
 }
 
-impl<R: BufRead> LineReader<R> {
-    fn new(lines: Lines<R>) -> Self {
+impl<'a> LineReader<'a> {
+    fn new(input: &'a str) -> Self {
         Self {
-            lines,
+            input,
+            offset: 0,
             line_number: 0,
+            remaining_bytes: input.len(),
         }
     }
 
@@ -341,17 +434,24 @@ impl<R: BufRead> LineReader<R> {
         self.line_number
     }
 
-    fn next_optional(&mut self) -> Result<Option<String>> {
-        match self.lines.next() {
-            Some(line) => {
-                self.line_number += 1;
-                Ok(Some(line?))
-            }
-            None => Ok(None),
+    fn next_optional(&mut self) -> Result<Option<&'a str>> {
+        if self.offset == self.input.len() {
+            return Ok(None);
         }
+
+        let rest = &self.input[self.offset..];
+        let (line_with_cr, consumed) = match rest.find('\n') {
+            Some(index) => (&rest[..index], index + 1),
+            None => (rest, rest.len()),
+        };
+        let line = line_with_cr.strip_suffix('\r').unwrap_or(line_with_cr);
+        self.offset += consumed;
+        self.remaining_bytes -= consumed;
+        self.line_number += 1;
+        Ok(Some(line))
     }
 
-    fn next_required(&mut self, message: &str) -> Result<String> {
+    fn next_required(&mut self, message: &str) -> Result<&'a str> {
         self.next_optional()?
             .ok_or_else(|| self.parse_error(message.to_string()))
     }
@@ -378,6 +478,29 @@ impl<R: BufRead> LineReader<R> {
             message: message.into(),
         }
     }
+}
+
+fn validate_count(reader: &LineReader<'_>, count: usize, limit: usize, label: &str) -> Result<()> {
+    if count > limit {
+        return Err(reader.parse_error(format!("{label} count {count} exceeds limit {limit}")));
+    }
+    if count > reader.remaining_bytes {
+        return Err(reader.parse_error(format!(
+            "{label} count {count} is implausible for {} remaining input bytes",
+            reader.remaining_bytes
+        )));
+    }
+    Ok(())
+}
+
+fn checked_storage_bytes<T>(reader: &LineReader<'_>, count: usize, label: &str) -> Result<usize> {
+    count
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(|| reader.parse_error(format!("{label} byte size overflows")))
+}
+
+fn checked_node_storage_bytes(reader: &LineReader<'_>, count: usize) -> Result<usize> {
+    checked_storage_bytes::<Point3>(reader, count, "node point storage")
 }
 
 #[cfg(test)]
@@ -461,6 +584,253 @@ $EndElements
 
         assert!(error.to_string().contains("tag count must be non-negative"));
         let _ = fs::remove_file(mesh_path);
+    }
+
+    #[test]
+    fn enforces_physical_name_limits_and_accepts_exact_limit() {
+        let content = "$PhysicalNames\n1\n2 7 \"wall\"\n$EndPhysicalNames\n";
+        let limits = GmshReadLimits {
+            max_input_bytes: 1024,
+            max_physical_names: 1,
+            max_physical_name_bytes: 4,
+            max_nodes: 1,
+            max_node_point_storage_bytes: 1024,
+        };
+        assert_eq!(read_content(content, limits).physical_names.len(), 1);
+
+        let error = read_content_error(
+            content,
+            GmshReadLimits {
+                max_physical_names: 0,
+                ..limits
+            },
+        );
+        assert!(error.contains("physical-name count 1 exceeds limit 0"));
+        let error = read_content_error(
+            content,
+            GmshReadLimits {
+                max_physical_name_bytes: 3,
+                ..limits
+            },
+        );
+        assert!(error.contains("physical-name text exceeds limit 3"));
+    }
+
+    #[test]
+    fn rejects_over_budget_name_before_owned_name_materialization() {
+        let content = "$PhysicalNames\n1\n2 7 \"name-too-long\"\n$EndPhysicalNames\n";
+        let error = read_content_error(
+            content,
+            GmshReadLimits {
+                max_physical_names: 1,
+                max_physical_name_bytes: 4,
+                ..GmshReadLimits::default()
+            },
+        );
+
+        assert!(error.contains("physical-name text exceeds limit 4"));
+    }
+
+    #[test]
+    fn rejects_below_limit_physical_name_eof() {
+        let error = read_content_error(
+            "$PhysicalNames\n2\n",
+            GmshReadLimits {
+                max_physical_names: 2,
+                ..GmshReadLimits::default()
+            },
+        );
+        assert!(error.contains("implausible"));
+    }
+
+    #[test]
+    fn padded_truncated_physical_names_fail_before_any_declared_count_allocation() {
+        let error = read_content_error(
+            "$PhysicalNames\n4\n    ",
+            GmshReadLimits {
+                max_physical_names: 4,
+                ..GmshReadLimits::default()
+            },
+        );
+        assert!(error.contains("physical name is missing opening quote"));
+        assert!(!error.contains("reserve physical-name table"));
+    }
+
+    #[test]
+    fn enforces_node_limits_and_accepts_sparse_labels() {
+        let content = "$Nodes\n1\n999999999 0 0 0\n$EndNodes\n$Elements\n1\n1 2 0 999999999 999999999 999999999\n$EndElements\n";
+        let limits = GmshReadLimits {
+            max_nodes: 1,
+            ..GmshReadLimits::default()
+        };
+        let mesh = read_content(content, limits);
+        assert_eq!(mesh.points.len(), 1);
+        assert_eq!(mesh.boundary_faces[0].nodes, vec![0, 0, 0]);
+
+        let error = read_content_error(
+            content,
+            GmshReadLimits {
+                max_nodes: 0,
+                ..limits
+            },
+        );
+        assert!(error.contains("node count 1 exceeds limit 0"));
+    }
+
+    #[test]
+    fn rejects_duplicate_and_unknown_node_labels() {
+        let duplicate = "$Nodes\n2\n4 0 0 0\n4 1 0 0\n$EndNodes\n";
+        assert!(
+            read_content_error(duplicate, GmshReadLimits::default())
+                .contains("duplicate node id 4")
+        );
+
+        let unknown = "$Nodes\n1\n4 0 0 0\n$EndNodes\n$Elements\n1\n1 2 0 4 4 5\n$EndElements\n";
+        assert!(
+            read_content_error(unknown, GmshReadLimits::default()).contains("unknown node id 5")
+        );
+    }
+
+    #[test]
+    fn node_collections_grow_only_for_parsed_records() {
+        let mut content = String::from("$Nodes\n15\n");
+        for node_id in 1..=15 {
+            content.push_str(&format!("{node_id} 0 0 0\n"));
+        }
+        content.push_str("$EndNodes\n");
+
+        let mut reader = LineReader::new(&content);
+        assert_eq!(reader.next_optional().expect("read marker"), Some("$Nodes"));
+        let loaded = read_nodes(
+            &mut reader,
+            GmshReadLimits {
+                max_nodes: 15,
+                ..GmshReadLimits::default()
+            },
+        )
+        .expect("read nodes across a typical hash-table growth threshold");
+        assert_eq!(loaded.points.len(), 15);
+        assert_eq!(loaded.node_id_to_index.len(), 15);
+    }
+
+    #[test]
+    fn padded_truncated_nodes_fail_before_any_declared_count_allocation() {
+        let error = read_content_error(
+            "$Nodes\n4\n    ",
+            GmshReadLimits {
+                max_nodes: 4,
+                ..GmshReadLimits::default()
+            },
+        );
+        assert!(error.contains("missing node id"));
+        assert!(!error.contains("reserve node"));
+    }
+
+    #[test]
+    fn checked_storage_overflow_is_structured() {
+        let reader = LineReader::new("");
+        let error = checked_storage_bytes::<Point3>(&reader, usize::MAX, "nodes")
+            .expect_err("multiplication must overflow");
+        assert!(error.to_string().contains("nodes byte size overflows"));
+    }
+
+    #[test]
+    fn enforces_node_storage_budget_before_reservation() {
+        let one_node = "$Nodes\n1\n1 0 0 0\n$EndNodes\n";
+        let exact = checked_node_storage_bytes(&LineReader::new(""), 1)
+            .expect("one-node point storage accounting must fit");
+        read_content(
+            one_node,
+            GmshReadLimits {
+                max_nodes: 1,
+                max_node_point_storage_bytes: exact,
+                ..GmshReadLimits::default()
+            },
+        );
+
+        let error = read_content_error(
+            one_node,
+            GmshReadLimits {
+                max_nodes: 1,
+                max_node_point_storage_bytes: exact - 1,
+                ..GmshReadLimits::default()
+            },
+        );
+        assert!(error.contains("node point storage"));
+        assert!(error.contains("exceeds limit"));
+    }
+
+    #[test]
+    fn rejects_large_declared_node_storage_without_records() {
+        let content = format!("$Nodes\n100\n{}", " ".repeat(100));
+        let error = read_content_error(
+            &content,
+            GmshReadLimits {
+                max_nodes: 100,
+                max_node_point_storage_bytes: 1,
+                ..GmshReadLimits::default()
+            },
+        );
+        assert!(error.contains("node point storage"));
+    }
+
+    #[test]
+    fn checked_node_point_storage_overflow_is_structured() {
+        let reader = LineReader::new("");
+        let error = checked_node_storage_bytes(&reader, usize::MAX)
+            .expect_err("node point storage must overflow");
+        assert!(error.to_string().contains("byte size overflows"));
+    }
+
+    #[test]
+    fn enforces_actual_input_byte_limit() {
+        let content = "$Nodes\n0\n$EndNodes\n";
+        let exact_limit = u64::try_from(content.len()).expect("content length fits u64");
+        read_content(
+            content,
+            GmshReadLimits {
+                max_input_bytes: exact_limit,
+                ..GmshReadLimits::default()
+            },
+        );
+
+        let error = read_content_error(
+            content,
+            GmshReadLimits {
+                max_input_bytes: exact_limit - 1,
+                ..GmshReadLimits::default()
+            },
+        );
+        assert!(error.contains("input exceeds size limit"));
+    }
+
+    #[test]
+    fn tracks_line_bytes_for_lf_crlf_and_final_line() {
+        let mut reader = LineReader::new("a\r\nb\nc");
+        assert_eq!(reader.remaining_bytes, 6);
+        assert_eq!(reader.next_optional().expect("read line"), Some("a"));
+        assert_eq!(reader.remaining_bytes, 3);
+        assert_eq!(reader.next_optional().expect("read line"), Some("b"));
+        assert_eq!(reader.remaining_bytes, 1);
+        assert_eq!(reader.next_optional().expect("read line"), Some("c"));
+        assert_eq!(reader.remaining_bytes, 0);
+        assert_eq!(reader.next_optional().expect("read eof"), None);
+    }
+
+    fn read_content(content: &str, limits: GmshReadLimits) -> Mesh {
+        let path = unique_temp_path("bounded", "msh");
+        fs::write(&path, content).expect("write test mesh");
+        let result = read_msh22_ascii_with_limits(&path, limits).expect("read test mesh");
+        let _ = fs::remove_file(path);
+        result
+    }
+
+    fn read_content_error(content: &str, limits: GmshReadLimits) -> String {
+        let path = unique_temp_path("bounded_error", "msh");
+        fs::write(&path, content).expect("write test mesh");
+        let error = read_msh22_ascii_with_limits(&path, limits).expect_err("mesh must fail");
+        let _ = fs::remove_file(path);
+        error.to_string()
     }
 
     fn unique_temp_path(label: &str, extension: &str) -> std::path::PathBuf {
