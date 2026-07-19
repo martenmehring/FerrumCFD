@@ -89,6 +89,14 @@ pub struct IterativeSolveReport {
     pub iterations: usize,
     pub residual_norm: f64,
     pub converged: bool,
+    pub termination: IterativeSolveTermination,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IterativeSolveTermination {
+    Converged,
+    MaxIterations,
+    Breakdown,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -415,6 +423,7 @@ pub fn jacobi_solve(
             iterations: 0,
             residual_norm,
             converged: true,
+            termination: IterativeSolveTermination::Converged,
         });
     }
 
@@ -447,6 +456,7 @@ pub fn jacobi_solve(
                 iterations: iteration,
                 residual_norm,
                 converged: true,
+                termination: IterativeSolveTermination::Converged,
             });
         }
     }
@@ -456,6 +466,7 @@ pub fn jacobi_solve(
         iterations: options.max_iterations,
         residual_norm,
         converged: false,
+        termination: IterativeSolveTermination::MaxIterations,
     })
 }
 
@@ -483,6 +494,7 @@ pub fn gauss_seidel_solve(
             iterations: 0,
             residual_norm,
             converged: true,
+            termination: IterativeSolveTermination::Converged,
         });
     }
 
@@ -496,6 +508,7 @@ pub fn gauss_seidel_solve(
                 iterations: iteration,
                 residual_norm,
                 converged: true,
+                termination: IterativeSolveTermination::Converged,
             });
         }
     }
@@ -505,6 +518,7 @@ pub fn gauss_seidel_solve(
         iterations: options.max_iterations,
         residual_norm,
         converged: false,
+        termination: IterativeSolveTermination::MaxIterations,
     })
 }
 
@@ -532,6 +546,7 @@ pub fn symmetric_gauss_seidel_solve(
             iterations: 0,
             residual_norm,
             converged: true,
+            termination: IterativeSolveTermination::Converged,
         });
     }
 
@@ -546,6 +561,7 @@ pub fn symmetric_gauss_seidel_solve(
                 iterations: iteration,
                 residual_norm,
                 converged: true,
+                termination: IterativeSolveTermination::Converged,
             });
         }
     }
@@ -555,6 +571,7 @@ pub fn symmetric_gauss_seidel_solve(
         iterations: options.max_iterations,
         residual_norm,
         converged: false,
+        termination: IterativeSolveTermination::MaxIterations,
     })
 }
 
@@ -660,6 +677,7 @@ pub fn conjugate_gradient_solve(
             iterations: 0,
             residual_norm,
             converged: true,
+            termination: IterativeSolveTermination::Converged,
         });
     }
 
@@ -676,9 +694,10 @@ pub fn conjugate_gradient_solve(
         if dot_product_is_singular(denominator, &p, &ap) {
             return Ok(IterativeSolveReport {
                 solution: x,
-                iterations: iteration.saturating_sub(1),
+                iterations: iteration,
                 residual_norm,
                 converged: false,
+                termination: IterativeSolveTermination::Breakdown,
             });
         }
 
@@ -696,6 +715,7 @@ pub fn conjugate_gradient_solve(
                 iterations: iteration,
                 residual_norm,
                 converged: true,
+                termination: IterativeSolveTermination::Converged,
             });
         }
 
@@ -711,6 +731,7 @@ pub fn conjugate_gradient_solve(
         iterations: options.max_iterations,
         residual_norm,
         converged: false,
+        termination: IterativeSolveTermination::MaxIterations,
     })
 }
 
@@ -843,6 +864,7 @@ impl PreconditionedConjugateGradientWorkspace {
                 iterations: 0,
                 residual_norm,
                 converged: true,
+                termination: IterativeSolveTermination::Converged,
             });
         }
 
@@ -879,6 +901,7 @@ impl PreconditionedConjugateGradientWorkspace {
                 iterations: 0,
                 residual_norm,
                 converged: false,
+                termination: IterativeSolveTermination::Breakdown,
             });
         }
 
@@ -910,9 +933,10 @@ impl PreconditionedConjugateGradientWorkspace {
             if denominator_is_singular {
                 return Ok(IterativeSolveReport {
                     solution,
-                    iterations: iteration.saturating_sub(1),
+                    iterations: iteration,
                     residual_norm,
                     converged: false,
+                    termination: IterativeSolveTermination::Breakdown,
                 });
             }
 
@@ -933,6 +957,7 @@ impl PreconditionedConjugateGradientWorkspace {
                     iterations: iteration,
                     residual_norm,
                     converged: true,
+                    termination: IterativeSolveTermination::Converged,
                 });
             }
 
@@ -969,6 +994,7 @@ impl PreconditionedConjugateGradientWorkspace {
                     iterations: iteration,
                     residual_norm,
                     converged: false,
+                    termination: IterativeSolveTermination::Breakdown,
                 });
             }
             let beta = next_residual_product / residual_product;
@@ -986,6 +1012,7 @@ impl PreconditionedConjugateGradientWorkspace {
             iterations: options.max_iterations,
             residual_norm,
             converged: false,
+            termination: IterativeSolveTermination::MaxIterations,
         })
     }
 }
@@ -1022,6 +1049,7 @@ pub fn bicgstab_solve(
             iterations: 0,
             residual_norm,
             converged: true,
+            termination: IterativeSolveTermination::Converged,
         });
     }
 
@@ -1041,9 +1069,10 @@ pub fn bicgstab_solve(
         if dot_product_is_singular(rho, &r_hat, &r) {
             return Ok(IterativeSolveReport {
                 solution: x,
-                iterations: iteration.saturating_sub(1),
+                iterations: iteration,
                 residual_norm,
                 converged: false,
+                termination: IterativeSolveTermination::Breakdown,
             });
         }
 
@@ -1063,9 +1092,10 @@ pub fn bicgstab_solve(
         if dot_product_is_singular(alpha_denominator, &r_hat, &v) {
             return Ok(IterativeSolveReport {
                 solution: x,
-                iterations: iteration.saturating_sub(1),
+                iterations: iteration,
                 residual_norm,
                 converged: false,
+                termination: IterativeSolveTermination::Breakdown,
             });
         }
         alpha = rho / alpha_denominator;
@@ -1084,6 +1114,7 @@ pub fn bicgstab_solve(
                 iterations: iteration,
                 residual_norm: s_norm,
                 converged: true,
+                termination: IterativeSolveTermination::Converged,
             });
         }
 
@@ -1098,9 +1129,10 @@ pub fn bicgstab_solve(
         if omega_denominator == 0.0 {
             return Ok(IterativeSolveReport {
                 solution: x,
-                iterations: iteration.saturating_sub(1),
+                iterations: iteration,
                 residual_norm,
                 converged: false,
+                termination: IterativeSolveTermination::Breakdown,
             });
         }
         omega = dot(&t, &s) / omega_denominator;
@@ -1110,9 +1142,10 @@ pub fn bicgstab_solve(
         if omega == 0.0 {
             return Ok(IterativeSolveReport {
                 solution: x,
-                iterations: iteration.saturating_sub(1),
+                iterations: iteration,
                 residual_norm,
                 converged: false,
+                termination: IterativeSolveTermination::Breakdown,
             });
         }
 
@@ -1127,6 +1160,7 @@ pub fn bicgstab_solve(
                 iterations: iteration,
                 residual_norm,
                 converged: true,
+                termination: IterativeSolveTermination::Converged,
             });
         }
         rho_old = rho;
@@ -1137,6 +1171,7 @@ pub fn bicgstab_solve(
         iterations: options.max_iterations,
         residual_norm,
         converged: false,
+        termination: IterativeSolveTermination::MaxIterations,
     })
 }
 
@@ -1652,12 +1687,12 @@ mod tests {
 
     use super::{
         BiCgStabOptions, CgPreconditioner, ConjugateGradientOptions, CsrMatrix, CsrSparsityPattern,
-        GaussSeidelOptions, IncompleteCholeskyPreconditioner, JacobiOptions,
-        PreconditionedConjugateGradientOptions, PreconditionedConjugateGradientWorkspace,
-        ReusablePreconditioner, bicgstab_solve, conjugate_gradient_solve, csr_diagonal_slots,
-        gauss_seidel_solve, gauss_seidel_sweep, gauss_seidel_sweep_with_cached_diagonal,
-        jacobi_solve, preconditioned_conjugate_gradient_solve, residual,
-        symmetric_gauss_seidel_solve,
+        GaussSeidelOptions, IncompleteCholeskyPreconditioner, IterativeSolveTermination,
+        JacobiOptions, PreconditionedConjugateGradientOptions,
+        PreconditionedConjugateGradientWorkspace, ReusablePreconditioner, bicgstab_solve,
+        conjugate_gradient_solve, csr_diagonal_slots, gauss_seidel_solve, gauss_seidel_sweep,
+        gauss_seidel_sweep_with_cached_diagonal, jacobi_solve,
+        preconditioned_conjugate_gradient_solve, residual, symmetric_gauss_seidel_solve,
     };
 
     #[test]
@@ -2190,8 +2225,63 @@ mod tests {
         .expect("breakdown should return a non-converged report");
 
         assert!(!report.converged);
-        assert_eq!(report.iterations, 0);
+        assert_eq!(report.termination, IterativeSolveTermination::Breakdown);
+        assert_eq!(report.iterations, 1);
         assert_close(&report.solution, &[0.0], 1.0e-14);
+        assert_eq!(report.residual_norm, 1.0);
+    }
+
+    #[test]
+    fn conjugate_gradient_reports_iteration_budget_and_convergence() {
+        let matrix = CsrMatrix::from_rows(vec![vec![(0, 2.0)]], 1).expect("matrix");
+        let exhausted = conjugate_gradient_solve(
+            &matrix,
+            &[1.0],
+            None,
+            ConjugateGradientOptions {
+                max_iterations: 0,
+                tolerance: 1.0e-12,
+            },
+        )
+        .expect("zero-budget solve");
+        assert_eq!(
+            exhausted.termination,
+            IterativeSolveTermination::MaxIterations
+        );
+        assert!(!exhausted.converged);
+
+        let converged = conjugate_gradient_solve(
+            &matrix,
+            &[1.0],
+            None,
+            ConjugateGradientOptions {
+                max_iterations: 1,
+                tolerance: 1.0e-12,
+            },
+        )
+        .expect("converged solve");
+        assert_eq!(converged.termination, IterativeSolveTermination::Converged);
+        assert!(converged.converged);
+    }
+
+    #[test]
+    fn unpreconditioned_pcg_reports_zero_matrix_breakdown() {
+        let matrix = CsrMatrix::from_rows(vec![vec![(0, 0.0)]], 1).expect("matrix");
+        let report = preconditioned_conjugate_gradient_solve(
+            &matrix,
+            &[1.0],
+            None,
+            PreconditionedConjugateGradientOptions {
+                max_iterations: 10,
+                tolerance: 1.0e-12,
+                preconditioner: CgPreconditioner::None,
+            },
+        )
+        .expect("breakdown report");
+
+        assert_eq!(report.termination, IterativeSolveTermination::Breakdown);
+        assert!(!report.converged);
+        assert_eq!(report.iterations, 1);
         assert_eq!(report.residual_norm, 1.0);
     }
 
