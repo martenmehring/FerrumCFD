@@ -4653,6 +4653,8 @@ fn limit_scalar_gradient(
         return Ok(gradient);
     }
 
+    let cell_faces = cell_face_adjacency(mesh)?;
+
     let mut minima = values.to_vec();
     let mut maxima = values.to_vec();
     for face_index in 0..mesh.faces {
@@ -4708,10 +4710,7 @@ fn limit_scalar_gradient(
         )?;
         let mut limiter: f64 = 1.0;
 
-        for face_index in 0..mesh.faces {
-            if mesh.owner[face_index] != cell && mesh.neighbour[face_index] != Some(cell) {
-                continue;
-            }
+        for &face_index in &cell_faces[cell] {
             let delta = checked_delta(
                 mesh.face_centres[face_index],
                 mesh.cell_centres[cell],
@@ -4743,6 +4742,45 @@ fn limit_scalar_gradient(
         )?;
     }
     Ok(gradient)
+}
+
+fn cell_face_adjacency(mesh: &SolverRuntimeMeshData) -> Result<Vec<Vec<usize>>> {
+    if mesh.owner.len() != mesh.faces || mesh.neighbour.len() != mesh.faces {
+        return Err(invalid_input(format!(
+            "cell-to-face adjacency requires {} owner and neighbour entries, got {} and {}",
+            mesh.faces,
+            mesh.owner.len(),
+            mesh.neighbour.len()
+        )));
+    }
+
+    let mut adjacency = vec![Vec::new(); mesh.cells];
+    for face_index in 0..mesh.faces {
+        let owner = mesh.owner[face_index];
+        let owner_faces = adjacency.get_mut(owner).ok_or_else(|| {
+            invalid_input(format!(
+                "face {face_index} owner cell {owner} is outside cell range 0..{}",
+                mesh.cells
+            ))
+        })?;
+        owner_faces.push(face_index);
+
+        if let Some(neighbour) = mesh.neighbour[face_index] {
+            if neighbour == owner {
+                return Err(invalid_input(format!(
+                    "face {face_index} has identical owner and neighbour cell {owner}"
+                )));
+            }
+            let neighbour_faces = adjacency.get_mut(neighbour).ok_or_else(|| {
+                invalid_input(format!(
+                    "face {face_index} neighbour cell {neighbour} is outside cell range 0..{}",
+                    mesh.cells
+                ))
+            })?;
+            neighbour_faces.push(face_index);
+        }
+    }
+    Ok(adjacency)
 }
 
 fn require_finite(value: f64, context: String) -> Result<f64> {
@@ -5273,13 +5311,14 @@ mod tests {
         VectorFaceTreatment, adjust_phi_hby_a, apply_pressure_reference,
         assemble_momentum_component_system, assemble_momentum_equation,
         assemble_variable_scalar_component_system, assemble_variable_scalar_component_system_into,
-        compute_face_flux, compute_phi_hby_a, consistent_reciprocal_momentum_diagonal,
-        constrained_pressure_treatments, face_diffusion_coefficient, hby_a_from_predicted_velocity,
-        limit_scalar_gradient, net_cell_flux, non_orthogonal_pressure_flux_correction,
-        normalized_residual_norm, pressure_correction_flux, reciprocal_momentum_diagonal,
-        relax_scalar_component_equation, scalar_component_boundary, scalar_gradient,
-        solve_laminar_simple, split_components, subtract_face_fluxes, upwind_face_vector_value,
-        vector_convection_divergence, vector_face_treatments, velocity_from_hby_a, zero,
+        cell_face_adjacency, compute_face_flux, compute_phi_hby_a,
+        consistent_reciprocal_momentum_diagonal, constrained_pressure_treatments,
+        face_diffusion_coefficient, hby_a_from_predicted_velocity, limit_scalar_gradient,
+        net_cell_flux, non_orthogonal_pressure_flux_correction, normalized_residual_norm,
+        pressure_correction_flux, reciprocal_momentum_diagonal, relax_scalar_component_equation,
+        scalar_component_boundary, scalar_gradient, solve_laminar_simple, split_components,
+        subtract_face_fluxes, upwind_face_vector_value, vector_convection_divergence,
+        vector_face_treatments, velocity_from_hby_a, zero,
     };
     use crate::Point3;
 
@@ -5483,6 +5522,169 @@ mod tests {
                 .iter()
                 .all(|value| value.x == 0.0 && value.y == 0.0 && value.z == 0.0)
         );
+    }
+
+    #[test]
+    fn cell_face_adjacency_preserves_global_order_and_membership() {
+        let adjacency = cell_face_adjacency(&three_cell_line_mesh()).expect("adjacency");
+        assert_eq!(adjacency, vec![vec![0, 2], vec![0, 1], vec![1, 3]]);
+
+        let mut boundary_only = two_cell_runtime().mesh;
+        boundary_only.cells = 1;
+        boundary_only.faces = 3;
+        boundary_only.owner = vec![0, 0, 0];
+        boundary_only.neighbour = vec![None; 3];
+        assert_eq!(
+            cell_face_adjacency(&boundary_only).expect("boundary-only adjacency"),
+            vec![vec![0, 1, 2]]
+        );
+    }
+
+    #[test]
+    fn cell_face_adjacency_rejects_malformed_cell_indices() {
+        let mut invalid_owner = two_cell_runtime().mesh;
+        invalid_owner.owner[2] = invalid_owner.cells;
+        assert!(cell_face_adjacency(&invalid_owner).is_err());
+
+        let mut invalid_neighbour = two_cell_runtime().mesh;
+        invalid_neighbour.neighbour[0] = Some(invalid_neighbour.cells);
+        assert!(cell_face_adjacency(&invalid_neighbour).is_err());
+    }
+
+    #[test]
+    fn adjacency_limits_each_cell_to_its_incident_faces() {
+        let adjacency = cell_face_adjacency(&three_cell_line_mesh()).expect("adjacency");
+        let visits: usize = adjacency.iter().map(Vec::len).sum();
+        assert_eq!(visits, 6);
+        assert!(visits < 3 * 4);
+    }
+
+    #[test]
+    fn optimized_cell_limiter_matches_naive_reference() {
+        let mesh = three_cell_line_mesh();
+        let boundary = vec![ScalarFaceTreatment::ZeroGradient; mesh.faces];
+        let values = [0.0, 1.0, 0.25];
+        let raw = vec![
+            point(2.0, -0.5, 0.25),
+            point(-1.5, 0.75, -0.25),
+            point(1.25, -1.0, 0.5),
+        ];
+
+        for coefficient in [0.0, 1.0, 0.4] {
+            let optimized =
+                limit_scalar_gradient(&mesh, &values, &boundary, raw.clone(), coefficient)
+                    .expect("optimized limiter");
+            let reference =
+                naive_limit_scalar_gradient(&mesh, &values, &boundary, raw.clone(), coefficient)
+                    .expect("naive limiter");
+            for (actual, expected) in optimized.iter().zip(reference) {
+                assert_eq!(actual.x.to_bits(), expected.x.to_bits());
+                assert_eq!(actual.y.to_bits(), expected.y.to_bits());
+                assert_eq!(actual.z.to_bits(), expected.z.to_bits());
+            }
+        }
+    }
+
+    fn naive_limit_scalar_gradient(
+        mesh: &SolverRuntimeMeshData,
+        values: &[f64],
+        boundary: &[ScalarFaceTreatment],
+        mut gradient: Vec<Point3>,
+        coefficient: f64,
+    ) -> crate::Result<Vec<Point3>> {
+        if coefficient == 0.0 {
+            return Ok(gradient);
+        }
+        let mut minima = values.to_vec();
+        let mut maxima = values.to_vec();
+        for face in 0..mesh.faces {
+            let owner = mesh.owner[face];
+            if let Some(neighbour) = mesh.neighbour[face] {
+                minima[owner] = minima[owner].min(values[neighbour]);
+                maxima[owner] = maxima[owner].max(values[neighbour]);
+                minima[neighbour] = minima[neighbour].min(values[owner]);
+                maxima[neighbour] = maxima[neighbour].max(values[owner]);
+            } else {
+                let value = super::face_scalar_value(mesh, values, boundary, face)?;
+                minima[owner] = minima[owner].min(value);
+                maxima[owner] = maxima[owner].max(value);
+            }
+        }
+        for cell in 0..mesh.cells {
+            let maximum_delta = super::checked_subtraction(
+                maxima[cell],
+                values[cell],
+                format!("cellLimited cell {cell} maximum extrema delta"),
+            )?;
+            let minimum_delta = super::checked_subtraction(
+                minima[cell],
+                values[cell],
+                format!("cellLimited cell {cell} minimum extrema delta"),
+            )?;
+            let span = super::checked_subtraction(
+                maxima[cell],
+                minima[cell],
+                format!("cellLimited cell {cell} extrema span"),
+            )?;
+            let widening = if coefficient == 1.0 {
+                0.0
+            } else {
+                let numerator = super::checked_product(
+                    span,
+                    1.0 - coefficient,
+                    format!("cellLimited cell {cell} widening numerator"),
+                )?;
+                super::require_finite(
+                    numerator / coefficient,
+                    format!("cellLimited cell {cell} widening term"),
+                )?
+            };
+            let widened_maximum = super::require_finite(
+                maximum_delta + widening,
+                format!("cellLimited cell {cell} widened maximum delta"),
+            )?;
+            let widened_minimum = super::require_finite(
+                minimum_delta - widening,
+                format!("cellLimited cell {cell} widened minimum delta"),
+            )?;
+            let mut limiter: f64 = 1.0;
+            for face in 0..mesh.faces {
+                if mesh.owner[face] != cell && mesh.neighbour[face] != Some(cell) {
+                    continue;
+                }
+                let delta = super::checked_delta(
+                    mesh.face_centres[face],
+                    mesh.cell_centres[cell],
+                    format!("cellLimited cell {cell} face {face} centre delta"),
+                )?;
+                let extrapolation = super::checked_dot(
+                    gradient[cell],
+                    delta,
+                    format!("cellLimited cell {cell} face {face} extrapolation"),
+                )?;
+                let ratio = if extrapolation > widened_maximum && extrapolation > 0.0 {
+                    widened_maximum / extrapolation
+                } else if extrapolation < widened_minimum && extrapolation < 0.0 {
+                    widened_minimum / extrapolation
+                } else {
+                    1.0
+                };
+                limiter = limiter.min(
+                    super::require_finite(
+                        ratio,
+                        format!("cellLimited cell {cell} face {face} limiter ratio"),
+                    )?
+                    .clamp(0.0, 1.0),
+                );
+                super::require_finite(limiter, format!("cellLimited cell {cell} final limiter"))?;
+            }
+            super::checked_scale(
+                &mut gradient[cell],
+                limiter,
+                format!("cellLimited cell {cell} limited gradient"),
+            )?;
+        }
+        Ok(gradient)
     }
 
     #[test]
