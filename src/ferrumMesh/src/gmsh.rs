@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -21,6 +21,11 @@ pub struct GmshReadLimits {
     /// Limits only the `Point3` vector; the sparse lookup grows fallibly per
     /// validated record and is population-bounded by `max_nodes` and `max_input_bytes`.
     pub max_node_point_storage_bytes: usize,
+    pub max_elements: usize,
+    pub max_element_record_values: usize,
+    /// Logical parsed storage for elements and unsupported summaries, excluding
+    /// process-memory and allocator overhead.
+    pub max_element_storage_bytes: usize,
 }
 
 impl Default for GmshReadLimits {
@@ -31,6 +36,9 @@ impl Default for GmshReadLimits {
             max_physical_name_bytes: 64 * 1024 * 1024,
             max_nodes: 100_000_000,
             max_node_point_storage_bytes: 1024 * 1024 * 1024,
+            max_elements: 100_000_000,
+            max_element_record_values: 4096,
+            max_element_storage_bytes: 1024 * 1024 * 1024,
         }
     }
 }
@@ -56,7 +64,7 @@ pub fn read_msh22_ascii_with_limits(path: &Path, limits: GmshReadLimits) -> Resu
     let mut node_id_to_index = HashMap::new();
     let mut cells = Vec::new();
     let mut boundary_faces = Vec::new();
-    let mut unsupported = BTreeMap::<i32, usize>::new();
+    let mut unsupported = HashMap::<i32, usize>::new();
 
     while let Some(line) = reader.next_optional()? {
         match line.trim() {
@@ -68,7 +76,7 @@ pub fn read_msh22_ascii_with_limits(path: &Path, limits: GmshReadLimits) -> Resu
                 points = loaded.points;
             }
             "$Elements" => {
-                let loaded = read_elements(&mut reader, &node_id_to_index)?;
+                let loaded = read_elements(&mut reader, &node_id_to_index, limits)?;
                 cells = loaded.cells;
                 boundary_faces = loaded.boundary_faces;
                 unsupported = loaded.unsupported;
@@ -82,13 +90,22 @@ pub fn read_msh22_ascii_with_limits(path: &Path, limits: GmshReadLimits) -> Resu
         cells,
         boundary_faces,
         physical_names,
-        unsupported_elements: unsupported
-            .into_iter()
-            .map(|(element_type, count)| UnsupportedElementCount {
-                element_type,
-                count,
-            })
-            .collect(),
+        unsupported_elements: {
+            let mut summaries = Vec::new();
+            summaries
+                .try_reserve_exact(unsupported.len())
+                .map_err(|_| {
+                    reader.parse_error("could not reserve final unsupported-element summaries")
+                })?;
+            summaries.extend(unsupported.into_iter().map(|(element_type, count)| {
+                UnsupportedElementCount {
+                    element_type,
+                    count,
+                }
+            }));
+            summaries.sort_unstable_by_key(|summary| summary.element_type);
+            summaries
+        },
     })
 }
 
@@ -233,92 +250,112 @@ fn read_nodes(reader: &mut LineReader<'_>, limits: GmshReadLimits) -> Result<Loa
 struct LoadedElements {
     cells: Vec<Cell>,
     boundary_faces: Vec<BoundaryFace>,
-    unsupported: BTreeMap<i32, usize>,
+    unsupported: HashMap<i32, usize>,
 }
 
 fn read_elements(
     reader: &mut LineReader<'_>,
     node_id_to_index: &HashMap<usize, usize>,
+    limits: GmshReadLimits,
 ) -> Result<LoadedElements> {
     let count = reader.parse_count("expected element count")?;
+    validate_count(reader, count, limits.max_elements, "element")?;
     let mut cells = Vec::new();
     let mut boundary_faces = Vec::new();
-    let mut unsupported = BTreeMap::<i32, usize>::new();
+    let mut unsupported = HashMap::<i32, usize>::new();
+    let mut logical_storage = 0usize;
 
     for _ in 0..count {
         let line = reader.next_required("expected element entry")?;
-        let fields = line
-            .split_whitespace()
-            .map(str::parse::<i64>)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|_| reader.parse_error("invalid integer in element entry"))?;
-
-        if fields.len() < 3 {
-            return Err(reader.parse_error("element entry is too short"));
-        }
-
-        let source_id = usize::try_from(fields[0])
+        let mut values =
+            ElementValues::new(line, reader.line_number(), limits.max_element_record_values);
+        let source_id = usize::try_from(values.required("element id")?)
             .map_err(|_| reader.parse_error("element id must be non-negative"))?;
-        let element_type = i32::try_from(fields[1])
+        let element_type = i32::try_from(values.required("element type")?)
             .map_err(|_| reader.parse_error("element type is outside the supported i32 range"))?;
-        let tag_count = usize::try_from(fields[2])
+        let tag_count = usize::try_from(values.required("element tag count")?)
             .map_err(|_| reader.parse_error("element tag count must be non-negative"))?;
-        let node_start = 3usize
+        let required_prefix_values = 3usize
             .checked_add(tag_count)
-            .ok_or_else(|| reader.parse_error("element tag count overflows the entry length"))?;
-        if fields.len() < node_start {
-            return Err(reader.parse_error("element entry has fewer tags than declared"));
+            .ok_or_else(|| reader.parse_error("element tag prefix value count overflows"))?;
+        if required_prefix_values > limits.max_element_record_values {
+            return Err(reader.parse_error(format!(
+                "element tag prefix value count {required_prefix_values} exceeds record value limit {}",
+                limits.max_element_record_values
+            )));
         }
-        let physical_tag = if tag_count > 0 {
-            i32::try_from(fields[3])
-                .map_err(|_| reader.parse_error("physical tag is outside the i32 range"))?
-        } else {
-            0
-        };
+        let mut physical_tag = 0;
+        for index in 0..tag_count {
+            let tag = values.required("element tag")?;
+            if index == 0 {
+                physical_tag = i32::try_from(tag)
+                    .map_err(|_| reader.parse_error("physical tag is outside the i32 range"))?;
+            }
+        }
 
         match element_type {
-            2 => {
-                if fields.len() != node_start + 3 {
-                    return Err(reader.parse_error("tri3 element does not have 3 nodes"));
-                }
+            2 | 3 => {
+                let (arity, name) = if element_type == 2 {
+                    (3, "tri3")
+                } else {
+                    (4, "quad4")
+                };
+                charge_element::<BoundaryFace>(
+                    reader,
+                    &mut logical_storage,
+                    arity,
+                    limits.max_element_storage_bytes,
+                )?;
+                let nodes = read_element_nodes(&mut values, arity, node_id_to_index, reader, name)?;
+                boundary_faces
+                    .try_reserve(1)
+                    .map_err(|_| reader.parse_error("could not grow boundary-face storage"))?;
                 boundary_faces.push(BoundaryFace {
                     source_id,
                     physical_tag,
-                    nodes: read_element_nodes(&fields[node_start..], node_id_to_index, reader)?,
+                    nodes,
                 });
             }
-            3 => {
-                if fields.len() != node_start + 4 {
-                    return Err(reader.parse_error("quad4 element does not have 4 nodes"));
-                }
-                boundary_faces.push(BoundaryFace {
-                    source_id,
-                    physical_tag,
-                    nodes: read_element_nodes(&fields[node_start..], node_id_to_index, reader)?,
-                });
-            }
-            5 => {
-                if fields.len() != node_start + 8 {
-                    return Err(reader.parse_error("hex8 element does not have 8 nodes"));
-                }
+            5 | 6 => {
+                let (arity, name) = if element_type == 5 {
+                    (8, "hex8")
+                } else {
+                    (6, "prism6")
+                };
+                charge_element::<Cell>(
+                    reader,
+                    &mut logical_storage,
+                    arity,
+                    limits.max_element_storage_bytes,
+                )?;
+                let nodes = read_element_nodes(&mut values, arity, node_id_to_index, reader, name)?;
+                cells
+                    .try_reserve(1)
+                    .map_err(|_| reader.parse_error("could not grow cell storage"))?;
                 cells.push(Cell {
                     source_id,
                     physical_tag,
-                    nodes: read_element_nodes(&fields[node_start..], node_id_to_index, reader)?,
-                });
-            }
-            6 => {
-                if fields.len() != node_start + 6 {
-                    return Err(reader.parse_error("prism6 element does not have 6 nodes"));
-                }
-                cells.push(Cell {
-                    source_id,
-                    physical_tag,
-                    nodes: read_element_nodes(&fields[node_start..], node_id_to_index, reader)?,
+                    nodes,
                 });
             }
             other => {
-                *unsupported.entry(other).or_default() += 1;
+                values.consume()?;
+                if let Some(value) = unsupported.get_mut(&other) {
+                    *value = value
+                        .checked_add(1)
+                        .ok_or_else(|| reader.parse_error("unsupported-element count overflows"))?;
+                } else {
+                    charge_bytes(
+                        reader,
+                        &mut logical_storage,
+                        std::mem::size_of::<UnsupportedElementCount>(),
+                        limits.max_element_storage_bytes,
+                    )?;
+                    unsupported.try_reserve(1).map_err(|_| {
+                        reader.parse_error("could not grow unsupported-element summaries")
+                    })?;
+                    unsupported.insert(other, 1);
+                }
             }
         }
     }
@@ -332,14 +369,110 @@ fn read_elements(
 }
 
 fn read_element_nodes(
-    node_ids: &[i64],
+    values: &mut ElementValues<'_>,
+    arity: usize,
     node_id_to_index: &HashMap<usize, usize>,
     reader: &LineReader<'_>,
+    name: &str,
 ) -> Result<Vec<usize>> {
-    node_ids
-        .iter()
-        .map(|node_id| node_index(*node_id, node_id_to_index, reader.line_number()))
-        .collect()
+    let mut nodes = Vec::new();
+    nodes
+        .try_reserve_exact(arity)
+        .map_err(|_| reader.parse_error("could not reserve element node-index storage"))?;
+    for _ in 0..arity {
+        let id = values.next().transpose()?.ok_or_else(|| {
+            reader.parse_error(format!("{name} element does not have {arity} nodes"))
+        })?;
+        nodes.push(node_index(id, node_id_to_index, reader.line_number())?);
+    }
+    if values.next().transpose()?.is_some() {
+        return Err(reader.parse_error(format!("{name} element does not have {arity} nodes")));
+    }
+    Ok(nodes)
+}
+
+struct ElementValues<'a> {
+    fields: std::str::SplitWhitespace<'a>,
+    line: usize,
+    seen: usize,
+    limit: usize,
+}
+
+impl<'a> ElementValues<'a> {
+    fn new(line: &'a str, number: usize, limit: usize) -> Self {
+        Self {
+            fields: line.split_whitespace(),
+            line: number,
+            seen: 0,
+            limit,
+        }
+    }
+    fn next(&mut self) -> Option<Result<i64>> {
+        let field = self.fields.next()?;
+        self.seen = match self.seen.checked_add(1) {
+            Some(value) => value,
+            None => return Some(Err(self.error("element record value count overflows"))),
+        };
+        if self.seen > self.limit {
+            return Some(Err(self.error(format!(
+                "element record value count exceeds limit {}",
+                self.limit
+            ))));
+        }
+        Some(
+            field
+                .parse()
+                .map_err(|_| self.error("invalid integer in element entry")),
+        )
+    }
+    fn required(&mut self, label: &str) -> Result<i64> {
+        self.next()
+            .transpose()?
+            .ok_or_else(|| self.error(format!("missing {label}")))
+    }
+    fn consume(&mut self) -> Result<()> {
+        while self.next().transpose()?.is_some() {}
+        Ok(())
+    }
+    fn error(&self, message: impl Into<String>) -> MeshError {
+        MeshError::Parse {
+            line: self.line,
+            message: message.into(),
+        }
+    }
+}
+
+fn charge_element<T>(
+    reader: &LineReader<'_>,
+    used: &mut usize,
+    nodes: usize,
+    limit: usize,
+) -> Result<()> {
+    let node_bytes = nodes
+        .checked_mul(std::mem::size_of::<usize>())
+        .ok_or_else(|| reader.parse_error("element node-index storage byte size overflows"))?;
+    let bytes = std::mem::size_of::<T>()
+        .checked_add(node_bytes)
+        .ok_or_else(|| reader.parse_error("element logical storage byte size overflows"))?;
+    charge_bytes(reader, used, bytes, limit)
+}
+
+fn charge_bytes(
+    reader: &LineReader<'_>,
+    used: &mut usize,
+    bytes: usize,
+    limit: usize,
+) -> Result<()> {
+    let total = used
+        .checked_add(bytes)
+        .ok_or_else(|| reader.parse_error("element logical storage byte size overflows"))?;
+    if total > limit {
+        return Err(reader.parse_error(format!(
+            "element logical storage {total} bytes exceeds limit {limit}"
+        )));
+    }
+    *used = total;
+    Ok(())
 }
 
 fn node_index(
@@ -595,6 +728,9 @@ $EndElements
             max_physical_name_bytes: 4,
             max_nodes: 1,
             max_node_point_storage_bytes: 1024,
+            max_elements: 1,
+            max_element_record_values: 16,
+            max_element_storage_bytes: 1024,
         };
         assert_eq!(read_content(content, limits).physical_names.len(), 1);
 
@@ -815,6 +951,127 @@ $EndElements
         assert_eq!(reader.next_optional().expect("read line"), Some("c"));
         assert_eq!(reader.remaining_bytes, 0);
         assert_eq!(reader.next_optional().expect("read eof"), None);
+    }
+
+    #[test]
+    fn enforces_element_count_and_record_value_limits_at_boundary() {
+        let content = "$Elements\n1\n1 15 0\n$EndElements\n";
+        read_content(
+            content,
+            GmshReadLimits {
+                max_elements: 1,
+                max_element_record_values: 3,
+                ..GmshReadLimits::default()
+            },
+        );
+        assert!(
+            read_content_error(
+                content,
+                GmshReadLimits {
+                    max_elements: 0,
+                    ..GmshReadLimits::default()
+                }
+            )
+            .contains("element count 1 exceeds limit 0")
+        );
+        assert!(
+            read_content_error(
+                content,
+                GmshReadLimits {
+                    max_element_record_values: 2,
+                    ..GmshReadLimits::default()
+                }
+            )
+            .contains("record value count exceeds limit 2")
+        );
+    }
+
+    #[test]
+    fn enforces_logical_element_storage_at_boundary() {
+        let content = "$Nodes\n1\n1 0 0 0\n$EndNodes\n$Elements\n1\n1 2 0 1 1 1\n$EndElements\n";
+        let exact = std::mem::size_of::<BoundaryFace>() + 3 * std::mem::size_of::<usize>();
+        read_content(
+            content,
+            GmshReadLimits {
+                max_element_storage_bytes: exact,
+                ..GmshReadLimits::default()
+            },
+        );
+        assert!(
+            read_content_error(
+                content,
+                GmshReadLimits {
+                    max_element_storage_bytes: exact - 1,
+                    ..GmshReadLimits::default()
+                }
+            )
+            .contains("element logical storage")
+        );
+    }
+
+    #[test]
+    fn reads_quad4_hex8_and_sorts_aggregated_unsupported_types() {
+        let content = "$Nodes\n8\n1 0 0 0\n2 0 0 0\n3 0 0 0\n4 0 0 0\n5 0 0 0\n6 0 0 0\n7 0 0 0\n8 0 0 0\n$EndNodes\n$Elements\n5\n1 99 0\n2 3 0 1 2 3 4\n3 42 0 7\n4 99 0 8\n5 5 0 1 2 3 4 5 6 7 8\n$EndElements\n";
+        let mesh = read_content(content, GmshReadLimits::default());
+        assert_eq!(mesh.boundary_faces[0].nodes.len(), 4);
+        assert_eq!(mesh.cells[0].nodes.len(), 8);
+        assert_eq!(mesh.unsupported_elements.len(), 2);
+        assert_eq!(mesh.unsupported_elements[0].element_type, 42);
+        assert_eq!(mesh.unsupported_elements[0].count, 1);
+        assert_eq!(mesh.unsupported_elements[1].element_type, 99);
+        assert_eq!(mesh.unsupported_elements[1].count, 2);
+    }
+
+    #[test]
+    fn rejects_invalid_and_over_limit_unsupported_record_tails() {
+        let invalid = "$Elements\n1\n1 99 0 invalid\n$EndElements\n";
+        assert!(
+            read_content_error(invalid, GmshReadLimits::default())
+                .contains("invalid integer in element entry")
+        );
+
+        let over_limit = "$Elements\n1\n1 99 0 7\n$EndElements\n";
+        assert!(
+            read_content_error(
+                over_limit,
+                GmshReadLimits {
+                    max_element_record_values: 3,
+                    ..GmshReadLimits::default()
+                }
+            )
+            .contains("record value count exceeds limit 3")
+        );
+    }
+
+    #[test]
+    fn enforces_default_record_value_limit_for_unsupported_tail() {
+        let limit = GmshReadLimits::default().max_element_record_values;
+        let record_at_limit = format!("1 99 0{}", " 7".repeat(limit - 3));
+        let content_at_limit = format!("$Elements\n1\n{record_at_limit}\n$EndElements\n");
+        let mesh = read_content(&content_at_limit, GmshReadLimits::default());
+        assert_eq!(mesh.unsupported_elements[0].element_type, 99);
+        assert_eq!(mesh.unsupported_elements[0].count, 1);
+
+        let record_over_limit = format!("{record_at_limit} 7");
+        let content_over_limit = format!("$Elements\n1\n{record_over_limit}\n$EndElements\n");
+        assert!(
+            read_content_error(&content_over_limit, GmshReadLimits::default())
+                .contains("record value count exceeds limit 4096")
+        );
+    }
+
+    #[test]
+    fn rejects_over_limit_tag_prefix_before_consuming_tags() {
+        let content = "$Elements\n1\n1 99 2\n$EndElements\n";
+        let error = read_content_error(
+            content,
+            GmshReadLimits {
+                max_element_record_values: 4,
+                ..GmshReadLimits::default()
+            },
+        );
+        assert!(error.contains("tag prefix value count 5 exceeds record value limit 4"));
+        assert!(!error.contains("missing element tag"));
     }
 
     fn read_content(content: &str, limits: GmshReadLimits) -> Mesh {
