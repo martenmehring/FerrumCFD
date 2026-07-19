@@ -4,7 +4,7 @@ use crate::fields::{FieldFile, FieldValueSummary, InitialFieldSet};
 use crate::linear::{
     BiCgStabOptions, CgPreconditioner, ConjugateGradientOptions, CsrMatrix, CsrSparsityPattern,
     GamgAgglomerator, GamgFacePairWeight, GamgKernelTiming, GamgOptions, GamgSolveControls,
-    GamgWorkspace, GaussSeidelOptions, JacobiOptions, PcgKernelTiming,
+    GamgWorkspace, GaussSeidelOptions, IterativeSolveTermination, JacobiOptions, PcgKernelTiming,
     PreconditionedConjugateGradientOptions, PreconditionedConjugateGradientWorkspace,
     bicgstab_solve, conjugate_gradient_solve, gauss_seidel_solve, jacobi_solve, l2_norm,
     preconditioned_conjugate_gradient_solve, symmetric_gauss_seidel_solve,
@@ -144,6 +144,8 @@ pub struct LaminarSimpleReport {
     pub fields: LaminarSimpleFieldSummary,
     pub final_velocity: Vec<Point3>,
     pub final_pressure: Vec<f64>,
+    #[cfg(test)]
+    pub final_phi: Vec<f64>,
     pub history: Vec<LaminarSimpleIterationSummary>,
 }
 
@@ -606,7 +608,25 @@ pub fn solve_laminar_simple_with_observer(
     runtime: &SolverRuntimeData,
     fields: &InitialFieldSet,
     options: &LaminarSimpleOptions,
+    on_iteration: Option<&mut dyn FnMut(&LaminarSimpleIterationSummary)>,
+) -> Result<LaminarSimpleReport> {
+    #[cfg(test)]
+    return solve_laminar_simple_driven(runtime, fields, options, on_iteration, None);
+
+    #[cfg(not(test))]
+    solve_laminar_simple_driven(runtime, fields, options, on_iteration)
+}
+
+#[cfg(test)]
+type PressureReportDriver<'a> =
+    &'a mut dyn FnMut(usize, &mut ScalarSolveReport, &[Point3], &[f64], ContinuitySummary);
+
+fn solve_laminar_simple_driven(
+    runtime: &SolverRuntimeData,
+    fields: &InitialFieldSet,
+    options: &LaminarSimpleOptions,
     mut on_iteration: Option<&mut dyn FnMut(&LaminarSimpleIterationSummary)>,
+    #[cfg(test)] mut drive_pressure_report: Option<PressureReportDriver<'_>>,
 ) -> Result<LaminarSimpleReport> {
     let solver_started = Instant::now();
     let setup_started = Instant::now();
@@ -967,7 +987,6 @@ pub fn solve_laminar_simple_with_observer(
                 options,
             )?;
             pressure_matrix_summary = summarize_csr_matrix(&pressure_system.matrix)?;
-            let pressure_system_rhs_norm = l2_norm(&pressure_system.rhs);
             pressure_linear_solves_this_simple += 1;
             timing.pressure_assembly_seconds += pressure_assembly_started.elapsed().as_secs_f64();
             let pressure_solve_started = Instant::now();
@@ -1013,85 +1032,98 @@ pub fn solve_laminar_simple_with_observer(
             timing.pressure_linear_solve_seconds += pressure_solve_started.elapsed().as_secs_f64();
             let mut report = match pressure_solve_result {
                 Ok(report) => report,
-                Err(error) if is_pressure_correction_breakdown(&error) => {
-                    pressure_linear_converged_this_simple = false;
-                    pressure_linear_non_converged_solves_this_simple += 1;
-                    velocity = predicted_velocity.clone();
-                    final_pressure_correction_residual_norm = pressure_system_rhs_norm;
-                    final_pressure_correction_normalized_residual_norm = normalized_residual_norm(
-                        pressure_system_rhs_norm,
-                        pressure_system_rhs_norm,
-                    );
-                    final_phi = phi_hby_a.clone();
-                    final_continuity = continuity_star;
-                    final_hby_a = hby_a.clone();
-                    final_grad_p = scalar_gradient_with_geometry(
-                        &runtime.mesh,
-                        &mesh_cache.scalar_gradient,
-                        &pressure,
-                        &constrained_pressure_boundary,
-                        options.schemes.grad_p,
-                    )?;
-                    emit_iteration(LaminarSimpleIterationSummary {
-                        iteration,
-                        continuity_before,
-                        continuity_after: final_continuity,
-                        pressure_correction_accepted: false,
-                        momentum_linear_iterations: momentum.iterations,
-                        momentum_linear_converged: momentum.converged,
-                        momentum_component_linear_converged: momentum.component_converged,
-                        pressure_linear_iterations: 0,
-                        pressure_linear_converged: false,
-                        pressure_linear_solves: pressure_linear_solves_this_simple,
-                        pressure_linear_non_converged_solves:
-                            pressure_linear_non_converged_solves_this_simple,
-                        momentum_initial_normalized_residual_norm: momentum
-                            .initial_normalized_residual_norm,
-                        momentum_residual_norm: momentum.residual_norm,
-                        momentum_normalized_residual_norm: momentum.normalized_residual_norm,
-                        momentum_component_initial_normalized_residual_norms: momentum
-                            .component_initial_normalized_residual_norms,
-                        momentum_component_residual_norms: momentum.component_residual_norms,
-                        momentum_component_normalized_residual_norms: momentum
-                            .component_normalized_residual_norms,
-                        momentum_diagonal_min: momentum.diagonal_min,
-                        momentum_diagonal_max: momentum.diagonal_max,
-                        momentum_h1_min: momentum.h1_min,
-                        momentum_h1_max: momentum.h1_max,
-                        pressure_correction_initial_normalized_residual_norm: f64::NAN,
-                        pressure_correction_residual_norm: final_pressure_correction_residual_norm,
-                        pressure_correction_normalized_residual_norm:
-                            final_pressure_correction_normalized_residual_norm,
-                        residual_control: evaluate_laminar_simple_residual_control(
-                            Some(momentum.initial_normalized_residual_norm),
-                            None,
-                            options,
-                        ),
-                        relative_velocity_change_l2: relative_vector_field_change_l2(
-                            &previous_velocity,
-                            &velocity,
-                        ),
-                        relative_pressure_change_l2: 0.0,
-                        momentum_update_scale,
-                        pressure_correction_update_scale: 0.0,
-                        adjust_phi_global_flux_before: adjust_phi_summary.global_flux_before,
-                        adjust_phi_global_flux_after: adjust_phi_summary.global_flux_after,
-                        adjust_phi_adjusted_faces: adjust_phi_summary.adjusted_faces,
-                    });
-                    stop_reason = Some(LaminarSimpleStopReason::PressureSolverInvalidState);
-                    break;
-                }
                 Err(error) => {
                     return Err(invalid_input(format!(
                         "laminar SIMPLE pressure correction solve failed: {error}"
                     )));
                 }
             };
+            #[cfg(test)]
+            if let Some(driver) = drive_pressure_report.as_deref_mut() {
+                driver(
+                    pressure_linear_solves_this_simple,
+                    &mut report,
+                    &predicted_velocity,
+                    &phi_hby_a,
+                    continuity_star,
+                );
+            }
             if let Some(pcg_timing) = report.pcg_timing {
                 timing.add_pressure_pcg_timing(pcg_timing);
             }
             if let Some(gamg_timing) = report.gamg_timing.take() {
                 timing.add_pressure_gamg_timing(gamg_timing)?;
+            }
+            if let Some(pressure_stop_reason) = pressure_solver_stop_reason(report.termination) {
+                pressure_linear_converged_this_simple = false;
+                pressure_linear_non_converged_solves_this_simple += 1;
+                total_pressure_linear_iterations += report.iterations;
+                pressure_linear_iterations_this_simple += report.iterations;
+                velocity = predicted_velocity.clone();
+                final_pressure_correction_initial_normalized_residual_norm =
+                    report.initial_normalized_residual_norm;
+                final_pressure_correction_residual_norm = report.residual_norm;
+                final_pressure_correction_normalized_residual_norm =
+                    report.normalized_residual_norm;
+                final_phi = phi_hby_a.clone();
+                final_continuity = continuity_star;
+                final_hby_a = hby_a.clone();
+                final_grad_p = scalar_gradient_with_geometry(
+                    &runtime.mesh,
+                    &mesh_cache.scalar_gradient,
+                    &pressure,
+                    &constrained_pressure_boundary,
+                    options.schemes.grad_p,
+                )?;
+                emit_iteration(LaminarSimpleIterationSummary {
+                    iteration,
+                    continuity_before,
+                    continuity_after: final_continuity,
+                    pressure_correction_accepted: false,
+                    momentum_linear_iterations: momentum.iterations,
+                    momentum_linear_converged: momentum.converged,
+                    momentum_component_linear_converged: momentum.component_converged,
+                    pressure_linear_iterations: pressure_linear_iterations_this_simple,
+                    pressure_linear_converged: false,
+                    pressure_linear_solves: pressure_linear_solves_this_simple,
+                    pressure_linear_non_converged_solves:
+                        pressure_linear_non_converged_solves_this_simple,
+                    momentum_initial_normalized_residual_norm: momentum
+                        .initial_normalized_residual_norm,
+                    momentum_residual_norm: momentum.residual_norm,
+                    momentum_normalized_residual_norm: momentum.normalized_residual_norm,
+                    momentum_component_initial_normalized_residual_norms: momentum
+                        .component_initial_normalized_residual_norms,
+                    momentum_component_residual_norms: momentum.component_residual_norms,
+                    momentum_component_normalized_residual_norms: momentum
+                        .component_normalized_residual_norms,
+                    momentum_diagonal_min: momentum.diagonal_min,
+                    momentum_diagonal_max: momentum.diagonal_max,
+                    momentum_h1_min: momentum.h1_min,
+                    momentum_h1_max: momentum.h1_max,
+                    pressure_correction_initial_normalized_residual_norm: report
+                        .initial_normalized_residual_norm,
+                    pressure_correction_residual_norm: report.residual_norm,
+                    pressure_correction_normalized_residual_norm: report.normalized_residual_norm,
+                    residual_control: evaluate_laminar_simple_residual_control(
+                        Some(momentum.initial_normalized_residual_norm),
+                        Some(report.initial_normalized_residual_norm),
+                        options,
+                    ),
+                    relative_velocity_change_l2: relative_vector_field_change_l2(
+                        &previous_velocity,
+                        &velocity,
+                    ),
+                    relative_pressure_change_l2: 0.0,
+                    momentum_update_scale,
+                    pressure_correction_update_scale: 0.0,
+                    adjust_phi_global_flux_before: adjust_phi_summary.global_flux_before,
+                    adjust_phi_global_flux_after: adjust_phi_summary.global_flux_after,
+                    adjust_phi_adjusted_faces: adjust_phi_summary.adjusted_faces,
+                });
+                stop_reason = Some(pressure_stop_reason);
+                pressure_report = None;
+                break;
             }
             if !report.converged {
                 pressure_linear_converged_this_simple = false;
@@ -1348,8 +1380,17 @@ pub fn solve_laminar_simple_with_observer(
         fields,
         final_velocity: velocity,
         final_pressure: pressure,
+        #[cfg(test)]
+        final_phi,
         history,
     })
+}
+
+fn pressure_solver_stop_reason(
+    termination: IterativeSolveTermination,
+) -> Option<LaminarSimpleStopReason> {
+    matches!(termination, IterativeSolveTermination::Breakdown)
+        .then_some(LaminarSimpleStopReason::PressureSolverInvalidState)
 }
 
 struct MomentumPredictorReport {
@@ -1386,6 +1427,7 @@ struct ScalarSolveReport {
     solution: Vec<f64>,
     iterations: usize,
     converged: bool,
+    termination: IterativeSolveTermination,
     initial_normalized_residual_norm: f64,
     residual_norm: f64,
     normalized_residual_norm: f64,
@@ -1921,6 +1963,7 @@ fn solve_scalar_system_with_workspaces(
             solution: initial_values.to_vec(),
             iterations: 0,
             converged: true,
+            termination: IterativeSolveTermination::Converged,
             initial_normalized_residual_norm,
             residual_norm: initial_residual_norm,
             normalized_residual_norm: initial_normalized_residual_norm,
@@ -2071,10 +2114,18 @@ fn solve_scalar_system_with_workspaces(
         || (relative_tolerance > 0.0
             && final_normalized_residual_norm
                 < relative_tolerance * initial_normalized_residual_norm);
+    let termination = if converged {
+        IterativeSolveTermination::Converged
+    } else if report.termination == IterativeSolveTermination::Breakdown {
+        IterativeSolveTermination::Breakdown
+    } else {
+        IterativeSolveTermination::MaxIterations
+    };
     Ok(ScalarSolveReport {
         solution: report.solution,
         iterations: report.iterations,
         converged,
+        termination,
         initial_normalized_residual_norm,
         residual_norm: report.residual_norm,
         normalized_residual_norm: final_normalized_residual_norm,
@@ -2140,6 +2191,7 @@ fn l1_norm(values: &[f64]) -> f64 {
     values.iter().map(|value| value.abs()).sum()
 }
 
+#[cfg(test)]
 fn normalized_residual_norm(residual_norm: f64, reference_norm: f64) -> f64 {
     if reference_norm.is_finite() && reference_norm > f64::EPSILON {
         residual_norm / reference_norm
@@ -2243,14 +2295,6 @@ fn map_cg_preconditioner(preconditioner: LaminarSimplePreconditioner) -> CgPreco
         LaminarSimplePreconditioner::Diagonal => CgPreconditioner::Diagonal,
         LaminarSimplePreconditioner::IncompleteCholesky => CgPreconditioner::IncompleteCholesky,
     }
-}
-
-fn is_pressure_correction_breakdown(error: &MeshError) -> bool {
-    matches!(
-        error,
-        MeshError::InvalidInput(message)
-            if message.contains("conjugate-gradient denominator is zero")
-    )
 }
 
 fn is_finite_continuity(summary: ContinuitySummary) -> bool {
@@ -5297,7 +5341,8 @@ mod tests {
     use crate::fields::{FieldBoundaryPatch, FieldFile, FieldValueSummary, InitialFieldSet};
     use crate::linear::{
         CgPreconditioner, CsrMatrix, GamgAgglomerator, GamgOptions, GamgWorkspace,
-        PreconditionedConjugateGradientOptions, PreconditionedConjugateGradientWorkspace,
+        IterativeSolveTermination, PreconditionedConjugateGradientOptions,
+        PreconditionedConjugateGradientWorkspace,
     };
     use crate::runtime::{
         SolverRuntimeData, SolverRuntimeFieldBuffer, SolverRuntimeMeshData, SolverRuntimePatchRange,
@@ -5307,8 +5352,8 @@ mod tests {
     use super::{
         LaminarSimpleConvectionScheme, LaminarSimpleGradientScheme, LaminarSimpleLinearSolver,
         LaminarSimpleMeshCache, LaminarSimpleOptions, LaminarSimplePreconditioner,
-        LaminarSimpleSchemes, MomentumCsrPattern, ScalarFaceTreatment, ScalarGradientGeometry,
-        VectorFaceTreatment, adjust_phi_hby_a, apply_pressure_reference,
+        LaminarSimpleSchemes, LaminarSimpleStopReason, MomentumCsrPattern, ScalarFaceTreatment,
+        ScalarGradientGeometry, VectorFaceTreatment, adjust_phi_hby_a, apply_pressure_reference,
         assemble_momentum_component_system, assemble_momentum_equation,
         assemble_variable_scalar_component_system, assemble_variable_scalar_component_system_into,
         cell_face_adjacency, compute_face_flux, compute_phi_hby_a,
@@ -7060,6 +7105,178 @@ mod tests {
         assert_eq!(workspace.zero_initial.as_ptr(), zero_initial_ptr);
         assert_eq!(workspace.matrix_product.as_ptr(), matrix_product_ptr);
         assert_eq!(workspace.residual.as_ptr(), residual_ptr);
+    }
+
+    #[test]
+    fn scalar_solve_preserves_breakdown_and_max_iterations_termination() {
+        let controls = |max_iterations| super::ScalarSolveControls {
+            solver: LaminarSimpleLinearSolver::Cg,
+            preconditioner: LaminarSimplePreconditioner::None,
+            tolerance: 1.0e-12,
+            max_iterations,
+            gamg_options: None,
+            profile_gamg: false,
+        };
+
+        let zero_matrix = CsrMatrix::from_rows(vec![Vec::new()], 1).expect("zero matrix");
+        let mut workspace = super::ScalarSolveWorkspace::new(1);
+        let breakdown = super::solve_scalar_system_with_workspaces(
+            &zero_matrix,
+            &[1.0],
+            None,
+            controls(1),
+            &mut workspace,
+            None,
+            None,
+        )
+        .expect("finite singular solve report");
+        assert_eq!(breakdown.termination, IterativeSolveTermination::Breakdown);
+        assert!(!breakdown.converged);
+
+        let identity = CsrMatrix::from_rows(vec![vec![(0, 1.0)]], 1).expect("identity matrix");
+        let exhausted = super::solve_scalar_system_with_workspaces(
+            &identity,
+            &[1.0],
+            None,
+            controls(0),
+            &mut workspace,
+            None,
+            None,
+        )
+        .expect("budget-exhausted solve report");
+        assert_eq!(
+            exhausted.termination,
+            IterativeSolveTermination::MaxIterations
+        );
+        assert!(!exhausted.converged);
+    }
+
+    #[test]
+    fn pressure_path_rejects_breakdown_but_not_iteration_exhaustion() {
+        let runtime = two_cell_runtime();
+        let fields = two_cell_fields();
+        let mut options = minimal_laminar_options();
+        options.pressure_linear_solver = LaminarSimpleLinearSolver::Pcg;
+        options.non_orthogonal_correctors = 1;
+
+        let mut attempted_pressure_solves = 0;
+        let mut expected_velocity = None;
+        let mut expected_phi = None;
+        let mut expected_continuity = None;
+        let breakdown = {
+            let mut drive_later_breakdown =
+                |solve: usize,
+                 report: &mut super::ScalarSolveReport,
+                 predicted_velocity: &[Point3],
+                 phi_hby_a: &[f64],
+                 continuity_star: super::ContinuitySummary| {
+                    attempted_pressure_solves += 1;
+                    if solve == 2 {
+                        expected_velocity = Some(predicted_velocity.to_vec());
+                        expected_phi = Some(phi_hby_a.to_vec());
+                        expected_continuity = Some(continuity_star);
+                        report.converged = false;
+                        report.termination = IterativeSolveTermination::Breakdown;
+                    }
+                };
+            super::solve_laminar_simple_driven(
+                &runtime,
+                &fields,
+                &options,
+                None,
+                Some(&mut drive_later_breakdown),
+            )
+            .expect("driven pressure-breakdown report")
+        };
+
+        assert_eq!(attempted_pressure_solves, 2);
+        assert_eq!(
+            breakdown.stop_reason,
+            LaminarSimpleStopReason::PressureSolverInvalidState
+        );
+        assert_eq!(breakdown.simple_iterations, 1);
+        assert_eq!(breakdown.final_pressure, runtime.fields[1].values);
+        let expected_velocity = expected_velocity.unwrap();
+        assert_eq!(breakdown.final_velocity.len(), expected_velocity.len());
+        for (actual, expected) in breakdown.final_velocity.iter().zip(&expected_velocity) {
+            assert_eq!(
+                (actual.x, actual.y, actual.z),
+                (expected.x, expected.y, expected.z)
+            );
+        }
+        assert_eq!(breakdown.final_phi, expected_phi.unwrap());
+        let expected_continuity = expected_continuity.unwrap();
+        assert_eq!(
+            breakdown.final_continuity.l2_norm,
+            expected_continuity.l2_norm
+        );
+        assert_eq!(
+            breakdown.final_continuity.max_abs,
+            expected_continuity.max_abs
+        );
+        assert_eq!(
+            breakdown.final_continuity.sum_abs,
+            expected_continuity.sum_abs
+        );
+        assert_eq!(
+            breakdown.final_continuity.global_sum,
+            expected_continuity.global_sum
+        );
+        let rejected = breakdown
+            .history
+            .last()
+            .expect("rejected iteration summary");
+        assert!(!rejected.pressure_correction_accepted);
+        assert_eq!(rejected.pressure_linear_solves, 2);
+        assert_eq!(rejected.pressure_linear_non_converged_solves, 1);
+        assert!(rejected.pressure_linear_iterations > 0);
+        assert!(
+            rejected
+                .pressure_correction_initial_normalized_residual_norm
+                .is_finite()
+        );
+        assert!(rejected.pressure_correction_residual_norm.is_finite());
+        assert!(
+            rejected
+                .pressure_correction_normalized_residual_norm
+                .is_finite()
+        );
+        assert_eq!(
+            rejected.continuity_after.l2_norm,
+            expected_continuity.l2_norm
+        );
+        assert!(breakdown.timing.pressure_matrix_vector_products > 0);
+
+        let mut drive_exhaustion =
+            |solve: usize,
+             report: &mut super::ScalarSolveReport,
+             _predicted_velocity: &[Point3],
+             _phi_hby_a: &[f64],
+             _continuity_star: super::ContinuitySummary| {
+                if solve == 2 {
+                    report.converged = false;
+                    report.termination = IterativeSolveTermination::MaxIterations;
+                }
+            };
+        let exhausted = super::solve_laminar_simple_driven(
+            &runtime,
+            &fields,
+            &options,
+            None,
+            Some(&mut drive_exhaustion),
+        )
+        .expect("driven iteration-budget-exhausted SIMPLE report");
+        assert_ne!(
+            exhausted.stop_reason,
+            LaminarSimpleStopReason::PressureSolverInvalidState
+        );
+        assert_eq!(exhausted.simple_iterations, options.max_simple_iterations);
+        assert!(
+            exhausted
+                .linear_solve_summary
+                .pressure_correction_non_converged_solves
+                > 0
+        );
     }
 
     #[test]
