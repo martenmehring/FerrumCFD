@@ -13,6 +13,9 @@ use crate::Result;
 const MAX_LEVELS: usize = 50;
 const COARSEST_MAX_ITERATIONS: usize = 1_000;
 const SCALE_STABILISER: f64 = 1.0e-300;
+/// Caps dense coarsest storage at 512 KiB and its cubic factorisation at
+/// roughly 17 million elimination steps, keeping both costs predictable.
+const MAX_DENSE_COARSEST_CELLS: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GamgAgglomerator {
@@ -1480,7 +1483,14 @@ fn dense_lu_solve(matrix: &CsrMatrix, rhs: &[f64], solution: &mut [f64]) -> Resu
             solution.len()
         )));
     }
-    let mut dense = vec![0.0; n * n];
+    let dense_len = checked_dense_storage_len(n)?;
+    let mut dense = Vec::new();
+    dense.try_reserve_exact(dense_len).map_err(|_| {
+        invalid_input(format!(
+            "GAMG direct coarsest solve could not allocate dense storage for {n} rows"
+        ))
+    })?;
+    dense.resize(dense_len, 0.0);
     for row in 0..n {
         for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
             dense[row * n + matrix.col_indices()[entry]] += matrix.values()[entry];
@@ -1535,11 +1545,26 @@ fn dense_lu_solve(matrix: &CsrMatrix, rhs: &[f64], solution: &mut [f64]) -> Resu
     Ok(())
 }
 
+fn checked_dense_storage_len(n: usize) -> Result<usize> {
+    let dense_len = n.checked_mul(n).ok_or_else(|| {
+        invalid_input(format!(
+            "GAMG direct coarsest dense storage size overflow for {n} rows"
+        ))
+    })?;
+    if n > MAX_DENSE_COARSEST_CELLS {
+        return Err(invalid_input(format!(
+            "GAMG direct coarsest solve supports at most {MAX_DENSE_COARSEST_CELLS} actual coarsest cells, got {n}"
+        )));
+    }
+    Ok(dense_len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        GamgAgglomerator, GamgFacePairWeight, GamgOptions, GamgSmoother, GamgWorkspace, PairEdge,
-        algebraic_pair_map, gamg_solve, pair_map_from_edges,
+        GamgAgglomerator, GamgFacePairWeight, GamgOptions, GamgSmoother, GamgWorkspace,
+        MAX_DENSE_COARSEST_CELLS, PairEdge, algebraic_pair_map, checked_dense_storage_len,
+        dense_lu_solve, gamg_solve, pair_map_from_edges,
     };
     use crate::linear::{
         CgPreconditioner, CsrMatrix, PreconditionedConjugateGradientOptions,
@@ -1679,6 +1704,61 @@ mod tests {
 
         assert!(report.converged, "GAMG residual={}", report.residual_norm);
         assert_close(&report.solution, &expected, 1.0e-8);
+    }
+
+    #[test]
+    fn legitimate_dense_coarsest_solve_preserves_the_expected_solution() {
+        let matrix =
+            CsrMatrix::from_rows(vec![vec![(0, 4.0), (1, 1.0)], vec![(0, 2.0), (1, 3.0)]], 2)
+                .expect("small direct matrix");
+        let mut solution = vec![0.0; 2];
+
+        dense_lu_solve(&matrix, &[6.0, 8.0], &mut solution).expect("bounded dense solve");
+
+        assert_close(&solution, &[1.0, 2.0], 1.0e-12);
+    }
+
+    #[test]
+    fn dense_coarsest_rejects_actual_sparse_matrix_above_the_limit() {
+        let n = MAX_DENSE_COARSEST_CELLS + 1;
+        let matrix = diagonal_matrix(n);
+        let mut solution = vec![0.0; n];
+
+        let error = dense_lu_solve(&matrix, &vec![1.0; n], &mut solution)
+            .expect_err("oversized actual coarsest matrix must fail")
+            .to_string();
+
+        assert!(error.contains("actual coarsest cells"));
+    }
+
+    #[test]
+    fn dense_storage_size_overflow_is_reported_without_allocation() {
+        let error = checked_dense_storage_len(usize::MAX)
+            .expect_err("overflow-sized dense matrix must fail")
+            .to_string();
+
+        assert!(error.contains("overflow"));
+    }
+
+    #[test]
+    fn configured_threshold_cannot_bypass_actual_coarsest_limit() {
+        let threshold = MAX_DENSE_COARSEST_CELLS + 1;
+        let matrix = tridiagonal_matrix(4 * threshold);
+        let options = GamgOptions {
+            n_cells_in_coarsest_level: threshold,
+            direct_solve_coarsest: true,
+            ..GamgOptions::default()
+        };
+        let mut workspace = GamgWorkspace::new(&matrix, options).expect("bounded hierarchy");
+        let rhs = vec![1.0; matrix.rows()];
+
+        let error = workspace
+            .solve(&matrix, &rhs, None)
+            .expect_err("actual direct coarsest matrix must be bounded")
+            .to_string();
+
+        assert!(error.contains("actual coarsest cells"));
+        assert_eq!(workspace.level_sizes().last(), Some(&threshold));
     }
 
     #[test]
@@ -1893,6 +1973,28 @@ mod tests {
             }
         }
         CsrMatrix::from_rows(rows, nx * ny).expect("Poisson grid")
+    }
+
+    fn diagonal_matrix(n: usize) -> CsrMatrix {
+        CsrMatrix::from_rows((0..n).map(|row| vec![(row, 1.0)]).collect(), n)
+            .expect("diagonal matrix")
+    }
+
+    fn tridiagonal_matrix(n: usize) -> CsrMatrix {
+        let rows = (0..n)
+            .map(|row| {
+                let mut entries = Vec::with_capacity(3);
+                if row > 0 {
+                    entries.push((row - 1, -1.0));
+                }
+                entries.push((row, 3.0));
+                if row + 1 < n {
+                    entries.push((row + 1, -1.0));
+                }
+                entries
+            })
+            .collect();
+        CsrMatrix::from_rows(rows, n).expect("tridiagonal matrix")
     }
 
     fn grid_face_weights(nx: usize, ny: usize) -> Vec<GamgFacePairWeight> {
