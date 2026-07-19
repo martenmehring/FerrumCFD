@@ -4,9 +4,9 @@ use std::time::Instant;
 
 use super::{
     CgPreconditioner, CsrMatrix, CsrSparsityPattern, IterativeSolveReport,
-    PreconditionedConjugateGradientOptions, PreconditionedConjugateGradientWorkspace, dot,
-    gauss_seidel_sweep_with_cached_diagonal, invalid_input, l2_norm,
-    validate_iterative_solve_input,
+    IterativeSolveTermination, PreconditionedConjugateGradientOptions,
+    PreconditionedConjugateGradientWorkspace, dot, gauss_seidel_sweep_with_cached_diagonal,
+    invalid_input, l2_norm, validate_iterative_solve_input,
 };
 use crate::Result;
 
@@ -665,6 +665,7 @@ impl GamgWorkspace {
                 iterations: 0,
                 residual_norm,
                 converged: true,
+                termination: IterativeSolveTermination::Converged,
             });
         }
 
@@ -692,6 +693,7 @@ impl GamgWorkspace {
                     iterations: iteration,
                     residual_norm,
                     converged: true,
+                    termination: IterativeSolveTermination::Converged,
                 });
             }
         }
@@ -702,6 +704,7 @@ impl GamgWorkspace {
             iterations: iteration_limit,
             residual_norm,
             converged: false,
+            termination: IterativeSolveTermination::MaxIterations,
         })
     }
 
