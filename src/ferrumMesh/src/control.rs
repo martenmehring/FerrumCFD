@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::dictionary::{TokenCursor, tokenize};
+use crate::dictionary::tokenize;
 use crate::{MeshError, Result};
 
 #[derive(Debug)]
@@ -111,12 +111,11 @@ pub fn validate_control_dict(control: &ControlDict) -> ControlValidation {
 }
 
 fn parse_control_dict_str(content: &str, path: &Path) -> Result<ControlDict> {
-    let tokens = tokenize(content);
-    let mut cursor = TokenCursor::new(path, tokens);
+    let mut cursor = tokenize(path, content)?.into_cursor();
     let mut builder = ControlDictBuilder::new(path);
 
-    while let Some(token) = cursor.peek() {
-        if token == "FoamFile" {
+    while let Some(token) = cursor.peek()? {
+        if token.value == "FoamFile" {
             cursor.next_required()?;
             cursor.skip_braced_block()?;
             continue;
@@ -124,7 +123,7 @@ fn parse_control_dict_str(content: &str, path: &Path) -> Result<ControlDict> {
 
         let key = cursor.next_required()?;
         let values = cursor.read_value_until_semicolon()?;
-        match key.as_str() {
+        match key.value.as_str() {
             "application" => builder.application = Some(single_value(&values, "application")?),
             "solver" => builder.solver = Some(single_value(&values, "solver")?),
             "startFrom" => builder.start_from = Some(single_value(&values, "startFrom")?),
