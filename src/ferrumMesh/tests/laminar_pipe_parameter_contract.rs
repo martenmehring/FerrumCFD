@@ -2,13 +2,56 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use ferrum_mesh::MeshError;
 use ferrum_mesh::dictionary::tokenize;
 use ferrum_mesh::fields::{FieldFile, FieldValueSummary, read_initial_fields};
 use ferrum_mesh::geometry::compute_poly_mesh_geometry;
 use ferrum_mesh::poly_mesh::PolyMesh;
 use ferrum_mesh::properties::{PropertyDictionary, PropertyEntry, read_case_properties};
 
-type CheckResult<T = ()> = Result<T, String>;
+type CheckResult<T = ()> = Result<T, CheckError>;
+
+#[derive(Debug)]
+enum CheckError {
+    Message(String),
+    Mesh(MeshError),
+}
+
+impl std::fmt::Display for CheckError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Message(message) => formatter.write_str(message),
+            Self::Mesh(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for CheckError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Message(_) => None,
+            Self::Mesh(error) => Some(error),
+        }
+    }
+}
+
+impl From<&str> for CheckError {
+    fn from(message: &str) -> Self {
+        Self::Message(message.to_string())
+    }
+}
+
+impl From<String> for CheckError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+impl From<MeshError> for CheckError {
+    fn from(error: MeshError) -> Self {
+        Self::Mesh(error)
+    }
+}
 
 const LENGTH: f64 = 1.0;
 const DIAMETER: f64 = 0.02;
@@ -102,7 +145,7 @@ fn parse_flat_toml(input: &str) -> CheckResult<FlatToml> {
         }
         if line.starts_with('[') {
             if !line.ends_with(']') || line.starts_with("[[") {
-                return Err(format!("line {}: malformed table header", number + 1));
+                return Err(format!("line {}: malformed table header", number + 1).into());
             }
             let table = line[1..line.len() - 1].trim();
             if table.is_empty()
@@ -111,7 +154,7 @@ fn parse_flat_toml(input: &str) -> CheckResult<FlatToml> {
                     .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
                 || !seen_tables.insert(table.to_string())
             {
-                return Err(format!("line {}: invalid or repeated table", number + 1));
+                return Err(format!("line {}: invalid or repeated table", number + 1).into());
             }
             current = table.to_string();
             tables.insert(current.clone(), BTreeMap::new());
@@ -125,7 +168,7 @@ fn parse_flat_toml(input: &str) -> CheckResult<FlatToml> {
             .insert(key.to_string(), value.to_string())
             .is_some()
         {
-            return Err(format!("line {}: duplicate assignment", number + 1));
+            return Err(format!("line {}: duplicate assignment", number + 1).into());
         }
     }
     Ok(FlatToml { tables })
@@ -138,11 +181,11 @@ fn exact_entries(entries: &BTreeMap<String, String>, expected: &[(&str, &str)]) 
         .map(|(key, _)| *key)
         .collect::<BTreeSet<_>>();
     if keys != expected_keys {
-        return Err(format!("key set mismatch: {keys:?} != {expected_keys:?}"));
+        return Err(format!("key set mismatch: {keys:?} != {expected_keys:?}").into());
     }
     for (key, value) in expected {
         if entries.get(*key).map(String::as_str) != Some(*value) {
-            return Err(format!("unexpected value for {key}"));
+            return Err(format!("unexpected value for {key}").into());
         }
     }
     Ok(())
@@ -150,7 +193,7 @@ fn exact_entries(entries: &BTreeMap<String, String>, expected: &[(&str, &str)]) 
 
 fn close(actual: f64, expected: f64, tolerance: f64) -> CheckResult {
     if !actual.is_finite() || (actual - expected).abs() > tolerance {
-        Err(format!("{actual} differs from {expected}"))
+        Err(format!("{actual} differs from {expected}").into())
     } else {
         Ok(())
     }
@@ -250,9 +293,9 @@ fn validate_metadata(comparison: &str, physical: &str) -> CheckResult {
     )?;
     let values = &physical.tables["root"];
     let number = |key: &str| -> CheckResult<f64> {
-        values[key]
+        Ok(values[key]
             .parse::<f64>()
-            .map_err(|_| format!("{key} is not numeric"))
+            .map_err(|_| format!("{key} is not numeric"))?)
     };
     for key in [
         "length_m",
@@ -266,7 +309,7 @@ fn validate_metadata(comparison: &str, physical: &str) -> CheckResult {
     ] {
         let value = number(key)?;
         if !value.is_finite() || value <= 0.0 {
-            return Err(format!("{key} must be finite and positive"));
+            return Err(format!("{key} must be finite and positive").into());
         }
     }
     close(number("kinematic_viscosity_m2_per_s")?, MU / RHO, EPS)?;
@@ -284,7 +327,7 @@ fn entry_map(dictionary: &PropertyDictionary) -> CheckResult<BTreeMap<&str, &Pro
     let mut entries = BTreeMap::new();
     for entry in &dictionary.entries {
         if entries.insert(entry.key.as_str(), entry).is_some() {
-            return Err(format!("duplicate property key {}", entry.key));
+            return Err(format!("duplicate property key {}", entry.key).into());
         }
     }
     Ok(entries)
@@ -297,18 +340,18 @@ fn assert_dimensioned(
     tolerance: f64,
 ) -> CheckResult {
     if entry.value.len() != 10 || entry.value[0] != "[" || entry.value[8] != "]" {
-        return Err(format!("malformed dimensioned entry {}", entry.key));
+        return Err(format!("malformed dimensioned entry {}", entry.key).into());
     }
     let parsed = entry.value[1..8]
         .iter()
         .map(|value| {
             value
                 .parse::<i32>()
-                .map_err(|_| "bad dimension".to_string())
+                .map_err(|_| CheckError::from("bad dimension"))
         })
         .collect::<CheckResult<Vec<_>>>()?;
     if parsed.as_slice() != dimensions {
-        return Err(format!("wrong dimensions for {}", entry.key));
+        return Err(format!("wrong dimensions for {}", entry.key).into());
     }
     let value = entry.value[9]
         .parse::<f64>()
@@ -374,7 +417,7 @@ fn field<'a>(fields: &'a [FieldFile], name: &str) -> CheckResult<&'a FieldFile> 
         .filter(|candidate| candidate.name == name && candidate.region.is_none())
         .collect::<Vec<_>>();
     if matching.len() != 1 {
-        return Err(format!("expected exactly one root-region {name} field"));
+        return Err(format!("expected exactly one root-region {name} field").into());
     }
     Ok(matching[0])
 }
@@ -384,21 +427,22 @@ fn dimensions(field: &FieldFile) -> CheckResult<Vec<&str>> {
         .dimensions
         .as_ref()
         .map(|items| items.iter().map(String::as_str).collect())
-        .ok_or_else(|| format!("{} has no dimensions", field.name))
+        .ok_or_else(|| format!("{} has no dimensions", field.name).into())
 }
 
-fn foam_scalar(input: &str, key: &str) -> f64 {
-    let tokens = tokenize(input);
+fn foam_scalar(input: &str, key: &str) -> CheckResult<f64> {
+    let tokens = tokenize(Path::new("laminar-pipe-parameter"), input)?;
     let position = tokens
+        .tokens()
         .iter()
         .position(|token| token.value == key)
-        .unwrap_or_else(|| panic!("missing Foam key {key}"));
-    tokens[position + 1..]
+        .ok_or_else(|| format!("missing Foam key {key}"))?;
+    tokens.tokens()[position + 1..]
         .iter()
         .take_while(|token| token.value != ";")
         .filter_map(|token| token.value.parse().ok())
         .last()
-        .unwrap_or_else(|| panic!("missing numeric value for Foam key {key}"))
+        .ok_or_else(|| format!("missing numeric value for Foam key {key}").into())
 }
 
 fn validate_case(name: &str, openfoam: bool) -> CheckResult {
@@ -474,7 +518,7 @@ fn validate_case(name: &str, openfoam: bool) -> CheckResult {
         .split_whitespace()
         .map(|part| {
             part.parse::<f64>()
-                .map_err(|_| "bad U component".to_string())
+                .map_err(|_| CheckError::from("bad U component"))
         })
         .collect::<CheckResult<Vec<_>>>()?;
     if components.len() != 3 {
@@ -506,7 +550,7 @@ fn validate_case(name: &str, openfoam: bool) -> CheckResult {
     let scale = foam_scalar(
         &text(&tutorial().join("analytical/pipeBenchmark")),
         "inletVelocityScale",
-    );
+    )?;
     let inlet_patch = mesh
         .patches
         .iter()

@@ -182,16 +182,15 @@ fn read_field_file(path: &Path, region: Option<String>) -> Result<FieldFile> {
 }
 
 fn parse_field_file_str(content: &str, path: &Path, region: Option<String>) -> Result<FieldFile> {
-    let tokens = tokenize(content);
-    let mut cursor = TokenCursor::new(path, tokens);
+    let mut cursor = tokenize(path, content)?.into_cursor();
     let mut class_name = None;
     let mut object_name = None;
     let mut dimensions = None;
     let mut internal_field = None;
     let mut boundary_patches = Vec::new();
 
-    while let Some(token) = cursor.peek() {
-        match token {
+    while let Some(token) = cursor.peek()? {
+        match token.value.as_str() {
             "FoamFile" => {
                 cursor.next_required()?;
                 let metadata = parse_foam_file(&mut cursor)?;
@@ -238,10 +237,10 @@ fn parse_foam_file(cursor: &mut TokenCursor) -> Result<FoamFileMetadata> {
     let mut class_name = None;
     let mut object_name = None;
 
-    while !cursor.peek_is("}")? {
+    while cursor.peek()?.is_none_or(|token| token.value != "}") {
         let key = cursor.next_required()?;
         let value = cursor.read_value_until_semicolon()?;
-        match key.as_str() {
+        match key.value.as_str() {
             "class" => class_name = value.first().cloned(),
             "object" => object_name = value.first().cloned(),
             _ => {}
@@ -257,14 +256,14 @@ fn parse_foam_file(cursor: &mut TokenCursor) -> Result<FoamFileMetadata> {
 
 fn parse_dimensions(cursor: &mut TokenCursor) -> Result<Vec<String>> {
     cursor.next_required()?;
-    if cursor.peek() != Some("[") {
+    if cursor.peek()?.is_none_or(|token| token.value != "[") {
         return cursor.read_value_until_semicolon();
     }
 
     cursor.expect("[")?;
     let mut values = Vec::new();
-    while !cursor.peek_is("]")? {
-        values.push(cursor.next_required()?);
+    while cursor.peek()?.is_none_or(|token| token.value != "]") {
+        values.push(cursor.next_required()?.value);
     }
     cursor.expect("]")?;
     cursor.expect_optional(";")?;
@@ -275,8 +274,8 @@ fn parse_boundary_field(cursor: &mut TokenCursor) -> Result<Vec<FieldBoundaryPat
     cursor.expect("{")?;
     let mut patches = Vec::new();
 
-    while !cursor.peek_is("}")? {
-        let name = cursor.next_required()?;
+    while cursor.peek()?.is_none_or(|token| token.value != "}") {
+        let name = cursor.next_required()?.value;
         cursor.expect("{")?;
         patches.push(parse_boundary_patch(cursor, name)?);
     }
@@ -290,9 +289,9 @@ fn parse_boundary_patch(cursor: &mut TokenCursor, name: String) -> Result<FieldB
     let mut inlet_value = None;
     let mut value = None;
 
-    while !cursor.peek_is("}")? {
+    while cursor.peek()?.is_none_or(|token| token.value != "}") {
         let key = cursor.next_required()?;
-        match key.as_str() {
+        match key.value.as_str() {
             "type" => {
                 patch_type = cursor.read_value_until_semicolon()?.first().cloned();
             }

@@ -166,24 +166,23 @@ fn top_level_section<'a>(
 }
 
 fn parse_numerics_dictionary_str(content: &str, path: &Path) -> Result<Vec<NumericsSection>> {
-    let tokens = tokenize(content);
-    let mut cursor = TokenCursor::new(path, tokens);
+    let mut cursor = tokenize(path, content)?.into_cursor();
     let mut sections = Vec::new();
 
-    while let Some(token) = cursor.peek() {
-        if token == ";" {
+    while let Some(token) = cursor.peek()? {
+        if token.value == ";" {
             cursor.next_required()?;
             continue;
         }
-        if token == "FoamFile" {
+        if token.value == "FoamFile" {
             cursor.next_required()?;
             cursor.skip_braced_block()?;
             continue;
         }
 
         let name = cursor.next_required()?;
-        if cursor.peek() == Some("{") {
-            sections.push(parse_section(&mut cursor, name, 1)?);
+        if cursor.peek()?.is_some_and(|token| token.value == "{") {
+            sections.push(parse_section(&mut cursor, name.value, 1)?);
         } else {
             cursor.skip_value_or_block()?;
         }
@@ -203,21 +202,21 @@ fn parse_section(cursor: &mut TokenCursor, name: String, depth: usize) -> Result
     let mut entries = Vec::new();
     let mut sections = Vec::new();
 
-    while !cursor.peek_is("}")? {
-        if cursor.peek() == Some(";") {
+    while cursor.peek()?.is_none_or(|token| token.value != "}") {
+        if cursor.peek()?.is_some_and(|token| token.value == ";") {
             cursor.next_required()?;
             continue;
         }
 
         let key = cursor.next_required()?;
-        if cursor.peek() == Some("{") {
-            sections.push(parse_section(cursor, key, depth + 1)?);
+        if cursor.peek()?.is_some_and(|token| token.value == "{") {
+            sections.push(parse_section(cursor, key.value, depth + 1)?);
             continue;
         }
 
         entries.push(NumericsEntry {
-            key,
-            value: cursor.read_value_until_semicolon()?,
+            key: key.value,
+            value: cursor.read_bare_entry()?,
         });
     }
     cursor.expect("}")?;
@@ -448,6 +447,10 @@ mod tests {
         let error = parse_numerics_dictionary_str(&content, Path::new("fvSolution"))
             .expect_err("excessive nesting must fail");
 
-        assert!(error.to_string().contains("nesting exceeds"));
+        assert!(
+            error
+                .to_string()
+                .contains("dictionary nesting limit exceeded")
+        );
     }
 }
