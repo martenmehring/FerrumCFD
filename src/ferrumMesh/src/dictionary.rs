@@ -280,9 +280,40 @@ pub mod streaming {
         failure: Option<Failure>,
         stack: [char; MAX_DICTIONARY_NESTING],
         depth: usize,
+        #[cfg(test)]
+        inject_token_reservation_failure: bool,
+        #[cfg(test)]
+        inject_batch_reservation_failure: bool,
+        #[cfg(test)]
+        inject_diagnostic_reservation_failure: bool,
     }
 
     impl<R: BufRead> TokenSource<R> {
+        #[cfg(test)]
+        fn inject_physical_overflow(&mut self) {
+            self.physical = usize::MAX;
+        }
+
+        #[cfg(test)]
+        fn inject_commit_bound_violation(&mut self) {
+            self.lookahead.as_mut().expect("lookahead required").1 = self.declared + 1;
+        }
+
+        #[cfg(test)]
+        fn inject_source_token_reservation_failure(&mut self) {
+            self.inject_token_reservation_failure = true;
+        }
+
+        #[cfg(test)]
+        fn inject_batch_reservation_failure(&mut self) {
+            self.inject_batch_reservation_failure = true;
+        }
+
+        #[cfg(test)]
+        fn inject_source_diagnostic_reservation_failure(&mut self) {
+            self.inject_diagnostic_reservation_failure = true;
+        }
+
         pub fn new(path: &Path, reader: R, exact_total_bytes: usize) -> Result<Self> {
             let mut owned = PathBuf::new();
             owned
@@ -305,6 +336,12 @@ pub mod streaming {
                 failure: None,
                 stack: ['\0'; MAX_DICTIONARY_NESTING],
                 depth: 0,
+                #[cfg(test)]
+                inject_token_reservation_failure: false,
+                #[cfg(test)]
+                inject_batch_reservation_failure: false,
+                #[cfg(test)]
+                inject_diagnostic_reservation_failure: false,
             })
         }
 
@@ -370,6 +407,8 @@ pub mod streaming {
                 tokens: self.tokens.into_iter(),
                 eof_line: self.eof_line,
                 failure: None,
+                #[cfg(test)]
+                inject_diagnostic_reservation_failure: false,
             }
         }
     }
@@ -395,9 +434,16 @@ pub mod streaming {
         tokens: std::vec::IntoIter<Token>,
         eof_line: usize,
         failure: Option<Failure>,
+        #[cfg(test)]
+        inject_diagnostic_reservation_failure: bool,
     }
 
     impl TokenCursor {
+        #[cfg(test)]
+        fn inject_cursor_diagnostic_reservation_failure(&mut self) {
+            self.inject_diagnostic_reservation_failure = true;
+        }
+
         pub fn path(&self) -> &Path {
             &self.path
         }
@@ -630,7 +676,7 @@ pub mod streaming {
                 },
                 None => MeshError::Parse {
                     line: self.eof_line,
-                    message: "dictionary cursor failed".to_owned(),
+                    message: String::new(),
                 },
             }
         }
@@ -649,12 +695,21 @@ pub mod streaming {
                     .checked_add(2)
                     .and_then(|n| n.checked_add(detail.len()));
                 let mut message = String::new();
-                if capacity.and_then(|n| message.try_reserve(n).ok()).is_some() {
+                #[cfg(test)]
+                let requested = if self.inject_diagnostic_reservation_failure {
+                    Some(usize::MAX)
+                } else {
+                    capacity
+                };
+                #[cfg(not(test))]
+                let requested = capacity;
+                if requested
+                    .and_then(|n| message.try_reserve(n).ok())
+                    .is_some()
+                {
                     message.push_str(path);
                     message.push_str(": ");
                     message.push_str(detail);
-                } else {
-                    message.push_str("dictionary error allocation failed");
                 }
                 self.failure = Some(Failure { line, message });
             }
@@ -666,6 +721,9 @@ pub mod streaming {
         #[allow(clippy::should_implement_trait)]
         pub fn next(&mut self) -> Result<Option<Token>> {
             self.peek()?;
+            if let Some((_, end)) = self.lookahead.as_ref() {
+                self.validate_commit(*end)?;
+            }
             if let Some((token, end)) = self.lookahead.take() {
                 self.committed = end;
                 Ok(Some(token))
@@ -688,21 +746,20 @@ pub mod streaming {
             let mut tokens = Vec::new();
             let mut payload_bytes = 0usize;
             while let Some(token) = self.next()? {
-                let count = tokens
-                    .len()
-                    .checked_add(1)
-                    .ok_or_else(|| self.latch(token.line, "dictionary token count overflow"))?;
-                if count > MAX_DICTIONARY_TOKENS {
-                    return Err(self.latch(token.line, "dictionary token count limit exceeded"));
-                }
-                payload_bytes = payload_bytes
-                    .checked_add(token.value.len())
-                    .ok_or_else(|| self.latch(token.line, "dictionary payload length overflow"))?;
-                if payload_bytes > MAX_DICTIONARY_PAYLOAD_BYTES {
-                    return Err(self.latch(token.line, "dictionary payload byte limit exceeded"));
-                }
+                Self::checked_token_count(tokens.len(), 1)
+                    .map_err(|detail| self.latch(token.line, detail))?;
+                payload_bytes = Self::checked_payload_bytes(payload_bytes, token.value.len())
+                    .map_err(|detail| self.latch(token.line, detail))?;
+                #[cfg(test)]
+                let additional = if self.inject_batch_reservation_failure {
+                    usize::MAX
+                } else {
+                    1
+                };
+                #[cfg(not(test))]
+                let additional = 1;
                 tokens
-                    .try_reserve(1)
+                    .try_reserve(additional)
                     .map_err(|_| self.latch(token.line, "dictionary token allocation failed"))?;
                 tokens.push(token);
             }
@@ -723,28 +780,38 @@ pub mod streaming {
                 },
                 None => MeshError::Parse {
                     line: self.line,
-                    message: "dictionary lexer failed".to_owned(),
+                    message: String::new(),
                 },
             }
         }
 
         fn latch(&mut self, line: usize, detail: &str) -> MeshError {
             if self.failure.is_none() {
-                let path = self.path.to_str().unwrap_or("<non-UTF-8 dictionary path>");
+                #[allow(clippy::manual_unwrap_or)]
+                let path = match self.path.to_str() {
+                    Some(value) => value,
+                    None => "<non-UTF-8 dictionary path>",
+                };
                 let capacity = path
                     .len()
                     .checked_add(2)
                     .and_then(|length| length.checked_add(detail.len()));
                 let mut message = String::new();
-                if capacity
+                #[cfg(test)]
+                let requested = if self.inject_diagnostic_reservation_failure {
+                    Some(usize::MAX)
+                } else {
+                    capacity
+                };
+                #[cfg(not(test))]
+                let requested = capacity;
+                if requested
                     .and_then(|length| message.try_reserve(length).ok())
                     .is_some()
                 {
                     message.push_str(path);
                     message.push_str(": ");
                     message.push_str(detail);
-                } else {
-                    message.push_str("dictionary error allocation failed");
                 }
                 self.failure = Some(Failure { line, message });
             }
@@ -755,10 +822,41 @@ pub mod streaming {
             let mut copy = String::new();
             if copy.try_reserve(message.len()).is_ok() {
                 copy.push_str(message);
-            } else {
-                copy.push_str("dictionary error allocation failed");
             }
             copy
+        }
+
+        fn checked_token_count(
+            current: usize,
+            additional: usize,
+        ) -> std::result::Result<usize, &'static str> {
+            let count = current
+                .checked_add(additional)
+                .ok_or("dictionary token count overflow")?;
+            if count > MAX_DICTIONARY_TOKENS {
+                return Err("dictionary token count limit exceeded");
+            }
+            Ok(count)
+        }
+
+        fn checked_payload_bytes(
+            current: usize,
+            additional: usize,
+        ) -> std::result::Result<usize, &'static str> {
+            let bytes = current
+                .checked_add(additional)
+                .ok_or("dictionary payload length overflow")?;
+            if bytes > MAX_DICTIONARY_PAYLOAD_BYTES {
+                return Err("dictionary payload byte limit exceeded");
+            }
+            Ok(bytes)
+        }
+
+        fn validate_commit(&mut self, end: usize) -> Result<()> {
+            if end > self.declared {
+                return Err(self.latch(self.line, "dictionary commit exceeds declared length"));
+            }
+            Ok(())
         }
 
         fn byte(&mut self) -> std::result::Result<Option<u8>, (usize, &'static str)> {
@@ -776,12 +874,13 @@ pub mod streaming {
                 ));
             }
             let value = bytes[0];
-            self.reader.consume(1);
-            self.physical = self
+            let physical = self
                 .physical
                 .checked_add(1)
                 .ok_or((self.line, "dictionary byte counter overflow"))?;
-            if self.physical > self.declared {
+            self.reader.consume(1);
+            self.physical = physical;
+            if physical > self.declared {
                 return Err((self.line, "dictionary input exceeds its declared length"));
             }
             Ok(Some(value))
@@ -852,6 +951,7 @@ pub mod streaming {
         }
 
         fn push_value(
+            &mut self,
             value: &mut String,
             ch: char,
             width: usize,
@@ -864,8 +964,16 @@ pub mod streaming {
             if wanted > MAX_TOKEN_BYTES {
                 return Err((line, "dictionary token byte limit exceeded"));
             }
+            #[cfg(test)]
+            let additional = if self.inject_token_reservation_failure {
+                usize::MAX
+            } else {
+                width
+            };
+            #[cfg(not(test))]
+            let additional = width;
             value
-                .try_reserve(width)
+                .try_reserve(additional)
                 .map_err(|_| (line, "dictionary token allocation failed"))?;
             value.push(ch);
             Ok(())
@@ -931,7 +1039,7 @@ pub mod streaming {
                         match self.take_char()? {
                             Some(('"', _)) => break,
                             Some((next, bytes)) => {
-                                Self::push_value(&mut value, next, bytes, start)?
+                                self.push_value(&mut value, next, bytes, self.line)?
                             }
                             None => return Err((self.line, "unclosed quoted token")),
                         }
@@ -980,7 +1088,7 @@ pub mod streaming {
                         }
                     }
                     let mut value = String::new();
-                    Self::push_value(&mut value, ch, width, start)?;
+                    self.push_value(&mut value, ch, width, start)?;
                     return Ok(Some((
                         Token {
                             value,
@@ -991,7 +1099,7 @@ pub mod streaming {
                     )));
                 }
                 let mut value = String::new();
-                Self::push_value(&mut value, ch, width, start)?;
+                self.push_value(&mut value, ch, width, start)?;
                 let mut function_stack = ['\0'; MAX_DICTIONARY_NESTING];
                 let mut function_depth = 0usize;
                 let mut token_end = self.physical;
@@ -1043,22 +1151,22 @@ pub mod streaming {
                                 continue;
                             }
                             Some(after) => {
-                                Self::push_value(&mut value, '/', 1, start)?;
+                                self.push_value(&mut value, '/', 1, self.line)?;
                                 self.put_char(after)?;
                                 continue;
                             }
                             None => {
-                                Self::push_value(&mut value, '/', 1, start)?;
+                                self.push_value(&mut value, '/', 1, self.line)?;
                                 break;
                             }
                         }
                     }
                     if next.0 == '"' && function_depth != 0 {
-                        Self::push_value(&mut value, next.0, next.1, start)?;
+                        self.push_value(&mut value, next.0, next.1, self.line)?;
                         loop {
                             match self.take_char()? {
                                 Some((quoted, bytes)) => {
-                                    Self::push_value(&mut value, quoted, bytes, start)?;
+                                    self.push_value(&mut value, quoted, bytes, self.line)?;
                                     if quoted == '"' {
                                         break;
                                     }
@@ -1073,27 +1181,27 @@ pub mod streaming {
                         if self
                             .depth
                             .checked_add(function_depth)
-                            .ok_or((start, "dictionary nesting overflow"))?
+                            .ok_or((self.line, "dictionary nesting overflow"))?
                             == MAX_DICTIONARY_NESTING
                         {
-                            return Err((start, "dictionary nesting limit exceeded"));
+                            return Err((self.line, "dictionary nesting limit exceeded"));
                         }
                         function_stack[function_depth] = next.0;
                         function_depth = function_depth
                             .checked_add(1)
-                            .ok_or((start, "dictionary nesting overflow"))?;
-                        Self::push_value(&mut value, next.0, next.1, start)?;
+                            .ok_or((self.line, "dictionary nesting overflow"))?;
+                        self.push_value(&mut value, next.0, next.1, self.line)?;
                         continue;
                     }
                     if matches!(next.0, ')' | ']' | '}') && function_depth > 0 {
                         let top = function_depth
                             .checked_sub(1)
-                            .ok_or((start, "dictionary nesting counter underflow"))?;
+                            .ok_or((self.line, "dictionary nesting counter underflow"))?;
                         if !Self::matching(function_stack[top], next.0) {
-                            return Err((start, "mismatched function delimiter"));
+                            return Err((self.line, "mismatched function delimiter"));
                         }
                         function_depth = top;
-                        Self::push_value(&mut value, next.0, next.1, start)?;
+                        self.push_value(&mut value, next.0, next.1, self.line)?;
                         continue;
                     }
                     if Self::structural(next.0) && function_depth == 0 {
@@ -1104,7 +1212,7 @@ pub mod streaming {
                         self.put_char(next)?;
                         break;
                     }
-                    Self::push_value(&mut value, next.0, next.1, start)?;
+                    self.push_value(&mut value, next.0, next.1, self.line)?;
                     token_end = self.physical;
                 }
                 if function_depth != 0 {
@@ -1147,6 +1255,16 @@ pub mod streaming {
                 result.push((token.value, token.provenance));
             }
             result
+        }
+
+        fn assert_parse(error: &MeshError, expected_line: usize, expected_message: &str) {
+            match error {
+                MeshError::Parse { line, message } => {
+                    assert_eq!(*line, expected_line);
+                    assert_eq!(message, expected_message);
+                }
+                _ => panic!("expected parse error"),
+            }
         }
 
         #[test]
@@ -1481,6 +1599,166 @@ pub mod streaming {
                 Err(error) => error.to_string(),
             };
             assert!(payload_error.contains("payload byte limit exceeded"));
+        }
+
+        #[test]
+        fn multiline_token_cap_reports_offending_line() {
+            let mut exact = Vec::with_capacity(MAX_TOKEN_BYTES + 3);
+            exact.push(b'"');
+            exact.extend(vec![b'a'; MAX_TOKEN_BYTES - 1]);
+            exact.push(b'\n');
+            exact.push(b'"');
+            assert_eq!(
+                source(&exact).next().unwrap().unwrap().value.len(),
+                MAX_TOKEN_BYTES
+            );
+
+            exact.insert(exact.len() - 1, b'b');
+            let mut lexer = source(&exact);
+            let first = lexer.peek().unwrap_err();
+            assert_parse(&first, 2, "fixture: dictionary token byte limit exceeded");
+            assert_eq!(lexer.next().unwrap_err().to_string(), first.to_string());
+            assert!(lexer.lookahead.is_none());
+        }
+
+        #[test]
+        fn token_count_limit_math_is_exact() {
+            assert_eq!(
+                TokenSource::<io::Empty>::checked_token_count(super::MAX_DICTIONARY_TOKENS - 1, 1),
+                Ok(super::MAX_DICTIONARY_TOKENS)
+            );
+            assert_eq!(
+                TokenSource::<io::Empty>::checked_token_count(super::MAX_DICTIONARY_TOKENS, 1),
+                Err("dictionary token count limit exceeded")
+            );
+        }
+
+        #[test]
+        fn aggregate_payload_limit_math_is_exact() {
+            assert_eq!(
+                TokenSource::<io::Empty>::checked_payload_bytes(
+                    super::MAX_DICTIONARY_PAYLOAD_BYTES - 1,
+                    1
+                ),
+                Ok(super::MAX_DICTIONARY_PAYLOAD_BYTES)
+            );
+            assert_eq!(
+                TokenSource::<io::Empty>::checked_payload_bytes(
+                    super::MAX_DICTIONARY_PAYLOAD_BYTES,
+                    1
+                ),
+                Err("dictionary payload byte limit exceeded")
+            );
+        }
+
+        #[test]
+        fn combined_cursor_nesting_limit_is_exact() {
+            let balanced = format!("{}{};", "(".repeat(128), ")".repeat(128));
+            super::tokenize(Path::new("depth"), &balanced)
+                .unwrap()
+                .into_cursor()
+                .read_strict_value()
+                .unwrap();
+
+            let tokens = (0..129)
+                .map(|_| super::Token {
+                    value: "(".to_owned(),
+                    line: 7,
+                    provenance: TokenProvenance::Structural,
+                })
+                .collect::<Vec<_>>();
+            let mut cursor = super::TokenBatch {
+                path: Path::new("depth").to_path_buf(),
+                tokens,
+                eof_line: 7,
+                payload_bytes: 129,
+            }
+            .into_cursor();
+            let first = cursor.read_strict_value().unwrap_err();
+            assert_parse(&first, 7, "depth: dictionary nesting limit exceeded");
+            assert_eq!(cursor.next().unwrap_err().to_string(), first.to_string());
+            assert_eq!(cursor.tokens.as_slice().len(), 0);
+
+            let mut mismatch = source(b"f(\n]");
+            let first = mismatch.peek().unwrap_err();
+            assert_parse(&first, 2, "fixture: mismatched function delimiter");
+            assert_eq!(mismatch.next().unwrap_err().to_string(), first.to_string());
+            assert!(mismatch.lookahead.is_none());
+
+            let mut nested = Vec::from(&b"f(\n"[..]);
+            nested.extend(std::iter::repeat_n(b'(', 128));
+            let mut nested = source(&nested);
+            let first = nested.peek().unwrap_err();
+            assert_parse(&first, 2, "fixture: dictionary nesting limit exceeded");
+            assert_eq!(nested.next().unwrap_err().to_string(), first.to_string());
+            assert!(nested.lookahead.is_none());
+        }
+
+        #[test]
+        fn injected_physical_byte_overflow_is_source_sticky() {
+            let mut lexer = source(b"x");
+            lexer.inject_physical_overflow();
+            let first = lexer.peek().unwrap_err();
+            assert_parse(&first, 1, "fixture: dictionary byte counter overflow");
+            assert_eq!(lexer.next().unwrap_err().to_string(), first.to_string());
+            assert!(lexer.lookahead.is_none());
+        }
+
+        #[test]
+        fn injected_commit_bound_violation_is_source_sticky() {
+            let mut lexer = source(b"x");
+            lexer.peek().unwrap();
+            lexer.inject_commit_bound_violation();
+            let first = lexer.next().unwrap_err();
+            assert_parse(
+                &first,
+                1,
+                "fixture: dictionary commit exceeds declared length",
+            );
+            assert_eq!(lexer.next().unwrap_err().to_string(), first.to_string());
+            assert!(lexer.lookahead.is_some());
+            assert_eq!(lexer.committed, 0);
+        }
+
+        #[test]
+        fn injected_source_token_reservation_failure_is_source_sticky() {
+            let mut lexer = source(b"x");
+            lexer.inject_source_token_reservation_failure();
+            let first = lexer.peek().unwrap_err();
+            assert_parse(&first, 1, "fixture: dictionary token allocation failed");
+            assert_eq!(lexer.next().unwrap_err().to_string(), first.to_string());
+            assert!(lexer.lookahead.is_none());
+        }
+
+        #[test]
+        fn injected_batch_reservation_failure_fails_closed() {
+            let mut lexer = source(b"x");
+            lexer.inject_batch_reservation_failure();
+            let error = match lexer.into_batch() {
+                Ok(_) => panic!("batch reservation unexpectedly succeeded"),
+                Err(error) => error,
+            };
+            assert_parse(&error, 1, "fixture: dictionary token allocation failed");
+        }
+
+        #[test]
+        fn injected_source_diagnostic_reservation_failure_uses_sticky_fallback() {
+            let mut lexer = source(b"]");
+            lexer.inject_source_diagnostic_reservation_failure();
+            let first = lexer.peek().unwrap_err();
+            assert_parse(&first, 1, "");
+            assert_eq!(lexer.next().unwrap_err().to_string(), first.to_string());
+        }
+
+        #[test]
+        fn injected_cursor_diagnostic_reservation_failure_uses_sticky_fallback() {
+            let mut cursor = super::tokenize(Path::new("cursor"), "")
+                .unwrap()
+                .into_cursor();
+            cursor.inject_cursor_diagnostic_reservation_failure();
+            let first = cursor.next_required().unwrap_err();
+            assert_parse(&first, 1, "");
+            assert_eq!(cursor.peek().unwrap_err().to_string(), first.to_string());
         }
     }
 }
