@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::dictionary::tokenize;
+use crate::dictionary::{TokenCursor, TokenProvenance, tokenize};
 use crate::{MeshError, Result};
 
 #[derive(Debug)]
@@ -115,13 +115,36 @@ fn parse_control_dict_str(content: &str, path: &Path) -> Result<ControlDict> {
     let mut builder = ControlDictBuilder::new(path);
 
     while let Some(token) = cursor.peek()? {
-        if token.value == "FoamFile" {
+        if token.value == "FoamFile" && token.provenance == TokenProvenance::Ordinary {
             cursor.next_required()?;
             cursor.skip_braced_block()?;
             continue;
         }
 
         let key = cursor.next_required()?;
+        if key.provenance == TokenProvenance::Structural {
+            return Err(MeshError::InvalidInput(format!(
+                "unexpected dictionary token in {}",
+                path.display()
+            )));
+        }
+        if key.provenance != TokenProvenance::Ordinary
+            || !matches!(
+                key.value.as_str(),
+                "application"
+                    | "solver"
+                    | "startFrom"
+                    | "startTime"
+                    | "stopAt"
+                    | "endTime"
+                    | "deltaT"
+                    | "writeControl"
+                    | "writeInterval"
+            )
+        {
+            skip_control_value(&mut cursor)?;
+            continue;
+        }
         let values = cursor.read_value_until_semicolon()?;
         match key.value.as_str() {
             "application" => builder.application = Some(single_value(&values, "application")?),
@@ -140,6 +163,36 @@ fn parse_control_dict_str(content: &str, path: &Path) -> Result<ControlDict> {
     }
 
     builder.finish()
+}
+
+fn skip_control_value(cursor: &mut TokenCursor) -> Result<()> {
+    let balanced = match cursor.peek()? {
+        Some(first) => {
+            if first.provenance == TokenProvenance::Structural
+                && matches!(first.value.as_str(), ";" | "}" | ")" | "]")
+            {
+                return Err(MeshError::InvalidInput(format!(
+                    "unexpected dictionary token in {}",
+                    cursor.path().display()
+                )));
+            }
+            first.provenance == TokenProvenance::Structural
+                && matches!(first.value.as_str(), "{" | "(" | "[")
+        }
+        None => {
+            return Err(MeshError::InvalidInput(format!(
+                "unexpected end of dictionary in {}",
+                cursor.path().display()
+            )));
+        }
+    };
+    if balanced {
+        cursor.skip_typed_balanced()?;
+    } else {
+        cursor.next_required()?;
+        cursor.expect_optional(";")?;
+    }
+    Ok(())
 }
 
 fn validate_finite_number(label: &str, value: f64, warnings: &mut Vec<String>) {
@@ -325,5 +378,56 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("writeControl"))
         );
+    }
+
+    #[test]
+    fn quoted_and_unknown_values_preserve_control_sentinels() {
+        let control = parse_control_dict_str(
+            r#"
+            "application" ignored application ferrumRun;
+            unknown { deltaT 99; } deltaT 0.25;
+            list (application swallowed) solver fluid;
+            quotedSemi ";" writeInterval 4;
+            "#,
+            Path::new("controlDict"),
+        )
+        .unwrap();
+
+        assert_eq!(control.application.as_deref(), Some("ferrumRun"));
+        assert_eq!(control.solver.as_deref(), Some("fluid"));
+        assert_eq!(control.delta_t, Some(0.25));
+        assert_eq!(control.write_interval, Some(4.0));
+    }
+
+    #[test]
+    fn unknown_entry_cannot_consume_a_structural_delimiter_as_its_value() {
+        let error = parse_control_dict_str("unknown ;", Path::new("controlDict")).unwrap_err();
+        assert!(error.to_string().contains("unexpected dictionary token"));
+    }
+
+    #[test]
+    fn quoted_and_unknown_control_value_matrix_preserves_sentinels() {
+        for key in ["unknown", r#""unknown""#] {
+            for value in ["scalar;", "(hidden values);", "{ hidden values; };"] {
+                let content = format!("{key} {value} application ferrumRun; deltaT 0.125;");
+                let control = parse_control_dict_str(&content, Path::new("controlDict")).unwrap();
+                assert_eq!(control.application.as_deref(), Some("ferrumRun"));
+                assert_eq!(control.delta_t, Some(0.125));
+            }
+        }
+
+        for value in ["(hidden values)", "{ hidden values; }"] {
+            let content = format!(r#""unknown" {value} application ferrumRun; deltaT 0.25;"#);
+            let control = parse_control_dict_str(&content, Path::new("controlDict")).unwrap();
+            assert_eq!(control.application.as_deref(), Some("ferrumRun"));
+            assert_eq!(control.delta_t, Some(0.25));
+        }
+    }
+
+    #[test]
+    fn structural_control_key_fails_closed() {
+        let error = parse_control_dict_str("; application ferrumRun;", Path::new("controlDict"))
+            .unwrap_err();
+        assert!(error.to_string().contains("unexpected dictionary token"));
     }
 }
