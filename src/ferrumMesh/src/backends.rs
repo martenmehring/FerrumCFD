@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::dictionary::{TokenCursor, tokenize};
+use crate::dictionary::{TokenCursor, TokenProvenance, tokenize};
 use crate::{MeshError, Result};
 
 #[derive(Debug)]
@@ -286,14 +286,17 @@ fn parse_backend_config_str(content: &str, path: &Path) -> Result<BackendConfig>
     let mut builder = BackendConfigBuilder::new(path);
 
     while let Some(token) = cursor.peek()? {
-        if token.value == "FoamFile" {
+        if token.value == "FoamFile" && token.provenance == TokenProvenance::Ordinary {
             cursor.next_required()?;
             cursor.skip_braced_block()?;
             continue;
         }
 
         if token.value == "ferrumBackends"
-            && cursor.peek_next()?.is_some_and(|token| token.value == "{")
+            && token.provenance == TokenProvenance::Ordinary
+            && cursor.peek_next()?.is_some_and(|token| {
+                token.value == "{" && token.provenance == TokenProvenance::Structural
+            })
         {
             cursor.next_required()?;
             cursor.expect("{")?;
@@ -313,7 +316,11 @@ fn parse_backend_entries(
     stop_at_close: bool,
 ) -> Result<()> {
     while cursor.peek()?.is_some() {
-        if stop_at_close && cursor.peek()?.is_some_and(|token| token.value == "}") {
+        if stop_at_close
+            && cursor.peek()?.is_some_and(|token| {
+                token.value == "}" && token.provenance == TokenProvenance::Structural
+            })
+        {
             cursor.expect("}")?;
             return Ok(());
         }
@@ -330,9 +337,35 @@ fn parse_backend_entries(
 
 fn parse_backend_entry(cursor: &mut TokenCursor, builder: &mut BackendConfigBuilder) -> Result<()> {
     let key = cursor.next_required()?;
+    if key.provenance == TokenProvenance::Structural {
+        return Err(MeshError::InvalidInput(format!(
+            "unexpected dictionary token in {}",
+            cursor.path().display()
+        )));
+    }
+    if key.provenance != TokenProvenance::Ordinary {
+        return skip_backend_value(cursor);
+    }
     match key.value.as_str() {
         "default" => {
-            let choice = parse_backend_choice(&cursor.next_required()?.value, cursor.path())?;
+            if cursor
+                .peek()?
+                .is_some_and(|choice| choice.provenance == TokenProvenance::Structural)
+            {
+                return Err(MeshError::InvalidInput(format!(
+                    "unexpected dictionary token in {}",
+                    cursor.path().display()
+                )));
+            }
+            let ordinary_choice = cursor
+                .peek()?
+                .is_some_and(|choice| choice.provenance == TokenProvenance::Ordinary);
+            if !ordinary_choice {
+                skip_backend_value(cursor)?;
+                return Ok(());
+            }
+            let choice = cursor.next_required()?;
+            let choice = parse_backend_choice(&choice.value, cursor.path())?;
             cursor.expect_optional(";")?;
             builder.default = Some(choice);
         }
@@ -346,24 +379,79 @@ fn parse_backend_entry(cursor: &mut TokenCursor, builder: &mut BackendConfigBuil
             builder.cpu = parse_cpu_block(cursor)?;
             builder.cpu_explicit = true;
         }
-        _ => {
+        name if known_backend_steps(name).is_some()
+            || cursor.peek()?.is_some_and(|token| {
+                token.value == "{" && token.provenance == TokenProvenance::Structural
+            }) =>
+        {
             cursor.expect("{")?;
             builder
                 .sections
                 .push(parse_backend_section(cursor, key.value)?);
         }
+        _ => skip_backend_value(cursor)?,
     }
     Ok(())
 }
 
 fn parse_backend_section(cursor: &mut TokenCursor, name: String) -> Result<BackendSection> {
     let mut entries = Vec::new();
+    let known_steps = known_backend_steps(&name);
 
-    while cursor.peek()?.is_none_or(|token| token.value != "}") {
-        let step = cursor.next_required()?.value;
-        let choice = parse_backend_choice(&cursor.next_required()?.value, cursor.path())?;
+    while cursor
+        .peek()?
+        .is_none_or(|token| token.value != "}" || token.provenance != TokenProvenance::Structural)
+    {
+        let step = cursor.next_required()?;
+        if step.provenance == TokenProvenance::Structural {
+            return Err(MeshError::InvalidInput(format!(
+                "unexpected dictionary token in {}",
+                cursor.path().display()
+            )));
+        }
+        if step.provenance != TokenProvenance::Ordinary {
+            skip_backend_value(cursor)?;
+            continue;
+        }
+        if cursor.peek()?.is_some_and(|token| {
+            token.provenance == TokenProvenance::Structural
+                && matches!(token.value.as_str(), "{" | "(" | "[")
+        }) {
+            if known_steps
+                .as_ref()
+                .is_some_and(|steps| steps.contains(step.value.as_str()))
+            {
+                return Err(MeshError::InvalidInput(format!(
+                    "unexpected dictionary token in {}",
+                    cursor.path().display()
+                )));
+            }
+            skip_backend_value(cursor)?;
+            continue;
+        }
+        if cursor
+            .peek()?
+            .is_some_and(|choice| choice.provenance == TokenProvenance::Structural)
+        {
+            return Err(MeshError::InvalidInput(format!(
+                "unexpected dictionary token in {}",
+                cursor.path().display()
+            )));
+        }
+        let ordinary_choice = cursor
+            .peek()?
+            .is_some_and(|choice| choice.provenance == TokenProvenance::Ordinary);
+        if !ordinary_choice {
+            skip_backend_value(cursor)?;
+            continue;
+        }
+        let choice = cursor.next_required()?;
+        let choice = parse_backend_choice(&choice.value, cursor.path())?;
         cursor.expect_optional(";")?;
-        entries.push(BackendSelection { step, choice });
+        entries.push(BackendSelection {
+            step: step.value,
+            choice,
+        });
     }
     cursor.expect("}")?;
 
@@ -373,8 +461,26 @@ fn parse_backend_section(cursor: &mut TokenCursor, name: String) -> Result<Backe
 fn parse_cpu_block(cursor: &mut TokenCursor) -> Result<CpuConfig> {
     let mut cpu = CpuConfig::default();
 
-    while cursor.peek()?.is_none_or(|token| token.value != "}") {
+    while cursor
+        .peek()?
+        .is_none_or(|token| token.value != "}" || token.provenance != TokenProvenance::Structural)
+    {
         let key = cursor.next_required()?;
+        if key.provenance == TokenProvenance::Structural {
+            return Err(MeshError::InvalidInput(format!(
+                "unexpected dictionary token in {}",
+                cursor.path().display()
+            )));
+        }
+        if key.provenance != TokenProvenance::Ordinary
+            || !matches!(
+                key.value.as_str(),
+                "cpus" | "coresPerCpu" | "threads" | "threadPinning" | "numa"
+            )
+        {
+            skip_backend_value(cursor)?;
+            continue;
+        }
         let values = cursor.read_value_until_semicolon()?;
         match key.value.as_str() {
             "cpus" => {
@@ -413,8 +519,35 @@ fn parse_cpu_block(cursor: &mut TokenCursor) -> Result<CpuConfig> {
 fn parse_gpu_block(cursor: &mut TokenCursor) -> Result<GpuConfig> {
     let mut gpu = GpuConfig::default();
 
-    while cursor.peek()?.is_none_or(|token| token.value != "}") {
+    while cursor
+        .peek()?
+        .is_none_or(|token| token.value != "}" || token.provenance != TokenProvenance::Structural)
+    {
         let key = cursor.next_required()?;
+        if key.provenance == TokenProvenance::Structural {
+            return Err(MeshError::InvalidInput(format!(
+                "unexpected dictionary token in {}",
+                cursor.path().display()
+            )));
+        }
+        if key.provenance != TokenProvenance::Ordinary
+            || !matches!(
+                key.value.as_str(),
+                "backend" | "device" | "devices" | "multiGpu" | "precision"
+            )
+        {
+            skip_backend_value(cursor)?;
+            continue;
+        }
+        let structurally_grouped = cursor.peek()?.is_some_and(|token| {
+            token.value == "(" && token.provenance == TokenProvenance::Structural
+        });
+        let raw_quoted_open = cursor
+            .peek()?
+            .is_some_and(|token| token.value == "(" && token.provenance == TokenProvenance::Quoted);
+        let raw_quoted_item = cursor
+            .peek_next()?
+            .is_some_and(|token| token.provenance == TokenProvenance::Quoted);
         let values = cursor.read_value_until_semicolon()?;
         match key.value.as_str() {
             "backend" => {
@@ -428,8 +561,18 @@ fn parse_gpu_block(cursor: &mut TokenCursor) -> Result<GpuConfig> {
                 gpu.devices = vec![value];
             }
             "devices" => {
-                let devices = value_list(&values, "GPU devices", cursor.path())?;
-                for device in &devices {
+                let raw_quoted_parentheses = !structurally_grouped
+                    && raw_quoted_open
+                    && raw_quoted_item
+                    && values.len() == 3
+                    && values.first().map(String::as_str) == Some("(")
+                    && values.last().map(String::as_str) == Some(")");
+                let devices =
+                    value_list(&values, structurally_grouped, "GPU devices", cursor.path())?;
+                for (index, device) in devices.iter().enumerate() {
+                    if raw_quoted_parentheses && (index == 0 || index + 1 == devices.len()) {
+                        continue;
+                    }
                     validate_word_or_number(device, "GPU device", cursor.path())?;
                 }
                 gpu.devices = devices;
@@ -476,7 +619,12 @@ fn single_value(values: &[String], label: &str, path: &Path) -> Result<String> {
     )))
 }
 
-fn value_list(values: &[String], label: &str, path: &Path) -> Result<Vec<String>> {
+fn value_list(
+    values: &[String],
+    structurally_grouped: bool,
+    label: &str,
+    path: &Path,
+) -> Result<Vec<String>> {
     if values.is_empty() {
         return Err(MeshError::InvalidInput(format!(
             "{label} in {} must not be empty",
@@ -484,7 +632,8 @@ fn value_list(values: &[String], label: &str, path: &Path) -> Result<Vec<String>
         )));
     }
 
-    if values.first().map(String::as_str) == Some("(")
+    if structurally_grouped
+        && values.first().map(String::as_str) == Some("(")
         && values.last().map(String::as_str) == Some(")")
     {
         let values = values[1..values.len() - 1].to_vec();
@@ -497,6 +646,12 @@ fn value_list(values: &[String], label: &str, path: &Path) -> Result<Vec<String>
         return Ok(values);
     }
 
+    if values.first().map(String::as_str) == Some("(")
+        && values.last().map(String::as_str) == Some(")")
+    {
+        return Ok(values.to_vec());
+    }
+
     if values.len() == 1 {
         return Ok(vec![values[0].clone()]);
     }
@@ -505,6 +660,36 @@ fn value_list(values: &[String], label: &str, path: &Path) -> Result<Vec<String>
         "{label} in {} must be a single value or parenthesized list",
         path.display()
     )))
+}
+
+fn skip_backend_value(cursor: &mut TokenCursor) -> Result<()> {
+    let balanced = match cursor.peek()? {
+        Some(first) => {
+            if first.provenance == TokenProvenance::Structural
+                && matches!(first.value.as_str(), ";" | "}" | ")" | "]")
+            {
+                return Err(MeshError::InvalidInput(format!(
+                    "unexpected dictionary token in {}",
+                    cursor.path().display()
+                )));
+            }
+            first.provenance == TokenProvenance::Structural
+                && matches!(first.value.as_str(), "{" | "(" | "[")
+        }
+        None => {
+            return Err(MeshError::InvalidInput(format!(
+                "unexpected end of dictionary in {}",
+                cursor.path().display()
+            )));
+        }
+    };
+    if balanced {
+        cursor.skip_typed_balanced()?;
+    } else {
+        cursor.next_required()?;
+        cursor.expect_optional(";")?;
+    }
+    Ok(())
 }
 
 fn validate_auto_or_positive_integer(value: &str, label: &str, path: &Path) -> Result<()> {
@@ -852,5 +1037,161 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("cpu.threads=16"))
         );
+    }
+
+    #[test]
+    fn quoted_device_parentheses_remain_device_values() {
+        for (device, expected) in [
+            ("0", ["(", "0", ")"]),
+            ("1", ["(", "1", ")"]),
+            ("auto", ["(", "auto", ")"]),
+        ] {
+            let config = parse_backend_config_str(
+                &format!(r#"gpu {{ devices "(" "{device}" ")"; }}"#),
+                Path::new("ferrumBackends"),
+            )
+            .unwrap();
+            assert_eq!(config.gpu.devices, expected);
+        }
+    }
+
+    #[test]
+    fn unknown_and_quoted_entries_preserve_backend_sentinels() {
+        let config = parse_backend_config_str(
+            r#"
+            cpu { "threads" 99 threads 7; mystery { swallowed gpu; } numa off; }
+            gpu { "precision" f32 precision f64; mystery (0 1) multiGpu on; }
+            flow {
+                mystery { swallowed gpu; }
+                "quotedStep" { swallowed gpu; };
+                residual "gpu" jacobian gpu;
+                "jacobian" gpu;
+            }
+            heat { "quotedStep" { swallowed gpu; } residual cpu; }
+            "default" gpu default cpu;
+            "#,
+            Path::new("ferrumBackends"),
+        )
+        .unwrap();
+        assert_eq!(config.cpu.threads, "7");
+        assert_eq!(config.cpu.numa, "off");
+        assert_eq!(config.gpu.precision, "f64");
+        assert_eq!(config.gpu.multi_gpu, "on");
+        assert_eq!(config.sections[0].entries.len(), 1);
+        assert_eq!(config.sections[0].entries[0].step, "jacobian");
+        assert_eq!(config.sections[0].entries[0].choice, BackendChoice::Gpu);
+        assert_eq!(config.sections[1].entries.len(), 1);
+        assert_eq!(config.sections[1].entries[0].step, "residual");
+        assert_eq!(config.sections[1].entries[0].choice, BackendChoice::Cpu);
+        assert_eq!(config.default, BackendChoice::Cpu);
+    }
+
+    #[test]
+    fn rejects_non_value_delimiters_and_invalid_quoted_device_parentheses() {
+        for content in ["default { choice gpu; }", "flow { residual }"] {
+            let error = parse_backend_config_str(content, Path::new("ferrumBackends")).unwrap_err();
+            assert!(error.to_string().contains("unexpected dictionary token"));
+        }
+
+        for content in [
+            r#"gpu { devices "(" auto ")"; }"#,
+            r#"gpu { devices "(" ")"; }"#,
+            r#"gpu { devices "(" "0" "1" ")"; }"#,
+            r#"gpu { devices "(" ( 0 ) ")"; }"#,
+            r#"gpu { devices "(" "invalid device" ")"; }"#,
+            r#"gpu { devices "(" "0"; }"#,
+        ] {
+            let error = parse_backend_config_str(content, Path::new("ferrumBackends")).unwrap_err();
+            assert!(error.to_string().contains("GPU device"));
+        }
+    }
+
+    #[test]
+    fn rejects_braced_value_for_known_section_step() {
+        let error = parse_backend_config_str(
+            "flow { residual { gpu; } pressureCorrection cpu; }",
+            Path::new("ferrumBackends"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unexpected dictionary token"));
+    }
+
+    #[test]
+    fn rejects_typed_list_for_known_section_step_without_consuming_sentinel() {
+        let error = parse_backend_config_str(
+            "flow { residual (gpu); pressureCorrection cpu; }",
+            Path::new("ferrumBackends"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "unexpected dictionary token in ferrumBackends"
+        );
+    }
+
+    #[test]
+    fn rejects_bare_multi_device_value_and_structural_key() {
+        let bare = parse_backend_config_str("gpu { devices 0 1; }", Path::new("ferrumBackends"))
+            .unwrap_err();
+        assert!(
+            bare.to_string()
+                .contains("single value or parenthesized list")
+        );
+
+        let structural =
+            parse_backend_config_str("; cpu;", Path::new("ferrumBackends")).unwrap_err();
+        assert!(
+            structural
+                .to_string()
+                .contains("unexpected dictionary token")
+        );
+    }
+
+    #[test]
+    fn section_braced_entries_preserve_residual_or_fail_closed() {
+        for key in ["mystery", r#""mystery""#] {
+            for terminator in ["", ";"] {
+                let content =
+                    format!("flow {{ {key} {{ swallowed gpu; }}{terminator} residual cpu; }}");
+                let config =
+                    parse_backend_config_str(&content, Path::new("ferrumBackends")).unwrap();
+                assert_eq!(config.sections.len(), 1);
+                assert_eq!(config.sections[0].entries.len(), 1);
+                assert_eq!(config.sections[0].entries[0].step, "residual");
+                assert_eq!(config.sections[0].entries[0].choice, BackendChoice::Cpu);
+            }
+        }
+
+        let error = parse_backend_config_str(
+            "flow { residual { swallowed gpu; } pressureCorrection cpu; }",
+            Path::new("ferrumBackends"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unexpected dictionary token"));
+    }
+
+    #[test]
+    fn unknown_resource_blocks_preserve_ordinary_sentinels() {
+        let config = parse_backend_config_str(
+            "cpu { mystery { threads 99; }; threads 3; } gpu { mystery { precision f32; } backend cuda; }",
+            Path::new("ferrumBackends"),
+        )
+        .unwrap();
+        assert_eq!(config.cpu.threads, "3");
+        assert_eq!(config.gpu.backend, "cuda");
+        assert_eq!(config.gpu.precision, "f64");
+    }
+
+    #[test]
+    fn structural_keys_fail_closed_in_every_backend_context() {
+        for content in [
+            "; default cpu;",
+            "cpu { ; threads 3; }",
+            "gpu { ; precision f64; }",
+            "flow { ; residual cpu; }",
+        ] {
+            let error = parse_backend_config_str(content, Path::new("ferrumBackends")).unwrap_err();
+            assert!(error.to_string().contains("unexpected dictionary token"));
+        }
     }
 }
