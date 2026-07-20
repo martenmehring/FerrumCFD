@@ -244,6 +244,8 @@ pub mod streaming {
 
     pub const MAX_DICTIONARY_NESTING: usize = 128;
     pub const MAX_TOKEN_BYTES: usize = 1024 * 1024;
+    pub const MAX_DICTIONARY_TOKENS: usize = 1_000_000;
+    pub const MAX_DICTIONARY_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum TokenProvenance {
@@ -334,7 +336,333 @@ pub mod streaming {
             }
             Ok(self.lookahead.as_ref().map(|entry| &entry.0))
         }
+    }
 
+    pub struct TokenBatch {
+        path: PathBuf,
+        tokens: Vec<Token>,
+        eof_line: usize,
+        payload_bytes: usize,
+    }
+
+    impl TokenBatch {
+        pub fn path(&self) -> &Path {
+            &self.path
+        }
+        pub fn tokens(&self) -> &[Token] {
+            &self.tokens
+        }
+        pub fn len(&self) -> usize {
+            self.tokens.len()
+        }
+        pub fn is_empty(&self) -> bool {
+            self.tokens.is_empty()
+        }
+        pub fn eof_line(&self) -> usize {
+            self.eof_line
+        }
+        pub fn payload_bytes(&self) -> usize {
+            self.payload_bytes
+        }
+        pub fn into_cursor(self) -> TokenCursor {
+            TokenCursor {
+                path: self.path,
+                tokens: self.tokens.into_iter(),
+                eof_line: self.eof_line,
+                failure: None,
+            }
+        }
+    }
+
+    pub fn tokenize(path: &Path, content: &str) -> Result<TokenBatch> {
+        tokenize_reader(
+            path,
+            std::io::Cursor::new(content.as_bytes()),
+            content.len(),
+        )
+    }
+
+    pub fn tokenize_reader<R: BufRead>(
+        path: &Path,
+        reader: R,
+        exact_total_bytes: usize,
+    ) -> Result<TokenBatch> {
+        TokenSource::new(path, reader, exact_total_bytes)?.into_batch()
+    }
+
+    pub struct TokenCursor {
+        path: PathBuf,
+        tokens: std::vec::IntoIter<Token>,
+        eof_line: usize,
+        failure: Option<Failure>,
+    }
+
+    impl TokenCursor {
+        pub fn path(&self) -> &Path {
+            &self.path
+        }
+        pub fn eof_line(&self) -> usize {
+            self.eof_line
+        }
+
+        pub fn peek(&mut self) -> Result<Option<&Token>> {
+            if self.failure.is_some() {
+                Err(self.sticky())
+            } else {
+                Ok(self.tokens.as_slice().first())
+            }
+        }
+        pub fn peek_next(&mut self) -> Result<Option<&Token>> {
+            if self.failure.is_some() {
+                return Err(self.sticky());
+            }
+            Ok(self.tokens.as_slice().get(1))
+        }
+        #[allow(clippy::should_implement_trait)]
+        pub fn next(&mut self) -> Result<Option<Token>> {
+            if self.failure.is_some() {
+                return Err(self.sticky());
+            }
+            Ok(self.tokens.next())
+        }
+        pub fn next_required(&mut self) -> Result<Token> {
+            match self.next()? {
+                Some(token) => Ok(token),
+                None => Err(self.latch(self.eof_line, "unexpected end of dictionary")),
+            }
+        }
+
+        pub fn expect(&mut self, expected: &str) -> Result<()> {
+            let token = self.next_required()?;
+            let provenance = if Self::is_syntax(expected) {
+                TokenProvenance::Structural
+            } else {
+                TokenProvenance::Ordinary
+            };
+            if token.value == expected && token.provenance == provenance {
+                return Ok(());
+            }
+            Err(self.latch_token(token.line, "unexpected dictionary token"))
+        }
+        pub fn expect_optional(&mut self, expected: &str) -> Result<bool> {
+            let provenance = if Self::is_syntax(expected) {
+                TokenProvenance::Structural
+            } else {
+                TokenProvenance::Ordinary
+            };
+            let matches = self
+                .peek()?
+                .is_some_and(|token| token.value == expected && token.provenance == provenance);
+            if matches {
+                self.next_required()?;
+            }
+            Ok(matches)
+        }
+        pub fn expect_keyword(&mut self, expected: &str) -> Result<()> {
+            let token = self.next_required()?;
+            if token.value == expected && token.provenance == TokenProvenance::Ordinary {
+                return Ok(());
+            }
+            Err(self.latch_token(token.line, "unexpected dictionary token"))
+        }
+        pub fn expect_optional_keyword(&mut self, expected: &str) -> Result<bool> {
+            let matches = self.peek()?.is_some_and(|token| {
+                token.value == expected && token.provenance == TokenProvenance::Ordinary
+            });
+            if matches {
+                self.next_required()?;
+            }
+            Ok(matches)
+        }
+
+        pub fn read_value_until_semicolon(&mut self) -> Result<Vec<String>> {
+            self.read_strict_value()
+        }
+        pub fn read_strict_value(&mut self) -> Result<Vec<String>> {
+            if self
+                .peek()?
+                .is_some_and(|t| Self::structural(t, ";") || Self::closer(t))
+            {
+                let eof_line = self.eof_line;
+                let line = self.peek()?.map_or(eof_line, |t| t.line);
+                return Err(self.latch(line, "dictionary value is missing"));
+            }
+            let mut values = Vec::new();
+            let mut payload = 0usize;
+            let mut stack = ['\0'; MAX_DICTIONARY_NESTING];
+            let mut depth = 0usize;
+            loop {
+                let token = self.next_required()?;
+                if depth == 0 && Self::structural(&token, ";") {
+                    return Ok(values);
+                }
+                if depth == 0 && Self::closer(&token) {
+                    return Err(self.latch(token.line, "dictionary value is missing a semicolon"));
+                }
+                Self::track_delimiter(&token, &mut stack, &mut depth)
+                    .map_err(|detail| self.latch(token.line, detail))?;
+                payload = payload
+                    .checked_add(token.value.len())
+                    .ok_or_else(|| self.latch(token.line, "dictionary payload length overflow"))?;
+                if payload > MAX_DICTIONARY_PAYLOAD_BYTES {
+                    return Err(self.latch(token.line, "dictionary payload byte limit exceeded"));
+                }
+                values
+                    .try_reserve(1)
+                    .map_err(|_| self.latch(token.line, "dictionary value allocation failed"))?;
+                values.push(token.value);
+            }
+        }
+        pub fn read_bare_entry(&mut self) -> Result<Vec<String>> {
+            if self.peek()?.is_some_and(|t| Self::structural(t, ";")) {
+                self.next_required()?;
+                Ok(Vec::new())
+            } else {
+                self.read_strict_value()
+            }
+        }
+        pub fn skip_typed_balanced(&mut self) -> Result<()> {
+            let first = self.next_required()?;
+            if !Self::opener(&first) {
+                return Err(self.latch(first.line, "expected dictionary delimiter"));
+            }
+            let mut stack = ['\0'; MAX_DICTIONARY_NESTING];
+            let mut depth = 0usize;
+            Self::track_delimiter(&first, &mut stack, &mut depth)
+                .map_err(|d| self.latch(first.line, d))?;
+            while depth != 0 {
+                let token = self.next_required()?;
+                Self::track_delimiter(&token, &mut stack, &mut depth)
+                    .map_err(|d| self.latch(token.line, d))?;
+            }
+            self.expect_optional(";")?;
+            Ok(())
+        }
+        pub fn skip_braced_block(&mut self) -> Result<()> {
+            if !self.peek()?.is_some_and(|t| Self::structural(t, "{")) {
+                let eof_line = self.eof_line;
+                let line = self.peek()?.map_or(eof_line, |t| t.line);
+                return Err(self.latch(line, "expected dictionary block"));
+            }
+            self.skip_typed_balanced()
+        }
+        pub fn skip_value_or_block(&mut self) -> Result<()> {
+            if self.peek()?.is_some_and(|t| Self::structural(t, "{")) {
+                return self.skip_typed_balanced();
+            }
+            if self
+                .peek()?
+                .is_some_and(|t| Self::structural(t, ";") || Self::closer(t))
+            {
+                let eof_line = self.eof_line;
+                let line = self.peek()?.map_or(eof_line, |t| t.line);
+                return Err(self.latch(line, "dictionary value is missing"));
+            }
+            let mut stack = ['\0'; MAX_DICTIONARY_NESTING];
+            let mut depth = 0usize;
+            loop {
+                let token = self.next_required()?;
+                if depth == 0 && Self::structural(&token, ";") {
+                    return Ok(());
+                }
+                if depth == 0 && Self::closer(&token) {
+                    return Err(self.latch(token.line, "dictionary value is missing a semicolon"));
+                }
+                Self::track_delimiter(&token, &mut stack, &mut depth)
+                    .map_err(|d| self.latch(token.line, d))?;
+            }
+        }
+        fn is_syntax(value: &str) -> bool {
+            matches!(value, "{" | "}" | "(" | ")" | "[" | "]" | ";")
+        }
+        fn structural(token: &Token, value: &str) -> bool {
+            token.provenance == TokenProvenance::Structural && token.value == value
+        }
+        fn opener(token: &Token) -> bool {
+            token.provenance == TokenProvenance::Structural
+                && matches!(token.value.as_str(), "{" | "(" | "[")
+        }
+        fn closer(token: &Token) -> bool {
+            token.provenance == TokenProvenance::Structural
+                && matches!(token.value.as_str(), "}" | ")" | "]")
+        }
+        fn track_delimiter(
+            token: &Token,
+            stack: &mut [char; MAX_DICTIONARY_NESTING],
+            depth: &mut usize,
+        ) -> std::result::Result<(), &'static str> {
+            if token.provenance != TokenProvenance::Structural {
+                return Ok(());
+            }
+            let ch = match token.value.as_str() {
+                "{" => '{',
+                "(" => '(',
+                "[" => '[',
+                "}" => '}',
+                ")" => ')',
+                "]" => ']',
+                _ => return Ok(()),
+            };
+            if matches!(ch, '{' | '(' | '[') {
+                if *depth == MAX_DICTIONARY_NESTING {
+                    return Err("dictionary nesting limit exceeded");
+                }
+                stack[*depth] = ch;
+                *depth = depth
+                    .checked_add(1)
+                    .ok_or("dictionary nesting counter overflow")?;
+            } else {
+                let top = depth
+                    .checked_sub(1)
+                    .ok_or("unexpected dictionary closing delimiter")?;
+                if !TokenSource::<std::io::Empty>::matching(stack[top], ch) {
+                    return Err("mismatched dictionary delimiter");
+                }
+                *depth = top;
+            }
+            Ok(())
+        }
+        fn sticky(&self) -> MeshError {
+            match &self.failure {
+                Some(f) => MeshError::Parse {
+                    line: f.line,
+                    message: TokenSource::<std::io::Empty>::copy_message(&f.message),
+                },
+                None => MeshError::Parse {
+                    line: self.eof_line,
+                    message: "dictionary cursor failed".to_owned(),
+                },
+            }
+        }
+        fn latch_token(&mut self, line: usize, detail: &str) -> MeshError {
+            self.latch(line, detail)
+        }
+        fn latch(&mut self, line: usize, detail: &str) -> MeshError {
+            if self.failure.is_none() {
+                #[allow(clippy::manual_unwrap_or)]
+                let path = match self.path.to_str() {
+                    Some(value) => value,
+                    None => "<non-UTF-8 dictionary path>",
+                };
+                let capacity = path
+                    .len()
+                    .checked_add(2)
+                    .and_then(|n| n.checked_add(detail.len()));
+                let mut message = String::new();
+                if capacity.and_then(|n| message.try_reserve(n).ok()).is_some() {
+                    message.push_str(path);
+                    message.push_str(": ");
+                    message.push_str(detail);
+                } else {
+                    message.push_str("dictionary error allocation failed");
+                }
+                self.failure = Some(Failure { line, message });
+            }
+            self.sticky()
+        }
+    }
+
+    impl<R: BufRead> TokenSource<R> {
         #[allow(clippy::should_implement_trait)]
         pub fn next(&mut self) -> Result<Option<Token>> {
             self.peek()?;
@@ -354,6 +682,36 @@ pub mod streaming {
                 Some(token) => Ok(token),
                 None => Err(self.latch(self.line, "unexpected end of dictionary")),
             }
+        }
+
+        pub fn into_batch(mut self) -> Result<TokenBatch> {
+            let mut tokens = Vec::new();
+            let mut payload_bytes = 0usize;
+            while let Some(token) = self.next()? {
+                let count = tokens
+                    .len()
+                    .checked_add(1)
+                    .ok_or_else(|| self.latch(token.line, "dictionary token count overflow"))?;
+                if count > MAX_DICTIONARY_TOKENS {
+                    return Err(self.latch(token.line, "dictionary token count limit exceeded"));
+                }
+                payload_bytes = payload_bytes
+                    .checked_add(token.value.len())
+                    .ok_or_else(|| self.latch(token.line, "dictionary payload length overflow"))?;
+                if payload_bytes > MAX_DICTIONARY_PAYLOAD_BYTES {
+                    return Err(self.latch(token.line, "dictionary payload byte limit exceeded"));
+                }
+                tokens
+                    .try_reserve(1)
+                    .map_err(|_| self.latch(token.line, "dictionary token allocation failed"))?;
+                tokens.push(token);
+            }
+            Ok(TokenBatch {
+                path: self.path,
+                tokens,
+                eof_line: self.line,
+                payload_bytes,
+            })
         }
 
         fn sticky(&self) -> MeshError {
@@ -977,6 +1335,152 @@ pub mod streaming {
                 MAX_TOKEN_BYTES
             );
             assert!(source(&vec![b'a'; MAX_TOKEN_BYTES + 1]).peek().is_err());
+        }
+
+        #[test]
+        fn token_batch_preserves_path_and_eof_line() {
+            let batch = super::tokenize(Path::new("batch"), "a;\n").unwrap();
+            assert_eq!(batch.path(), Path::new("batch"));
+            assert_eq!(batch.eof_line(), 2);
+        }
+
+        #[test]
+        fn tokenize_helpers_use_incremental_source() {
+            let batch =
+                super::tokenize_reader(Path::new("reader"), source(b"a;").reader, 2).unwrap();
+            assert_eq!(batch.tokens().len(), 2);
+        }
+
+        #[test]
+        fn cursor_peek_next_and_expect_are_provenance_safe() {
+            let mut cursor = super::tokenize(Path::new("cursor"), "key;")
+                .unwrap()
+                .into_cursor();
+            assert_eq!(cursor.peek_next().unwrap().unwrap().value, ";");
+            cursor.expect("key").unwrap();
+        }
+
+        #[test]
+        fn quoted_semicolon_remains_data() {
+            let mut cursor = super::tokenize(Path::new("quoted"), "\";\";")
+                .unwrap()
+                .into_cursor();
+            assert_eq!(cursor.read_strict_value().unwrap(), vec![";"]);
+        }
+
+        #[test]
+        fn provenance_safe_keywords() {
+            let mut cursor = super::tokenize(Path::new("keyword"), "\"FoamFile\";")
+                .unwrap()
+                .into_cursor();
+            assert!(cursor.expect_keyword("FoamFile").is_err());
+
+            let mut cursor = super::tokenize(Path::new("keyword-semicolon"), ";")
+                .unwrap()
+                .into_cursor();
+            assert!(cursor.expect_keyword(";").is_err());
+            let mut cursor = super::tokenize(Path::new("optional-keyword-semicolon"), ";")
+                .unwrap()
+                .into_cursor();
+            assert!(!cursor.expect_optional_keyword(";").unwrap());
+            assert_eq!(cursor.next_required().unwrap().value, ";");
+        }
+
+        #[test]
+        fn strict_value_and_bare_entry_are_distinct() {
+            assert!(
+                super::tokenize(Path::new("strict"), ";")
+                    .unwrap()
+                    .into_cursor()
+                    .read_strict_value()
+                    .is_err()
+            );
+            assert!(
+                super::tokenize(Path::new("bare"), ";")
+                    .unwrap()
+                    .into_cursor()
+                    .read_bare_entry()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[test]
+        fn missing_semicolon_is_sticky() {
+            let mut cursor = super::tokenize(Path::new("missing"), "value")
+                .unwrap()
+                .into_cursor();
+            let first = cursor.read_strict_value().unwrap_err().to_string();
+            assert_eq!(cursor.next().unwrap_err().to_string(), first);
+        }
+
+        #[test]
+        fn typed_balanced_discard_validates_mixed_delimiters() {
+            let mut cursor = super::tokenize(Path::new("typed"), "{([])};")
+                .unwrap()
+                .into_cursor();
+            cursor.skip_typed_balanced().unwrap();
+            assert!(cursor.next().unwrap().is_none());
+        }
+
+        #[test]
+        fn optional_semicolon_requires_structural_provenance() {
+            let mut cursor = super::tokenize(Path::new("optional"), "\";\"")
+                .unwrap()
+                .into_cursor();
+            assert!(!cursor.expect_optional(";").unwrap());
+        }
+
+        #[test]
+        fn value_or_block_skip_collects_nothing() {
+            let mut cursor = super::tokenize(Path::new("skip"), "{ value; };")
+                .unwrap()
+                .into_cursor();
+            cursor.skip_value_or_block().unwrap();
+            assert!(cursor.next().unwrap().is_none());
+
+            for value in ["(a) tail; next;", "[a] tail; next;"] {
+                let mut cursor = super::tokenize(Path::new("skip-value"), value)
+                    .unwrap()
+                    .into_cursor();
+                cursor.skip_value_or_block().unwrap();
+                assert_eq!(cursor.next_required().unwrap().value, "next");
+            }
+        }
+
+        #[test]
+        fn cursor_terminal_errors_are_sticky() {
+            let mut cursor = super::tokenize(Path::new("terminal"), "")
+                .unwrap()
+                .into_cursor();
+            let first = cursor.next_required().unwrap_err().to_string();
+            assert_eq!(cursor.peek().unwrap_err().to_string(), first);
+        }
+
+        #[test]
+        fn batch_caps_fail_before_growth() {
+            let token_fixture = ";".repeat(super::MAX_DICTIONARY_TOKENS + 1);
+            let token_error = match super::tokenize(Path::new("token-cap"), &token_fixture) {
+                Ok(_) => panic!("token cap fixture unexpectedly succeeded"),
+                Err(error) => error.to_string(),
+            };
+            assert!(token_error.contains("token count limit exceeded"));
+
+            let token_len = super::MAX_TOKEN_BYTES - 1;
+            let token_count = super::MAX_DICTIONARY_PAYLOAD_BYTES / token_len + 1;
+            let mut payload_fixture = String::new();
+            payload_fixture
+                .try_reserve(token_count * (token_len + 1))
+                .unwrap();
+            for _ in 0..token_count {
+                payload_fixture.push_str(&"a".repeat(token_len));
+                payload_fixture.push(' ');
+            }
+            let payload_error = match super::tokenize(Path::new("payload-cap"), &payload_fixture) {
+                Ok(_) => panic!("payload cap fixture unexpectedly succeeded"),
+                Err(error) => error.to_string(),
+            };
+            assert!(payload_error.contains("payload byte limit exceeded"));
         }
     }
 }
