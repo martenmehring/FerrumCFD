@@ -129,12 +129,11 @@ pub fn validate_interface_config(
 }
 
 fn parse_interface_config_str(content: &str, path: &Path) -> Result<InterfaceConfig> {
-    let tokens = tokenize(content);
-    let mut cursor = TokenCursor::new(path, tokens);
+    let mut cursor = tokenize(path, content)?.into_cursor();
     let mut entries = Vec::new();
 
-    while let Some(token) = cursor.peek() {
-        match token {
+    while let Some(token) = cursor.peek()? {
+        match token.value.as_str() {
             "FoamFile" => {
                 cursor.next_required()?;
                 cursor.skip_braced_block()?;
@@ -159,8 +158,8 @@ fn parse_interface_config_str(content: &str, path: &Path) -> Result<InterfaceCon
 fn parse_interfaces_block(cursor: &mut TokenCursor) -> Result<Vec<InterfaceConfigEntry>> {
     let mut entries = Vec::new();
 
-    while !cursor.peek_is("}")? {
-        let name = cursor.next_required()?;
+    while cursor.peek()?.is_none_or(|token| token.value != "}") {
+        let name = cursor.next_required()?.value;
         cursor.expect("{")?;
         entries.push(parse_interface_entry(cursor, name)?);
     }
@@ -175,9 +174,9 @@ fn parse_interface_entry(cursor: &mut TokenCursor, name: String) -> Result<Inter
     let mut orientation = None;
     let mut model = None;
 
-    while !cursor.peek_is("}")? {
+    while cursor.peek()?.is_none_or(|token| token.value != "}") {
         let key = cursor.next_required()?;
-        match key.as_str() {
+        match key.value.as_str() {
             "regions" => regions = Some(read_regions(cursor)?),
             "faceZone" => {
                 face_zone = Some(cursor.next_required()?);
@@ -199,23 +198,23 @@ fn parse_interface_entry(cursor: &mut TokenCursor, name: String) -> Result<Inter
     let regions = regions.ok_or_else(|| missing_key(cursor.path(), &name, "regions"))?;
     let raw_orientation =
         orientation.ok_or_else(|| missing_key(cursor.path(), &name, "orientation"))?;
-    let orientation = parse_orientation(&raw_orientation, &regions, cursor.path())?;
+    let orientation = parse_orientation(&raw_orientation.value, &regions, cursor.path())?;
     let face_zone = face_zone.ok_or_else(|| missing_key(cursor.path(), &name, "faceZone"))?;
 
     Ok(InterfaceConfigEntry {
         name,
         regions,
-        face_zone,
+        face_zone: face_zone.value,
         orientation,
-        model: model.unwrap_or_else(|| "none".to_string()),
+        model: model.map_or_else(|| "none".to_string(), |token| token.value),
     })
 }
 
 fn read_regions(cursor: &mut TokenCursor) -> Result<[String; 2]> {
     cursor.expect("(")?;
     let mut values = Vec::new();
-    while !cursor.peek_is(")")? {
-        values.push(cursor.next_required()?);
+    while cursor.peek()?.is_none_or(|token| token.value != ")") {
+        values.push(cursor.next_required()?.value);
     }
     cursor.expect(")")?;
     cursor.expect_optional(";")?;
@@ -227,7 +226,7 @@ fn read_regions(cursor: &mut TokenCursor) -> Result<[String; 2]> {
         )));
     }
 
-    Ok([values.remove(0), values.remove(0)])
+    Ok([values[0].clone(), values[1].clone()])
 }
 
 fn parse_orientation(

@@ -144,29 +144,28 @@ fn parse_property_dictionary_str(
     path: &Path,
     region: Option<String>,
 ) -> Result<PropertyDictionary> {
-    let tokens = tokenize(content);
-    let mut cursor = TokenCursor::new(path, tokens);
+    let mut cursor = tokenize(path, content)?.into_cursor();
     let mut entries = Vec::new();
     let mut sections = Vec::new();
 
-    while let Some(token) = cursor.peek() {
-        if token == ";" {
+    while let Some(token) = cursor.peek()? {
+        if token.value == ";" {
             cursor.next_required()?;
             continue;
         }
-        if token == "FoamFile" {
+        if token.value == "FoamFile" {
             cursor.next_required()?;
             cursor.skip_braced_block()?;
             continue;
         }
 
         let key = cursor.next_required()?;
-        if cursor.peek() == Some("{") {
-            sections.push(parse_property_section(&mut cursor, key, 1)?);
+        if cursor.peek()?.is_some_and(|token| token.value == "{") {
+            sections.push(parse_property_section(&mut cursor, key.value, 1)?);
         } else {
             entries.push(PropertyEntry {
-                key,
-                value: cursor.read_value_until_semicolon()?,
+                key: key.value,
+                value: cursor.read_bare_entry()?,
             });
         }
     }
@@ -198,19 +197,19 @@ fn parse_property_section(
     let mut entries = Vec::new();
     let mut sections = Vec::new();
 
-    while !cursor.peek_is("}")? {
-        if cursor.peek() == Some(";") {
+    while cursor.peek()?.is_none_or(|token| token.value != "}") {
+        if cursor.peek()?.is_some_and(|token| token.value == ";") {
             cursor.next_required()?;
             continue;
         }
 
         let key = cursor.next_required()?;
-        if cursor.peek() == Some("{") {
-            sections.push(parse_property_section(cursor, key, depth + 1)?);
+        if cursor.peek()?.is_some_and(|token| token.value == "{") {
+            sections.push(parse_property_section(cursor, key.value, depth + 1)?);
         } else {
             entries.push(PropertyEntry {
-                key,
-                value: cursor.read_value_until_semicolon()?,
+                key: key.value,
+                value: cursor.read_bare_entry()?,
             });
         }
     }

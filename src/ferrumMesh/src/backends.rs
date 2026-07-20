@@ -282,18 +282,19 @@ fn choice_can_use_gpu(choice: BackendChoice) -> bool {
 }
 
 fn parse_backend_config_str(content: &str, path: &Path) -> Result<BackendConfig> {
-    let tokens = tokenize(content);
-    let mut cursor = TokenCursor::new(path, tokens);
+    let mut cursor = tokenize(path, content)?.into_cursor();
     let mut builder = BackendConfigBuilder::new(path);
 
-    while let Some(token) = cursor.peek() {
-        if token == "FoamFile" {
+    while let Some(token) = cursor.peek()? {
+        if token.value == "FoamFile" {
             cursor.next_required()?;
             cursor.skip_braced_block()?;
             continue;
         }
 
-        if token == "ferrumBackends" && cursor.peek_next() == Some("{") {
+        if token.value == "ferrumBackends"
+            && cursor.peek_next()?.is_some_and(|token| token.value == "{")
+        {
             cursor.next_required()?;
             cursor.expect("{")?;
             parse_backend_entries(&mut cursor, &mut builder, true)?;
@@ -311,8 +312,8 @@ fn parse_backend_entries(
     builder: &mut BackendConfigBuilder,
     stop_at_close: bool,
 ) -> Result<()> {
-    while cursor.peek().is_some() {
-        if stop_at_close && cursor.peek_is("}")? {
+    while cursor.peek()?.is_some() {
+        if stop_at_close && cursor.peek()?.is_some_and(|token| token.value == "}") {
             cursor.expect("}")?;
             return Ok(());
         }
@@ -329,9 +330,9 @@ fn parse_backend_entries(
 
 fn parse_backend_entry(cursor: &mut TokenCursor, builder: &mut BackendConfigBuilder) -> Result<()> {
     let key = cursor.next_required()?;
-    match key.as_str() {
+    match key.value.as_str() {
         "default" => {
-            let choice = parse_backend_choice(&cursor.next_required()?, cursor.path())?;
+            let choice = parse_backend_choice(&cursor.next_required()?.value, cursor.path())?;
             cursor.expect_optional(";")?;
             builder.default = Some(choice);
         }
@@ -347,7 +348,9 @@ fn parse_backend_entry(cursor: &mut TokenCursor, builder: &mut BackendConfigBuil
         }
         _ => {
             cursor.expect("{")?;
-            builder.sections.push(parse_backend_section(cursor, key)?);
+            builder
+                .sections
+                .push(parse_backend_section(cursor, key.value)?);
         }
     }
     Ok(())
@@ -356,9 +359,9 @@ fn parse_backend_entry(cursor: &mut TokenCursor, builder: &mut BackendConfigBuil
 fn parse_backend_section(cursor: &mut TokenCursor, name: String) -> Result<BackendSection> {
     let mut entries = Vec::new();
 
-    while !cursor.peek_is("}")? {
-        let step = cursor.next_required()?;
-        let choice = parse_backend_choice(&cursor.next_required()?, cursor.path())?;
+    while cursor.peek()?.is_none_or(|token| token.value != "}") {
+        let step = cursor.next_required()?.value;
+        let choice = parse_backend_choice(&cursor.next_required()?.value, cursor.path())?;
         cursor.expect_optional(";")?;
         entries.push(BackendSelection { step, choice });
     }
@@ -370,10 +373,10 @@ fn parse_backend_section(cursor: &mut TokenCursor, name: String) -> Result<Backe
 fn parse_cpu_block(cursor: &mut TokenCursor) -> Result<CpuConfig> {
     let mut cpu = CpuConfig::default();
 
-    while !cursor.peek_is("}")? {
+    while cursor.peek()?.is_none_or(|token| token.value != "}") {
         let key = cursor.next_required()?;
         let values = cursor.read_value_until_semicolon()?;
-        match key.as_str() {
+        match key.value.as_str() {
             "cpus" => {
                 let value = single_value(&values, "CPU cpus", cursor.path())?;
                 validate_auto_or_positive_integer(&value, "CPU cpus", cursor.path())?;
@@ -410,10 +413,10 @@ fn parse_cpu_block(cursor: &mut TokenCursor) -> Result<CpuConfig> {
 fn parse_gpu_block(cursor: &mut TokenCursor) -> Result<GpuConfig> {
     let mut gpu = GpuConfig::default();
 
-    while !cursor.peek_is("}")? {
+    while cursor.peek()?.is_none_or(|token| token.value != "}") {
         let key = cursor.next_required()?;
         let values = cursor.read_value_until_semicolon()?;
-        match key.as_str() {
+        match key.value.as_str() {
             "backend" => {
                 let value = single_value(&values, "GPU backend", cursor.path())?;
                 validate_gpu_backend(&value, cursor.path())?;
@@ -713,7 +716,7 @@ mod tests {
             parse_backend_config_str("ferrumBackends { default cpu;", Path::new("ferrumBackends"))
                 .expect_err("missing closing brace must fail");
 
-        assert!(error.to_string().contains("missing closing"));
+        assert!(error.to_string().contains("unclosed dictionary delimiter"));
     }
 
     #[test]
