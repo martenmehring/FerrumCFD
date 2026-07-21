@@ -45,8 +45,8 @@ use ferrum_mesh::regions::{
     read_region_mesh_summaries, split_regions_by_cell_zones,
 };
 use ferrum_mesh::runner::{
-    SolverRunnerDryRun, SolverRunnerDryRunEvent, SolverRunnerDryRunOptions,
-    build_solver_runner_dry_run,
+    MAX_SOLVER_RUNNER_DRY_RUN_STEPS, SolverRunnerDryRun, SolverRunnerDryRunEvent,
+    SolverRunnerDryRunOptions, build_solver_runner_dry_run,
 };
 use ferrum_mesh::runtime::SolverRuntimeData;
 use ferrum_mesh::solver_plan::{
@@ -6791,6 +6791,11 @@ fn parse_solver_args_for_invocation(
                 if max_runner_steps == 0 {
                     return Err("--maxRunnerSteps must be greater than zero".to_string());
                 }
+                if max_runner_steps > MAX_SOLVER_RUNNER_DRY_RUN_STEPS {
+                    return Err(format!(
+                        "--maxRunnerSteps must be no greater than {MAX_SOLVER_RUNNER_DRY_RUN_STEPS}"
+                    ));
+                }
                 index += 2;
             }
             "-solveScalarDiffusion"
@@ -7567,7 +7572,9 @@ fn print_solver_usage() {
     println!("options:");
     println!("  --planJson <file>    also write the solver-neutral plan as JSON");
     println!("  --runnerDryRun       preview the future solver runner without solving equations");
-    println!("  --maxRunnerSteps <n> limit runner dry-run preview steps (default: 3)");
+    println!(
+        "  --maxRunnerSteps <n> limit runner dry-run preview steps (default: 3, max: {MAX_SOLVER_RUNNER_DRY_RUN_STEPS})"
+    );
     println!("  --solveScalarDiffusion <field> assemble and solve one CPU scalar diffusion system");
 
     println!("  --solveTolerance <v> absolute residual tolerance (default: 1e-10)");
@@ -7599,11 +7606,11 @@ fn normalize_case_path(path: &Path) -> PathBuf {
 mod tests {
     use super::{
         ContinuitySummary, LaminarSimpleIterationSummary, LaminarSimpleOptions,
-        LaminarSimpleResidualControlSummary, LaminarSimpleSchemes, ScalarDiffusionLinearSolver,
-        SolverNumericsDictionaryPlan, SolverSelectionSource, estimate_iterations_to_convergence,
-        estimate_simple_iterations_to_convergence, numerics_dictionary_number,
-        numerics_dictionary_usize, numerics_dictionary_value, openfoam_gamg_options,
-        outer_convergence_status_for_reason, parse_ferrum_run_args,
+        LaminarSimpleResidualControlSummary, LaminarSimpleSchemes, MAX_SOLVER_RUNNER_DRY_RUN_STEPS,
+        ScalarDiffusionLinearSolver, SolverNumericsDictionaryPlan, SolverSelectionSource,
+        estimate_iterations_to_convergence, estimate_simple_iterations_to_convergence,
+        numerics_dictionary_number, numerics_dictionary_usize, numerics_dictionary_value,
+        openfoam_gamg_options, outer_convergence_status_for_reason, parse_ferrum_run_args,
         parse_incompressible_fluid_args, parse_incompressible_fluid_plan_args,
         parse_laminar_simple_convection_scheme, parse_laminar_simple_gradient_scheme,
         parse_laminar_simple_laplacian_scheme, parse_laminar_simple_sn_grad_scheme,
@@ -7810,6 +7817,18 @@ mod tests {
         let error = parse_solver_args(&args).expect_err("zero preview steps should fail");
 
         assert!(error.contains("greater than zero"));
+    }
+
+    #[test]
+    fn rejects_excessive_runner_preview_steps() {
+        let args = vec![
+            "--maxRunnerSteps".to_string(),
+            (MAX_SOLVER_RUNNER_DRY_RUN_STEPS + 1).to_string(),
+        ];
+
+        let error = parse_solver_args(&args).expect_err("excessive preview steps should fail");
+
+        assert!(error.contains("no greater than"));
     }
 
     #[test]

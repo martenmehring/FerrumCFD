@@ -3,6 +3,8 @@ use crate::linear::linear_solver_capabilities;
 use crate::solver_plan::{SolverCasePlan, SolverRunPlan, SolverRunStageSource};
 use crate::solver_state::SolverStatePlan;
 
+pub const MAX_SOLVER_RUNNER_DRY_RUN_STEPS: usize = 1_000;
+
 #[derive(Clone, Copy, Debug)]
 pub struct SolverRunnerDryRunOptions {
     pub max_steps: usize,
@@ -126,7 +128,7 @@ pub fn build_solver_runner_dry_run(
     plan: &SolverCasePlan,
     options: SolverRunnerDryRunOptions,
 ) -> SolverRunnerDryRun {
-    let max_steps = options.max_steps.max(1);
+    let max_steps = options.max_steps.clamp(1, MAX_SOLVER_RUNNER_DRY_RUN_STEPS);
     let planned_steps = plan.run.estimated_steps;
     let preview_steps = planned_steps
         .map(|steps| steps.min(max_steps))
@@ -135,6 +137,11 @@ pub fn build_solver_runner_dry_run(
         .map(|steps| steps > preview_steps)
         .unwrap_or(false);
     let mut warnings = Vec::new();
+    if options.max_steps > MAX_SOLVER_RUNNER_DRY_RUN_STEPS {
+        warnings.push(format!(
+            "runner dry-run preview is capped at {MAX_SOLVER_RUNNER_DRY_RUN_STEPS} steps"
+        ));
+    }
     if planned_steps.is_none() {
         warnings.push(
             "time loop cannot be expanded because the run plan has no finite estimated step count"
@@ -324,7 +331,10 @@ mod tests {
     };
     use crate::solver_state::SolverStatePlan;
 
-    use super::{SolverRunnerDryRunEvent, SolverRunnerDryRunOptions, build_solver_runner_dry_run};
+    use super::{
+        MAX_SOLVER_RUNNER_DRY_RUN_STEPS, SolverRunnerDryRunEvent, SolverRunnerDryRunOptions,
+        build_solver_runner_dry_run,
+    };
     use super::{SolverRuntimeDispatchStatus, SolverRuntimeTarget};
 
     #[test]
@@ -374,6 +384,33 @@ mod tests {
                 .events
                 .iter()
                 .any(|event| matches!(event, SolverRunnerDryRunEvent::Write { step: 2, .. }))
+        );
+    }
+
+    #[test]
+    fn caps_excessive_dry_run_preview_steps() {
+        let plan = case_plan(
+            Some(MAX_SOLVER_RUNNER_DRY_RUN_STEPS + 50),
+            1.0,
+            "timeStep",
+            None,
+        );
+
+        let dry_run = build_solver_runner_dry_run(
+            &plan,
+            SolverRunnerDryRunOptions {
+                max_steps: MAX_SOLVER_RUNNER_DRY_RUN_STEPS + 50,
+            },
+        );
+
+        assert_eq!(dry_run.max_steps, MAX_SOLVER_RUNNER_DRY_RUN_STEPS);
+        assert_eq!(dry_run.preview_steps, MAX_SOLVER_RUNNER_DRY_RUN_STEPS);
+        assert!(dry_run.truncated);
+        assert!(
+            dry_run
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("capped"))
         );
     }
 
