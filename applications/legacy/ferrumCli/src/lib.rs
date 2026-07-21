@@ -28,8 +28,9 @@ use ferrum_mesh::flow::{
     LaminarSimpleLinearSolver, LaminarSimpleOptions, LaminarSimplePreconditioner,
     LaminarSimpleReport, LaminarSimpleResidualControlSummary, LaminarSimpleSchemes,
     LaminarSimpleSnGradScheme, LaminarSimpleStopReason, LinearSolveSummary,
-    MatrixDiagnosticSummary, PressureAssemblyDiagnostics, ScalarDiagnosticSummary,
-    VectorDiagnosticSummary, solve_laminar_simple, solve_laminar_simple_with_observer,
+    MAX_NON_ORTHOGONAL_CORRECTORS, MatrixDiagnosticSummary, PressureAssemblyDiagnostics,
+    ScalarDiagnosticSummary, VectorDiagnosticSummary, solve_laminar_simple,
+    solve_laminar_simple_with_observer,
 };
 use ferrum_mesh::foam::{FoamWriteOptions, write_openfoam_case_with_options};
 use ferrum_mesh::geometry::{GeometrySummary, summarize_case_geometry};
@@ -7004,10 +7005,7 @@ fn parse_solver_args_for_invocation(
                 let value = args.get(index + 1).ok_or_else(|| {
                     "--nNonOrthogonalCorrectors requires a non-negative integer".to_string()
                 })?;
-                non_orthogonal_correctors = Some(parse_non_negative_usize_arg(
-                    "--nNonOrthogonalCorrectors",
-                    value,
-                )?);
+                non_orthogonal_correctors = Some(parse_non_orthogonal_correctors_arg(value)?);
                 laminar_simple_option_seen = true;
                 index += 2;
             }
@@ -7278,6 +7276,16 @@ fn parse_non_negative_usize_arg(label: &str, value: &str) -> Result<usize, Strin
     value
         .parse::<usize>()
         .map_err(|_| format!("invalid {label} value '{value}'; expected a non-negative integer"))
+}
+
+fn parse_non_orthogonal_correctors_arg(value: &str) -> Result<usize, String> {
+    let parsed = parse_non_negative_usize_arg("--nNonOrthogonalCorrectors", value)?;
+    if parsed > MAX_NON_ORTHOGONAL_CORRECTORS {
+        return Err(format!(
+            "--nNonOrthogonalCorrectors must not exceed {MAX_NON_ORTHOGONAL_CORRECTORS}, got {parsed}"
+        ));
+    }
+    Ok(parsed)
 }
 
 fn parse_finite_f64_arg(label: &str, value: &str) -> Result<f64, String> {
@@ -7599,11 +7607,11 @@ fn normalize_case_path(path: &Path) -> PathBuf {
 mod tests {
     use super::{
         ContinuitySummary, LaminarSimpleIterationSummary, LaminarSimpleOptions,
-        LaminarSimpleResidualControlSummary, LaminarSimpleSchemes, ScalarDiffusionLinearSolver,
-        SolverNumericsDictionaryPlan, SolverSelectionSource, estimate_iterations_to_convergence,
-        estimate_simple_iterations_to_convergence, numerics_dictionary_number,
-        numerics_dictionary_usize, numerics_dictionary_value, openfoam_gamg_options,
-        outer_convergence_status_for_reason, parse_ferrum_run_args,
+        LaminarSimpleResidualControlSummary, LaminarSimpleSchemes, MAX_NON_ORTHOGONAL_CORRECTORS,
+        ScalarDiffusionLinearSolver, SolverNumericsDictionaryPlan, SolverSelectionSource,
+        estimate_iterations_to_convergence, estimate_simple_iterations_to_convergence,
+        numerics_dictionary_number, numerics_dictionary_usize, numerics_dictionary_value,
+        openfoam_gamg_options, outer_convergence_status_for_reason, parse_ferrum_run_args,
         parse_incompressible_fluid_args, parse_incompressible_fluid_plan_args,
         parse_laminar_simple_convection_scheme, parse_laminar_simple_gradient_scheme,
         parse_laminar_simple_laplacian_scheme, parse_laminar_simple_sn_grad_scheme,
@@ -7852,6 +7860,19 @@ mod tests {
             parse_solver_args(&args).expect_err("diffusivity without solve field should fail");
 
         assert!(error.contains("--solveScalarDiffusion"));
+    }
+
+    #[test]
+    fn rejects_excessive_non_orthogonal_correctors_arg() {
+        let args = vec![
+            "--nNonOrthogonalCorrectors".to_string(),
+            (MAX_NON_ORTHOGONAL_CORRECTORS + 1).to_string(),
+        ];
+
+        let error = parse_incompressible_fluid_args(&args)
+            .expect_err("excessive non-orthogonal correctors should fail");
+
+        assert!(error.contains("--nNonOrthogonalCorrectors must not exceed"));
     }
 
     #[test]
