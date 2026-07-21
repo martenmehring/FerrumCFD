@@ -140,7 +140,9 @@ pub fn validate_initial_field_boundaries(
     fields: &InitialFieldSet,
 ) -> FieldBoundaryValidationSummary {
     let mut validator = FieldBoundaryValidator::new(case_dir);
-    for field in &fields.fields {
+    let mut fields_by_region = fields.fields.iter().collect::<Vec<_>>();
+    fields_by_region.sort_by(|left, right| left.region.cmp(&right.region));
+    for field in fields_by_region {
         validator.validate_field(field);
     }
 
@@ -392,7 +394,8 @@ fn join_tokens(tokens: &[String]) -> String {
 
 struct FieldBoundaryValidator<'a> {
     case_dir: &'a Path,
-    mesh_cache: HashMap<Option<String>, Result<PolyMesh>>,
+    current_region: Option<Option<String>>,
+    current_mesh: Option<Result<PolyMesh>>,
     warnings: Vec<String>,
 }
 
@@ -400,40 +403,22 @@ impl<'a> FieldBoundaryValidator<'a> {
     fn new(case_dir: &'a Path) -> Self {
         Self {
             case_dir,
-            mesh_cache: HashMap::new(),
+            current_region: None,
+            current_mesh: None,
             warnings: Vec::new(),
         }
     }
 
     fn validate_field(&mut self, field: &FieldFile) {
         let region = field.region.clone();
-        let mesh = self.mesh_for_region(region.clone());
-        let Some(mesh) = mesh else {
-            return;
-        };
+        self.load_region_mesh(region.clone());
 
-        let mut field_warnings = Vec::new();
-        validate_field_boundary_patches(field, mesh, &mut field_warnings);
-        self.warnings.extend(field_warnings);
-    }
-
-    fn mesh_for_region(&mut self, region: Option<String>) -> Option<&PolyMesh> {
-        if !self.mesh_cache.contains_key(&region) {
-            let mesh_path = if let Some(region) = &region {
-                self.case_dir.join("constant").join(region).join("polyMesh")
-            } else {
-                self.case_dir.join("constant").join("polyMesh")
-            };
-            let mesh = PolyMesh::read(&mesh_path);
-            self.mesh_cache.insert(region.clone(), mesh);
-        }
-
-        match self
-            .mesh_cache
-            .get(&region)
-            .expect("mesh cache entry exists")
-        {
-            Ok(mesh) => Some(mesh),
+        match self.current_mesh.as_ref().expect("region mesh is loaded") {
+            Ok(mesh) => {
+                let mut field_warnings = Vec::new();
+                validate_field_boundary_patches(field, mesh, &mut field_warnings);
+                self.warnings.extend(field_warnings);
+            }
             Err(error) => {
                 let label = region
                     .as_deref()
@@ -441,9 +426,22 @@ impl<'a> FieldBoundaryValidator<'a> {
                     .unwrap_or_else(|| "base mesh".to_string());
                 self.warnings
                     .push(format!("could not validate fields for {label}: {error}"));
-                None
             }
         }
+    }
+
+    fn load_region_mesh(&mut self, region: Option<String>) {
+        if self.current_region.as_ref() == Some(&region) {
+            return;
+        }
+
+        let mesh_path = if let Some(region) = &region {
+            self.case_dir.join("constant").join(region).join("polyMesh")
+        } else {
+            self.case_dir.join("constant").join("polyMesh")
+        };
+        self.current_mesh = Some(PolyMesh::read(&mesh_path));
+        self.current_region = Some(region);
     }
 }
 
