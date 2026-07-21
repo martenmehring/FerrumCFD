@@ -188,9 +188,11 @@ pub fn materialize_cpu_buffer(field: &SolverStateFieldPlan) -> Option<Vec<f64>> 
 
     match field.cpu_buffer.status {
         SolverStateCpuBufferStatus::UniformReady => materialize_uniform_cpu_buffer(field),
-        SolverStateCpuBufferStatus::NonUniformReady => {
-            field.internal_field.nonuniform_values.clone()
-        }
+        SolverStateCpuBufferStatus::NonUniformReady => field
+            .internal_field
+            .nonuniform_values
+            .as_deref()
+            .and_then(try_clone_nonuniform_values),
         _ => None,
     }
 }
@@ -327,13 +329,19 @@ fn build_internal_field_plan(
                 label,
                 warnings,
             );
+            let nonuniform_values = values.as_deref().and_then(try_clone_nonuniform_values);
+            if values.is_some() && nonuniform_values.is_none() {
+                warnings.push(format!(
+                    "field '{label}' nonuniform internalField numeric values could not be cloned within allocation limits"
+                ));
+            }
             SolverStateInternalFieldPlan {
                 kind: SolverStateValueKind::NonUniform,
                 value_count: *count,
                 expected_count,
                 valid_count,
                 uniform_components: None,
-                nonuniform_values: values.clone(),
+                nonuniform_values,
             }
         }
         Some(FieldValueSummary::Other(_)) => SolverStateInternalFieldPlan {
@@ -356,6 +364,13 @@ fn build_internal_field_plan(
             }
         }
     }
+}
+
+fn try_clone_nonuniform_values(values: &[f64]) -> Option<Vec<f64>> {
+    let mut cloned = Vec::new();
+    cloned.try_reserve_exact(values.len()).ok()?;
+    cloned.extend_from_slice(values);
+    Some(cloned)
 }
 
 fn validate_nonuniform_values(

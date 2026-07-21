@@ -6,6 +6,8 @@ use crate::dictionary::{TokenCursor, tokenize};
 use crate::poly_mesh::PolyMesh;
 use crate::{MeshError, Result};
 
+const MAX_NONUNIFORM_FIELD_VALUE_BYTES: usize = 256 * 1024 * 1024;
+
 #[derive(Debug)]
 pub struct InitialFieldSet {
     pub case_dir: PathBuf,
@@ -358,7 +360,12 @@ fn parse_nonuniform_numeric_values(
 ) -> Option<Vec<f64>> {
     let components = nonuniform_components_for_type(value_type.as_deref())?;
     let expected_values = count.checked_mul(components)?;
+    let expected_bytes = expected_values.checked_mul(std::mem::size_of::<f64>())?;
+    if expected_bytes > MAX_NONUNIFORM_FIELD_VALUE_BYTES {
+        return None;
+    }
     let mut values = Vec::new();
+    values.try_reserve_exact(expected_values).ok()?;
     for token in &tokens[start_index..] {
         if matches!(token.as_str(), "(" | ")" | "[" | "]") {
             continue;
@@ -529,8 +536,8 @@ mod tests {
     use crate::poly_mesh::{BoundaryPatch, PolyMesh};
 
     use super::{
-        FieldBoundaryPatch, FieldFile, FieldValueSummary, parse_field_file_str,
-        validate_field_boundary_patches,
+        FieldBoundaryPatch, FieldFile, FieldValueSummary, MAX_NONUNIFORM_FIELD_VALUE_BYTES,
+        parse_field_file_str, validate_field_boundary_patches,
     };
 
     #[test]
@@ -716,6 +723,26 @@ mod tests {
         match field.internal_field {
             Some(FieldValueSummary::NonUniform { count, values, .. }) => {
                 assert_eq!(count, Some(1));
+                assert_eq!(values, None);
+            }
+            other => panic!("unexpected field value: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_nonuniform_value_count_above_allocation_budget() {
+        let over_budget_scalars = MAX_NONUNIFORM_FIELD_VALUE_BYTES / std::mem::size_of::<f64>() + 1;
+        let content = format!(
+            "FoamFile {{ class volScalarField; object p; }}\n\
+             internalField nonuniform List<scalar> {over_budget_scalars} ( 1 );\n\
+             boundaryField {{ }}"
+        );
+
+        let field = parse_field_file_str(&content, Path::new("0/p"), None).unwrap();
+
+        match field.internal_field {
+            Some(FieldValueSummary::NonUniform { count, values, .. }) => {
+                assert_eq!(count, Some(over_budget_scalars));
                 assert_eq!(values, None);
             }
             other => panic!("unexpected field value: {other:?}"),
