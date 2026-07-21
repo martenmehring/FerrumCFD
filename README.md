@@ -1,8 +1,15 @@
-# FerrumCFD
+<p align="center">
+  <img src="ferrumcfd-banner-dark.png" alt="FerrumCFD logo with cylinder-flow visualization" width="720">
+</p>
 
-FerrumCFD is an early Rust CFD platform focused on native, backend-aware
-finite-volume solvers and reproducible comparison with OpenFOAM 13 and
-analytical references.
+<h1 align="center">FerrumCFD</h1>
+
+<p align="center">
+  Rust CFD program focused on native, backend-aware finite-volume solvers<br>
+  and reproducible comparison with OpenFOAM 13 and analytical references.
+</p>
+
+---
 
 **Current project version:** `0.1.0` (pre-stable).
 
