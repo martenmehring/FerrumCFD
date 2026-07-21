@@ -1,9 +1,9 @@
 mod case;
 
 use std::env;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Error, ErrorKind, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
 use case::{InitCaseOptions, init_case};
@@ -556,13 +556,20 @@ fn solve_case_with_contract(
         run_laminar_simple_solve(&plan, solve)?;
     }
     if let Some(path) = options.plan_json {
-        write_solver_plan_json(&plan, dispatch.as_ref(), &path).map_err(|error| {
+        let plan_json_path =
+            resolve_solver_plan_json_path(&options.case_dir, &path).map_err(|error| {
+                format!(
+                    "could not prepare solver plan JSON path {} ({error})",
+                    path.display()
+                )
+            })?;
+        write_solver_plan_json(&plan, dispatch.as_ref(), &plan_json_path).map_err(|error| {
             format!(
                 "could not write solver plan JSON to {} ({error})",
-                path.display()
+                plan_json_path.display()
             )
         })?;
-        println!("wrote solver plan json: {}", path.display());
+        println!("wrote solver plan json: {}", plan_json_path.display());
     }
     Ok(())
 }
@@ -3134,13 +3141,40 @@ fn print_solver_runner_state(plan: &SolverStatePlan) {
     }
 }
 
+fn resolve_solver_plan_json_path(case_dir: &Path, path: &Path) -> std::io::Result<PathBuf> {
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "--planJson must be a relative path inside the case directory without '..' components",
+        ));
+    }
+
+    let case_root = case_dir.canonicalize()?;
+    let resolved = case_root.join(path);
+    ensure_parent_dir(&resolved)?;
+    let parent = resolved.parent().unwrap_or(&case_root).canonicalize()?;
+    if !parent.starts_with(&case_root) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "--planJson parent directory must resolve inside the case directory",
+        ));
+    }
+    Ok(resolved)
+}
+
 fn write_solver_plan_json(
     plan: &SolverCasePlan,
     dispatch: Option<&SolverDispatch>,
     path: &Path,
 ) -> std::io::Result<()> {
-    ensure_parent_dir(path)?;
-    let file = File::create(path)?;
+    let file = OpenOptions::new().write(true).create_new(true).open(path)?;
     let mut writer = BufWriter::new(file);
 
     writeln!(writer, "{{")?;
@@ -7609,10 +7643,10 @@ mod tests {
         parse_laminar_simple_laplacian_scheme, parse_laminar_simple_sn_grad_scheme,
         parse_openfoam_laminar_preconditioner, parse_openfoam_laminar_solver, parse_solver_args,
         resolve_laminar_simple_convection_scheme, resolve_laminar_simple_options,
-        resolve_solver_dispatch, resolved_gradient_scheme_value, run_ferrum_subcommand,
-        validate_laminar_residual_control_dictionary, validate_module_execution_contract,
-        write_json_solver_state, write_json_string, write_laminar_simple_residual_plot,
-        write_solver_plan_json,
+        resolve_solver_dispatch, resolve_solver_plan_json_path, resolved_gradient_scheme_value,
+        run_ferrum_subcommand, validate_laminar_residual_control_dictionary,
+        validate_module_execution_contract, write_json_solver_state, write_json_string,
+        write_laminar_simple_residual_plot, write_solver_plan_json,
     };
     use ferrum_mesh::backends::BackendChoice;
     use ferrum_mesh::control::ControlDict;
@@ -7635,7 +7669,7 @@ mod tests {
         SolverStateStoragePlan, SolverStateStorageStatus, SolverStateValueKind,
     };
     use std::io::ErrorKind;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn outer_convergence_status_distinguishes_missing_and_unmet_criteria() {
@@ -7801,6 +7835,82 @@ mod tests {
         );
         assert!(parsed.runner_dry_run);
         assert_eq!(parsed.max_runner_steps, 4);
+    }
+
+    #[test]
+    fn rejects_solver_plan_json_paths_outside_case() {
+        let case_dir = std::env::temp_dir().join(format!(
+            "ferrum-plan-case-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after Unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&case_dir).expect("case dir should be creatable");
+
+        let absolute_path = std::env::temp_dir().join("ferrum-plan-outside.json");
+        let absolute_error = resolve_solver_plan_json_path(&case_dir, &absolute_path)
+            .expect_err("absolute plan JSON paths should be rejected");
+        assert_eq!(absolute_error.kind(), ErrorKind::InvalidInput);
+
+        let traversal_error =
+            resolve_solver_plan_json_path(&case_dir, Path::new("../outside.json"))
+                .expect_err("traversal plan JSON paths should be rejected");
+        assert_eq!(traversal_error.kind(), ErrorKind::InvalidInput);
+
+        let _ = std::fs::remove_dir_all(&case_dir);
+    }
+
+    #[test]
+    fn rejects_solver_plan_json_symlink_parent_escape() {
+        let root = std::env::temp_dir().join(format!(
+            "ferrum-plan-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after Unix epoch")
+                .as_nanos()
+        ));
+        let case_dir = root.join("case");
+        let outside_dir = root.join("outside");
+        std::fs::create_dir_all(&case_dir).expect("case dir should be creatable");
+        std::fs::create_dir_all(&outside_dir).expect("outside dir should be creatable");
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside_dir, case_dir.join("link"))
+                .expect("symlink should be creatable");
+            let error = resolve_solver_plan_json_path(&case_dir, Path::new("link/plan.json"))
+                .expect_err("symlink parent escapes should be rejected");
+            assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn solver_plan_json_does_not_clobber_existing_file() {
+        let plan = laminar_simple_test_plan(1000.0, 0.001);
+        let path = std::env::temp_dir().join(format!(
+            "ferrum-plan-existing-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after Unix epoch")
+                .as_nanos()
+        ));
+        std::fs::write(&path, "keep").expect("existing file should be writable");
+
+        let error = write_solver_plan_json(&plan, None, &path)
+            .expect_err("existing plan JSON output should not be overwritten");
+        assert_eq!(error.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("existing file should be readable"),
+            "keep"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
