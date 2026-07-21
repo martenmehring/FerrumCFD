@@ -6,6 +6,9 @@ use crate::dictionary::{TokenCursor, tokenize};
 use crate::poly_mesh::PolyMesh;
 use crate::{MeshError, Result};
 
+const MAX_INITIAL_FIELD_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_NONUNIFORM_LOADED_SCALARS: usize = 1_000_000;
+
 #[derive(Debug)]
 pub struct InitialFieldSet {
     pub case_dir: PathBuf,
@@ -175,6 +178,18 @@ fn read_field_files_in_dir(
 }
 
 fn read_field_file(path: &Path, region: Option<String>) -> Result<FieldFile> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        MeshError::InvalidInput(format!("could not inspect {} ({error})", path.display()))
+    })?;
+    if metadata.len() > MAX_INITIAL_FIELD_FILE_BYTES {
+        return Err(MeshError::InvalidInput(format!(
+            "initial field file {} is {} bytes, exceeding the {} byte limit",
+            path.display(),
+            metadata.len(),
+            MAX_INITIAL_FIELD_FILE_BYTES
+        )));
+    }
+
     let content = fs::read_to_string(path).map_err(|error| {
         MeshError::InvalidInput(format!("could not read {} ({error})", path.display()))
     })?;
@@ -201,9 +216,7 @@ fn parse_field_file_str(content: &str, path: &Path, region: Option<String>) -> R
             "dimensions" => dimensions = Some(parse_dimensions(&mut cursor)?),
             "internalField" => {
                 cursor.next_required()?;
-                internal_field = Some(parse_field_value_tokens(
-                    cursor.read_value_until_semicolon()?,
-                ));
+                internal_field = Some(parse_field_value(&mut cursor)?);
             }
             "boundaryField" => {
                 cursor.next_required()?;
@@ -297,14 +310,10 @@ fn parse_boundary_patch(cursor: &mut TokenCursor, name: String) -> Result<FieldB
                 patch_type = cursor.read_value_until_semicolon()?.first().cloned();
             }
             "value" => {
-                value = Some(parse_field_value_tokens(
-                    cursor.read_value_until_semicolon()?,
-                ));
+                value = Some(parse_field_value(cursor)?);
             }
             "inletValue" => {
-                inlet_value = Some(parse_field_value_tokens(
-                    cursor.read_value_until_semicolon()?,
-                ));
+                inlet_value = Some(parse_field_value(cursor)?);
             }
             _ => cursor.skip_value_or_block()?,
         }
@@ -319,57 +328,94 @@ fn parse_boundary_patch(cursor: &mut TokenCursor, name: String) -> Result<FieldB
     })
 }
 
-fn parse_field_value_tokens(tokens: Vec<String>) -> FieldValueSummary {
-    let Some(kind) = tokens.first() else {
-        return FieldValueSummary::Other("empty".to_string());
+fn parse_field_value(cursor: &mut TokenCursor) -> Result<FieldValueSummary> {
+    let Some(kind) = cursor.peek() else {
+        return Ok(FieldValueSummary::Other("empty".to_string()));
     };
 
-    match kind.as_str() {
-        "uniform" => FieldValueSummary::Uniform(join_tokens(&tokens[1..])),
-        "nonuniform" => parse_nonuniform_field_value(&tokens),
-        _ => FieldValueSummary::Other(join_tokens(&tokens)),
+    match kind {
+        "uniform" => {
+            cursor.next_required()?;
+            Ok(FieldValueSummary::Uniform(join_tokens(
+                &cursor.read_value_until_semicolon()?,
+            )))
+        }
+        "nonuniform" => parse_nonuniform_field_value(cursor),
+        _ => Ok(FieldValueSummary::Other(join_tokens(
+            &cursor.read_value_until_semicolon()?,
+        ))),
     }
 }
 
-fn parse_nonuniform_field_value(tokens: &[String]) -> FieldValueSummary {
-    let value_type = tokens.get(1).cloned();
-    let count_index = tokens
-        .iter()
-        .enumerate()
-        .skip(2)
-        .find_map(|(index, token)| token.parse::<usize>().ok().map(|count| (index, count)));
-    let count = count_index.map(|(_, count)| count);
-    let values = count_index.and_then(|(index, count)| {
-        parse_nonuniform_numeric_values(tokens, index + 1, &value_type, count)
-    });
+fn parse_nonuniform_field_value(cursor: &mut TokenCursor) -> Result<FieldValueSummary> {
+    cursor.expect("nonuniform")?;
+    let value_type = cursor.next_required().ok();
+    let mut count = None;
+    while count.is_none() {
+        let Some(token) = cursor.peek() else {
+            break;
+        };
+        if token == ";" || token == "}" {
+            break;
+        }
+        let token = cursor.next_required()?;
+        count = token.parse::<usize>().ok();
+    }
 
-    FieldValueSummary::NonUniform {
+    let values = parse_nonuniform_numeric_values(cursor, &value_type, count);
+    Ok(FieldValueSummary::NonUniform {
         value_type,
         count,
         values,
-    }
+    })
 }
 
 fn parse_nonuniform_numeric_values(
-    tokens: &[String],
-    start_index: usize,
+    cursor: &mut TokenCursor,
     value_type: &Option<String>,
-    count: usize,
+    count: Option<usize>,
 ) -> Option<Vec<f64>> {
-    let components = nonuniform_components_for_type(value_type.as_deref())?;
-    let expected_values = count.checked_mul(components)?;
-    let mut values = Vec::new();
-    for token in &tokens[start_index..] {
+    let expected_values = count.and_then(|count| {
+        count.checked_mul(nonuniform_components_for_type(value_type.as_deref())?)
+    });
+    let mut values = expected_values
+        .filter(|expected_values| *expected_values <= MAX_NONUNIFORM_LOADED_SCALARS)
+        .map(|_| Vec::new());
+    let mut parsed_scalars = 0usize;
+    let mut invalid_or_extra = expected_values.is_none();
+
+    while let Some(token) = cursor.peek() {
+        if token == ";" {
+            let _ = cursor.next_required();
+            break;
+        }
+        if token == "}" {
+            break;
+        }
+
+        let token = cursor.next_required().ok()?;
         if matches!(token.as_str(), "(" | ")" | "[" | "]") {
             continue;
         }
-        if values.len() == expected_values {
-            return None;
+        if expected_values.is_some_and(|expected_values| parsed_scalars == expected_values) {
+            invalid_or_extra = true;
+            continue;
         }
-        values.push(token.parse::<f64>().ok()?);
+        let scalar = match token.parse::<f64>() {
+            Ok(value) => value,
+            Err(_) => {
+                invalid_or_extra = true;
+                continue;
+            }
+        };
+        parsed_scalars += 1;
+        if let Some(values) = values.as_mut() {
+            values.push(scalar);
+        }
     }
-    if values.len() == expected_values {
-        Some(values)
+
+    if expected_values == Some(parsed_scalars) && !invalid_or_extra {
+        values
     } else {
         None
     }
