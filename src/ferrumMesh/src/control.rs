@@ -189,8 +189,7 @@ fn skip_control_value(cursor: &mut TokenCursor) -> Result<()> {
     if balanced {
         cursor.skip_typed_balanced()?;
     } else {
-        cursor.next_required()?;
-        cursor.expect_optional(";")?;
+        cursor.read_value_until_semicolon()?;
     }
     Ok(())
 }
@@ -384,10 +383,10 @@ mod tests {
     fn quoted_and_unknown_values_preserve_control_sentinels() {
         let control = parse_control_dict_str(
             r#"
-            "application" ignored application ferrumRun;
+            "application" ignored; application ferrumRun;
             unknown { deltaT 99; } deltaT 0.25;
             list (application swallowed) solver fluid;
-            quotedSemi ";" writeInterval 4;
+            quotedSemi ";"; writeInterval 4;
             "#,
             Path::new("controlDict"),
         )
@@ -397,6 +396,20 @@ mod tests {
         assert_eq!(control.solver.as_deref(), Some("fluid"));
         assert_eq!(control.delta_t, Some(0.25));
         assert_eq!(control.write_interval, Some(4.0));
+    }
+
+    #[test]
+    fn unknown_multi_token_value_does_not_smuggle_control_entry() {
+        let control = parse_control_dict_str(
+            r#"
+            deltaT 0.1;
+            ignored inert deltaT 0.000001;
+            "#,
+            Path::new("controlDict"),
+        )
+        .unwrap();
+
+        assert_eq!(control.delta_t, Some(0.1));
     }
 
     #[test]

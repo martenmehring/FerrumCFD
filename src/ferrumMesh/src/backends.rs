@@ -686,8 +686,7 @@ fn skip_backend_value(cursor: &mut TokenCursor) -> Result<()> {
     if balanced {
         cursor.skip_typed_balanced()?;
     } else {
-        cursor.next_required()?;
-        cursor.expect_optional(";")?;
+        cursor.read_value_until_semicolon()?;
     }
     Ok(())
 }
@@ -1059,16 +1058,16 @@ mod tests {
     fn unknown_and_quoted_entries_preserve_backend_sentinels() {
         let config = parse_backend_config_str(
             r#"
-            cpu { "threads" 99 threads 7; mystery { swallowed gpu; } numa off; }
-            gpu { "precision" f32 precision f64; mystery (0 1) multiGpu on; }
+            cpu { "threads" 99; threads 7; mystery { swallowed gpu; } numa off; }
+            gpu { "precision" f32; precision f64; mystery (0 1) multiGpu on; }
             flow {
                 mystery { swallowed gpu; }
                 "quotedStep" { swallowed gpu; };
-                residual "gpu" jacobian gpu;
+                residual "gpu"; jacobian gpu;
                 "jacobian" gpu;
             }
             heat { "quotedStep" { swallowed gpu; } residual cpu; }
-            "default" gpu default cpu;
+            "default" gpu; default cpu;
             "#,
             Path::new("ferrumBackends"),
         )
@@ -1084,6 +1083,22 @@ mod tests {
         assert_eq!(config.sections[1].entries[0].step, "residual");
         assert_eq!(config.sections[1].entries[0].choice, BackendChoice::Cpu);
         assert_eq!(config.default, BackendChoice::Cpu);
+    }
+
+    #[test]
+    fn unknown_multi_token_values_do_not_smuggle_backend_entries() {
+        let config = parse_backend_config_str(
+            r#"
+            default cpu;
+            mystery inert default gpu;
+            cpu { threads 2; mystery inert threads 999999; }
+            "#,
+            Path::new("ferrumBackends"),
+        )
+        .unwrap();
+
+        assert_eq!(config.default, BackendChoice::Cpu);
+        assert_eq!(config.cpu.threads, "2");
     }
 
     #[test]
