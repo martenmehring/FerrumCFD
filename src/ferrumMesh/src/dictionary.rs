@@ -213,6 +213,41 @@ pub mod streaming {
             self.eof_line
         }
 
+        #[allow(dead_code)]
+        pub(crate) fn remaining_tokens(&mut self) -> Result<&[Token]> {
+            if self.failure.is_some() {
+                Err(self.sticky())
+            } else {
+                Ok(self.tokens.as_slice())
+            }
+        }
+        #[allow(dead_code)]
+        pub(crate) fn reject_current(&mut self, detail: &'static str) -> Result<()> {
+            if self.failure.is_some() {
+                return Err(self.sticky());
+            }
+            let line = self
+                .tokens
+                .as_slice()
+                .first()
+                .map_or(self.eof_line, |token| token.line);
+            Err(self.latch(line, detail))
+        }
+        #[allow(dead_code)]
+        pub(crate) fn try_reserve_current_value(&mut self, additional: usize) -> Result<()> {
+            if self.failure.is_some() {
+                return Err(self.sticky());
+            }
+            let Some(token) = self.tokens.as_mut_slice().first_mut() else {
+                return Err(self.latch(self.eof_line, "unexpected end of dictionary"));
+            };
+            let line = token.line;
+            token
+                .value
+                .try_reserve(additional)
+                .map_err(|_| self.latch(line, "dictionary token allocation failed"))
+        }
+
         pub fn peek(&mut self) -> Result<Option<&Token>> {
             if self.failure.is_some() {
                 Err(self.sticky())
@@ -1330,11 +1365,137 @@ pub mod streaming {
 
         #[test]
         fn cursor_terminal_errors_are_sticky() {
-            let mut cursor = super::tokenize(Path::new("terminal"), "")
+            let mut current = super::tokenize(Path::new("terminal-current"), "\nfirst\nsecond\n\n")
                 .unwrap()
                 .into_cursor();
-            let first = cursor.next_required().unwrap_err().to_string();
-            assert_eq!(cursor.peek().unwrap_err().to_string(), first);
+            assert_eq!(current.remaining_tokens().unwrap().len(), 2);
+            assert_eq!(current.remaining_tokens().unwrap()[0].value, "first");
+            assert_eq!(current.remaining_tokens().unwrap()[1].value, "second");
+            let rejected = current
+                .reject_current("planned field rejection")
+                .unwrap_err();
+            assert_parse(&rejected, 2, "terminal-current: planned field rejection");
+            assert_eq!(
+                rejected.to_string(),
+                "line 2: terminal-current: planned field rejection"
+            );
+            let replay = current.remaining_tokens().unwrap_err();
+            assert_parse(&replay, 2, "terminal-current: planned field rejection");
+            assert_eq!(replay.to_string(), rejected.to_string());
+            assert_eq!(current.tokens.as_slice().len(), 2);
+            assert_eq!(current.tokens.as_slice()[0].value, "first");
+            assert_eq!(current.tokens.as_slice()[1].value, "second");
+
+            let mut eof_reserve = super::tokenize(Path::new("terminal-eof-reserve"), "\n\n\n")
+                .unwrap()
+                .into_cursor();
+            assert_eq!(eof_reserve.remaining_tokens().unwrap().len(), 0);
+            let missing_reserve = eof_reserve.try_reserve_current_value(1).unwrap_err();
+            assert_parse(
+                &missing_reserve,
+                4,
+                "terminal-eof-reserve: unexpected end of dictionary",
+            );
+            assert_eq!(
+                missing_reserve.to_string(),
+                "line 4: terminal-eof-reserve: unexpected end of dictionary"
+            );
+            assert_eq!(
+                missing_reserve
+                    .to_string()
+                    .matches("terminal-eof-reserve")
+                    .count(),
+                1
+            );
+            assert_eq!(eof_reserve.tokens.as_slice().len(), 0);
+            assert_eq!(
+                eof_reserve
+                    .try_reserve_current_value(1)
+                    .unwrap_err()
+                    .to_string(),
+                missing_reserve.to_string()
+            );
+            assert_eq!(
+                eof_reserve.next().unwrap_err().to_string(),
+                missing_reserve.to_string()
+            );
+            assert_eq!(eof_reserve.tokens.as_slice().len(), 0);
+
+            let mut eof = super::tokenize(Path::new("terminal-eof"), "")
+                .unwrap()
+                .into_cursor();
+            assert!(eof.remaining_tokens().unwrap().is_empty());
+            let missing = eof.next_required().unwrap_err();
+            assert_parse(&missing, 1, "terminal-eof: unexpected end of dictionary");
+            assert_eq!(
+                missing.to_string(),
+                "line 1: terminal-eof: unexpected end of dictionary"
+            );
+            assert_eq!(eof.peek().unwrap_err().to_string(), missing.to_string());
+            assert_eq!(eof.tokens.as_slice().len(), 0);
+
+            let mut eof_reject = super::tokenize(Path::new("terminal-eof-reject"), "\n\n\n")
+                .unwrap()
+                .into_cursor();
+            assert!(eof_reject.remaining_tokens().unwrap().is_empty());
+            let rejected_eof = eof_reject
+                .reject_current("planned EOF rejection")
+                .unwrap_err();
+            assert_parse(
+                &rejected_eof,
+                4,
+                "terminal-eof-reject: planned EOF rejection",
+            );
+            assert_eq!(
+                rejected_eof.to_string(),
+                "line 4: terminal-eof-reject: planned EOF rejection"
+            );
+            assert_eq!(
+                rejected_eof
+                    .to_string()
+                    .matches("terminal-eof-reject")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                eof_reject.next().unwrap_err().to_string(),
+                rejected_eof.to_string()
+            );
+            assert_eq!(eof_reject.tokens.as_slice().len(), 0);
+
+            let mut overflow =
+                super::tokenize(Path::new("terminal-capacity"), "\nfirst\nsecond\n\n")
+                    .unwrap()
+                    .into_cursor();
+            assert_eq!(overflow.remaining_tokens().unwrap().len(), 2);
+            let capacity = overflow.try_reserve_current_value(usize::MAX).unwrap_err();
+            assert_parse(
+                &capacity,
+                2,
+                "terminal-capacity: dictionary token allocation failed",
+            );
+            assert_eq!(
+                capacity.to_string(),
+                "line 2: terminal-capacity: dictionary token allocation failed"
+            );
+            assert_eq!(capacity.to_string().matches("terminal-capacity").count(), 1);
+            let reserve_replay = overflow.try_reserve_current_value(1).unwrap_err();
+            assert_parse(
+                &reserve_replay,
+                2,
+                "terminal-capacity: dictionary token allocation failed",
+            );
+            assert_eq!(reserve_replay.to_string(), capacity.to_string());
+            let replay = overflow.next().unwrap_err();
+            assert_parse(
+                &replay,
+                2,
+                "terminal-capacity: dictionary token allocation failed",
+            );
+            assert_eq!(replay.to_string(), capacity.to_string());
+            assert_eq!(overflow.tokens.as_slice().len(), 2);
+            assert_eq!(overflow.tokens.as_slice()[0].value, "first");
+            assert_eq!(overflow.tokens.as_slice()[1].value, "second");
         }
 
         #[test]
