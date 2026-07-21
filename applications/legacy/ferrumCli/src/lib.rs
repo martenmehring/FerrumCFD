@@ -58,6 +58,7 @@ use ferrum_mesh::solver_state::SolverStatePlan;
 
 const FERRUM_DEFAULT_LDU_TOLERANCE: f64 = 1.0e-6;
 const FERRUM_DEFAULT_LDU_MAX_ITERATIONS: usize = 1_000;
+const FERRUM_MAX_CASE_LDU_MAX_ITERATIONS: usize = 100_000;
 
 pub fn run_ferrum() -> i32 {
     let args = env::args().skip(1).collect::<Vec<_>>();
@@ -1635,8 +1636,6 @@ fn resolve_laminar_simple_options(
         })?;
     let momentum_case_tolerance = fv_solution_number(plan, "solvers.U", "tolerance")?;
     let pressure_case_tolerance = fv_solution_number(plan, "solvers.p", "tolerance")?;
-    let momentum_case_max_iterations = fv_solution_usize(plan, "solvers.U", "maxIter")?;
-    let pressure_case_max_iterations = fv_solution_usize(plan, "solvers.p", "maxIter")?;
 
     let linear_tolerance = solve
         .linear_tolerance
@@ -1655,16 +1654,22 @@ fn resolve_laminar_simple_options(
         .or(solve.linear_tolerance)
         .or(pressure_case_tolerance)
         .unwrap_or(FERRUM_DEFAULT_LDU_TOLERANCE);
-    let momentum_max_linear_iterations = solve
+    let momentum_max_linear_iterations = match solve
         .momentum_max_linear_iterations
         .or(solve.max_linear_iterations)
-        .or(momentum_case_max_iterations)
-        .unwrap_or(FERRUM_DEFAULT_LDU_MAX_ITERATIONS);
-    let pressure_max_linear_iterations = solve
+    {
+        Some(value) => value,
+        None => fv_solution_max_iterations(plan, "solvers.U")?
+            .unwrap_or(FERRUM_DEFAULT_LDU_MAX_ITERATIONS),
+    };
+    let pressure_max_linear_iterations = match solve
         .pressure_max_linear_iterations
         .or(solve.max_linear_iterations)
-        .or(pressure_case_max_iterations)
-        .unwrap_or(FERRUM_DEFAULT_LDU_MAX_ITERATIONS);
+    {
+        Some(value) => value,
+        None => fv_solution_max_iterations(plan, "solvers.p")?
+            .unwrap_or(FERRUM_DEFAULT_LDU_MAX_ITERATIONS),
+    };
     let momentum_linear_solver = match solve.momentum_linear_solver.or(solve.linear_solver) {
         Some(solver) => solver,
         None => required_fv_solution_laminar_solver(plan, "solvers.U")?,
@@ -1685,7 +1690,8 @@ fn resolve_laminar_simple_options(
     validate_openfoam_linear_controls(plan, "solvers.U", momentum_linear_solver)?;
     validate_openfoam_linear_controls(plan, "solvers.p", pressure_linear_solver)?;
     let pressure_gamg_options = if pressure_linear_solver == LaminarSimpleLinearSolver::Gamg {
-        let mut options = openfoam_gamg_options(plan, "solvers.p")?;
+        let mut options =
+            openfoam_gamg_options(plan, "solvers.p", Some(pressure_max_linear_iterations))?;
         options.max_iterations = pressure_max_linear_iterations;
         options.tolerance = pressure_linear_tolerance;
         Some(options)
@@ -2208,7 +2214,11 @@ fn required_fv_solution_laminar_solver(
     parse_openfoam_laminar_solver(value)
 }
 
-fn openfoam_gamg_options(plan: &SolverCasePlan, section: &str) -> Result<GamgOptions, String> {
+fn openfoam_gamg_options(
+    plan: &SolverCasePlan,
+    section: &str,
+    max_iterations_override: Option<usize>,
+) -> Result<GamgOptions, String> {
     let smoother = numerics_dictionary_value(&plan.numerics.fv_solution, section, "smoother")
         .ok_or_else(|| format!("fvSolution {section} GAMG requires a smoother entry"))?;
     let smoother = match smoother.trim().trim_end_matches(';') {
@@ -2242,8 +2252,12 @@ fn openfoam_gamg_options(plan: &SolverCasePlan, section: &str) -> Result<GamgOpt
         smoother,
         ..GamgOptions::default()
     };
-    options.max_iterations =
-        fv_solution_usize(plan, section, "maxIter")?.unwrap_or(FERRUM_DEFAULT_LDU_MAX_ITERATIONS);
+    options.max_iterations = match max_iterations_override {
+        Some(value) => value,
+        None => {
+            fv_solution_max_iterations(plan, section)?.unwrap_or(FERRUM_DEFAULT_LDU_MAX_ITERATIONS)
+        }
+    };
     options.min_iterations = fv_solution_usize(plan, section, "minIter")?.unwrap_or(0);
     options.tolerance =
         fv_solution_number(plan, section, "tolerance")?.unwrap_or(FERRUM_DEFAULT_LDU_TOLERANCE);
@@ -2318,7 +2332,7 @@ fn validate_openfoam_linear_controls(
     solver: LaminarSimpleLinearSolver,
 ) -> Result<(), String> {
     if solver == LaminarSimpleLinearSolver::Gamg {
-        openfoam_gamg_options(plan, section)?;
+        openfoam_gamg_options(plan, section, None)?;
         return Ok(());
     }
     if let Some(relative_tolerance) = fv_solution_number(plan, section, "relTol")?
@@ -2365,6 +2379,21 @@ fn fv_solution_usize(
         .ok_or_else(|| {
             format!("fvSolution {section}.{key} must contain a non-negative integer, got '{value}'")
         })
+}
+
+fn fv_solution_max_iterations(
+    plan: &SolverCasePlan,
+    section: &str,
+) -> Result<Option<usize>, String> {
+    let Some(max_iterations) = fv_solution_usize(plan, section, "maxIter")? else {
+        return Ok(None);
+    };
+    if max_iterations > FERRUM_MAX_CASE_LDU_MAX_ITERATIONS {
+        return Err(format!(
+            "fvSolution {section}.maxIter={max_iterations} exceeds Ferrum's case-file safety cap of {FERRUM_MAX_CASE_LDU_MAX_ITERATIONS}; use an explicit CLI iteration override for trusted operator-controlled runs"
+        ));
+    }
+    Ok(Some(max_iterations))
 }
 
 fn numerics_dictionary_value<'a>(
@@ -7598,12 +7627,12 @@ fn normalize_case_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContinuitySummary, LaminarSimpleIterationSummary, LaminarSimpleOptions,
-        LaminarSimpleResidualControlSummary, LaminarSimpleSchemes, ScalarDiffusionLinearSolver,
-        SolverNumericsDictionaryPlan, SolverSelectionSource, estimate_iterations_to_convergence,
-        estimate_simple_iterations_to_convergence, numerics_dictionary_number,
-        numerics_dictionary_usize, numerics_dictionary_value, openfoam_gamg_options,
-        outer_convergence_status_for_reason, parse_ferrum_run_args,
+        ContinuitySummary, FERRUM_MAX_CASE_LDU_MAX_ITERATIONS, LaminarSimpleIterationSummary,
+        LaminarSimpleOptions, LaminarSimpleResidualControlSummary, LaminarSimpleSchemes,
+        ScalarDiffusionLinearSolver, SolverNumericsDictionaryPlan, SolverSelectionSource,
+        estimate_iterations_to_convergence, estimate_simple_iterations_to_convergence,
+        numerics_dictionary_number, numerics_dictionary_usize, numerics_dictionary_value,
+        openfoam_gamg_options, outer_convergence_status_for_reason, parse_ferrum_run_args,
         parse_incompressible_fluid_args, parse_incompressible_fluid_plan_args,
         parse_laminar_simple_convection_scheme, parse_laminar_simple_gradient_scheme,
         parse_laminar_simple_laplacian_scheme, parse_laminar_simple_sn_grad_scheme,
@@ -8180,6 +8209,55 @@ mod tests {
     }
 
     #[test]
+    fn laminar_simple_rejects_case_file_max_iter_above_safety_cap() {
+        let mut plan = laminar_simple_test_plan(1000.0, 0.001002);
+        plan.numerics
+            .fv_solution
+            .entries
+            .push(ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
+                section: "solvers.U".to_string(),
+                key: "maxIter".to_string(),
+                value: (FERRUM_MAX_CASE_LDU_MAX_ITERATIONS + 1).to_string(),
+            });
+        let parsed = parse_incompressible_fluid_args(&[]).expect("solver args should parse");
+        let solve = parsed
+            .laminar_simple_solve
+            .expect("laminar SIMPLE solve args");
+
+        let error = resolve_laminar_simple_options(&plan, &solve)
+            .expect_err("case-file maxIter above the safety cap must fail");
+
+        assert!(error.contains("solvers.U.maxIter"));
+        assert!(error.contains("case-file safety cap"));
+    }
+
+    #[test]
+    fn laminar_simple_cli_max_iter_override_bypasses_case_file_cap() {
+        let mut plan = laminar_simple_test_plan(1000.0, 0.001002);
+        plan.numerics
+            .fv_solution
+            .entries
+            .push(ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
+                section: "solvers.U".to_string(),
+                key: "maxIter".to_string(),
+                value: (FERRUM_MAX_CASE_LDU_MAX_ITERATIONS + 1).to_string(),
+            });
+        let parsed = parse_incompressible_fluid_args(&[
+            "--momentumMaxIterations".to_string(),
+            "25".to_string(),
+        ])
+        .expect("solver args should parse");
+        let solve = parsed
+            .laminar_simple_solve
+            .expect("laminar SIMPLE solve args");
+
+        let options = resolve_laminar_simple_options(&plan, &solve)
+            .expect("trusted CLI override should resolve without reading unsafe case maxIter");
+
+        assert_eq!(options.momentum_max_linear_iterations, 25);
+    }
+
+    #[test]
     fn laminar_simple_rejects_unimplemented_nonzero_relative_tolerance() {
         let mut plan = laminar_simple_test_plan(1000.0, 0.001002);
         plan.numerics
@@ -8469,7 +8547,8 @@ mod tests {
                 });
         }
 
-        let options = openfoam_gamg_options(&plan, "solvers.p").expect("GAMG controls should map");
+        let options =
+            openfoam_gamg_options(&plan, "solvers.p", None).expect("GAMG controls should map");
 
         assert_eq!(options.agglomerator, GamgAgglomerator::AlgebraicPair);
         assert_eq!(options.smoother, GamgSmoother::SymGaussSeidel);
@@ -8618,8 +8697,8 @@ mod tests {
                 value: "GAMG".to_string(),
             });
 
-        let missing_smoother =
-            openfoam_gamg_options(&plan, "solvers.p").expect_err("GAMG without smoother must fail");
+        let missing_smoother = openfoam_gamg_options(&plan, "solvers.p", None)
+            .expect_err("GAMG without smoother must fail");
         assert!(missing_smoother.contains("requires a smoother"));
 
         plan.numerics
@@ -8639,7 +8718,7 @@ mod tests {
                 value: "unknownPair".to_string(),
             });
 
-        let unknown_agglomerator = openfoam_gamg_options(&plan, "solvers.p")
+        let unknown_agglomerator = openfoam_gamg_options(&plan, "solvers.p", None)
             .expect_err("unknown GAMG agglomerator must fail");
         assert!(unknown_agglomerator.contains("no agglomerator fallback was applied"));
     }
