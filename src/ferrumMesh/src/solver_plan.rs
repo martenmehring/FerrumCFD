@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 
 use crate::Result;
 use crate::backends::{
-    BackendChoice, read_backend_config, validate_backend_policy, validate_backend_resources,
+    BackendChoice, BackendConfig, read_backend_config, validate_backend_policy,
+    validate_backend_resources,
 };
 use crate::control::{ControlDict, read_control_dict, validate_control_dict};
 use crate::fields::{
@@ -11,15 +12,11 @@ use crate::fields::{
 };
 use crate::interfaces::{read_interface_config, validate_interface_config};
 use crate::numerics::{
-    NumericsSection, format_numerics_value, read_fv_schemes, read_fv_solution, validate_fv_schemes,
-    validate_fv_solution,
+    NumericsSection, read_fv_schemes, read_fv_solution, validate_fv_schemes, validate_fv_solution,
 };
 use crate::patches::{PatchValidationSummary, validate_poly_mesh_patches};
 use crate::poly_mesh::PolyMesh;
-use crate::properties::{
-    PropertyDictionary, PropertySection, format_property_value, read_case_properties,
-    validate_properties,
-};
+use crate::properties::{PropertyDictionary, PropertySection, read_case_properties};
 use crate::regions::{build_interface_registry, read_region_mesh_summaries};
 use crate::runtime::{SolverRuntimeData, build_solver_runtime_data};
 use crate::solver_state::{SolverStatePlan, build_solver_state_plan};
@@ -247,6 +244,147 @@ const BUILT_IN_RUN_STAGES: &[(&str, &str)] = &[
     ("chemistry", "odeSolve"),
     ("chemistry", "nonlinearSolve"),
 ];
+
+/// Maximum number of dictionaries, section paths, flattened entries, and
+/// validation warnings constructed by the property portion of a solver plan.
+pub const MAX_SOLVER_PROPERTY_PLAN_ITEMS: usize = 65_536;
+/// Maximum cumulative owned string bytes constructed by the property portion
+/// of a solver plan and its validation warnings.
+pub const MAX_SOLVER_PROPERTY_PLAN_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum number of flattened sections, entries, and validation warnings
+/// constructed across both numerics dictionaries in one solver plan.
+pub const MAX_SOLVER_NUMERICS_PLAN_ITEMS: usize = 65_536;
+/// Maximum cumulative copied bytes for flattened numerics section paths,
+/// entries, and validation warnings.
+pub const MAX_SOLVER_NUMERICS_PLAN_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum number of flattened backend stages and validation warnings retained
+/// by one solver plan.
+pub const MAX_SOLVER_BACKEND_PLAN_ITEMS: usize = 16_384;
+/// Maximum cumulative copied bytes for backend stages and validation warnings.
+pub const MAX_SOLVER_BACKEND_PLAN_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct PropertyPlanLimits {
+    items: usize,
+    payload_bytes: usize,
+}
+
+const PROPERTY_PLAN_LIMITS: PropertyPlanLimits = PropertyPlanLimits {
+    items: MAX_SOLVER_PROPERTY_PLAN_ITEMS,
+    payload_bytes: MAX_SOLVER_PROPERTY_PLAN_PAYLOAD_BYTES,
+};
+
+struct PropertyPlanBudget {
+    limits: PropertyPlanLimits,
+    items: usize,
+    payload_bytes: usize,
+}
+
+impl PropertyPlanBudget {
+    fn new(limits: PropertyPlanLimits) -> Self {
+        Self {
+            limits,
+            items: 0,
+            payload_bytes: 0,
+        }
+    }
+
+    fn add_item(&mut self, payload_bytes: usize) -> Result<()> {
+        let items = self
+            .items
+            .checked_add(1)
+            .ok_or_else(|| property_plan_limit_error("solver property plan item limit exceeded"))?;
+        if items > self.limits.items {
+            return Err(property_plan_limit_error(
+                "solver property plan item limit exceeded",
+            ));
+        }
+        let retained = self.checked_payload(payload_bytes)?;
+        self.items = items;
+        self.payload_bytes = retained;
+        Ok(())
+    }
+
+    fn add_temporary_payload(&mut self, payload_bytes: usize) -> Result<()> {
+        self.payload_bytes = self.checked_payload(payload_bytes)?;
+        Ok(())
+    }
+
+    fn checked_payload(&self, payload_bytes: usize) -> Result<usize> {
+        let retained = self
+            .payload_bytes
+            .checked_add(payload_bytes)
+            .ok_or_else(|| {
+                property_plan_limit_error("solver property plan payload limit exceeded")
+            })?;
+        if retained > self.limits.payload_bytes {
+            return Err(property_plan_limit_error(
+                "solver property plan payload limit exceeded",
+            ));
+        }
+        Ok(retained)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DerivedPlanLimits {
+    items: usize,
+    payload_bytes: usize,
+}
+
+struct DerivedPlanBudget {
+    limits: DerivedPlanLimits,
+    items: usize,
+    payload_bytes: usize,
+    item_error: &'static str,
+    payload_error: &'static str,
+}
+
+impl DerivedPlanBudget {
+    fn new(
+        limits: DerivedPlanLimits,
+        item_error: &'static str,
+        payload_error: &'static str,
+    ) -> Self {
+        Self {
+            limits,
+            items: 0,
+            payload_bytes: 0,
+            item_error,
+            payload_error,
+        }
+    }
+
+    fn add_item(&mut self, payload_bytes: usize) -> Result<()> {
+        let items = self
+            .items
+            .checked_add(1)
+            .ok_or_else(|| derived_plan_error(self.item_error))?;
+        if items > self.limits.items {
+            return Err(derived_plan_error(self.item_error));
+        }
+        let copied = self.checked_payload(payload_bytes)?;
+        self.items = items;
+        self.payload_bytes = copied;
+        Ok(())
+    }
+
+    fn add_temporary_payload(&mut self, payload_bytes: usize) -> Result<()> {
+        self.payload_bytes = self.checked_payload(payload_bytes)?;
+        Ok(())
+    }
+
+    fn checked_payload(&self, payload_bytes: usize) -> Result<usize> {
+        let copied = self
+            .payload_bytes
+            .checked_add(payload_bytes)
+            .ok_or_else(|| derived_plan_error(self.payload_error))?;
+        if copied > self.limits.payload_bytes {
+            return Err(derived_plan_error(self.payload_error));
+        }
+        Ok(copied)
+    }
+}
 
 /// Builds a solver-ready plan and loads initial-field payloads. Call
 /// `build_solver_case_plan_with_policy(..., FieldLoadPolicy::Summary)` only
@@ -539,23 +677,52 @@ fn build_properties_plan(
     warnings: &mut Vec<String>,
 ) -> Result<SolverPropertiesPlan> {
     let dictionaries = read_case_properties(case_dir)?;
-    let validation = validate_properties(&dictionaries);
-    warnings.extend(
-        validation
-            .warnings
-            .iter()
-            .map(|warning| format!("properties: {warning}")),
-    );
+    build_properties_plan_from_dictionaries_with_limits(
+        &dictionaries,
+        warnings,
+        PROPERTY_PLAN_LIMITS,
+    )
+}
+
+fn build_properties_plan_from_dictionaries_with_limits(
+    dictionaries: &[PropertyDictionary],
+    warnings: &mut Vec<String>,
+    limits: PropertyPlanLimits,
+) -> Result<SolverPropertiesPlan> {
+    let mut budget = PropertyPlanBudget::new(limits);
 
     let mut dictionary_plans = Vec::new();
     let mut entry_plans = Vec::new();
-    for dictionary in &dictionaries {
-        let label = property_dictionary_label(dictionary);
+    for dictionary in dictionaries {
+        let label_len = property_dictionary_label_len(dictionary)?;
+        budget.add_temporary_payload(label_len)?;
+        let label = property_dictionary_label(dictionary)?;
+        let (sections, nested_entries) = count_property_sections_and_entries(&dictionary.sections)?;
+        let entries = dictionary
+            .entries
+            .len()
+            .checked_add(nested_entries)
+            .ok_or_else(|| property_plan_limit_error("solver property plan item limit exceeded"))?;
+        let dictionary_payload = dictionary
+            .name
+            .len()
+            .checked_add(dictionary.region.as_ref().map_or(0, String::len))
+            .ok_or_else(|| {
+                property_plan_limit_error("solver property plan payload limit exceeded")
+            })?;
+        budget.add_item(dictionary_payload)?;
+        dictionary_plans
+            .try_reserve(1)
+            .map_err(|_| crate::MeshError::OutOfMemory)?;
         dictionary_plans.push(SolverPropertyDictionaryPlan {
-            name: dictionary.name.clone(),
-            region: dictionary.region.clone(),
-            sections: count_property_sections(&dictionary.sections),
-            entries: count_property_entries(dictionary),
+            name: try_copy_property_plan_string(&dictionary.name)?,
+            region: dictionary
+                .region
+                .as_deref()
+                .map(try_copy_property_plan_string)
+                .transpose()?,
+            sections,
+            entries,
         });
         append_property_entries(
             &label,
@@ -563,8 +730,16 @@ fn build_properties_plan(
             &dictionary.entries,
             &dictionary.sections,
             &mut entry_plans,
-        );
+            &mut budget,
+        )?;
     }
+
+    let mut property_warnings = Vec::new();
+    append_property_validation_warnings(dictionaries, &mut property_warnings, &mut budget)?;
+    warnings
+        .try_reserve(property_warnings.len())
+        .map_err(|_| crate::MeshError::OutOfMemory)?;
+    warnings.append(&mut property_warnings);
 
     Ok(SolverPropertiesPlan {
         dictionaries: dictionary_plans,
@@ -572,30 +747,47 @@ fn build_properties_plan(
     })
 }
 
-fn property_dictionary_label(dictionary: &PropertyDictionary) -> String {
+fn property_dictionary_label(dictionary: &PropertyDictionary) -> Result<String> {
     if let Some(region) = &dictionary.region {
-        format!("{region}/{}", dictionary.name)
+        try_join_property_plan_parts(&[region, "/", &dictionary.name])
     } else {
-        dictionary.name.clone()
+        try_copy_property_plan_string(&dictionary.name)
     }
 }
 
-fn count_property_sections(sections: &[PropertySection]) -> usize {
-    sections
-        .iter()
-        .map(|section| 1 + count_property_sections(&section.sections))
-        .sum()
+fn property_dictionary_label_len(dictionary: &PropertyDictionary) -> Result<usize> {
+    match dictionary.region.as_deref() {
+        Some(region) => region
+            .len()
+            .checked_add(1)
+            .and_then(|bytes| bytes.checked_add(dictionary.name.len()))
+            .ok_or_else(|| {
+                property_plan_limit_error("solver property plan payload limit exceeded")
+            }),
+        None => Ok(dictionary.name.len()),
+    }
 }
 
-fn count_property_entries(dictionary: &PropertyDictionary) -> usize {
-    dictionary.entries.len() + count_section_property_entries(&dictionary.sections)
-}
-
-fn count_section_property_entries(sections: &[PropertySection]) -> usize {
-    sections
-        .iter()
-        .map(|section| section.entries.len() + count_section_property_entries(&section.sections))
-        .sum()
+fn count_property_sections_and_entries(sections: &[PropertySection]) -> Result<(usize, usize)> {
+    let mut section_count = 0usize;
+    let mut entry_count = 0usize;
+    for section in sections {
+        section_count = section_count
+            .checked_add(1)
+            .ok_or_else(|| property_plan_limit_error("solver property plan item limit exceeded"))?;
+        entry_count = entry_count
+            .checked_add(section.entries.len())
+            .ok_or_else(|| property_plan_limit_error("solver property plan item limit exceeded"))?;
+        let (nested_sections, nested_entries) =
+            count_property_sections_and_entries(&section.sections)?;
+        section_count = section_count
+            .checked_add(nested_sections)
+            .ok_or_else(|| property_plan_limit_error("solver property plan item limit exceeded"))?;
+        entry_count = entry_count
+            .checked_add(nested_entries)
+            .ok_or_else(|| property_plan_limit_error("solver property plan item limit exceeded"))?;
+    }
+    Ok((section_count, entry_count))
 }
 
 fn append_property_entries(
@@ -604,21 +796,47 @@ fn append_property_entries(
     entries: &[crate::properties::PropertyEntry],
     sections: &[PropertySection],
     entry_plans: &mut Vec<SolverPropertyEntryPlan>,
-) {
+    budget: &mut PropertyPlanBudget,
+) -> Result<()> {
     for entry in entries {
+        let formatted_value_len = property_value_plan_len(&entry.value)?;
+        let payload = dictionary
+            .len()
+            .checked_add(section.map_or(0, str::len))
+            .and_then(|bytes| bytes.checked_add(entry.key.len()))
+            .and_then(|bytes| bytes.checked_add(formatted_value_len))
+            .ok_or_else(|| {
+                property_plan_limit_error("solver property plan payload limit exceeded")
+            })?;
+        budget.add_item(payload)?;
+        let formatted_value = format_property_value_for_plan(&entry.value, formatted_value_len)?;
+        entry_plans
+            .try_reserve(1)
+            .map_err(|_| crate::MeshError::OutOfMemory)?;
         entry_plans.push(SolverPropertyEntryPlan {
-            dictionary: dictionary.to_string(),
-            section: section.map(str::to_string),
-            key: entry.key.clone(),
-            value: format_property_value(&entry.value),
+            dictionary: try_copy_property_plan_string(dictionary)?,
+            section: section.map(try_copy_property_plan_string).transpose()?,
+            key: try_copy_property_plan_string(&entry.key)?,
+            value: formatted_value,
         });
     }
 
     for nested in sections {
+        let nested_path_len = match section {
+            Some(section) => section
+                .len()
+                .checked_add(1)
+                .and_then(|bytes| bytes.checked_add(nested.name.len()))
+                .ok_or_else(|| {
+                    property_plan_limit_error("solver property plan payload limit exceeded")
+                })?,
+            None => nested.name.len(),
+        };
+        budget.add_item(nested_path_len)?;
         let nested_path = if let Some(section) = section {
-            format!("{section}.{}", nested.name)
+            try_join_property_plan_parts(&[section, ".", &nested.name])?
         } else {
-            nested.name.clone()
+            try_copy_property_plan_string(&nested.name)?
         };
         append_property_entries(
             dictionary,
@@ -626,8 +844,249 @@ fn append_property_entries(
             &nested.entries,
             &nested.sections,
             entry_plans,
+            budget,
+        )?;
+    }
+    Ok(())
+}
+
+fn property_value_plan_len(value: &[String]) -> Result<usize> {
+    if value.is_empty() {
+        return Ok("empty".len());
+    }
+    let separators = value
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| property_plan_limit_error("solver property plan payload limit exceeded"))?;
+    value.iter().try_fold(separators, |bytes, part| {
+        bytes
+            .checked_add(part.len())
+            .ok_or_else(|| property_plan_limit_error("solver property plan payload limit exceeded"))
+    })
+}
+
+fn format_property_value_for_plan(value: &[String], capacity: usize) -> Result<String> {
+    if value.is_empty() {
+        return try_copy_property_plan_string("empty");
+    }
+    let mut formatted = String::new();
+    formatted
+        .try_reserve_exact(capacity)
+        .map_err(|_| crate::MeshError::OutOfMemory)?;
+    for (index, part) in value.iter().enumerate() {
+        if index > 0 {
+            formatted.push(' ');
+        }
+        formatted.push_str(part);
+    }
+    Ok(formatted)
+}
+
+fn append_property_validation_warnings(
+    dictionaries: &[PropertyDictionary],
+    warnings: &mut Vec<String>,
+    budget: &mut PropertyPlanBudget,
+) -> Result<()> {
+    if dictionaries.is_empty() {
+        return push_property_warning(
+            warnings,
+            budget,
+            &["no constant property dictionaries found"],
+            None,
         );
     }
+
+    for dictionary in dictionaries {
+        let label_len = property_dictionary_label_len(dictionary)?;
+        budget.add_temporary_payload(label_len)?;
+        let label = property_dictionary_label(dictionary)?;
+        if dictionary.entries.is_empty() && dictionary.sections.is_empty() {
+            push_property_warning(
+                warnings,
+                budget,
+                &["property dictionary '", &label, "' has no entries"],
+                None,
+            )?;
+        }
+        append_dimensioned_property_warnings(&label, &dictionary.entries, warnings, budget)?;
+        append_section_property_warnings(&label, &dictionary.sections, warnings, budget)?;
+    }
+    Ok(())
+}
+
+fn append_section_property_warnings(
+    dictionary: &str,
+    sections: &[PropertySection],
+    warnings: &mut Vec<String>,
+    budget: &mut PropertyPlanBudget,
+) -> Result<()> {
+    for section in sections {
+        let label_len = dictionary
+            .len()
+            .checked_add(1)
+            .and_then(|bytes| bytes.checked_add(section.name.len()))
+            .ok_or_else(|| {
+                property_plan_limit_error("solver property plan payload limit exceeded")
+            })?;
+        budget.add_temporary_payload(label_len)?;
+        let label = try_join_property_plan_parts(&[dictionary, ".", &section.name])?;
+        append_dimensioned_property_warnings(&label, &section.entries, warnings, budget)?;
+        append_section_property_warnings(&label, &section.sections, warnings, budget)?;
+    }
+    Ok(())
+}
+
+fn append_dimensioned_property_warnings(
+    label: &str,
+    entries: &[crate::properties::PropertyEntry],
+    warnings: &mut Vec<String>,
+    budget: &mut PropertyPlanBudget,
+) -> Result<()> {
+    for entry in entries {
+        if entry.value.first().map(String::as_str) != Some("[") {
+            continue;
+        }
+        let Some(end) = entry.value.iter().position(|value| value == "]") else {
+            push_property_warning(
+                warnings,
+                budget,
+                &[
+                    label,
+                    ".",
+                    &entry.key,
+                    " has an unterminated dimension vector",
+                ],
+                None,
+            )?;
+            continue;
+        };
+        if end != 8 {
+            let dimension_entries = end.checked_sub(1).ok_or_else(|| {
+                property_plan_limit_error("solver property warning construction failed")
+            })?;
+            push_property_warning(
+                warnings,
+                budget,
+                &[
+                    label,
+                    ".",
+                    &entry.key,
+                    " dimension vector has ",
+                    " entries; expected 7",
+                ],
+                Some(dimension_entries),
+            )?;
+        }
+        let value_index = end.checked_add(1).ok_or_else(|| {
+            property_plan_limit_error("solver property warning construction failed")
+        })?;
+        if entry.value.len() <= value_index {
+            push_property_warning(
+                warnings,
+                budget,
+                &[label, ".", &entry.key, " has dimensions but no value"],
+                None,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn push_property_warning(
+    warnings: &mut Vec<String>,
+    budget: &mut PropertyPlanBudget,
+    parts: &[&str],
+    number_before_last_part: Option<usize>,
+) -> Result<()> {
+    const PREFIX: &str = "properties: ";
+    let number_len = number_before_last_part.map_or(0, decimal_usize_len);
+    let parts_capacity = parts.iter().try_fold(PREFIX.len(), |bytes, part| {
+        bytes
+            .checked_add(part.len())
+            .ok_or_else(|| property_plan_limit_error("solver property plan payload limit exceeded"))
+    })?;
+    let capacity = parts_capacity
+        .checked_add(number_len)
+        .ok_or_else(|| property_plan_limit_error("solver property plan payload limit exceeded"))?;
+    budget.add_item(capacity)?;
+    let mut warning = String::new();
+    warning
+        .try_reserve_exact(capacity)
+        .map_err(|_| crate::MeshError::OutOfMemory)?;
+    warning.push_str(PREFIX);
+    if let Some(number) = number_before_last_part {
+        let (last, leading) = parts.split_last().ok_or_else(|| {
+            property_plan_limit_error("solver property warning construction failed")
+        })?;
+        for part in leading {
+            warning.push_str(part);
+        }
+        push_decimal_usize(&mut warning, number);
+        warning.push_str(last);
+    } else {
+        for part in parts {
+            warning.push_str(part);
+        }
+    }
+    warnings
+        .try_reserve(1)
+        .map_err(|_| crate::MeshError::OutOfMemory)?;
+    warnings.push(warning);
+    Ok(())
+}
+
+fn try_join_property_plan_parts(parts: &[&str]) -> Result<String> {
+    let capacity = parts.iter().try_fold(0usize, |bytes, part| {
+        bytes
+            .checked_add(part.len())
+            .ok_or(crate::MeshError::OutOfMemory)
+    })?;
+    let mut value = String::new();
+    value
+        .try_reserve_exact(capacity)
+        .map_err(|_| crate::MeshError::OutOfMemory)?;
+    for part in parts {
+        value.push_str(part);
+    }
+    Ok(value)
+}
+
+fn try_copy_property_plan_string(value: &str) -> Result<String> {
+    try_join_property_plan_parts(&[value])
+}
+
+fn decimal_usize_len(mut value: usize) -> usize {
+    let mut digits = 1;
+    while value >= 10 {
+        value /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+fn push_decimal_usize(target: &mut String, mut value: usize) {
+    let mut digits = [0u8; 40];
+    let mut index = digits.len();
+    loop {
+        index -= 1;
+        digits[index] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    for digit in &digits[index..] {
+        target.push(char::from(*digit));
+    }
+}
+
+fn property_plan_limit_error(message: &'static str) -> crate::MeshError {
+    let mut owned = String::new();
+    if owned.try_reserve_exact(message.len()).is_err() {
+        return crate::MeshError::OutOfMemory;
+    }
+    owned.push_str(message);
+    crate::MeshError::InvalidInput(owned)
 }
 
 fn unique_field_names(fields: &crate::fields::InitialFieldSet) -> Vec<String> {
@@ -646,58 +1105,117 @@ fn build_numerics_plan(
     field_names: &[String],
     warnings: &mut Vec<String>,
 ) -> Result<SolverNumericsPlan> {
-    let fv_schemes = match read_fv_schemes(case_dir)? {
-        Some(schemes) => {
-            let validation = validate_fv_schemes(&schemes);
-            warnings.extend(
-                validation
-                    .warnings
-                    .iter()
-                    .map(|warning| format!("fvSchemes: {warning}")),
-            );
-            build_numerics_dictionary_plan(true, &schemes.sections)
+    let fv_schemes = read_fv_schemes(case_dir)?;
+    let fv_solution = read_fv_solution(case_dir)?;
+    let schemes_validation = fv_schemes.as_ref().map(validate_fv_schemes);
+    let solution_validation = fv_solution
+        .as_ref()
+        .map(|solution| validate_fv_solution(solution, field_names));
+    let no_warnings: &[String] = &[];
+    let schemes_input = fv_schemes.as_ref().map(|schemes| {
+        (
+            schemes.sections.as_slice(),
+            schemes_validation
+                .as_ref()
+                .map_or(no_warnings, |validation| validation.warnings.as_slice()),
+        )
+    });
+    let solution_input = fv_solution.as_ref().map(|solution| {
+        (
+            solution.sections.as_slice(),
+            solution_validation
+                .as_ref()
+                .map_or(no_warnings, |validation| validation.warnings.as_slice()),
+        )
+    });
+    build_numerics_plan_from_loaded(
+        schemes_input,
+        solution_input,
+        warnings,
+        DerivedPlanLimits {
+            items: MAX_SOLVER_NUMERICS_PLAN_ITEMS,
+            payload_bytes: MAX_SOLVER_NUMERICS_PLAN_PAYLOAD_BYTES,
+        },
+    )
+}
+
+fn build_numerics_plan_from_loaded(
+    fv_schemes: Option<(&[NumericsSection], &[String])>,
+    fv_solution: Option<(&[NumericsSection], &[String])>,
+    warnings: &mut Vec<String>,
+    limits: DerivedPlanLimits,
+) -> Result<SolverNumericsPlan> {
+    let mut budget = DerivedPlanBudget::new(
+        limits,
+        "solver numerics plan item limit exceeded",
+        "solver numerics plan payload limit exceeded",
+    );
+    let mut derived_warnings = Vec::new();
+
+    let fv_schemes = match fv_schemes {
+        Some((sections, validation_warnings)) => {
+            let plan = build_numerics_dictionary_plan_with_budget(true, sections, &mut budget)?;
+            append_prefixed_derived_warnings(
+                &mut derived_warnings,
+                &mut budget,
+                "fvSchemes: ",
+                validation_warnings,
+            )?;
+            plan
         }
         None => {
-            warnings.push("no system/fvSchemes found; discretisation plan is empty".to_string());
-            build_numerics_dictionary_plan(false, &[])
+            push_prefixed_derived_warning(
+                &mut derived_warnings,
+                &mut budget,
+                "",
+                "no system/fvSchemes found; discretisation plan is empty",
+            )?;
+            build_numerics_dictionary_plan_with_budget(false, &[], &mut budget)?
         }
     };
 
-    let fv_solution = match read_fv_solution(case_dir)? {
-        Some(solution) => {
-            let validation = validate_fv_solution(&solution, field_names);
-            warnings.extend(
-                validation
-                    .warnings
-                    .iter()
-                    .map(|warning| format!("fvSolution: {warning}")),
-            );
-            build_numerics_dictionary_plan(true, &solution.sections)
+    let fv_solution = match fv_solution {
+        Some((sections, validation_warnings)) => {
+            let plan = build_numerics_dictionary_plan_with_budget(true, sections, &mut budget)?;
+            append_prefixed_derived_warnings(
+                &mut derived_warnings,
+                &mut budget,
+                "fvSolution: ",
+                validation_warnings,
+            )?;
+            plan
         }
         None => {
-            warnings.push("no system/fvSolution found; solver settings plan is empty".to_string());
-            build_numerics_dictionary_plan(false, &[])
+            push_prefixed_derived_warning(
+                &mut derived_warnings,
+                &mut budget,
+                "",
+                "no system/fvSolution found; solver settings plan is empty",
+            )?;
+            build_numerics_dictionary_plan_with_budget(false, &[], &mut budget)?
         }
     };
 
+    append_derived_warnings_atomically(warnings, &mut derived_warnings)?;
     Ok(SolverNumericsPlan {
         fv_schemes,
         fv_solution,
     })
 }
 
-fn build_numerics_dictionary_plan(
+fn build_numerics_dictionary_plan_with_budget(
     present: bool,
     sections: &[NumericsSection],
-) -> SolverNumericsDictionaryPlan {
+    budget: &mut DerivedPlanBudget,
+) -> Result<SolverNumericsDictionaryPlan> {
     let mut section_plans = Vec::new();
     let mut entries = Vec::new();
-    append_numerics_sections(sections, None, &mut section_plans, &mut entries);
-    SolverNumericsDictionaryPlan {
+    append_numerics_sections(sections, None, &mut section_plans, &mut entries, budget)?;
+    Ok(SolverNumericsDictionaryPlan {
         present,
         sections: section_plans,
         entries,
-    }
+    })
 }
 
 fn append_numerics_sections(
@@ -705,92 +1223,243 @@ fn append_numerics_sections(
     parent: Option<&str>,
     section_plans: &mut Vec<SolverNumericsSectionPlan>,
     entries: &mut Vec<SolverNumericsEntryPlan>,
-) {
+    budget: &mut DerivedPlanBudget,
+) -> Result<()> {
     for section in sections {
+        let path_len = match parent {
+            Some(parent) => parent
+                .len()
+                .checked_add(1)
+                .and_then(|bytes| bytes.checked_add(section.name.len()))
+                .ok_or_else(|| derived_plan_error("solver numerics plan payload limit exceeded"))?,
+            None => section.name.len(),
+        };
+        budget.add_temporary_payload(path_len)?;
         let path = if let Some(parent) = parent {
-            format!("{parent}.{}", section.name)
+            try_join_derived_plan_parts(&[parent, ".", &section.name])?
         } else {
-            section.name.clone()
+            try_copy_derived_plan_string(&section.name)?
         };
 
+        budget.add_item(path_len)?;
+        section_plans
+            .try_reserve(1)
+            .map_err(|_| crate::MeshError::OutOfMemory)?;
         section_plans.push(SolverNumericsSectionPlan {
-            path: path.clone(),
+            path: try_copy_derived_plan_string(&path)?,
             entries: section.entries.len(),
         });
         for entry in &section.entries {
+            let value_len = numerics_value_plan_len(&entry.value)?;
+            let payload = path
+                .len()
+                .checked_add(entry.key.len())
+                .and_then(|bytes| bytes.checked_add(value_len))
+                .ok_or_else(|| derived_plan_error("solver numerics plan payload limit exceeded"))?;
+            budget.add_item(payload)?;
+            let value = format_numerics_value_for_plan(&entry.value, value_len)?;
+            entries
+                .try_reserve(1)
+                .map_err(|_| crate::MeshError::OutOfMemory)?;
             entries.push(SolverNumericsEntryPlan {
-                section: path.clone(),
-                key: entry.key.clone(),
-                value: format_numerics_value(&entry.value),
+                section: try_copy_derived_plan_string(&path)?,
+                key: try_copy_derived_plan_string(&entry.key)?,
+                value,
             });
         }
-        append_numerics_sections(&section.sections, Some(&path), section_plans, entries);
+        append_numerics_sections(
+            &section.sections,
+            Some(&path),
+            section_plans,
+            entries,
+            budget,
+        )?;
     }
+    Ok(())
+}
+
+fn numerics_value_plan_len(value: &[String]) -> Result<usize> {
+    if value.is_empty() {
+        return Ok("empty".len());
+    }
+    let separators = value
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| derived_plan_error("solver numerics plan payload limit exceeded"))?;
+    value.iter().try_fold(separators, |bytes, part| {
+        bytes
+            .checked_add(part.len())
+            .ok_or_else(|| derived_plan_error("solver numerics plan payload limit exceeded"))
+    })
+}
+
+fn format_numerics_value_for_plan(value: &[String], capacity: usize) -> Result<String> {
+    if value.is_empty() {
+        return try_copy_derived_plan_string("empty");
+    }
+    let mut formatted = String::new();
+    formatted
+        .try_reserve_exact(capacity)
+        .map_err(|_| crate::MeshError::OutOfMemory)?;
+    for (index, part) in value.iter().enumerate() {
+        if index > 0 {
+            formatted.push(' ');
+        }
+        formatted.push_str(part);
+    }
+    Ok(formatted)
+}
+
+fn append_prefixed_derived_warnings(
+    derived_warnings: &mut Vec<String>,
+    budget: &mut DerivedPlanBudget,
+    prefix: &str,
+    warnings: &[String],
+) -> Result<()> {
+    for warning in warnings {
+        push_prefixed_derived_warning(derived_warnings, budget, prefix, warning)?;
+    }
+    Ok(())
+}
+
+fn push_prefixed_derived_warning(
+    derived_warnings: &mut Vec<String>,
+    budget: &mut DerivedPlanBudget,
+    prefix: &str,
+    warning: &str,
+) -> Result<()> {
+    let payload = prefix
+        .len()
+        .checked_add(warning.len())
+        .ok_or_else(|| derived_plan_error(budget.payload_error))?;
+    budget.add_item(payload)?;
+    derived_warnings
+        .try_reserve(1)
+        .map_err(|_| crate::MeshError::OutOfMemory)?;
+    derived_warnings.push(try_join_derived_plan_parts(&[prefix, warning])?);
+    Ok(())
+}
+
+fn append_derived_warnings_atomically(
+    warnings: &mut Vec<String>,
+    derived_warnings: &mut Vec<String>,
+) -> Result<()> {
+    warnings
+        .try_reserve(derived_warnings.len())
+        .map_err(|_| crate::MeshError::OutOfMemory)?;
+    warnings.append(derived_warnings);
+    Ok(())
+}
+
+fn try_join_derived_plan_parts(parts: &[&str]) -> Result<String> {
+    let capacity = parts.iter().try_fold(0usize, |bytes, part| {
+        bytes
+            .checked_add(part.len())
+            .ok_or(crate::MeshError::OutOfMemory)
+    })?;
+    let mut value = String::new();
+    value
+        .try_reserve_exact(capacity)
+        .map_err(|_| crate::MeshError::OutOfMemory)?;
+    for part in parts {
+        value.push_str(part);
+    }
+    Ok(value)
+}
+
+fn try_copy_derived_plan_string(value: &str) -> Result<String> {
+    try_join_derived_plan_parts(&[value])
+}
+
+fn derived_plan_error(message: &'static str) -> crate::MeshError {
+    let mut owned = String::new();
+    if owned.try_reserve_exact(message.len()).is_err() {
+        return crate::MeshError::OutOfMemory;
+    }
+    owned.push_str(message);
+    crate::MeshError::InvalidInput(owned)
 }
 
 fn build_backend_plan(case_dir: &Path, warnings: &mut Vec<String>) -> Result<SolverBackendPlan> {
+    let limits = DerivedPlanLimits {
+        items: MAX_SOLVER_BACKEND_PLAN_ITEMS,
+        payload_bytes: MAX_SOLVER_BACKEND_PLAN_PAYLOAD_BYTES,
+    };
     let Some(config) = read_backend_config(case_dir)? else {
-        warnings.push("no system/ferrumBackends found; solver plan defaults to CPU".to_string());
-        return Ok(SolverBackendPlan {
-            config_present: false,
-            default: BackendChoice::Cpu,
-            uses_cpu: true,
-            uses_gpu: false,
-            mixed_execution: false,
-            cpu: SolverCpuResourcePlan {
-                cpus: "auto".to_string(),
-                cores_per_cpu: "auto".to_string(),
-                threads: "auto".to_string(),
-                thread_pinning: "off".to_string(),
-                numa: "auto".to_string(),
-            },
-            gpu: SolverGpuResourcePlan {
-                backend: "auto".to_string(),
-                devices: vec!["auto".to_string()],
-                multi_gpu: "auto".to_string(),
-                precision: "f64".to_string(),
-            },
-            stages: Vec::new(),
-        });
+        return build_default_backend_plan(warnings, limits);
     };
 
     let resource_validation = validate_backend_resources(&config);
-    warnings.extend(
-        resource_validation
-            .warnings
-            .iter()
-            .map(|warning| format!("backend resources: {warning}")),
-    );
     let policy_validation = validate_backend_policy(&config);
-    warnings.extend(
-        policy_validation
-            .warnings
-            .iter()
-            .map(|warning| format!("backend policy: {warning}")),
-    );
-
-    let stages = config
-        .sections
-        .iter()
-        .flat_map(|section| {
-            section
-                .entries
-                .iter()
-                .map(|entry| SolverBackendStagePlan {
-                    section: section.name.clone(),
-                    step: entry.step.clone(),
-                    choice: entry.choice,
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect();
-
-    Ok(SolverBackendPlan {
-        config_present: true,
-        default: config.default,
+    let validation = BackendPlanValidation {
         uses_cpu: resource_validation.uses_cpu,
         uses_gpu: resource_validation.uses_gpu,
         mixed_execution: resource_validation.mixed_execution,
+        resource_warnings: &resource_validation.warnings,
+        policy_warnings: &policy_validation.warnings,
+    };
+    build_backend_plan_from_validated_config(config, validation, warnings, limits)
+}
+
+struct BackendPlanValidation<'a> {
+    uses_cpu: bool,
+    uses_gpu: bool,
+    mixed_execution: bool,
+    resource_warnings: &'a [String],
+    policy_warnings: &'a [String],
+}
+
+fn build_backend_plan_from_validated_config(
+    config: BackendConfig,
+    validation: BackendPlanValidation<'_>,
+    warnings: &mut Vec<String>,
+    limits: DerivedPlanLimits,
+) -> Result<SolverBackendPlan> {
+    let mut budget = DerivedPlanBudget::new(
+        limits,
+        "solver backend plan item limit exceeded",
+        "solver backend plan payload limit exceeded",
+    );
+    let mut derived_warnings = Vec::new();
+    append_prefixed_derived_warnings(
+        &mut derived_warnings,
+        &mut budget,
+        "backend resources: ",
+        validation.resource_warnings,
+    )?;
+    append_prefixed_derived_warnings(
+        &mut derived_warnings,
+        &mut budget,
+        "backend policy: ",
+        validation.policy_warnings,
+    )?;
+
+    let mut stages = Vec::new();
+    for section in &config.sections {
+        for entry in &section.entries {
+            let payload = section
+                .name
+                .len()
+                .checked_add(entry.step.len())
+                .ok_or_else(|| derived_plan_error("solver backend plan payload limit exceeded"))?;
+            budget.add_item(payload)?;
+            stages
+                .try_reserve(1)
+                .map_err(|_| crate::MeshError::OutOfMemory)?;
+            stages.push(SolverBackendStagePlan {
+                section: try_copy_derived_plan_string(&section.name)?,
+                step: try_copy_derived_plan_string(&entry.step)?,
+                choice: entry.choice,
+            });
+        }
+    }
+
+    let plan = SolverBackendPlan {
+        config_present: true,
+        default: config.default,
+        uses_cpu: validation.uses_cpu,
+        uses_gpu: validation.uses_gpu,
+        mixed_execution: validation.mixed_execution,
         cpu: SolverCpuResourcePlan {
             cpus: config.cpu.cpus,
             cores_per_cpu: config.cpu.cores_per_cpu,
@@ -805,7 +1474,65 @@ fn build_backend_plan(case_dir: &Path, warnings: &mut Vec<String>) -> Result<Sol
             precision: config.gpu.precision,
         },
         stages,
-    })
+    };
+    append_derived_warnings_atomically(warnings, &mut derived_warnings)?;
+    Ok(plan)
+}
+
+fn build_default_backend_plan(
+    warnings: &mut Vec<String>,
+    limits: DerivedPlanLimits,
+) -> Result<SolverBackendPlan> {
+    let mut budget = DerivedPlanBudget::new(
+        limits,
+        "solver backend plan item limit exceeded",
+        "solver backend plan payload limit exceeded",
+    );
+    let mut derived_warnings = Vec::new();
+    push_prefixed_derived_warning(
+        &mut derived_warnings,
+        &mut budget,
+        "",
+        "no system/ferrumBackends found; solver plan defaults to CPU",
+    )?;
+    let cpu = SolverCpuResourcePlan {
+        cpus: copy_default_backend_value("auto", &mut budget)?,
+        cores_per_cpu: copy_default_backend_value("auto", &mut budget)?,
+        threads: copy_default_backend_value("auto", &mut budget)?,
+        thread_pinning: copy_default_backend_value("off", &mut budget)?,
+        numa: copy_default_backend_value("auto", &mut budget)?,
+    };
+    let mut devices = Vec::new();
+    devices
+        .try_reserve_exact(1)
+        .map_err(|_| crate::MeshError::OutOfMemory)?;
+    devices.push(copy_default_backend_value("auto", &mut budget)?);
+    let gpu = SolverGpuResourcePlan {
+        backend: copy_default_backend_value("auto", &mut budget)?,
+        devices,
+        multi_gpu: copy_default_backend_value("auto", &mut budget)?,
+        precision: copy_default_backend_value("f64", &mut budget)?,
+    };
+    let plan = SolverBackendPlan {
+        config_present: false,
+        default: BackendChoice::Cpu,
+        uses_cpu: true,
+        uses_gpu: false,
+        mixed_execution: false,
+        cpu,
+        gpu,
+        stages: Vec::new(),
+    };
+    append_derived_warnings_atomically(warnings, &mut derived_warnings)?;
+    Ok(plan)
+}
+
+fn copy_default_backend_value(
+    value: &'static str,
+    budget: &mut DerivedPlanBudget,
+) -> Result<String> {
+    budget.add_item(value.len())?;
+    try_copy_derived_plan_string(value)
 }
 
 fn build_run_plan(
@@ -961,17 +1688,23 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::backends::BackendChoice;
+    use crate::backends::{
+        BackendChoice, BackendConfig, BackendSection, BackendSelection, CpuConfig, GpuConfig,
+    };
     use crate::control::ControlDict;
     use crate::fields::{FieldFile, FieldLoadPolicy, FieldValueSummary, InitialFieldSet};
+    use crate::numerics::NumericsSection;
     use crate::patches::PatchValidationSummary;
+    use crate::properties::{PropertyDictionary, PropertyEntry};
     use crate::solver_state::SolverStateCpuBufferStatus;
 
     use super::{
-        SolverBackendPlan, SolverBackendStagePlan, SolverCpuResourcePlan, SolverDimensionality,
-        SolverGpuResourcePlan, SolverRunStageSource, build_run_plan, build_solver_case_plan,
-        build_solver_case_plan_with_policy, classify_dimensionality,
-        validate_openfoam_case_structure,
+        BackendPlanValidation, DerivedPlanLimits, PropertyPlanLimits, SolverBackendPlan,
+        SolverBackendStagePlan, SolverCpuResourcePlan, SolverDimensionality, SolverGpuResourcePlan,
+        SolverRunStageSource, build_backend_plan_from_validated_config,
+        build_numerics_plan_from_loaded, build_properties_plan_from_dictionaries_with_limits,
+        build_run_plan, build_solver_case_plan, build_solver_case_plan_with_policy,
+        classify_dimensionality, validate_openfoam_case_structure,
     };
 
     #[test]
@@ -1008,6 +1741,310 @@ mod tests {
             classify_dimensionality(&summary),
             SolverDimensionality::MixedSpecialPatches
         );
+    }
+
+    #[test]
+    fn property_plan_count_and_payload_caps_are_exact() {
+        let dictionaries = vec![test_property_dictionary(
+            "d",
+            vec![PropertyEntry {
+                key: "k".to_string(),
+                value: vec!["v".to_string()],
+            }],
+        )];
+        let exact_limits = PropertyPlanLimits {
+            items: 2,
+            payload_bytes: 6,
+        };
+        let mut warnings = Vec::new();
+
+        let exact = build_properties_plan_from_dictionaries_with_limits(
+            &dictionaries,
+            &mut warnings,
+            exact_limits,
+        )
+        .expect("the exact property-plan count and payload limits must succeed");
+
+        assert_eq!(exact.dictionaries.len(), 1);
+        assert_eq!(exact.entries.len(), 1);
+        assert_eq!(exact.entries[0].dictionary, "d");
+        assert_eq!(exact.entries[0].key, "k");
+        assert_eq!(exact.entries[0].value, "v");
+        assert!(warnings.is_empty());
+
+        let mut count_warnings = vec!["sentinel".to_string()];
+        let count_error = build_properties_plan_from_dictionaries_with_limits(
+            &dictionaries,
+            &mut count_warnings,
+            PropertyPlanLimits {
+                items: exact_limits.items - 1,
+                payload_bytes: exact_limits.payload_bytes,
+            },
+        )
+        .expect_err("one item over the property-plan count limit must fail");
+        assert_eq!(
+            count_error.to_string(),
+            "solver property plan item limit exceeded"
+        );
+        assert_eq!(count_warnings, ["sentinel"]);
+
+        let mut payload_warnings = vec!["sentinel".to_string()];
+        let payload_error = build_properties_plan_from_dictionaries_with_limits(
+            &dictionaries,
+            &mut payload_warnings,
+            PropertyPlanLimits {
+                items: exact_limits.items,
+                payload_bytes: exact_limits.payload_bytes - 1,
+            },
+        )
+        .expect_err("one byte over the property-plan payload limit must fail");
+        assert_eq!(
+            payload_error.to_string(),
+            "solver property plan payload limit exceeded"
+        );
+        assert_eq!(payload_warnings, ["sentinel"]);
+    }
+
+    #[test]
+    fn property_warning_budget_is_exact_and_failure_appends_no_prefix() {
+        let dictionaries = vec![test_property_dictionary("p", Vec::new())];
+        let expected_warning = "properties: property dictionary 'p' has no entries";
+        let exact_limits = PropertyPlanLimits {
+            items: 2,
+            payload_bytes: (3 * "p".len()) + expected_warning.len(),
+        };
+        let mut warnings = vec!["sentinel".to_string()];
+
+        let plan = build_properties_plan_from_dictionaries_with_limits(
+            &dictionaries,
+            &mut warnings,
+            exact_limits,
+        )
+        .expect("the exact property warning budget must succeed");
+
+        assert_eq!(plan.dictionaries.len(), 1);
+        assert!(plan.entries.is_empty());
+        assert_eq!(warnings, ["sentinel", expected_warning]);
+
+        let mut rejected_warnings = vec!["sentinel".to_string()];
+        let error = build_properties_plan_from_dictionaries_with_limits(
+            &dictionaries,
+            &mut rejected_warnings,
+            PropertyPlanLimits {
+                items: exact_limits.items,
+                payload_bytes: exact_limits.payload_bytes - 1,
+            },
+        )
+        .expect_err("one warning byte over the shared payload limit must fail");
+        assert_eq!(
+            error.to_string(),
+            "solver property plan payload limit exceeded"
+        );
+        assert_eq!(rejected_warnings, ["sentinel"]);
+    }
+
+    #[test]
+    fn property_warning_count_failure_appends_no_partial_prefix() {
+        let dictionaries = vec![
+            test_property_dictionary("a", Vec::new()),
+            test_property_dictionary("b", Vec::new()),
+        ];
+        let mut warnings = vec!["sentinel".to_string()];
+
+        let error = build_properties_plan_from_dictionaries_with_limits(
+            &dictionaries,
+            &mut warnings,
+            PropertyPlanLimits {
+                items: 3,
+                payload_bytes: usize::MAX,
+            },
+        )
+        .expect_err("the second warning must exceed the shared item limit");
+
+        assert_eq!(
+            error.to_string(),
+            "solver property plan item limit exceeded"
+        );
+        assert_eq!(warnings, ["sentinel"]);
+    }
+
+    #[test]
+    fn property_dimension_warnings_preserve_exact_text() {
+        let dictionaries = vec![test_property_dictionary(
+            "transport",
+            vec![PropertyEntry {
+                key: "nu".to_string(),
+                value: vec!["[".to_string(), "0".to_string(), "]".to_string()],
+            }],
+        )];
+        let mut warnings = Vec::new();
+
+        build_properties_plan_from_dictionaries_with_limits(
+            &dictionaries,
+            &mut warnings,
+            PropertyPlanLimits {
+                items: usize::MAX,
+                payload_bytes: usize::MAX,
+            },
+        )
+        .expect("dimension warning construction should succeed");
+
+        assert_eq!(
+            warnings,
+            [
+                "properties: transport.nu dimension vector has 1 entries; expected 7",
+                "properties: transport.nu has dimensions but no value",
+            ]
+        );
+    }
+
+    #[test]
+    fn cumulative_numerics_section_paths_have_exact_caps_and_no_prefix() {
+        let outer_name = "a".repeat(1_024);
+        let inner_name = "b".repeat(1_024);
+        let nested_path = format!("{outer_name}.{inner_name}");
+        let sections = vec![NumericsSection {
+            name: outer_name.clone(),
+            entries: Vec::new(),
+            sections: vec![NumericsSection {
+                name: inner_name,
+                entries: Vec::new(),
+                sections: Vec::new(),
+            }],
+        }];
+        let exact_limits = DerivedPlanLimits {
+            items: 2,
+            payload_bytes: (2 * outer_name.len()) + (2 * nested_path.len()),
+        };
+        let mut warnings = vec!["sentinel".to_string()];
+
+        let exact = build_numerics_plan_from_loaded(
+            Some((&sections, &[])),
+            Some((&[], &[])),
+            &mut warnings,
+            exact_limits,
+        )
+        .expect("the exact cumulative numerics section-path budget must succeed");
+
+        assert_eq!(exact.fv_schemes.sections.len(), 2);
+        assert_eq!(exact.fv_schemes.sections[0].path, outer_name);
+        assert_eq!(exact.fv_schemes.sections[1].path, nested_path);
+        assert_eq!(warnings, ["sentinel"]);
+
+        let mut payload_warnings = vec!["sentinel".to_string()];
+        let payload_error = build_numerics_plan_from_loaded(
+            Some((&sections, &[])),
+            Some((&[], &[])),
+            &mut payload_warnings,
+            DerivedPlanLimits {
+                items: exact_limits.items,
+                payload_bytes: exact_limits.payload_bytes - 1,
+            },
+        )
+        .expect_err("one cumulative section-path byte over the limit must fail");
+        assert_eq!(
+            payload_error.to_string(),
+            "solver numerics plan payload limit exceeded"
+        );
+        assert_eq!(payload_warnings, ["sentinel"]);
+
+        let mut count_warnings = vec!["sentinel".to_string()];
+        let count_error = build_numerics_plan_from_loaded(
+            Some((&sections, &[])),
+            Some((&[], &[])),
+            &mut count_warnings,
+            DerivedPlanLimits {
+                items: exact_limits.items - 1,
+                payload_bytes: exact_limits.payload_bytes,
+            },
+        )
+        .expect_err("one cumulative section-path item over the limit must fail");
+        assert_eq!(
+            count_error.to_string(),
+            "solver numerics plan item limit exceeded"
+        );
+        assert_eq!(count_warnings, ["sentinel"]);
+    }
+
+    #[test]
+    fn repeated_backend_section_names_have_exact_caps_and_no_prefix() {
+        let section_name = "s".repeat(4_096);
+        let resource_warnings = vec!["resource warning".to_string()];
+        let warning_payload = "backend resources: ".len() + resource_warnings[0].len();
+        let stage_payload = (2 * section_name.len()) + "one".len() + "two".len();
+        let exact_limits = DerivedPlanLimits {
+            items: 3,
+            payload_bytes: warning_payload + stage_payload,
+        };
+        let mut warnings = vec!["sentinel".to_string()];
+
+        let exact = build_backend_plan_from_validated_config(
+            test_backend_config(&section_name),
+            BackendPlanValidation {
+                uses_cpu: true,
+                uses_gpu: false,
+                mixed_execution: false,
+                resource_warnings: &resource_warnings,
+                policy_warnings: &[],
+            },
+            &mut warnings,
+            exact_limits,
+        )
+        .expect("the exact repeated backend-section budget must succeed");
+
+        assert_eq!(exact.stages.len(), 2);
+        assert_eq!(exact.stages[0].section, section_name);
+        assert_eq!(exact.stages[1].section, section_name);
+        assert_eq!(
+            warnings,
+            ["sentinel", "backend resources: resource warning"]
+        );
+
+        let mut payload_warnings = vec!["sentinel".to_string()];
+        let payload_error = build_backend_plan_from_validated_config(
+            test_backend_config(&section_name),
+            BackendPlanValidation {
+                uses_cpu: true,
+                uses_gpu: false,
+                mixed_execution: false,
+                resource_warnings: &resource_warnings,
+                policy_warnings: &[],
+            },
+            &mut payload_warnings,
+            DerivedPlanLimits {
+                items: exact_limits.items,
+                payload_bytes: exact_limits.payload_bytes - 1,
+            },
+        )
+        .expect_err("one repeated backend-section byte over the limit must fail");
+        assert_eq!(
+            payload_error.to_string(),
+            "solver backend plan payload limit exceeded"
+        );
+        assert_eq!(payload_warnings, ["sentinel"]);
+
+        let mut count_warnings = vec!["sentinel".to_string()];
+        let count_error = build_backend_plan_from_validated_config(
+            test_backend_config(&section_name),
+            BackendPlanValidation {
+                uses_cpu: true,
+                uses_gpu: false,
+                mixed_execution: false,
+                resource_warnings: &resource_warnings,
+                policy_warnings: &[],
+            },
+            &mut count_warnings,
+            DerivedPlanLimits {
+                items: exact_limits.items - 1,
+                payload_bytes: exact_limits.payload_bytes,
+            },
+        )
+        .expect_err("one repeated backend-section item over the limit must fail");
+        assert_eq!(
+            count_error.to_string(),
+            "solver backend plan item limit exceeded"
+        );
+        assert_eq!(count_warnings, ["sentinel"]);
     }
 
     #[test]
@@ -1347,6 +2384,40 @@ mod tests {
                     choice,
                 })
                 .collect(),
+        }
+    }
+
+    fn test_property_dictionary(name: &str, entries: Vec<PropertyEntry>) -> PropertyDictionary {
+        PropertyDictionary {
+            path: PathBuf::from(name),
+            region: None,
+            name: name.to_string(),
+            entries,
+            sections: Vec::new(),
+        }
+    }
+
+    fn test_backend_config(section_name: &str) -> BackendConfig {
+        BackendConfig {
+            path: PathBuf::from("ferrumBackends"),
+            default: BackendChoice::Cpu,
+            sections: vec![BackendSection {
+                name: section_name.to_string(),
+                entries: vec![
+                    BackendSelection {
+                        step: "one".to_string(),
+                        choice: BackendChoice::Cpu,
+                    },
+                    BackendSelection {
+                        step: "two".to_string(),
+                        choice: BackendChoice::Cpu,
+                    },
+                ],
+            }],
+            cpu: CpuConfig::default(),
+            gpu: GpuConfig::default(),
+            cpu_explicit: true,
+            gpu_explicit: false,
         }
     }
 

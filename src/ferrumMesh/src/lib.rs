@@ -18,6 +18,7 @@ pub mod properties;
 pub mod regions;
 pub mod runner;
 pub mod runtime;
+pub mod safe_output;
 pub mod solver_plan;
 pub mod solver_state;
 

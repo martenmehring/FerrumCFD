@@ -1,7 +1,8 @@
 mod case;
 
 use std::env;
-use std::fs::{File, OpenOptions};
+use std::fmt;
+use std::fs::File;
 use std::io::{BufWriter, Error, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -49,6 +50,7 @@ use ferrum_mesh::runner::{
     SolverRunnerDryRunOptions, build_solver_runner_dry_run,
 };
 use ferrum_mesh::runtime::SolverRuntimeData;
+use ferrum_mesh::safe_output::SafeOutputRoot;
 use ferrum_mesh::solver_plan::{
     SolverBackendPlan, SolverCasePlan, SolverFieldPlan, SolverInterfacePlan, SolverMeshPlan,
     SolverNumericsDictionaryPlan, SolverNumericsPlan, SolverPropertiesPlan, SolverRunPlan,
@@ -2619,12 +2621,27 @@ fn runtime_initial_guess<'a>(plan: &'a SolverCasePlan, field: &FieldFile) -> Opt
         .and_then(|buffer| buffer.values.as_deref())
 }
 
-fn field_label(field: &FieldFile) -> String {
-    if let Some(region) = &field.region {
-        format!("{region}/{}", field.name)
-    } else {
-        field.name.clone()
+#[derive(Clone, Copy)]
+struct QualifiedName<'a> {
+    region: Option<&'a str>,
+    name: &'a str,
+}
+
+impl fmt::Display for QualifiedName<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(region) = self.region {
+            write!(formatter, "{region}/")?;
+        }
+        formatter.write_str(self.name)
     }
+}
+
+fn qualified_name<'a>(region: Option<&'a str>, name: &'a str) -> QualifiedName<'a> {
+    QualifiedName { region, name }
+}
+
+fn field_label(field: &FieldFile) -> QualifiedName<'_> {
+    qualified_name(field.region.as_deref(), &field.name)
 }
 
 fn summarize_scalar_solution(values: &[f64]) -> ScalarSolutionSummary {
@@ -2703,14 +2720,9 @@ fn print_solver_case_plan(plan: &SolverCasePlan, dispatch: Option<&SolverDispatc
     } else {
         println!("fields:");
         for field in &plan.fields.fields {
-            let name = if let Some(region) = &field.region {
-                format!("{region}/{}", field.name)
-            } else {
-                field.name.clone()
-            };
             println!(
                 "  {}: class={} boundaryPatches={}",
-                name,
+                qualified_name(field.region.as_deref(), &field.name),
                 field.class_name.as_deref().unwrap_or("unknown"),
                 field.boundary_patches
             );
@@ -2748,24 +2760,23 @@ fn print_solver_case_plan(plan: &SolverCasePlan, dispatch: Option<&SolverDispatc
 }
 
 fn print_openfoam_case_compatibility_warnings(warnings: &[String]) {
-    let compatibility_warnings: Vec<String> = warnings
+    let compatibility_count = warnings
         .iter()
-        .filter_map(|warning| {
-            warning
-                .strip_prefix("OpenFOAM compatibility: ")
-                .map(std::string::ToString::to_string)
-        })
-        .collect();
-    if compatibility_warnings.is_empty() {
+        .filter(|warning| warning.starts_with("OpenFOAM compatibility: "))
+        .count();
+    if compatibility_count == 0 {
         println!("OpenFOAM compatibility: case layout and required fields look present");
         return;
     }
 
     println!(
         "OpenFOAM compatibility: {} item(s) to check",
-        compatibility_warnings.len()
+        compatibility_count
     );
-    for message in compatibility_warnings {
+    for message in warnings
+        .iter()
+        .filter_map(|warning| warning.strip_prefix("OpenFOAM compatibility: "))
+    {
         println!("  {}", message);
     }
 }
@@ -2807,23 +2818,22 @@ fn print_solver_properties(plan: &SolverPropertiesPlan) {
         plan.entries.len()
     );
     for dictionary in &plan.dictionaries {
-        let label = if let Some(region) = &dictionary.region {
-            format!("{region}/{}", dictionary.name)
-        } else {
-            dictionary.name.clone()
-        };
         println!(
             "  {}: sections={} entries={}",
-            label, dictionary.sections, dictionary.entries
+            qualified_name(dictionary.region.as_deref(), &dictionary.name),
+            dictionary.sections,
+            dictionary.entries
         );
     }
     for entry in &plan.entries {
-        let path = if let Some(section) = &entry.section {
-            format!("{}.{}.{}", entry.dictionary, section, entry.key)
+        if let Some(section) = &entry.section {
+            println!(
+                "    {}.{}.{}={}",
+                entry.dictionary, section, entry.key, entry.value
+            );
         } else {
-            format!("{}.{}", entry.dictionary, entry.key)
-        };
-        println!("    {path}={}", entry.value);
+            println!("    {}.{}={}", entry.dictionary, entry.key, entry.value);
+        }
     }
 }
 
@@ -2857,14 +2867,9 @@ fn print_solver_state_plan(plan: &SolverStatePlan) {
         format_optional_usize(bytes_f64)
     );
     for field in &plan.fields {
-        let name = if let Some(region) = &field.region {
-            format!("{region}/{}", field.name)
-        } else {
-            field.name.clone()
-        };
         println!(
             "  {}: class={} kind={} meshCells={} internal={} values={} expected={} valid={} components={} scalarSlots={} bytesF64={} uniform={} loadedScalars={} boundaryPatches={}/{} cpu={} gpu={} storage={} cpuBuffer={} cpuBufferStatus={}",
-            name,
+            qualified_name(field.region.as_deref(), &field.name),
             field.class_name.as_deref().unwrap_or("unknown"),
             field.kind,
             format_optional_usize(field.mesh_cells),
@@ -2950,14 +2955,9 @@ fn print_solver_runtime_data(runtime: &SolverRuntimeData) {
     } else {
         println!("runtime field buffers:");
         for field in &runtime.fields {
-            let name = if let Some(region) = &field.region {
-                format!("{region}/{}", field.name)
-            } else {
-                field.name.clone()
-            };
             println!(
                 "  {}: kind={} components={} scalarSlots={} bytesF64={} values={}",
-                name,
+                qualified_name(field.region.as_deref(), &field.name),
                 field.kind,
                 field.components,
                 field.scalar_slots,
@@ -3139,14 +3139,9 @@ fn print_solver_runner_state(plan: &SolverStatePlan) {
         format_optional_usize(bytes_f64)
     );
     for field in &plan.fields {
-        let name = if let Some(region) = &field.region {
-            format!("{region}/{}", field.name)
-        } else {
-            field.name.clone()
-        };
         println!(
             "  field {}: kind={} internal={} values={} expected={} components={} scalarSlots={} bytesF64={} uniform={} loadedScalars={} cpu={} gpu={} storage={} cpuBuffer={} cpuBufferStatus={}",
-            name,
+            qualified_name(field.region.as_deref(), &field.name),
             field.kind,
             field.internal_field.kind,
             format_optional_usize(field.internal_field.value_count),
@@ -3173,7 +3168,30 @@ fn write_solver_plan_json(
     dispatch: Option<&SolverDispatch>,
     path: &Path,
 ) -> std::io::Result<()> {
-    let file = create_new_output_file(path)?;
+    let trusted_root = env::current_dir()?;
+    write_solver_plan_json_in_root(plan, dispatch, &trusted_root, path)
+}
+
+fn write_solver_plan_json_in_root(
+    plan: &SolverCasePlan,
+    dispatch: Option<&SolverDispatch>,
+    trusted_root: &Path,
+    path: &Path,
+) -> std::io::Result<()> {
+    let output = SafeOutputRoot::open_existing(trusted_root)?;
+    let relative = if path.is_absolute() {
+        path.strip_prefix(output.path())
+            .map_err(|_| {
+                Error::new(
+                    ErrorKind::PermissionDenied,
+                    "solver plan output must remain below the process working directory",
+                )
+            })?
+            .to_path_buf()
+    } else {
+        path.to_path_buf()
+    };
+    let file = output.open_create_new(&relative)?;
     let mut writer = BufWriter::new(file);
 
     writeln!(writer, "{{")?;
@@ -5497,11 +5515,6 @@ fn ensure_parent_dir(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn create_new_output_file(path: &Path) -> std::io::Result<File> {
-    ensure_parent_dir(path)?;
-    OpenOptions::new().write(true).create_new(true).open(path)
-}
-
 fn write_json_control(writer: &mut impl Write, plan: &SolverCasePlan) -> std::io::Result<()> {
     write_json_key(writer, 2, "control")?;
     writeln!(writer, "{{")?;
@@ -6385,13 +6398,14 @@ fn print_backend_config(case_dir: &Path) -> Result<(), String> {
             continue;
         }
 
-        let selections = section
-            .entries
-            .iter()
-            .map(|entry| format!("{}={}", entry.step, entry.choice))
-            .collect::<Vec<_>>()
-            .join(", ");
-        println!("  {}: {}", section.name, selections);
+        print!("  {}: ", section.name);
+        for (index, entry) in section.entries.iter().enumerate() {
+            if index != 0 {
+                print!(", ");
+            }
+            print!("{}={}", entry.step, entry.choice);
+        }
+        println!();
     }
     let validation = validate_backend_resources(&config);
     println!(
@@ -6409,11 +6423,27 @@ fn print_backend_config(case_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn format_devices(devices: &[String]) -> String {
-    if devices.len() == 1 {
-        return devices[0].clone();
+#[derive(Clone, Copy)]
+struct DeviceList<'a>(&'a [String]);
+
+impl fmt::Display for DeviceList<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let [device] = self.0 {
+            return formatter.write_str(device);
+        }
+        formatter.write_str("(")?;
+        for (index, device) in self.0.iter().enumerate() {
+            if index != 0 {
+                formatter.write_str(" ")?;
+            }
+            formatter.write_str(device)?;
+        }
+        formatter.write_str(")")
     }
-    format!("({})", devices.join(" "))
+}
+
+fn format_devices(devices: &[String]) -> DeviceList<'_> {
+    DeviceList(devices)
 }
 
 fn format_optional_number(value: Option<f64>) -> String {
@@ -7666,7 +7696,7 @@ mod tests {
         resolve_solver_dispatch, resolved_gradient_scheme_value, run_ferrum_subcommand,
         validate_laminar_residual_control_dictionary, validate_module_execution_contract,
         write_json_solver_state, write_json_string, write_laminar_simple_residual_plot,
-        write_solver_plan_json,
+        write_solver_plan_json_in_root,
     };
     use ferrum_mesh::backends::BackendChoice;
     use ferrum_mesh::control::ControlDict;
@@ -7689,7 +7719,7 @@ mod tests {
         SolverStateStoragePlan, SolverStateStorageStatus, SolverStateValueKind,
     };
     use std::io::ErrorKind;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn outer_convergence_status_distinguishes_missing_and_unmet_criteria() {
@@ -9150,19 +9180,21 @@ mod tests {
         let plan = laminar_simple_test_plan(1000.0, 0.001);
         let dispatch = resolve_solver_dispatch(Some("incompressibleFluid".to_string()), None)
             .expect("explicit solver selection");
-        let path = std::env::temp_dir().join(format!(
-            "ferrum-plan-dispatch-{}-{}.json",
+        let base = std::env::temp_dir().join(format!(
+            "ferrum-plan-dispatch-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock should be after Unix epoch")
                 .as_nanos()
         ));
+        std::fs::create_dir_all(&base).expect("test root should be created");
+        let path = base.join("nested/plan.json");
 
-        write_solver_plan_json(&plan, Some(&dispatch), &path)
+        write_solver_plan_json_in_root(&plan, Some(&dispatch), &base, &path)
             .expect("solver plan JSON should be written");
         let json = std::fs::read_to_string(&path).expect("solver plan JSON should be readable");
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&base);
 
         assert!(json.contains("\"schemaVersion\": 2"));
         assert!(json.contains("\"dispatch\""));
@@ -9173,20 +9205,22 @@ mod tests {
     #[test]
     fn solver_plan_json_does_not_clobber_existing_file() {
         let plan = laminar_simple_test_plan(1000.0, 0.001);
-        let path = std::env::temp_dir().join(format!(
-            "ferrum-plan-existing-{}-{}.json",
+        let base = std::env::temp_dir().join(format!(
+            "ferrum-plan-existing-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock should be after Unix epoch")
                 .as_nanos()
         ));
+        std::fs::create_dir_all(&base).expect("test root should be created");
+        let path = base.join("plan.json");
         std::fs::write(&path, "do-not-clobber").expect("existing file should be created");
 
-        let error = write_solver_plan_json(&plan, None, &path)
+        let error = write_solver_plan_json_in_root(&plan, None, &base, &path)
             .expect_err("existing plan path must not be clobbered");
         let contents = std::fs::read_to_string(&path).expect("existing file should be readable");
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&base);
 
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(contents, "do-not-clobber");
@@ -9210,13 +9244,72 @@ mod tests {
         std::fs::write(&target, "do-not-clobber").expect("target should be created");
         std::os::unix::fs::symlink(&target, &link).expect("symlink should be created");
 
-        let error = write_solver_plan_json(&plan, None, &link)
+        let error = write_solver_plan_json_in_root(&plan, None, &base, &link)
             .expect_err("symlink plan path must not be followed");
         let contents = std::fs::read_to_string(&target).expect("target should be readable");
         let _ = std::fs::remove_dir_all(&base);
 
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(contents, "do-not-clobber");
+    }
+
+    #[test]
+    fn solver_plan_json_rejects_parent_and_absolute_root_escape() {
+        let plan = laminar_simple_test_plan(1000.0, 0.001);
+        let base = std::env::temp_dir().join(format!(
+            "ferrum-plan-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after Unix epoch")
+                .as_nanos()
+        ));
+        let trusted = base.join("trusted");
+        std::fs::create_dir_all(&trusted).expect("trusted root should be created");
+
+        let parent_error =
+            write_solver_plan_json_in_root(&plan, None, &trusted, Path::new("../escaped.json"))
+                .expect_err("parent traversal must be rejected");
+        let absolute_error =
+            write_solver_plan_json_in_root(&plan, None, &trusted, &base.join("outside.json"))
+                .expect_err("absolute escape must be rejected");
+
+        assert_eq!(parent_error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(absolute_error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!base.join("escaped.json").exists());
+        assert!(!base.join("outside.json").exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn solver_plan_json_rejects_windows_reparse_ancestor() {
+        use std::os::windows::fs::symlink_dir;
+
+        let plan = laminar_simple_test_plan(1000.0, 0.001);
+        let base = std::env::temp_dir().join(format!(
+            "ferrum-plan-reparse-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after Unix epoch")
+                .as_nanos()
+        ));
+        let trusted = base.join("trusted");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&trusted).expect("trusted root should be created");
+        std::fs::create_dir_all(&outside).expect("outside root should be created");
+        if symlink_dir(&outside, trusted.join("linked")).is_err() {
+            let _ = std::fs::remove_dir_all(base);
+            return;
+        }
+
+        assert!(
+            write_solver_plan_json_in_root(&plan, None, &trusted, Path::new("linked/plan.json"),)
+                .is_err()
+        );
+        assert!(!outside.join("plan.json").exists());
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
