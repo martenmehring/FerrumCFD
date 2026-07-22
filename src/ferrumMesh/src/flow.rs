@@ -14,12 +14,10 @@ use crate::solver_state::SolverStateFieldKind;
 use crate::{MeshError, Point3, Result};
 
 const LAMINAR_SIMPLE_MAX_CONTINUITY_GROWTH_PER_STEP: f64 = 100.0;
-const LAMINAR_SIMPLE_CONTINUITY_FLOOR: f64 = 100.0 * f64::EPSILON;
 const LAMINAR_SIMPLE_SUSTAINED_GROWTH_FACTOR: f64 = 2.0;
 const LAMINAR_SIMPLE_MAX_SUSTAINED_GROWTH_STEPS: usize = 3;
 const LAMINAR_SIMPLE_MAX_FIELD_NORM_GROWTH_PER_STEP: f64 = 64.0;
 const LAMINAR_SIMPLE_MAX_FIELD_NORM_TOTAL_GROWTH: f64 = 1_048_576.0;
-const LAMINAR_SIMPLE_FIELD_NORM_FLOOR: f64 = 1.0;
 const LAMINAR_SIMPLE_LARGE_RELATIVE_UPDATE: f64 = 1.5;
 const LAMINAR_SIMPLE_MAX_SUSTAINED_LARGE_UPDATE_STEPS: usize = 3;
 
@@ -60,53 +58,64 @@ impl SimpleUpdateGuard {
         ]
         .into_iter()
         .any(|(before, after)| {
-            growth_ratio_exceeds(
-                before,
-                after,
-                LAMINAR_SIMPLE_FIELD_NORM_FLOOR,
-                LAMINAR_SIMPLE_MAX_FIELD_NORM_TOTAL_GROWTH,
-            )
+            growth_ratio_exceeds(before, after, LAMINAR_SIMPLE_MAX_FIELD_NORM_TOTAL_GROWTH)
         });
 
-        let continuity_worsened = next.continuity_l2
-            > self
-                .previous
-                .continuity_l2
-                .max(LAMINAR_SIMPLE_CONTINUITY_FLOOR);
+        let continuity_reference =
+            anchored_growth_reference(self.previous.continuity_l2, self.baseline.continuity_l2);
+        let continuity_worsened =
+            continuity_reference.is_some_and(|before| next.continuity_l2 > before);
         let exceeds_step_growth = continuity_worsened
             && [
-                (self.previous.velocity_l2, next.velocity_l2),
-                (self.previous.pressure_l2, next.pressure_l2),
-                (self.previous.phi_l2, next.phi_l2),
+                (
+                    anchored_growth_reference(self.previous.velocity_l2, self.baseline.velocity_l2),
+                    next.velocity_l2,
+                ),
+                (
+                    anchored_growth_reference(self.previous.pressure_l2, self.baseline.pressure_l2),
+                    next.pressure_l2,
+                ),
+                (
+                    anchored_growth_reference(self.previous.phi_l2, self.baseline.phi_l2),
+                    next.phi_l2,
+                ),
             ]
             .into_iter()
             .any(|(before, after)| {
-                growth_ratio_exceeds(
-                    before,
-                    after,
-                    LAMINAR_SIMPLE_FIELD_NORM_FLOOR,
-                    LAMINAR_SIMPLE_MAX_FIELD_NORM_GROWTH_PER_STEP,
-                )
+                before.is_some_and(|before| {
+                    growth_ratio_exceeds(
+                        before,
+                        after,
+                        LAMINAR_SIMPLE_MAX_FIELD_NORM_GROWTH_PER_STEP,
+                    )
+                })
             });
 
-        let coupled_growth = growth_ratio_at_least(
-            self.previous.continuity_l2,
-            next.continuity_l2,
-            LAMINAR_SIMPLE_CONTINUITY_FLOOR,
-            LAMINAR_SIMPLE_SUSTAINED_GROWTH_FACTOR,
-        ) && [
-            (self.previous.velocity_l2, next.velocity_l2),
-            (self.previous.pressure_l2, next.pressure_l2),
-            (self.previous.phi_l2, next.phi_l2),
+        let coupled_growth = continuity_reference.is_some_and(|before| {
+            growth_ratio_at_least(
+                before,
+                next.continuity_l2,
+                LAMINAR_SIMPLE_SUSTAINED_GROWTH_FACTOR,
+            )
+        }) && [
+            (
+                anchored_growth_reference(self.previous.velocity_l2, self.baseline.velocity_l2),
+                next.velocity_l2,
+            ),
+            (
+                anchored_growth_reference(self.previous.pressure_l2, self.baseline.pressure_l2),
+                next.pressure_l2,
+            ),
+            (
+                anchored_growth_reference(self.previous.phi_l2, self.baseline.phi_l2),
+                next.phi_l2,
+            ),
         ]
         .into_iter()
         .any(|(before, after)| {
-            growth_ratio_at_least(
-                before,
-                after,
-                LAMINAR_SIMPLE_FIELD_NORM_FLOOR,
-                LAMINAR_SIMPLE_SUSTAINED_GROWTH_FACTOR,
-            )
+            before.is_some_and(|before| {
+                growth_ratio_at_least(before, after, LAMINAR_SIMPLE_SUSTAINED_GROWTH_FACTOR)
+            })
         });
         let next_sustained_growth_steps = if coupled_growth {
             self.sustained_growth_steps.saturating_add(1)
@@ -135,6 +144,10 @@ impl SimpleUpdateGuard {
             || exceeds_sustained_large_update;
 
         if !rejected {
+            anchor_zero_metric(&mut self.baseline.velocity_l2, next.velocity_l2);
+            anchor_zero_metric(&mut self.baseline.pressure_l2, next.pressure_l2);
+            anchor_zero_metric(&mut self.baseline.phi_l2, next.phi_l2);
+            anchor_zero_metric(&mut self.baseline.continuity_l2, next.continuity_l2);
             self.previous = next;
             self.sustained_growth_steps = next_sustained_growth_steps;
             self.sustained_large_update_steps = next_sustained_large_update_steps;
@@ -143,12 +156,24 @@ impl SimpleUpdateGuard {
     }
 }
 
-fn growth_ratio_exceeds(before: f64, after: f64, floor: f64, limit: f64) -> bool {
-    after / before.max(floor) > limit
+fn anchor_zero_metric(baseline: &mut f64, accepted: f64) {
+    if *baseline == 0.0 && accepted > 0.0 {
+        *baseline = accepted;
+    }
 }
 
-fn growth_ratio_at_least(before: f64, after: f64, floor: f64, limit: f64) -> bool {
-    after / before.max(floor) >= limit
+fn anchored_growth_reference(previous: f64, baseline: f64) -> Option<f64> {
+    (previous > 0.0)
+        .then_some(previous)
+        .or_else(|| (baseline > 0.0).then_some(baseline))
+}
+
+fn growth_ratio_exceeds(before: f64, after: f64, limit: f64) -> bool {
+    before > 0.0 && after / before > limit
+}
+
+fn growth_ratio_at_least(before: f64, after: f64, limit: f64) -> bool {
+    before > 0.0 && after / before >= limit
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2588,12 +2613,7 @@ fn simple_step_continuity_growth_exceeded(
     fn component_growth_exceeded(before: f64, after: f64) -> bool {
         after.is_finite()
             && before.is_finite()
-            && growth_ratio_exceeds(
-                before,
-                after,
-                LAMINAR_SIMPLE_CONTINUITY_FLOOR,
-                LAMINAR_SIMPLE_MAX_CONTINUITY_GROWTH_PER_STEP,
-            )
+            && growth_ratio_exceeds(before, after, LAMINAR_SIMPLE_MAX_CONTINUITY_GROWTH_PER_STEP)
     }
 
     component_growth_exceeded(before.l2_norm, after.l2_norm)
@@ -2649,18 +2669,54 @@ fn checked_gauge_invariant_scalar_l2(values: &[f64]) -> Option<f64> {
     checked_l2_norm(values.iter().map(|value| *value - reference))
 }
 
-fn checked_l2_norm(values: impl IntoIterator<Item = f64>) -> Option<f64> {
-    let mut norm = 0.0_f64;
-    for value in values {
+#[derive(Clone, Copy, Debug)]
+struct CheckedScaledSumSquares {
+    scale: f64,
+    scaled_sum_squares: f64,
+}
+
+impl CheckedScaledSumSquares {
+    fn new() -> Self {
+        Self {
+            scale: 0.0,
+            scaled_sum_squares: 1.0,
+        }
+    }
+
+    fn add(&mut self, value: f64) -> Option<()> {
         if !value.is_finite() {
             return None;
         }
-        norm = norm.hypot(value);
-        if !norm.is_finite() {
-            return None;
+        let absolute = value.abs();
+        if absolute == 0.0 {
+            return Some(());
         }
+        if self.scale < absolute {
+            let ratio = self.scale / absolute;
+            self.scaled_sum_squares = 1.0 + self.scaled_sum_squares * ratio * ratio;
+            self.scale = absolute;
+        } else {
+            let ratio = absolute / self.scale;
+            self.scaled_sum_squares += ratio * ratio;
+        }
+        self.scaled_sum_squares.is_finite().then_some(())
     }
-    Some(norm)
+
+    fn finish(self) -> Option<f64> {
+        if self.scale == 0.0 {
+            return Some(0.0);
+        }
+        let norm = self.scale * self.scaled_sum_squares.sqrt();
+        norm.is_finite().then_some(norm)
+    }
+}
+
+fn checked_l2_norm(values: impl IntoIterator<Item = f64>) -> Option<f64> {
+    let mut accumulator = CheckedScaledSumSquares::new();
+    for value in values {
+        accumulator.add(value)?;
+    }
+    accumulator.finish()
 }
 
 fn points_are_finite(values: &[Point3]) -> bool {
@@ -2677,19 +2733,16 @@ fn checked_relative_vector_field_change_l2(before: &[Point3], after: &[Point3]) 
     if before.len() != after.len() {
         return None;
     }
-    let mut delta_norm = 0.0_f64;
+    let mut delta_norm = CheckedScaledSumSquares::new();
     for (before, after) in before.iter().zip(after) {
         let dx = after.x - before.x;
         let dy = after.y - before.y;
         let dz = after.z - before.z;
-        if !dx.is_finite() || !dy.is_finite() || !dz.is_finite() {
-            return None;
-        }
-        delta_norm = delta_norm.hypot(dx).hypot(dy).hypot(dz);
-        if !delta_norm.is_finite() {
-            return None;
-        }
+        delta_norm.add(dx)?;
+        delta_norm.add(dy)?;
+        delta_norm.add(dz)?;
     }
+    let delta_norm = delta_norm.finish()?;
     let before_norm = checked_l2_norm(before.iter().flat_map(|value| [value.x, value.y, value.z]))?;
     let after_norm = checked_l2_norm(after.iter().flat_map(|value| [value.x, value.y, value.z]))?;
     checked_relative_change_ratio(delta_norm, before_norm, after_norm)
@@ -2699,17 +2752,12 @@ fn checked_relative_scalar_field_change_l2(before: &[f64], after: &[f64]) -> Opt
     if before.len() != after.len() {
         return None;
     }
-    let mut delta_norm = 0.0_f64;
+    let mut delta_norm = CheckedScaledSumSquares::new();
     for (before, after) in before.iter().zip(after) {
         let delta = *after - *before;
-        if !delta.is_finite() {
-            return None;
-        }
-        delta_norm = delta_norm.hypot(delta);
-        if !delta_norm.is_finite() {
-            return None;
-        }
+        delta_norm.add(delta)?;
     }
+    let delta_norm = delta_norm.finish()?;
     let before_norm = checked_l2_norm(before.iter().copied())?;
     let after_norm = checked_l2_norm(after.iter().copied())?;
     checked_relative_change_ratio(delta_norm, before_norm, after_norm)
@@ -2721,19 +2769,17 @@ fn checked_relative_gauge_scalar_field_change_l2(before: &[f64], after: &[f64]) 
     }
     let before_reference = before.first().copied().unwrap_or(0.0);
     let after_reference = after.first().copied().unwrap_or(0.0);
-    let mut delta_norm = 0.0_f64;
+    let mut delta_norm = CheckedScaledSumSquares::new();
     for (before, after) in before.iter().zip(after) {
         let before_centered = *before - before_reference;
         let after_centered = *after - after_reference;
         let delta = after_centered - before_centered;
-        if !before_centered.is_finite() || !after_centered.is_finite() || !delta.is_finite() {
+        if !before_centered.is_finite() || !after_centered.is_finite() {
             return None;
         }
-        delta_norm = delta_norm.hypot(delta);
-        if !delta_norm.is_finite() {
-            return None;
-        }
+        delta_norm.add(delta)?;
     }
+    let delta_norm = delta_norm.finish()?;
     let before_norm = checked_gauge_invariant_scalar_l2(before)?;
     let after_norm = checked_gauge_invariant_scalar_l2(after)?;
     checked_relative_change_ratio(delta_norm, before_norm, after_norm)
@@ -2744,9 +2790,10 @@ fn checked_relative_change_ratio(
     before_norm: f64,
     after_norm: f64,
 ) -> Option<f64> {
-    let scale = before_norm
-        .max(after_norm)
-        .max(LAMINAR_SIMPLE_FIELD_NORM_FLOOR);
+    let scale = before_norm.max(after_norm);
+    if scale == 0.0 {
+        return (delta_norm == 0.0).then_some(0.0);
+    }
     let ratio = delta_norm / scale;
     ratio.is_finite().then_some(ratio)
 }
@@ -7561,42 +7608,66 @@ mod tests {
     }
 
     #[test]
+    fn checked_scaled_sum_squares_is_finite_and_overflow_exact() {
+        assert_eq!(super::checked_l2_norm([0.0, -0.0]), Some(0.0));
+        assert_eq!(super::checked_l2_norm([3.0, 4.0]), Some(5.0));
+
+        let subnormal = f64::from_bits(1);
+        let subnormal_norm = super::checked_l2_norm([subnormal, subnormal])
+            .expect("subnormal norm remains representable");
+        assert!(subnormal_norm.is_finite());
+        assert!(subnormal_norm > 0.0);
+
+        let large = f64::MAX / 4.0;
+        let large_norm = super::checked_l2_norm([large, -large])
+            .expect("large finite norm remains representable");
+        assert!(large_norm.is_finite());
+        assert!(large_norm > large);
+
+        assert!(super::checked_l2_norm([f64::MAX, f64::MAX]).is_none());
+        assert!(super::checked_l2_norm([f64::NAN]).is_none());
+        assert!(super::checked_l2_norm([f64::INFINITY]).is_none());
+    }
+
+    #[test]
     fn simple_update_guard_total_growth_cap_is_exact() {
+        let reference = 2.0_f64.powi(-40);
         let baseline = super::SimpleUpdateMetrics {
-            velocity_l2: 1.0,
-            pressure_l2: 1.0,
-            phi_l2: 1.0,
-            continuity_l2: 1.0,
+            velocity_l2: reference,
+            pressure_l2: reference,
+            phi_l2: reference,
+            continuity_l2: reference,
             velocity_change_l2: 0.0,
             pressure_change_l2: 0.0,
             phi_change_l2: 0.0,
         };
         let cap = super::LAMINAR_SIMPLE_MAX_FIELD_NORM_TOTAL_GROWTH;
+        let at_limit = reference * cap;
         let at_cap = [
             super::SimpleUpdateMetrics {
-                velocity_l2: cap,
+                velocity_l2: at_limit,
                 ..baseline
             },
             super::SimpleUpdateMetrics {
-                pressure_l2: cap,
+                pressure_l2: at_limit,
                 ..baseline
             },
             super::SimpleUpdateMetrics {
-                phi_l2: cap,
+                phi_l2: at_limit,
                 ..baseline
             },
         ];
         let over_cap = [
             super::SimpleUpdateMetrics {
-                velocity_l2: cap.next_up(),
+                velocity_l2: at_limit.next_up(),
                 ..baseline
             },
             super::SimpleUpdateMetrics {
-                pressure_l2: cap.next_up(),
+                pressure_l2: at_limit.next_up(),
                 ..baseline
             },
             super::SimpleUpdateMetrics {
-                phi_l2: cap.next_up(),
+                phi_l2: at_limit.next_up(),
                 ..baseline
             },
         ];
@@ -7611,47 +7682,49 @@ mod tests {
 
     #[test]
     fn simple_update_guard_step_growth_cap_is_exact() {
+        let reference = 2.0_f64.powi(-40);
         let baseline = super::SimpleUpdateMetrics {
-            velocity_l2: 1.0,
-            pressure_l2: 1.0,
-            phi_l2: 1.0,
-            continuity_l2: 1.0,
+            velocity_l2: reference,
+            pressure_l2: reference,
+            phi_l2: reference,
+            continuity_l2: reference,
             velocity_change_l2: 0.0,
             pressure_change_l2: 0.0,
             phi_change_l2: 0.0,
         };
         let cap = super::LAMINAR_SIMPLE_MAX_FIELD_NORM_GROWTH_PER_STEP;
-        let continuity_l2 = 1.0_f64.next_up();
+        let at_limit = reference * cap;
+        let continuity_l2 = reference.next_up();
         let at_cap = [
             super::SimpleUpdateMetrics {
-                velocity_l2: cap,
+                velocity_l2: at_limit,
                 continuity_l2,
                 ..baseline
             },
             super::SimpleUpdateMetrics {
-                pressure_l2: cap,
+                pressure_l2: at_limit,
                 continuity_l2,
                 ..baseline
             },
             super::SimpleUpdateMetrics {
-                phi_l2: cap,
+                phi_l2: at_limit,
                 continuity_l2,
                 ..baseline
             },
         ];
         let over_cap = [
             super::SimpleUpdateMetrics {
-                velocity_l2: cap.next_up(),
+                velocity_l2: at_limit.next_up(),
                 continuity_l2,
                 ..baseline
             },
             super::SimpleUpdateMetrics {
-                pressure_l2: cap.next_up(),
+                pressure_l2: at_limit.next_up(),
                 continuity_l2,
                 ..baseline
             },
             super::SimpleUpdateMetrics {
-                phi_l2: cap.next_up(),
+                phi_l2: at_limit.next_up(),
                 continuity_l2,
                 ..baseline
             },
@@ -7663,6 +7736,123 @@ mod tests {
         for metrics in over_cap {
             assert!(super::SimpleUpdateGuard::new(baseline).rejects(metrics));
         }
+    }
+
+    #[test]
+    fn simple_update_guard_decisions_are_scale_invariant() {
+        let baseline = super::SimpleUpdateMetrics {
+            velocity_l2: 2.0,
+            pressure_l2: 3.0,
+            phi_l2: 4.0,
+            continuity_l2: 5.0,
+            velocity_change_l2: 0.0,
+            pressure_change_l2: 0.0,
+            phi_change_l2: 0.0,
+        };
+        let sequence = [2.0, 4.0, 8.0].map(|factor| super::SimpleUpdateMetrics {
+            velocity_l2: baseline.velocity_l2 * factor,
+            pressure_l2: baseline.pressure_l2,
+            phi_l2: baseline.phi_l2,
+            continuity_l2: baseline.continuity_l2 * factor,
+            velocity_change_l2: 0.25,
+            pressure_change_l2: 0.0,
+            phi_change_l2: 0.0,
+        });
+
+        for scale in [1.0e-12, 1.0, 1.0e12] {
+            let scale_metrics = |metrics: super::SimpleUpdateMetrics| super::SimpleUpdateMetrics {
+                velocity_l2: metrics.velocity_l2 * scale,
+                pressure_l2: metrics.pressure_l2 * scale,
+                phi_l2: metrics.phi_l2 * scale,
+                continuity_l2: metrics.continuity_l2 * scale,
+                ..metrics
+            };
+            let mut guard = super::SimpleUpdateGuard::new(scale_metrics(baseline));
+            let decisions = sequence.map(|metrics| guard.rejects(scale_metrics(metrics)));
+            assert_eq!(decisions, [false, false, true]);
+        }
+    }
+
+    #[test]
+    fn simple_update_guard_anchors_zero_once_then_enforces_exact_total_cap() {
+        let zero = super::SimpleUpdateMetrics {
+            velocity_l2: 0.0,
+            pressure_l2: 0.0,
+            phi_l2: 0.0,
+            continuity_l2: 0.0,
+            velocity_change_l2: 0.0,
+            pressure_change_l2: 0.0,
+            phi_change_l2: 0.0,
+        };
+        let first = super::SimpleUpdateMetrics {
+            phi_l2: 1.0e-12,
+            continuity_l2: 1.0e-14,
+            phi_change_l2: 1.0,
+            ..zero
+        };
+        let mut guard = super::SimpleUpdateGuard::new(zero);
+        assert!(!guard.rejects(first));
+
+        let at_limit = first.phi_l2 * super::LAMINAR_SIMPLE_MAX_FIELD_NORM_TOTAL_GROWTH;
+        assert!(!guard.rejects(super::SimpleUpdateMetrics {
+            phi_l2: at_limit,
+            ..first
+        }));
+        assert!(guard.rejects(super::SimpleUpdateMetrics {
+            phi_l2: at_limit.next_up(),
+            ..first
+        }));
+    }
+
+    #[test]
+    fn simple_update_guard_zero_revisit_cannot_reset_the_anchor() {
+        let zero = super::SimpleUpdateMetrics {
+            velocity_l2: 0.0,
+            pressure_l2: 0.0,
+            phi_l2: 0.0,
+            continuity_l2: 0.0,
+            velocity_change_l2: 0.0,
+            pressure_change_l2: 0.0,
+            phi_change_l2: 0.0,
+        };
+        let first = super::SimpleUpdateMetrics {
+            phi_l2: 1.0e-12,
+            continuity_l2: 1.0e-14,
+            ..zero
+        };
+        let mut guard = super::SimpleUpdateGuard::new(zero);
+        assert!(!guard.rejects(first));
+        assert!(!guard.rejects(zero));
+        assert!(guard.rejects(super::SimpleUpdateMetrics {
+            phi_l2: (first.phi_l2 * super::LAMINAR_SIMPLE_MAX_FIELD_NORM_TOTAL_GROWTH).next_up(),
+            ..zero
+        }));
+    }
+
+    #[test]
+    fn simple_update_guard_rejects_small_scale_phi_growth() {
+        let baseline = super::SimpleUpdateMetrics {
+            velocity_l2: 1.0e-9,
+            pressure_l2: 1.0e-9,
+            phi_l2: 1.0e-12,
+            continuity_l2: 1.0e-14,
+            velocity_change_l2: 0.0,
+            pressure_change_l2: 0.0,
+            phi_change_l2: 0.0,
+        };
+        let mut guard = super::SimpleUpdateGuard::new(baseline);
+        for factor in [2.0, 4.0] {
+            assert!(!guard.rejects(super::SimpleUpdateMetrics {
+                phi_l2: baseline.phi_l2 * factor,
+                continuity_l2: baseline.continuity_l2 * factor,
+                ..baseline
+            }));
+        }
+        assert!(guard.rejects(super::SimpleUpdateMetrics {
+            phi_l2: baseline.phi_l2 * 8.0,
+            continuity_l2: baseline.continuity_l2 * 8.0,
+            ..baseline
+        }));
     }
 
     #[test]
@@ -7733,33 +7923,50 @@ mod tests {
 
     #[test]
     fn simple_update_guard_accepts_pipe_and_channel_envelopes() {
-        let baseline = super::SimpleUpdateMetrics {
-            velocity_l2: 1.0,
-            pressure_l2: 0.0,
-            phi_l2: 1.0,
-            continuity_l2: 0.0,
-            velocity_change_l2: 0.0,
-            pressure_change_l2: 0.0,
-            phi_change_l2: 0.0,
-        };
         let envelopes = [
-            super::SimpleUpdateMetrics {
-                velocity_l2: 1.14647,
-                pressure_l2: 6.03506,
-                phi_l2: 1.14647,
-                continuity_l2: 50.0 * f64::EPSILON,
-                ..baseline
-            },
-            super::SimpleUpdateMetrics {
-                velocity_l2: 1.087,
-                pressure_l2: 2.4,
-                phi_l2: 1.087,
-                continuity_l2: 80.0 * f64::EPSILON,
-                ..baseline
-            },
+            (
+                super::SimpleUpdateMetrics {
+                    velocity_l2: 0.894_427_190_999_915_9,
+                    pressure_l2: 0.0,
+                    phi_l2: 6.283_185_307_179_586e-6,
+                    continuity_l2: 0.0,
+                    velocity_change_l2: 0.0,
+                    pressure_change_l2: 0.0,
+                    phi_change_l2: 0.0,
+                },
+                super::SimpleUpdateMetrics {
+                    velocity_l2: 1.025_919,
+                    pressure_l2: 6.035_06,
+                    phi_l2: 7.203_914e-6,
+                    continuity_l2: 50.0 * f64::EPSILON,
+                    velocity_change_l2: 0.128,
+                    pressure_change_l2: 1.0,
+                    phi_change_l2: 0.128,
+                },
+            ),
+            (
+                super::SimpleUpdateMetrics {
+                    velocity_l2: 0.894_427_190_999_915_9,
+                    pressure_l2: 0.0,
+                    phi_l2: 4.0e-7,
+                    continuity_l2: 0.0,
+                    velocity_change_l2: 0.0,
+                    pressure_change_l2: 0.0,
+                    phi_change_l2: 0.0,
+                },
+                super::SimpleUpdateMetrics {
+                    velocity_l2: 0.972_239,
+                    pressure_l2: 2.4,
+                    phi_l2: 4.348e-7,
+                    continuity_l2: 80.0 * f64::EPSILON,
+                    velocity_change_l2: 0.08,
+                    pressure_change_l2: 1.0,
+                    phi_change_l2: 0.08,
+                },
+            ),
         ];
 
-        for envelope in envelopes {
+        for (baseline, envelope) in envelopes {
             assert!(!super::SimpleUpdateGuard::new(baseline).rejects(envelope));
         }
     }
@@ -7859,7 +8066,7 @@ mod tests {
              _predicted_velocity: &[Point3],
              _phi_hby_a: &[f64],
              _continuity_star: super::ContinuitySummary| {
-                report.solution.copy_from_slice(&[1.0e12, 1.0e12]);
+                report.solution.copy_from_slice(&[1.0e12, -1.0e12]);
             };
 
         let report = super::solve_laminar_simple_driven(
