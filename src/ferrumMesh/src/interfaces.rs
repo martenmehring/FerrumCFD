@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -169,6 +170,7 @@ fn parse_interface_config_str(content: &str, path: &Path) -> Result<InterfaceCon
 
 fn parse_interfaces_block(cursor: &mut TokenCursor) -> Result<Vec<InterfaceConfigEntry>> {
     let mut entries = Vec::new();
+    let mut seen_names = HashSet::new();
 
     while !peek_structural(cursor, "}")? {
         let Some(token) = cursor.peek()? else {
@@ -177,17 +179,18 @@ fn parse_interfaces_block(cursor: &mut TokenCursor) -> Result<Vec<InterfaceConfi
         if token.provenance != TokenProvenance::Ordinary {
             return cursor.reject_current_as("interface name must be an ordinary token");
         }
-        if entries
-            .iter()
-            .any(|entry: &InterfaceConfigEntry| entry.name == token.value)
-        {
+        if seen_names.contains(token.value.as_str()) {
             return cursor.reject_current_as("duplicate interface name");
         }
         if entries.try_reserve(1).is_err() {
             return cursor.reject_current_as("interface entry allocation failed");
         }
+        if seen_names.try_reserve(1).is_err() {
+            return cursor.reject_current_as("interface name allocation failed");
+        }
 
         let name = cursor.next_required()?.value;
+        seen_names.insert(name.clone());
         cursor.expect("{")?;
         entries.push(parse_interface_entry(cursor, name)?);
     }
