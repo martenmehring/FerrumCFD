@@ -64,9 +64,9 @@ pub struct BoundaryFaceZoneSummary {
 }
 
 pub fn split_regions_by_cell_zones(case_dir: &Path) -> Result<RegionSplitSummary> {
+    let output = SafeOutputRoot::open_existing(case_dir)?;
     let poly_mesh_dir = case_dir.join("constant").join("polyMesh");
     let mesh = PolyMesh::read(&poly_mesh_dir)?;
-    let output = SafeOutputRoot::open_trusted(case_dir)?;
 
     if mesh.cell_zones.is_empty() {
         return Err(MeshError::InvalidInput(format!(
@@ -1433,6 +1433,88 @@ fn unique_region_output_names(cell_zones: &[CellZone]) -> Result<Vec<String>> {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(unix)]
+    fn inventory(root: &Path) -> Vec<(PathBuf, &'static str, Vec<u8>)> {
+        fn visit(base: &Path, path: &Path, out: &mut Vec<(PathBuf, &'static str, Vec<u8>)>) {
+            let mut children: Vec<_> = fs::read_dir(path)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect();
+            children.sort();
+            for child in children {
+                let metadata = fs::symlink_metadata(&child).unwrap();
+                let kind = if metadata.is_dir() {
+                    "dir"
+                } else if metadata.is_file() {
+                    "file"
+                } else if metadata.file_type().is_symlink() {
+                    "symlink"
+                } else {
+                    "other"
+                };
+                let bytes = if metadata.is_file() {
+                    fs::read(&child).unwrap()
+                } else {
+                    Vec::new()
+                };
+                out.push((child.strip_prefix(base).unwrap().to_path_buf(), kind, bytes));
+                if metadata.is_dir() {
+                    visit(base, &child, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        visit(root, root, &mut out);
+        out
+    }
+
+    #[cfg(unix)]
+    fn assert_strict_root_rejection(case_dir: &Path, target: &Path) {
+        let before = inventory(target);
+        let error = split_regions_by_cell_zones(case_dir).expect_err("linked root must fail");
+        assert!(
+            matches!(error, MeshError::Io(_)),
+            "expected I/O rejection, got {error}"
+        );
+        assert_eq!(inventory(target), before);
+        assert!(!target.join("constant/region0").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn split_regions_rejects_linked_case_root_before_parsing_without_mutation() {
+        use std::os::unix::fs::symlink;
+        let root = temp_path("linked_case_root");
+        let target = root.join("target");
+        fs::create_dir_all(target.join("constant/polyMesh")).unwrap();
+        fs::write(target.join("sentinel"), b"preserve me").unwrap();
+        fs::write(
+            target.join("constant/polyMesh/points"),
+            b"malformed nonempty points",
+        )
+        .unwrap();
+        let case_dir = root.join("case");
+        symlink(&target, &case_dir).unwrap();
+        assert_strict_root_rejection(&case_dir, &target);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn split_regions_rejects_missing_case_below_linked_ancestor_without_mutation() {
+        use std::os::unix::fs::symlink;
+        let root = temp_path("linked_case_ancestor");
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("sentinel"), b"preserve me").unwrap();
+        let linked = root.join("linked");
+        symlink(&target, &linked).unwrap();
+        let case_dir = linked.join("missing-case");
+        assert_strict_root_rejection(&case_dir, &target);
+        assert!(!case_dir.exists());
+        let _ = fs::remove_dir_all(root);
+    }
 
     fn temp_path(name: &str) -> PathBuf {
         let suffix = SystemTime::now()

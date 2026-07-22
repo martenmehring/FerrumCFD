@@ -36,6 +36,7 @@ struct SimpleUpdateMetrics {
 struct SimpleUpdateGuard {
     baseline: SimpleUpdateMetrics,
     previous: SimpleUpdateMetrics,
+    provisional_field_baselines: [Option<f64>; 3],
     sustained_growth_steps: usize,
     sustained_large_update_steps: usize,
 }
@@ -45,6 +46,7 @@ impl SimpleUpdateGuard {
         Self {
             baseline: initial,
             previous: initial,
+            provisional_field_baselines: [None; 3],
             sustained_growth_steps: 0,
             sustained_large_update_steps: 0,
         }
@@ -144,9 +146,21 @@ impl SimpleUpdateGuard {
             || exceeds_sustained_large_update;
 
         if !rejected {
-            anchor_zero_metric(&mut self.baseline.velocity_l2, next.velocity_l2);
-            anchor_zero_metric(&mut self.baseline.pressure_l2, next.pressure_l2);
-            anchor_zero_metric(&mut self.baseline.phi_l2, next.phi_l2);
+            anchor_zero_field_metric(
+                &mut self.baseline.velocity_l2,
+                &mut self.provisional_field_baselines[0],
+                next.velocity_l2,
+            );
+            anchor_zero_field_metric(
+                &mut self.baseline.pressure_l2,
+                &mut self.provisional_field_baselines[1],
+                next.pressure_l2,
+            );
+            anchor_zero_field_metric(
+                &mut self.baseline.phi_l2,
+                &mut self.provisional_field_baselines[2],
+                next.phi_l2,
+            );
             anchor_zero_metric(&mut self.baseline.continuity_l2, next.continuity_l2);
             self.previous = next;
             self.sustained_growth_steps = next_sustained_growth_steps;
@@ -159,6 +173,16 @@ impl SimpleUpdateGuard {
 fn anchor_zero_metric(baseline: &mut f64, accepted: f64) {
     if *baseline == 0.0 && accepted > 0.0 {
         *baseline = accepted;
+    }
+}
+
+fn anchor_zero_field_metric(baseline: &mut f64, provisional: &mut Option<f64>, accepted: f64) {
+    if *baseline != 0.0 || accepted <= 0.0 {
+        return;
+    }
+    match provisional.take() {
+        Some(first) => *baseline = first.max(accepted),
+        None => *provisional = Some(accepted),
     }
 }
 
@@ -7792,6 +7816,7 @@ mod tests {
         };
         let mut guard = super::SimpleUpdateGuard::new(zero);
         assert!(!guard.rejects(first));
+        assert!(!guard.rejects(first));
 
         let at_limit = first.phi_l2 * super::LAMINAR_SIMPLE_MAX_FIELD_NORM_TOTAL_GROWTH;
         assert!(!guard.rejects(super::SimpleUpdateMetrics {
@@ -7802,6 +7827,103 @@ mod tests {
             phi_l2: at_limit.next_up(),
             ..first
         }));
+    }
+
+    #[test]
+    fn simple_update_guard_two_positive_field_anchors_are_exact_and_transactional() {
+        fn with_field(
+            mut metrics: super::SimpleUpdateMetrics,
+            field: usize,
+            value: f64,
+            change: f64,
+        ) -> super::SimpleUpdateMetrics {
+            match field {
+                0 => {
+                    metrics.velocity_l2 = value;
+                    metrics.velocity_change_l2 = change;
+                }
+                1 => {
+                    metrics.pressure_l2 = value;
+                    metrics.pressure_change_l2 = change;
+                }
+                2 => {
+                    metrics.phi_l2 = value;
+                    metrics.phi_change_l2 = change;
+                }
+                _ => unreachable!(),
+            }
+            metrics
+        }
+
+        fn guard_bits(guard: &super::SimpleUpdateGuard) -> Vec<u64> {
+            let metrics_bits = |metrics: super::SimpleUpdateMetrics| {
+                [
+                    metrics.velocity_l2.to_bits(),
+                    metrics.pressure_l2.to_bits(),
+                    metrics.phi_l2.to_bits(),
+                    metrics.continuity_l2.to_bits(),
+                    metrics.velocity_change_l2.to_bits(),
+                    metrics.pressure_change_l2.to_bits(),
+                    metrics.phi_change_l2.to_bits(),
+                ]
+            };
+            let mut bits = Vec::from(metrics_bits(guard.baseline));
+            bits.extend(metrics_bits(guard.previous));
+            bits.extend(
+                guard
+                    .provisional_field_baselines
+                    .map(|value| value.map_or(0, |value| value.to_bits())),
+            );
+            bits.push(guard.sustained_growth_steps as u64);
+            bits.push(guard.sustained_large_update_steps as u64);
+            bits
+        }
+
+        let zero = super::SimpleUpdateMetrics {
+            velocity_l2: 0.0,
+            pressure_l2: 0.0,
+            phi_l2: 0.0,
+            continuity_l2: 0.0,
+            velocity_change_l2: 0.0,
+            pressure_change_l2: 0.0,
+            phi_change_l2: 0.0,
+        };
+        for field in 0..3 {
+            for (first, second) in [
+                (2f64.powi(-40), 2f64.powi(-20)),
+                (2f64.powi(-20), 2f64.powi(-40)),
+            ] {
+                let mut guard = super::SimpleUpdateGuard::new(zero);
+                assert!(!guard.rejects(with_field(zero, field, first, 0.125)));
+                assert_eq!(guard.provisional_field_baselines[field], Some(first));
+                assert!(!guard.rejects(with_field(zero, field, second, 0.25)));
+                assert_eq!(guard.provisional_field_baselines[field], None);
+                let baseline = [
+                    guard.baseline.velocity_l2,
+                    guard.baseline.pressure_l2,
+                    guard.baseline.phi_l2,
+                ][field];
+                assert_eq!(baseline.to_bits(), 2f64.powi(-20).to_bits());
+
+                assert!(!guard.rejects(with_field(zero, field, 2f64.powi(-19), 0.375)));
+                assert!(!guard.rejects(with_field(zero, field, 0.0, 0.5)));
+                assert_eq!(
+                    [
+                        guard.baseline.velocity_l2,
+                        guard.baseline.pressure_l2,
+                        guard.baseline.phi_l2
+                    ][field]
+                        .to_bits(),
+                    2f64.powi(-20).to_bits()
+                );
+
+                assert!(!guard.rejects(with_field(zero, field, 1.0, 0.625)));
+                let snapshot = guard_bits(&guard);
+                assert!(guard.rejects(with_field(zero, field, 1.0f64.next_up(), 0.75)));
+                assert_eq!(guard_bits(&guard), snapshot);
+                assert!(!guard.rejects(with_field(zero, field, 1.0, 0.875)));
+            }
+        }
     }
 
     #[test]
@@ -7823,6 +7945,7 @@ mod tests {
         let mut guard = super::SimpleUpdateGuard::new(zero);
         assert!(!guard.rejects(first));
         assert!(!guard.rejects(zero));
+        assert!(!guard.rejects(first));
         assert!(guard.rejects(super::SimpleUpdateMetrics {
             phi_l2: (first.phi_l2 * super::LAMINAR_SIMPLE_MAX_FIELD_NORM_TOTAL_GROWTH).next_up(),
             ..zero
@@ -7922,8 +8045,8 @@ mod tests {
     }
 
     #[test]
-    fn simple_update_guard_accepts_pipe_and_channel_envelopes() {
-        let envelopes = [
+    fn simple_update_guard_accepts_synthetic_finite_norm_transitions() {
+        let transitions = [
             (
                 super::SimpleUpdateMetrics {
                     velocity_l2: 0.894_427_190_999_915_9,
@@ -7966,8 +8089,8 @@ mod tests {
             ),
         ];
 
-        for (baseline, envelope) in envelopes {
-            assert!(!super::SimpleUpdateGuard::new(baseline).rejects(envelope));
+        for (baseline, transition) in transitions {
+            assert!(!super::SimpleUpdateGuard::new(baseline).rejects(transition));
         }
     }
 
