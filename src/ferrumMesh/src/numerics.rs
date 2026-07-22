@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::dictionary::{MAX_DICTIONARY_NESTING, TokenCursor, tokenize};
+use crate::dictionary::{MAX_DICTIONARY_NESTING, Token, TokenCursor, TokenProvenance, tokenize};
 use crate::{MeshError, Result};
 
 #[derive(Debug)]
@@ -170,19 +170,24 @@ fn parse_numerics_dictionary_str(content: &str, path: &Path) -> Result<Vec<Numer
     let mut sections = Vec::new();
 
     while let Some(token) = cursor.peek()? {
-        if token.value == ";" {
+        if structural(token, ";") {
             cursor.next_required()?;
             continue;
         }
-        if token.value == "FoamFile" {
+        if ordinary(token, "FoamFile") {
             cursor.next_required()?;
             cursor.skip_braced_block()?;
             continue;
         }
 
-        let name = cursor.next_required()?;
-        if cursor.peek()?.is_some_and(|token| token.value == "{") {
-            sections.push(parse_section(&mut cursor, name.value, 1)?);
+        let (name, provenance) = take_name(&mut cursor, false)?;
+        if cursor.peek()?.is_some_and(|token| structural(token, "{")) {
+            let role = if provenance == TokenProvenance::Ordinary && name == "solvers" {
+                SectionRole::Solvers
+            } else {
+                SectionRole::General
+            };
+            sections.push(parse_section(&mut cursor, name, role, 1)?);
         } else {
             cursor.skip_value_or_block()?;
         }
@@ -191,7 +196,18 @@ fn parse_numerics_dictionary_str(content: &str, path: &Path) -> Result<Vec<Numer
     Ok(sections)
 }
 
-fn parse_section(cursor: &mut TokenCursor, name: String, depth: usize) -> Result<NumericsSection> {
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SectionRole {
+    General,
+    Solvers,
+}
+
+fn parse_section(
+    cursor: &mut TokenCursor,
+    name: String,
+    role: SectionRole,
+    depth: usize,
+) -> Result<NumericsSection> {
     if depth > MAX_DICTIONARY_NESTING {
         return Err(MeshError::InvalidInput(format!(
             "numerics dictionary nesting exceeds {MAX_DICTIONARY_NESTING} levels in {}",
@@ -202,21 +218,21 @@ fn parse_section(cursor: &mut TokenCursor, name: String, depth: usize) -> Result
     let mut entries = Vec::new();
     let mut sections = Vec::new();
 
-    while cursor.peek()?.is_none_or(|token| token.value != "}") {
-        if cursor.peek()?.is_some_and(|token| token.value == ";") {
+    while !cursor.peek()?.is_some_and(|token| structural(token, "}")) {
+        if cursor.peek()?.is_some_and(|token| structural(token, ";")) {
             cursor.next_required()?;
             continue;
         }
 
-        let key = cursor.next_required()?;
-        if cursor.peek()?.is_some_and(|token| token.value == "{") {
-            sections.push(parse_section(cursor, key.value, depth + 1)?);
+        let (key, _) = take_name(cursor, role == SectionRole::Solvers)?;
+        if cursor.peek()?.is_some_and(|token| structural(token, "{")) {
+            sections.push(parse_section(cursor, key, SectionRole::General, depth + 1)?);
             continue;
         }
 
         entries.push(NumericsEntry {
-            key: key.value,
-            value: cursor.read_bare_entry()?,
+            key,
+            value: cursor.read_provenance_preserving_bare_entry()?,
         });
     }
     cursor.expect("}")?;
@@ -227,6 +243,58 @@ fn parse_section(cursor: &mut TokenCursor, name: String, depth: usize) -> Result
         entries,
         sections,
     })
+}
+
+fn structural(token: &Token, expected: &str) -> bool {
+    token.provenance == TokenProvenance::Structural && token.value == expected
+}
+
+fn ordinary(token: &Token, expected: &str) -> bool {
+    token.provenance == TokenProvenance::Ordinary && token.value == expected
+}
+
+fn take_name(
+    cursor: &mut TokenCursor,
+    allow_quoted_field_selector: bool,
+) -> Result<(String, TokenProvenance)> {
+    if cursor
+        .peek()?
+        .is_some_and(|token| token.provenance == TokenProvenance::Structural)
+    {
+        return cursor.reject_current_as("numerics name must not be structural punctuation");
+    }
+    let quoted_inert = cursor.peek()?.is_some_and(|token| {
+        token.provenance == TokenProvenance::Quoted
+            && !(allow_quoted_field_selector && narrow_field_selector(&token.value))
+    });
+    if quoted_inert {
+        cursor.try_reserve_current_value(2)?;
+    }
+    let mut token = cursor.next_required()?;
+    if quoted_inert {
+        token.value.insert(0, '"');
+        token.value.push('"');
+    }
+    Ok((token.value, token.provenance))
+}
+
+fn narrow_field_selector(value: &str) -> bool {
+    let Some(inner) = value
+        .strip_prefix('(')
+        .and_then(|candidate| candidate.strip_suffix(')'))
+    else {
+        return false;
+    };
+    !inner.is_empty()
+        && inner.split('|').all(|candidate| {
+            candidate == ".*"
+                || candidate
+                    .strip_prefix(|ch: char| ch.is_ascii_alphabetic() || ch == '_')
+                    .is_some_and(|tail| {
+                        tail.chars()
+                            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                    })
+        })
 }
 
 #[cfg(test)]
@@ -432,6 +500,118 @@ mod tests {
         let validation = validate_fv_solution(&solution, &["p".to_string(), "U".to_string()]);
 
         assert!(validation.warnings.is_empty());
+    }
+
+    #[test]
+    fn quoted_reserved_numerics_tokens_are_inert() {
+        let sections = parse_numerics_dictionary_str(
+            r#"
+            "FoamFile" { object decoy; }
+            "solvers" { p { solver PCG; } }
+            solvers
+            {
+                "default" { solver smoothSolver; }
+                p { "solver" PCG; }
+            }
+            ddtSchemes { "default" Euler; }
+            "default" ignored;
+            "#,
+            Path::new("fvSolution"),
+        )
+        .unwrap();
+
+        assert!(
+            sections
+                .iter()
+                .any(|section| section.name == "\"FoamFile\"")
+        );
+        assert!(sections.iter().any(|section| section.name == "\"solvers\""));
+        assert!(sections.iter().any(|section| section.name == "solvers"));
+        let solution = FvSolution {
+            path: Path::new("fvSolution").to_path_buf(),
+            sections: sections.clone(),
+        };
+        let solution_validation = validate_fv_solution(&solution, &["p".into(), "T".into()]);
+        assert!(
+            solution_validation
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("solvers.p has no solver entry"))
+        );
+        assert!(
+            solution_validation
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("initial field 'T'"))
+        );
+
+        let schemes = FvSchemes {
+            path: Path::new("fvSchemes").to_path_buf(),
+            sections,
+        };
+        let schemes_validation = validate_fv_schemes(&schemes);
+        assert!(
+            schemes_validation
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("ddtSchemes"))
+        );
+    }
+
+    #[test]
+    fn only_narrow_quoted_field_selector_patterns_are_unquoted() {
+        let sections = parse_numerics_dictionary_str(
+            r#"
+            solvers
+            {
+                "(p|U)" { solver smoothSolver; }
+                "default" { solver PCG; }
+                "(p|U|*)" { solver PCG; }
+            }
+            "#,
+            Path::new("fvSolution"),
+        )
+        .unwrap();
+        let solvers = &sections[0];
+
+        assert_eq!(solvers.sections[0].name, "(p|U)");
+        assert_eq!(solvers.sections[1].name, "\"default\"");
+        assert_eq!(solvers.sections[2].name, "\"(p|U|*)\"");
+        let solution = FvSolution {
+            path: Path::new("fvSolution").to_path_buf(),
+            sections,
+        };
+        assert!(
+            validate_fv_solution(&solution, &["p".into(), "U".into()])
+                .warnings
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn quoted_structural_spelling_is_not_numerics_syntax() {
+        let sections = parse_numerics_dictionary_str(
+            r#"
+            solvers
+            {
+                p
+                {
+                    ";" value;
+                    marker ";";
+                    "}" inert;
+                    solver PCG;
+                }
+            }
+            "#,
+            Path::new("fvSolution"),
+        )
+        .unwrap();
+        let entries = &sections[0].sections[0].entries;
+
+        assert_eq!(entries[0].key, "\";\"");
+        assert_eq!(entries[1].value, ["\";\""]);
+        assert_eq!(entries[2].key, "\"}\"");
+        assert_eq!(entries[3].key, "solver");
     }
 
     #[test]

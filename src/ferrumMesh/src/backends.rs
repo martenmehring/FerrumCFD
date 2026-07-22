@@ -366,7 +366,7 @@ fn parse_backend_entry(cursor: &mut TokenCursor, builder: &mut BackendConfigBuil
             }
             let choice = cursor.next_required()?;
             let choice = parse_backend_choice(&choice.value, cursor.path())?;
-            cursor.expect_optional(";")?;
+            cursor.expect(";")?;
             builder.default = Some(choice);
         }
         "gpu" => {
@@ -447,7 +447,7 @@ fn parse_backend_section(cursor: &mut TokenCursor, name: String) -> Result<Backe
         }
         let choice = cursor.next_required()?;
         let choice = parse_backend_choice(&choice.value, cursor.path())?;
-        cursor.expect_optional(";")?;
+        cursor.expect(";")?;
         entries.push(BackendSelection {
             step: step.value,
             choice,
@@ -663,33 +663,7 @@ fn value_list(
 }
 
 fn skip_backend_value(cursor: &mut TokenCursor) -> Result<()> {
-    let balanced = match cursor.peek()? {
-        Some(first) => {
-            if first.provenance == TokenProvenance::Structural
-                && matches!(first.value.as_str(), ";" | "}" | ")" | "]")
-            {
-                return Err(MeshError::InvalidInput(format!(
-                    "unexpected dictionary token in {}",
-                    cursor.path().display()
-                )));
-            }
-            first.provenance == TokenProvenance::Structural
-                && matches!(first.value.as_str(), "{" | "(" | "[")
-        }
-        None => {
-            return Err(MeshError::InvalidInput(format!(
-                "unexpected end of dictionary in {}",
-                cursor.path().display()
-            )));
-        }
-    };
-    if balanced {
-        cursor.skip_typed_balanced()?;
-    } else {
-        cursor.next_required()?;
-        cursor.expect_optional(";")?;
-    }
-    Ok(())
+    cursor.skip_exact_value_or_block()
 }
 
 fn validate_auto_or_positive_integer(value: &str, label: &str, path: &Path) -> Result<()> {
@@ -1059,16 +1033,16 @@ mod tests {
     fn unknown_and_quoted_entries_preserve_backend_sentinels() {
         let config = parse_backend_config_str(
             r#"
-            cpu { "threads" 99 threads 7; mystery { swallowed gpu; } numa off; }
-            gpu { "precision" f32 precision f64; mystery (0 1) multiGpu on; }
+            cpu { "threads" 99; threads 7; mystery { swallowed gpu; } numa off; }
+            gpu { "precision" f32; precision f64; mystery (0 1); multiGpu on; }
             flow {
                 mystery { swallowed gpu; }
                 "quotedStep" { swallowed gpu; };
-                residual "gpu" jacobian gpu;
+                residual "gpu"; jacobian gpu;
                 "jacobian" gpu;
             }
             heat { "quotedStep" { swallowed gpu; } residual cpu; }
-            "default" gpu default cpu;
+            "default" gpu; default cpu;
             "#,
             Path::new("ferrumBackends"),
         )
@@ -1193,5 +1167,108 @@ mod tests {
             let error = parse_backend_config_str(content, Path::new("ferrumBackends")).unwrap_err();
             assert!(error.to_string().contains("unexpected dictionary token"));
         }
+    }
+
+    #[test]
+    fn exact_unknown_backend_values_preserve_reserved_sentinels() {
+        for key in ["mystery", r#""mystery""#] {
+            for (value, ordinary_custom_step) in [
+                ("gpu;", true),
+                (r#""ignored";"#, false),
+                ("(ignored nested);", false),
+                ("[ignored nested];", false),
+                ("{ default gpu; }", false),
+                ("{ default gpu; };", false),
+            ] {
+                // An ordinary top-level name followed by a brace is an intentional custom
+                // backend section, not an unknown value. Such sections do not use the skip
+                // path, so the optional block terminator is covered by the quoted-key and
+                // nested-resource cases below.
+                if !(key == "mystery" && value == "{ default gpu; };") {
+                    let top = parse_backend_config_str(
+                        &format!("{key} {value} default cpu;"),
+                        Path::new("ferrumBackends"),
+                    )
+                    .unwrap();
+                    assert_eq!(top.default, BackendChoice::Cpu);
+                }
+
+                let cpu = parse_backend_config_str(
+                    &format!("cpu {{ {key} {value} threads 3; }}"),
+                    Path::new("ferrumBackends"),
+                )
+                .unwrap();
+                assert_eq!(cpu.cpu.threads, "3");
+
+                let gpu = parse_backend_config_str(
+                    &format!("gpu {{ {key} {value} precision f32; }}"),
+                    Path::new("ferrumBackends"),
+                )
+                .unwrap();
+                assert_eq!(gpu.gpu.precision, "f32");
+
+                let section = parse_backend_config_str(
+                    &format!("flow {{ {key} {value} residual cpu; }}"),
+                    Path::new("ferrumBackends"),
+                )
+                .unwrap();
+                let entries = &section.sections[0].entries;
+                let sentinel = entries.last().unwrap();
+                assert_eq!(sentinel.step, "residual");
+                assert_eq!(sentinel.choice, BackendChoice::Cpu);
+                let expected = usize::from(key == "mystery" && ordinary_custom_step) + 1;
+                assert_eq!(entries.len(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn unterminated_backend_values_cannot_redispatch_reserved_keys() {
+        for content in [
+            "mystery ignored default cpu;",
+            r#""mystery" "ignored" default cpu;"#,
+            "mystery (ignored) default cpu;",
+            "mystery [ignored] default cpu;",
+            "cpu { mystery ignored threads 3; }",
+            "gpu { mystery (ignored) precision f32; }",
+            "flow { mystery [ignored] residual cpu; }",
+        ] {
+            let error = parse_backend_config_str(content, Path::new("ferrumBackends"))
+                .expect_err("missing structural semicolon must fail before the sentinel");
+            assert!(
+                error
+                    .to_string()
+                    .contains("dictionary value is missing a semicolon"),
+                "unexpected error for {content:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_choices_require_structural_semicolons() {
+        for content in [
+            "default cpu flow { residual gpu; }",
+            "flow { residual cpu pressureCorrection gpu; }",
+        ] {
+            let error = parse_backend_config_str(content, Path::new("ferrumBackends"))
+                .expect_err("ordinary backend choice without semicolon must fail");
+            assert!(
+                error.to_string().contains("unexpected dictionary token"),
+                "unexpected error for {content:?}: {error}"
+            );
+        }
+
+        let config = parse_backend_config_str(
+            r#"
+            default "gpu";
+            default cpu;
+            flow { residual "gpu"; residual cpu; }
+            "#,
+            Path::new("ferrumBackends"),
+        )
+        .unwrap();
+        assert_eq!(config.default, BackendChoice::Cpu);
+        assert_eq!(config.sections[0].entries.len(), 1);
+        assert_eq!(config.sections[0].entries[0].choice, BackendChoice::Cpu);
     }
 }

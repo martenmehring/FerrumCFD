@@ -330,6 +330,17 @@ pub mod streaming {
             self.read_strict_value()
         }
         pub fn read_strict_value(&mut self) -> Result<Vec<String>> {
+            self.read_strict_value_impl(false)
+        }
+        pub(crate) fn read_provenance_preserving_bare_entry(&mut self) -> Result<Vec<String>> {
+            if self.peek()?.is_some_and(|t| Self::structural(t, ";")) {
+                self.next_required()?;
+                Ok(Vec::new())
+            } else {
+                self.read_strict_value_impl(true)
+            }
+        }
+        fn read_strict_value_impl(&mut self, preserve_quoted: bool) -> Result<Vec<String>> {
             if self
                 .peek()?
                 .is_some_and(|t| Self::structural(t, ";") || Self::closer(t))
@@ -343,7 +354,7 @@ pub mod streaming {
             let mut stack = ['\0'; MAX_DICTIONARY_NESTING];
             let mut depth = 0usize;
             loop {
-                let token = self.next_required()?;
+                let mut token = self.next_required()?;
                 if depth == 0 && Self::structural(&token, ";") {
                     return Ok(values);
                 }
@@ -352,6 +363,19 @@ pub mod streaming {
                 }
                 Self::track_delimiter(&token, &mut stack, &mut depth)
                     .map_err(|detail| self.latch(token.line, detail))?;
+                if preserve_quoted && token.provenance == TokenProvenance::Quoted {
+                    let represented_len = token.value.len().checked_add(2).ok_or_else(|| {
+                        self.latch(token.line, "dictionary token length overflow")
+                    })?;
+                    if represented_len > MAX_TOKEN_BYTES {
+                        return Err(self.latch(token.line, "dictionary token byte limit exceeded"));
+                    }
+                    token.value.try_reserve(2).map_err(|_| {
+                        self.latch(token.line, "dictionary quoted value allocation failed")
+                    })?;
+                    token.value.insert(0, '"');
+                    token.value.push('"');
+                }
                 payload = payload
                     .checked_add(token.value.len())
                     .ok_or_else(|| self.latch(token.line, "dictionary payload length overflow"))?;
@@ -422,6 +446,63 @@ pub mod streaming {
                 Self::track_delimiter(&token, &mut stack, &mut depth)
                     .map_err(|d| self.latch(token.line, d))?;
             }
+        }
+        pub(crate) fn skip_exact_value_or_block(&mut self) -> Result<()> {
+            if self.failure.is_some() {
+                return Err(self.sticky());
+            }
+            let plan = {
+                let tokens = self.tokens.as_slice();
+                (|| -> std::result::Result<(usize, bool), (usize, &'static str)> {
+                    let first = tokens.first().ok_or((0, "dictionary value is missing"))?;
+                    if Self::structural(first, ";") || Self::closer(first) {
+                        return Err((0, "dictionary value is missing"));
+                    }
+                    let braced = Self::structural(first, "{");
+                    let end = if Self::opener(first) {
+                        let mut stack = ['\0'; MAX_DICTIONARY_NESTING];
+                        let mut depth = 0usize;
+                        let mut result = None;
+                        for (index, token) in tokens.iter().enumerate() {
+                            if let Err(detail) =
+                                Self::track_delimiter(token, &mut stack, &mut depth)
+                            {
+                                result = Some(Err((index, detail)));
+                                break;
+                            }
+                            if depth == 0 {
+                                result = Some(
+                                    index
+                                        .checked_add(1)
+                                        .ok_or((index, "dictionary index overflow")),
+                                );
+                                break;
+                            }
+                        }
+                        result.unwrap_or(Err((tokens.len(), "unterminated dictionary group")))?
+                    } else {
+                        1
+                    };
+                    let has_terminator = tokens
+                        .get(end)
+                        .is_some_and(|token| Self::structural(token, ";"));
+                    if !braced && !has_terminator {
+                        return Err((end, "dictionary value is missing a semicolon"));
+                    }
+                    Ok((end, has_terminator))
+                })()
+            };
+            let (end, has_terminator) = match plan {
+                Ok(value) => value,
+                Err((offset, detail)) => return self.reject_at_as(offset, detail),
+            };
+            for _ in 0..end {
+                self.next_required()?;
+            }
+            if has_terminator {
+                self.next_required()?;
+            }
+            Ok(())
         }
         fn is_syntax(value: &str) -> bool {
             matches!(value, "{" | "}" | "(" | ")" | "[" | "]" | ";")
@@ -1326,6 +1407,31 @@ pub mod streaming {
                     .unwrap()
                     .is_empty()
             );
+
+            let exact_payload = "a".repeat(MAX_TOKEN_BYTES - 2);
+            let exact_fixture = format!("\"{exact_payload}\";");
+            let exact = super::tokenize(Path::new("quoted-exact"), &exact_fixture)
+                .unwrap()
+                .into_cursor()
+                .read_provenance_preserving_bare_entry()
+                .unwrap();
+            assert_eq!(exact.len(), 1);
+            assert_eq!(exact[0].len(), MAX_TOKEN_BYTES);
+            assert!(exact[0].starts_with('"'));
+            assert!(exact[0].ends_with('"'));
+
+            let over_payload = "a".repeat(MAX_TOKEN_BYTES - 1);
+            let over_fixture = format!("\"{over_payload}\";");
+            let mut over = super::tokenize(Path::new("quoted-over"), &over_fixture)
+                .unwrap()
+                .into_cursor();
+            let first = over.read_provenance_preserving_bare_entry().unwrap_err();
+            assert_parse(
+                &first,
+                1,
+                "quoted-over: dictionary token byte limit exceeded",
+            );
+            assert_eq!(over.next().unwrap_err().to_string(), first.to_string());
         }
 
         #[test]
@@ -1368,6 +1474,34 @@ pub mod streaming {
                     .into_cursor();
                 cursor.skip_value_or_block().unwrap();
                 assert_eq!(cursor.next_required().unwrap().value, "next");
+            }
+
+            for value in ["scalar; next;", "(a [b]); next;", "[a (b)]; next;"] {
+                let mut cursor = super::tokenize(Path::new("skip-exact"), value)
+                    .unwrap()
+                    .into_cursor();
+                cursor.skip_exact_value_or_block().unwrap();
+                assert_eq!(cursor.next_required().unwrap().value, "next");
+            }
+            for value in ["{ value; } next;", "{ value; }; next;"] {
+                let mut cursor = super::tokenize(Path::new("skip-block"), value)
+                    .unwrap()
+                    .into_cursor();
+                cursor.skip_exact_value_or_block().unwrap();
+                assert_eq!(cursor.next_required().unwrap().value, "next");
+            }
+            for value in ["scalar next;", "(a) next;", "[a] next;"] {
+                let mut cursor = super::tokenize(Path::new("skip-reject"), value)
+                    .unwrap()
+                    .into_cursor();
+                let before = cursor.tokens.as_slice().len();
+                let error = cursor.skip_exact_value_or_block().unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("dictionary value is missing a semicolon")
+                );
+                assert_eq!(cursor.tokens.as_slice().len(), before);
             }
         }
 

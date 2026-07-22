@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ferrum_mesh::MeshError;
-use ferrum_mesh::dictionary::tokenize;
+use ferrum_mesh::dictionary::{TokenCursor, TokenProvenance, tokenize};
 use ferrum_mesh::fields::{FieldFile, FieldValueSummary, read_initial_fields};
 use ferrum_mesh::geometry::compute_poly_mesh_geometry;
 use ferrum_mesh::poly_mesh::PolyMesh;
@@ -431,18 +431,97 @@ fn dimensions(field: &FieldFile) -> CheckResult<Vec<&str>> {
 }
 
 fn foam_scalar(input: &str, key: &str) -> CheckResult<f64> {
-    let tokens = tokenize(Path::new("laminar-pipe-parameter"), input)?;
-    let position = tokens
-        .tokens()
-        .iter()
-        .position(|token| token.value == key)
-        .ok_or_else(|| format!("missing Foam key {key}"))?;
-    tokens.tokens()[position + 1..]
-        .iter()
-        .take_while(|token| token.value != ";")
-        .filter_map(|token| token.value.parse().ok())
-        .last()
-        .ok_or_else(|| format!("missing numeric value for Foam key {key}").into())
+    let mut cursor = tokenize(Path::new("laminar-pipe-parameter"), input)?.into_cursor();
+    let mut value = None;
+    scan_foam_scalar_entries(&mut cursor, key, false, &mut value)?;
+    value.ok_or_else(|| format!("missing Foam key {key}").into())
+}
+
+fn scan_foam_scalar_entries(
+    cursor: &mut TokenCursor,
+    key: &str,
+    nested: bool,
+    value: &mut Option<f64>,
+) -> CheckResult {
+    loop {
+        let Some(token) = cursor.peek()? else {
+            return if nested {
+                Err("unterminated Foam dictionary block".into())
+            } else {
+                Ok(())
+            };
+        };
+        if token.provenance == TokenProvenance::Structural && token.value == "}" {
+            if !nested {
+                return Err("unexpected Foam dictionary closer".into());
+            }
+            cursor.expect("}")?;
+            cursor.expect_optional(";")?;
+            return Ok(());
+        }
+        if token.provenance == TokenProvenance::Structural && token.value == ";" {
+            cursor.next_required()?;
+            continue;
+        }
+        if token.provenance == TokenProvenance::Structural {
+            return Err("Foam entry name must not be structural punctuation".into());
+        }
+
+        let name = cursor.next_required()?;
+        let target = name.provenance == TokenProvenance::Ordinary && name.value == key;
+        if cursor.peek()?.is_some_and(|token| {
+            token.provenance == TokenProvenance::Structural && token.value == "{"
+        }) {
+            if target {
+                return Err(format!("Foam key {key} must be a scalar entry").into());
+            }
+            cursor.expect("{")?;
+            scan_foam_scalar_entries(cursor, key, true, value)?;
+        } else if target {
+            if value.is_some() {
+                return Err(format!("duplicate Foam key {key}").into());
+            }
+            *value = Some(read_dimensionless_foam_scalar(cursor, key)?);
+        } else {
+            cursor.skip_value_or_block()?;
+        }
+    }
+}
+
+fn read_dimensionless_foam_scalar(cursor: &mut TokenCursor, key: &str) -> CheckResult<f64> {
+    let opener = cursor.next_required()?;
+    if opener.provenance != TokenProvenance::Structural || opener.value != "[" {
+        return Err(format!("missing dimensions for Foam key {key}").into());
+    }
+    for _ in 0..7 {
+        let exponent = cursor.next_required()?;
+        if exponent.provenance != TokenProvenance::Ordinary
+            || exponent.value.parse::<i32>().ok() != Some(0)
+        {
+            return Err(format!("Foam key {key} must be dimensionless").into());
+        }
+    }
+    let closer = cursor.next_required()?;
+    if closer.provenance != TokenProvenance::Structural || closer.value != "]" {
+        return Err(format!("invalid dimensions for Foam key {key}").into());
+    }
+
+    let numeric = cursor.next_required()?;
+    if numeric.provenance != TokenProvenance::Ordinary {
+        return Err(format!("non-ordinary numeric value for Foam key {key}").into());
+    }
+    let parsed = numeric
+        .value
+        .parse::<f64>()
+        .map_err(|_| format!("invalid numeric value for Foam key {key}"))?;
+    if !parsed.is_finite() {
+        return Err(format!("non-finite numeric value for Foam key {key}").into());
+    }
+    let terminator = cursor.next_required()?;
+    if terminator.provenance != TokenProvenance::Structural || terminator.value != ";" {
+        return Err(format!("non-immediate semicolon for Foam key {key}").into());
+    }
+    Ok(parsed)
 }
 
 fn validate_case(name: &str, openfoam: bool) -> CheckResult {
@@ -636,4 +715,39 @@ fn laminar_pipe_property_dimension_mutations_are_rejected() {
         .map(str::to_string)
         .to_vec();
     assert!(assert_dimensioned(&entry, [0, 2, -1, 0, 0, 0, 0], FERRUM_NU, EPS).is_err());
+}
+
+#[test]
+fn foam_scalar_requires_one_ordinary_finite_exact_entry() {
+    assert_eq!(
+        foam_scalar(
+            r#""scale" [0 0 0 0 0 0 0] 99;
+               decoy scale [0 0 0 0 0 0 0] 99;
+               group { scale [0 0 0 0 0 0 0] 2.5; }"#,
+            "scale",
+        )
+        .unwrap(),
+        2.5
+    );
+    assert_eq!(
+        foam_scalar("scale [0 0 0 0 0 0 0] 2.5;", "scale").unwrap(),
+        2.5
+    );
+    for bad in [
+        r#""scale" 2.5;"#,
+        "decoy scale [0 0 0 0 0 0 0] 2.5;",
+        "group { decoy scale [0 0 0 0 0 0 0] 2.5; }",
+        "scale 2.5;",
+        r#"scale [0 0 0 0 0 0 0] "2.5";"#,
+        "scale [0 0 0 0 0 0 0] NaN;",
+        "scale [0 0 0 0 0 0 0] inf;",
+        "scale [0 0 0 0 0 0 0] 2.5 trailing;",
+        r#"scale [0 0 0 0 0 0 0] 2.5 ";""#,
+        "scale [0 0 0 0 0 0] 2.5;",
+        "scale [1 0 0 0 0 0 0] 2.5;",
+        r#"scale "[" 0 0 0 0 0 0 0 "]" 2.5;"#,
+        "scale [0 0 0 0 0 0 0] 2.5; scale [0 0 0 0 0 0 0] 3.0;",
+    ] {
+        assert!(foam_scalar(bad, "scale").is_err(), "accepted {bad:?}");
+    }
 }
