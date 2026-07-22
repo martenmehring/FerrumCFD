@@ -614,7 +614,7 @@ fn parse_boundary_patch<R: BufRead>(
             }
             Action::Other => {
                 source.next_required()?;
-                source.discard_exact_value_or_block()?;
+                source.discard_semicolon_terminated_value_or_block()?;
             }
         }
     }
@@ -848,8 +848,13 @@ fn nonuniform_layout(count: usize, components: usize) -> Option<(usize, usize)> 
     } else {
         0
     };
-    let minimum_remaining = expected.checked_add(tuple_delimiters)?.checked_add(2)?;
-    Some((expected, minimum_remaining))
+    // This is a conservative physical-byte lower bound, not a token/byte unit
+    // conversion: every required numeric token and structural delimiter has
+    // at least one source byte. Whitespace and longer numerics only increase
+    // the real byte requirement. Keeping the lower bound conservative also
+    // preserves more specific grammar errors for malformed short lists.
+    let minimum_encoded_bytes = expected.checked_add(tuple_delimiters)?.checked_add(2)?;
+    Some((expected, minimum_encoded_bytes))
 }
 
 fn take_finite_numeric<R: BufRead>(source: &mut TokenSource<R>) -> Result<f64> {
@@ -885,13 +890,13 @@ fn parse_nonuniform<R: BufRead>(
         Ok(value) => value,
         Err(_) => return source.reject_line_as(count_token.line, "invalid nonuniform count"),
     };
-    let (expected, minimum_remaining) = match nonuniform_layout(count, components) {
+    let (expected, minimum_encoded_bytes) = match nonuniform_layout(count, components) {
         Some(value) => value,
         None => return source.reject_line_as(count_token.line, "nonuniform count overflow"),
     };
 
     expect_structural(source, "(", "expected nonuniform list opener")?;
-    if source.checked_remaining()? < minimum_remaining {
+    if source.checked_remaining_bytes()? < minimum_encoded_bytes {
         return source.reject_line_as(count_token.line, "nonuniform count exceeds remaining input");
     }
 
@@ -1497,6 +1502,96 @@ mod tests {
     }
 
     #[test]
+    fn unknown_openfoam_boundary_entries_are_ignored_under_both_load_policies() {
+        let content = r#"
+        FoamFile { class volScalarField; object p; }
+        dimensions [0 2 -2 0 0 0 0];
+        internalField uniform 0;
+        boundaryField
+        {
+            fixedGradientPatch
+            {
+                type fixedGradient;
+                gradient uniform 0;
+                value uniform 11;
+            }
+            mixedPatch
+            {
+                type mixed;
+                refValue uniform 0;
+                refGradient uniform 0;
+                valueFraction uniform 1;
+                inletValue uniform 2;
+                value uniform 3;
+            }
+            totalPressurePatch
+            {
+                type totalPressure;
+                p0 uniform 1e5;
+                value uniform 4;
+            }
+            nonuniformAuxiliaryPatch
+            {
+                type custom;
+                profile nonuniform List<scalar> 2 (1 2);
+                value uniform 5;
+            }
+            quotedKeyPatch
+            {
+                type custom;
+                "value" uniform 99;
+                value uniform 6;
+            }
+            provenancePatch
+            {
+                type custom;
+                ignored innocent value uniform 88;
+                quotedTerminator alpha ";" beta;
+                value uniform 7;
+            }
+        }
+        "#;
+
+        for policy in [FieldLoadPolicy::Summary, FieldLoadPolicy::Full] {
+            let field =
+                parse_field_file_str_with_policy(content, Path::new("0/p"), None, policy).unwrap();
+            assert_eq!(field.boundary_patches.len(), 6);
+            let expected = [
+                ("fixedGradient", "11", None),
+                ("mixed", "3", Some("2")),
+                ("totalPressure", "4", None),
+                ("custom", "5", None),
+                ("custom", "6", None),
+                ("custom", "7", None),
+            ];
+            for (patch, (patch_type, value, inlet_value)) in
+                field.boundary_patches.iter().zip(expected)
+            {
+                assert_eq!(patch.patch_type.as_deref(), Some(patch_type));
+                assert!(matches!(
+                    patch.value,
+                    Some(FieldValueSummary::Uniform(ref actual)) if actual == value
+                ));
+                match inlet_value {
+                    Some(expected) => assert!(matches!(
+                        patch.inlet_value,
+                        Some(FieldValueSummary::Uniform(ref actual)) if actual == expected
+                    )),
+                    None => assert!(patch.inlet_value.is_none()),
+                }
+            }
+        }
+
+        assert_parse_error(
+            "FoamFile { class volScalarField; object p; }\n\
+             internalField uniform 0;\n\
+             boundaryField { outlet { type fixedGradient; gradient uniform 0 } }",
+            3,
+            "dictionary value is missing a semicolon",
+        );
+    }
+
+    #[test]
     fn parses_nonuniform_summary() {
         let content = r#"
         FoamFile
@@ -1894,6 +1989,20 @@ boundaryField
             "FoamFile {{ class volScalarField; object p; }}\ninternalField nonuniform List<scalar> {count} ();\n"
         );
         assert_parse_error(&oversized, 2, "nonuniform count exceeds remaining input");
+
+        for exact in [
+            "FoamFile { class volScalarField; object p; }\ninternalField nonuniform List<scalar> 1 (0);",
+            "FoamFile { class volVectorField; object U; }\ninternalField nonuniform List<vector> 1 ((0 0 0));",
+        ] {
+            parse_field_file_str(exact, Path::new("0/exact"), None)
+                .expect("compact exact-fit nonuniform list must parse");
+        }
+        for impossible in [
+            "FoamFile { class volScalarField; object p; }\ninternalField nonuniform List<scalar> 2 (0);",
+            "FoamFile { class volVectorField; object U; }\ninternalField nonuniform List<vector> 2 ((0 0 0));",
+        ] {
+            assert_parse_error(impossible, 2, "nonuniform count exceeds remaining input");
+        }
         assert_eq!(nonuniform_layout(usize::MAX, 3), None);
     }
 

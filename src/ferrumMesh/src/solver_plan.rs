@@ -1218,6 +1218,70 @@ mod tests {
         case_dir.cleanup();
     }
 
+    #[test]
+    fn solver_plan_accepts_standard_openfoam_auxiliary_boundary_entries() {
+        let case_dir = create_temp_case_dir("openfoam-auxiliary-boundary-entries");
+        write_solver_ready_case(&case_dir);
+        write_file(
+            &case_dir.join("0/U"),
+            r#"
+            FoamFile { class volVectorField; object U; }
+            dimensions [0 1 -1 0 0 0 0];
+            internalField nonuniform vectorField 1 ((1 2 3));
+            boundaryField
+            {
+                walls
+                {
+                    type mixed;
+                    refValue uniform (0 0 0);
+                    refGradient uniform (0 0 0);
+                    valueFraction uniform 1;
+                    value uniform (0 0 0);
+                }
+            }
+            "#,
+        );
+        write_file(
+            &case_dir.join("0/p"),
+            r#"
+            FoamFile { class volScalarField; object p; }
+            dimensions [1 -1 -2 0 0 0 0];
+            internalField nonuniform scalarField 1 (7);
+            boundaryField
+            {
+                walls
+                {
+                    type fixedGradient;
+                    gradient uniform 0;
+                }
+            }
+            "#,
+        );
+
+        let full = build_solver_case_plan(&case_dir)
+            .expect("full solver planning must accept OpenFOAM auxiliary patch entries");
+        assert_eq!(full.runtime_data.fields.len(), 2);
+        assert!(
+            full.runtime_data
+                .fields
+                .iter()
+                .all(|field| field.values.is_some())
+        );
+
+        let summary = build_solver_case_plan_with_policy(&case_dir, FieldLoadPolicy::Summary)
+            .expect("summary planning must accept OpenFOAM auxiliary patch entries");
+        assert_eq!(summary.runtime_data.fields.len(), 2);
+        assert!(
+            summary
+                .runtime_data
+                .fields
+                .iter()
+                .all(|field| field.values.is_none())
+        );
+
+        case_dir.cleanup();
+    }
+
     fn patch_summary(empty_patches: usize, wedge_patches: usize) -> PatchValidationSummary {
         PatchValidationSummary {
             case_dir: PathBuf::from("case"),

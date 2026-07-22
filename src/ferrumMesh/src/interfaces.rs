@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::dictionary::{MAX_DICTIONARY_NESTING, Token, TokenCursor, TokenProvenance, tokenize};
+use crate::dictionary::{Token, TokenCursor, TokenProvenance, tokenize};
 use crate::regions::InterfaceRegistrySummary;
 use crate::{MeshError, Result};
 
@@ -197,8 +197,6 @@ fn parse_interfaces_block(cursor: &mut TokenCursor) -> Result<Vec<InterfaceConfi
 }
 
 fn parse_interface_entry(cursor: &mut TokenCursor, name: String) -> Result<InterfaceConfigEntry> {
-    preflight_orientation(cursor)?;
-
     let mut regions = None;
     let mut face_zone = None;
     let mut orientation = None;
@@ -324,8 +322,10 @@ fn parse_orientation(
         } else if orientation_matches(&orientation.value, &regions[1].value, &regions[0].value) {
             (&regions[1].value, &regions[0].value)
         } else {
-            return cursor
-                .reject_current_as("orientation must match the declared ordinary region order");
+            return cursor.reject_line_as(
+                orientation.line,
+                "orientation must match the declared ordinary region order",
+            );
         };
 
     Ok(InterfaceOrientation {
@@ -370,195 +370,6 @@ fn copy_path(cursor: &mut TokenCursor) -> Result<PathBuf> {
     }
     copy.push(cursor.path());
     Ok(copy)
-}
-
-fn preflight_orientation(cursor: &mut TokenCursor) -> Result<()> {
-    let invalid_offset = invalid_orientation_offset(cursor.remaining_tokens()?);
-    if let Some(offset) = invalid_offset {
-        return cursor.reject_at_as(
-            offset,
-            "orientation must match the declared ordinary region order",
-        );
-    }
-    Ok(())
-}
-
-fn invalid_orientation_offset(tokens: &[Token]) -> Option<usize> {
-    let mut index = 0usize;
-    let mut regions = None;
-    let mut orientation = None;
-    let mut seen_regions = false;
-    let mut seen_face_zone = false;
-    let mut seen_orientation = false;
-    let mut seen_model = false;
-
-    loop {
-        let key = tokens.get(index)?;
-        if structural(key, "}") {
-            break;
-        }
-        if key.provenance == TokenProvenance::Structural {
-            return None;
-        }
-        index = index.checked_add(1)?;
-
-        match (key.provenance, key.value.as_str()) {
-            (TokenProvenance::Ordinary, "regions") => {
-                if seen_regions {
-                    return None;
-                }
-                seen_regions = true;
-                let open = token_at(tokens, index, 0)?;
-                let first = token_at(tokens, index, 1)?;
-                let second = token_at(tokens, index, 2)?;
-                let close = token_at(tokens, index, 3)?;
-                let terminator = token_at(tokens, index, 4)?;
-                if !structural(open, "(")
-                    || first.provenance != TokenProvenance::Ordinary
-                    || second.provenance != TokenProvenance::Ordinary
-                    || first.value == second.value
-                    || !structural(close, ")")
-                    || !structural(terminator, ";")
-                {
-                    return None;
-                }
-                regions = Some((first.value.as_str(), second.value.as_str()));
-                index = index.checked_add(5)?;
-            }
-            (TokenProvenance::Ordinary, "faceZone") => {
-                if seen_face_zone {
-                    return None;
-                }
-                seen_face_zone = true;
-                index = preflight_scalar(tokens, index)?.0;
-            }
-            (TokenProvenance::Ordinary, "orientation") => {
-                if seen_orientation {
-                    return None;
-                }
-                seen_orientation = true;
-                let (next, value_index) = preflight_scalar(tokens, index)?;
-                orientation = Some((value_index, tokens.get(value_index)?.value.as_str()));
-                index = next;
-            }
-            (TokenProvenance::Ordinary, "model") => {
-                if seen_model {
-                    return None;
-                }
-                seen_model = true;
-                index = preflight_scalar(tokens, index)?.0;
-            }
-            _ => index = preflight_skip_exact(tokens, index)?,
-        }
-    }
-
-    let ((first, second), (offset, value)) = (regions?, orientation?);
-    if orientation_matches(value, first, second) || orientation_matches(value, second, first) {
-        None
-    } else {
-        Some(offset)
-    }
-}
-
-fn preflight_scalar(tokens: &[Token], index: usize) -> Option<(usize, usize)> {
-    let value = tokens.get(index)?;
-    if value.provenance != TokenProvenance::Ordinary {
-        return None;
-    }
-    let terminator_index = index.checked_add(1)?;
-    if !structural(tokens.get(terminator_index)?, ";") {
-        return None;
-    }
-    Some((terminator_index.checked_add(1)?, index))
-}
-
-fn preflight_skip_exact(tokens: &[Token], index: usize) -> Option<usize> {
-    let first = tokens.get(index)?;
-    if structural(first, ";") || closer(first) {
-        return None;
-    }
-    let braced = structural(first, "{");
-    let end = if opener(first) {
-        let mut stack = ['\0'; MAX_DICTIONARY_NESTING];
-        let mut depth = 0usize;
-        let mut end = None;
-        for (relative, token) in tokens.get(index..)?.iter().enumerate() {
-            if !track_delimiter(token, &mut stack, &mut depth) {
-                return None;
-            }
-            if depth == 0 {
-                end = index.checked_add(relative)?.checked_add(1);
-                break;
-            }
-        }
-        end?
-    } else {
-        index.checked_add(1)?
-    };
-    let has_terminator = tokens.get(end).is_some_and(|token| structural(token, ";"));
-    if !braced && !has_terminator {
-        return None;
-    }
-    end.checked_add(usize::from(has_terminator))
-}
-
-fn token_at(tokens: &[Token], index: usize, offset: usize) -> Option<&Token> {
-    tokens.get(index.checked_add(offset)?)
-}
-
-fn structural(token: &Token, value: &str) -> bool {
-    token.provenance == TokenProvenance::Structural && token.value == value
-}
-
-fn opener(token: &Token) -> bool {
-    token.provenance == TokenProvenance::Structural
-        && matches!(token.value.as_str(), "{" | "(" | "[")
-}
-
-fn closer(token: &Token) -> bool {
-    token.provenance == TokenProvenance::Structural
-        && matches!(token.value.as_str(), "}" | ")" | "]")
-}
-
-fn track_delimiter(
-    token: &Token,
-    stack: &mut [char; MAX_DICTIONARY_NESTING],
-    depth: &mut usize,
-) -> bool {
-    if token.provenance != TokenProvenance::Structural {
-        return true;
-    }
-    let delimiter = match token.value.as_str() {
-        "{" => '{',
-        "(" => '(',
-        "[" => '[',
-        "}" => '}',
-        ")" => ')',
-        "]" => ']',
-        _ => return true,
-    };
-    if matches!(delimiter, '{' | '(' | '[') {
-        if *depth == MAX_DICTIONARY_NESTING {
-            return false;
-        }
-        stack[*depth] = delimiter;
-        let Some(next) = depth.checked_add(1) else {
-            return false;
-        };
-        *depth = next;
-        return true;
-    }
-    let Some(top) = depth.checked_sub(1) else {
-        return false;
-    };
-    let matches = matches!(
-        (stack[top], delimiter),
-        ('{', '}') | ('(', ')') | ('[', ']')
-    );
-    if matches {
-        *depth = top;
-    }
-    matches
 }
 
 #[cfg(test)]
@@ -775,6 +586,11 @@ mod tests {
             "interfaces {\nmembrane {\norientation wrong_order;\nregions (fluid solid);\nfaceZone membrane_wall;\n}\n}",
             3,
             "orientation must match the declared ordinary region order",
+        );
+        assert_parse(
+            "interfaces {\nmembrane {\norientation wrong_order;\nregions (fluid solid);\n}\n}",
+            5,
+            "missing ordinary 'faceZone' in interface entry",
         );
 
         let quoted_optional = parse_interface_config_str(
