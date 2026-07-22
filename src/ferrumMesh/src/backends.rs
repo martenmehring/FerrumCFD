@@ -412,18 +412,28 @@ fn warn_duplicate_sections(config: &BackendConfig, warnings: &mut BackendWarning
         *count = next_count;
     }
 
+    let mut duplicates = Vec::<(&str, usize)>::new();
+    if duplicates.try_reserve(counts.len()).is_err() {
+        warnings.truncate();
+        return false;
+    }
     for (section, count) in counts {
-        if count > 1
-            && !warnings.push(&[
-                BackendWarningPart::Text("backend section '"),
-                BackendWarningPart::Text(section),
-                BackendWarningPart::Text("' appears "),
-                BackendWarningPart::Number(count),
-                BackendWarningPart::Text(
-                    " times; merge duplicate sections to avoid ambiguous stage policy",
-                ),
-            ])
-        {
+        if count > 1 {
+            duplicates.push((section, count));
+        }
+    }
+    duplicates.sort_unstable_by(|left, right| left.0.cmp(right.0));
+
+    for (section, count) in duplicates {
+        if !warnings.push(&[
+            BackendWarningPart::Text("backend section '"),
+            BackendWarningPart::Text(section),
+            BackendWarningPart::Text("' appears "),
+            BackendWarningPart::Number(count),
+            BackendWarningPart::Text(
+                " times; merge duplicate sections to avoid ambiguous stage policy",
+            ),
+        ]) {
             return false;
         }
     }
@@ -1146,10 +1156,11 @@ mod tests {
 
     use super::{
         BACKEND_VALIDATION_TRUNCATED_WARNING, BackendChoice, BackendConfig, BackendSection,
-        BackendSelection, CpuConfig, GpuConfig, MAX_BACKEND_POLICY_PAYLOAD_BYTES,
-        MAX_BACKEND_SECTION_COUNT, MAX_BACKEND_STAGE_COUNT, MAX_BACKEND_VALIDATION_WARNING_BYTES,
-        MAX_BACKEND_VALIDATION_WARNINGS, MAX_GPU_DEVICE_COUNT, MAX_GPU_DEVICE_LIST_BYTES,
-        parse_backend_config_str, validate_backend_policy,
+        BackendSelection, BackendWarningCollector, CpuConfig, GpuConfig,
+        MAX_BACKEND_POLICY_PAYLOAD_BYTES, MAX_BACKEND_SECTION_COUNT, MAX_BACKEND_STAGE_COUNT,
+        MAX_BACKEND_VALIDATION_WARNING_BYTES, MAX_BACKEND_VALIDATION_WARNINGS,
+        MAX_GPU_DEVICE_COUNT, MAX_GPU_DEVICE_LIST_BYTES, parse_backend_config_str,
+        validate_backend_policy, warn_duplicate_sections,
     };
 
     fn policy_config(sections: Vec<BackendSection>) -> BackendConfig {
@@ -1353,6 +1364,62 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("customModel"))
+        );
+    }
+
+    #[test]
+    fn duplicate_section_warnings_are_sorted_with_an_exact_truncated_prefix() {
+        fn section(name: String) -> BackendSection {
+            BackendSection {
+                name,
+                entries: Vec::new(),
+            }
+        }
+
+        fn warning(name: &str) -> String {
+            format!(
+                "backend section '{name}' appears 2 times; merge duplicate sections to avoid ambiguous stage policy"
+            )
+        }
+
+        let ordered = policy_config(vec![
+            section("zeta".to_string()),
+            section("zeta".to_string()),
+            section("alpha".to_string()),
+            section("alpha".to_string()),
+            section("middle".to_string()),
+            section("middle".to_string()),
+        ]);
+        let mut ordered_warnings = BackendWarningCollector::production();
+        assert!(warn_duplicate_sections(&ordered, &mut ordered_warnings));
+        assert_eq!(
+            ordered_warnings.finish(),
+            vec![warning("alpha"), warning("middle"), warning("zeta")]
+        );
+
+        let alpha = "a".repeat(30_000);
+        let middle = "m".repeat(30_000);
+        let zeta = "z".repeat(30_000);
+        let truncated = policy_config(vec![
+            section(zeta.clone()),
+            section(zeta),
+            section(alpha.clone()),
+            section(alpha.clone()),
+            section(middle.clone()),
+            section(middle.clone()),
+        ]);
+        let mut truncated_warnings = BackendWarningCollector::production();
+        assert!(!warn_duplicate_sections(
+            &truncated,
+            &mut truncated_warnings
+        ));
+        assert_eq!(
+            truncated_warnings.finish(),
+            vec![
+                warning(&alpha),
+                warning(&middle),
+                BACKEND_VALIDATION_TRUNCATED_WARNING.to_string(),
+            ]
         );
     }
 

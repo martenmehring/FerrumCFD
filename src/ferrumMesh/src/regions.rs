@@ -66,7 +66,7 @@ pub struct BoundaryFaceZoneSummary {
 pub fn split_regions_by_cell_zones(case_dir: &Path) -> Result<RegionSplitSummary> {
     let poly_mesh_dir = case_dir.join("constant").join("polyMesh");
     let mesh = PolyMesh::read(&poly_mesh_dir)?;
-    let output = SafeOutputRoot::open_existing(case_dir)?;
+    let output = SafeOutputRoot::open_trusted(case_dir)?;
 
     if mesh.cell_zones.is_empty() {
         return Err(MeshError::InvalidInput(format!(
@@ -74,6 +74,7 @@ pub fn split_regions_by_cell_zones(case_dir: &Path) -> Result<RegionSplitSummary
             poly_mesh_dir.join("cellZones").display()
         )));
     }
+    let region_output_names = unique_region_output_names(&mesh.cell_zones)?;
 
     let cell_count = mesh.cell_count();
     let cell_to_zone = build_cell_to_zone(&mesh.cell_zones, cell_count)?;
@@ -81,7 +82,9 @@ pub fn split_regions_by_cell_zones(case_dir: &Path) -> Result<RegionSplitSummary
     let boundary_by_face = build_boundary_index(&mesh.patches)?;
 
     let mut summaries = Vec::new();
-    for (zone_index, zone) in mesh.cell_zones.iter().enumerate() {
+    for (zone_index, (zone, output_name)) in
+        mesh.cell_zones.iter().zip(&region_output_names).enumerate()
+    {
         let region = build_region_mesh(
             &mesh,
             zone_index,
@@ -90,9 +93,7 @@ pub fn split_regions_by_cell_zones(case_dir: &Path) -> Result<RegionSplitSummary
             &face_zone_by_face,
             &boundary_by_face,
         )?;
-        let region_relative = PathBuf::from("constant")
-            .join(sanitize_name(&zone.name))
-            .join("polyMesh");
+        let region_relative = PathBuf::from("constant").join(output_name).join("polyMesh");
         output.ensure_dir(&region_relative)?;
         write_region_poly_mesh(&output, &region_relative, &region)?;
         let region_dir = case_dir.join(&region_relative);
@@ -496,7 +497,7 @@ fn build_region_mesh(
                     face_index,
                     face_zone_by_face,
                     boundary_by_face,
-                );
+                )?;
                 boundary.push(
                     patch,
                     RegionFace {
@@ -519,7 +520,7 @@ fn build_region_mesh(
                     face_index,
                     face_zone_by_face,
                     boundary_by_face,
-                );
+                )?;
                 let mut reversed_nodes = mesh.faces[face_index].clone();
                 reversed_nodes.reverse();
                 boundary.push(
@@ -559,33 +560,52 @@ fn region_patch_for_face(
     face_index: usize,
     face_zone_by_face: &HashMap<usize, FaceZoneRef>,
     boundary_by_face: &HashMap<usize, BoundaryPatchRef>,
-) -> BoundaryPatchRef {
+) -> Result<BoundaryPatchRef> {
     if let Some(patch) = boundary_by_face.get(&face_index) {
         let mut patch = patch.clone();
         if patch.face_zone_flip.is_none() {
             patch.face_zone_flip = face_zone_by_face.get(&face_index).map(|zone| zone.flip);
         }
-        return patch;
+        return Ok(patch);
     }
 
     if let Some(face_zone) = face_zone_by_face.get(&face_index) {
-        return BoundaryPatchRef {
+        return Ok(BoundaryPatchRef {
             name: face_zone.name.clone(),
             patch_type: "patch".to_string(),
             face_zone_flip: Some(face_zone.flip),
-        };
+        });
     }
 
-    let zone_name = sanitize_name(&mesh.cell_zones[zone_index].name);
-    let other_name = other_zone
-        .and_then(|index| mesh.cell_zones.get(index))
-        .map(|zone| sanitize_name(&zone.name))
-        .unwrap_or_else(|| "unknown".to_string());
-    BoundaryPatchRef {
-        name: format!("interface_{zone_name}_to_{other_name}"),
+    let zone_name = sanitize_name(&mesh.cell_zones[zone_index].name)?;
+    let other_name = if let Some(zone) = other_zone.and_then(|index| mesh.cell_zones.get(index)) {
+        sanitize_name(&zone.name)?
+    } else {
+        let mut unknown = String::new();
+        unknown
+            .try_reserve_exact("unknown".len())
+            .map_err(|_| MeshError::OutOfMemory)?;
+        unknown.push_str("unknown");
+        unknown
+    };
+    let name_len = "interface_"
+        .len()
+        .checked_add(zone_name.len())
+        .and_then(|length| length.checked_add("_to_".len()))
+        .and_then(|length| length.checked_add(other_name.len()))
+        .ok_or(MeshError::OutOfMemory)?;
+    let mut name = String::new();
+    name.try_reserve_exact(name_len)
+        .map_err(|_| MeshError::OutOfMemory)?;
+    name.push_str("interface_");
+    name.push_str(&zone_name);
+    name.push_str("_to_");
+    name.push_str(&other_name);
+    Ok(BoundaryPatchRef {
+        name,
         patch_type: "patch".to_string(),
         face_zone_flip: None,
-    }
+    })
 }
 
 fn map_nodes(
@@ -1327,23 +1347,86 @@ impl DictCursor {
     }
 }
 
-fn sanitize_name(name: &str) -> String {
-    let sanitized: String = name
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect();
-
-    if sanitized.is_empty() {
-        "unnamed".to_string()
-    } else {
-        sanitized
+fn sanitize_name(name: &str) -> Result<String> {
+    if name.is_empty() {
+        let mut unnamed = String::new();
+        unnamed
+            .try_reserve_exact("unnamed".len())
+            .map_err(|_| MeshError::OutOfMemory)?;
+        unnamed.push_str("unnamed");
+        return Ok(unnamed);
     }
+
+    let mut sanitized = String::new();
+    sanitized
+        .try_reserve_exact(name.len())
+        .map_err(|_| MeshError::OutOfMemory)?;
+    for ch in name.chars() {
+        sanitized.push(if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            ch
+        } else {
+            '_'
+        });
+    }
+    Ok(sanitized)
+}
+
+fn unique_region_output_names(cell_zones: &[CellZone]) -> Result<Vec<String>> {
+    let mut output_names = Vec::new();
+    output_names
+        .try_reserve_exact(cell_zones.len())
+        .map_err(|_| MeshError::OutOfMemory)?;
+    for zone in cell_zones {
+        output_names.push(sanitize_name(&zone.name)?);
+    }
+
+    let mut order = Vec::new();
+    order
+        .try_reserve_exact(cell_zones.len())
+        .map_err(|_| MeshError::OutOfMemory)?;
+    order.extend(0..cell_zones.len());
+    order.sort_unstable_by(|left, right| {
+        output_names[*left]
+            .bytes()
+            .map(|byte| byte.to_ascii_lowercase())
+            .cmp(
+                output_names[*right]
+                    .bytes()
+                    .map(|byte| byte.to_ascii_lowercase()),
+            )
+            .then_with(|| left.cmp(right))
+    });
+
+    for pair in order.windows(2) {
+        let first = pair[0];
+        let second = pair[1];
+        if output_names[first].eq_ignore_ascii_case(&output_names[second]) {
+            let parts = [
+                "cellZones '",
+                cell_zones[first].name.as_str(),
+                "' and '",
+                cell_zones[second].name.as_str(),
+                "' map to colliding sanitized region output names '",
+                output_names[first].as_str(),
+                "' and '",
+                output_names[second].as_str(),
+                "' on case-insensitive filesystems",
+            ];
+            let message_len = parts.iter().try_fold(0_usize, |total, part| {
+                total.checked_add(part.len()).ok_or(MeshError::OutOfMemory)
+            })?;
+            let mut message = String::new();
+            message
+                .try_reserve_exact(message_len)
+                .map_err(|_| MeshError::OutOfMemory)?;
+            for part in parts {
+                message.push_str(part);
+            }
+            return Err(MeshError::InvalidInput(message));
+        }
+    }
+
+    Ok(output_names)
 }
 
 #[cfg(test)]
@@ -1357,6 +1440,68 @@ mod tests {
             .expect("system time before epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("ferrum_regions_{name}_{suffix}"))
+    }
+
+    #[test]
+    fn sanitized_region_output_collision_fails_before_clobbering() {
+        let root = temp_path("sanitized_collision");
+        let poly_mesh = root.join("constant/polyMesh");
+        fs::create_dir_all(&poly_mesh).expect("create source polyMesh");
+        for name in [
+            "points",
+            "faces",
+            "owner",
+            "neighbour",
+            "boundary",
+            "faceZones",
+        ] {
+            fs::write(poly_mesh.join(name), "0\n(\n)\n").expect("write empty mesh list");
+        }
+        fs::write(
+            poly_mesh.join("cellZones"),
+            "2\n(\nfluid/a\n{\ncellLabels List<label>\n0\n(\n)\n}\nfluid?a\n{\ncellLabels List<label>\n0\n(\n)\n}\n)\n",
+        )
+        .expect("write colliding cell zones");
+
+        let colliding_output = root.join("constant/fluid_a/polyMesh");
+        fs::create_dir_all(&colliding_output).expect("create existing output");
+        let sentinel = colliding_output.join("points");
+        fs::write(&sentinel, "do-not-clobber").expect("write sentinel");
+
+        let error = split_regions_by_cell_zones(&root)
+            .expect_err("sanitized output-name collision must fail before writing");
+        let message = error.to_string();
+        assert!(message.contains("fluid/a"));
+        assert!(message.contains("fluid?a"));
+        assert!(message.contains("fluid_a"));
+        assert_eq!(
+            fs::read_to_string(&sentinel).expect("read sentinel"),
+            "do-not-clobber"
+        );
+        assert!(!colliding_output.join("faces").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sanitized_region_output_collision_is_case_insensitive() {
+        let zones = [
+            CellZone {
+                name: "Fluid".to_string(),
+                cells: Vec::new(),
+            },
+            CellZone {
+                name: "fluid".to_string(),
+                cells: Vec::new(),
+            },
+        ];
+
+        let error = unique_region_output_names(&zones)
+            .expect_err("case-insensitive output-name collision must fail");
+        let message = error.to_string();
+        assert!(message.contains("Fluid"));
+        assert!(message.contains("fluid"));
+        assert!(message.contains("case-insensitive"));
     }
 
     #[cfg(unix)]

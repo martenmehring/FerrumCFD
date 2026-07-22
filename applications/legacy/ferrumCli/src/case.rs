@@ -20,12 +20,13 @@ pub struct InitCaseSummary {
 }
 
 pub fn init_case(options: &InitCaseOptions) -> Result<InitCaseSummary, String> {
-    let (output, created_dirs) = SafeOutputRoot::create(&options.case_dir).map_err(|error| {
-        format!(
-            "could not safely open or create case directory {} ({error})",
-            options.case_dir.display()
-        )
-    })?;
+    let (output, created_dirs) =
+        SafeOutputRoot::create_trusted(&options.case_dir).map_err(|error| {
+            format!(
+                "could not safely open or create case directory {} ({error})",
+                options.case_dir.display()
+            )
+        })?;
     let mut summary = InitCaseSummary {
         case_dir: options.case_dir.clone(),
         created_dirs,
