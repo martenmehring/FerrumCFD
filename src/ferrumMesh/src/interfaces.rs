@@ -1,9 +1,8 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::Result;
 use crate::dictionary::{Token, TokenCursor, TokenProvenance, tokenize};
 use crate::regions::InterfaceRegistrySummary;
-use crate::{MeshError, Result};
 
 #[derive(Debug)]
 pub struct InterfaceConfig {
@@ -44,13 +43,11 @@ pub struct ValidatedInterfaceConfigEntry {
 
 pub fn read_interface_config(case_dir: &Path) -> Result<Option<InterfaceConfig>> {
     let path = case_dir.join("constant").join("interfaces");
-    if !path.exists() {
+    let Some(content) =
+        crate::case_input::CaseInput::new(case_dir).optional("constant/interfaces")?
+    else {
         return Ok(None);
-    }
-
-    let content = fs::read_to_string(&path).map_err(|error| {
-        MeshError::InvalidInput(format!("could not read {} ({error})", path.display()))
-    })?;
+    };
     let mut config = parse_interface_config_str(&content, &path)?;
     config.path = path;
     Ok(Some(config))

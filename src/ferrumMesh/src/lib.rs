@@ -1,4 +1,5 @@
 pub mod backends;
+mod case_input;
 pub mod check;
 pub mod control;
 pub mod dictionary;
@@ -84,6 +85,7 @@ pub struct UnsupportedElementCount {
 
 #[derive(Debug)]
 pub enum MeshError {
+    OutOfMemory,
     Io(std::io::Error),
     Parse { line: usize, message: String },
     InvalidInput(String),
@@ -92,6 +94,7 @@ pub enum MeshError {
 impl std::fmt::Display for MeshError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            MeshError::OutOfMemory => f.write_str("out of memory"),
             MeshError::Io(error) => write!(f, "{error}"),
             MeshError::Parse { line, message } => write!(f, "line {line}: {message}"),
             MeshError::InvalidInput(message) => write!(f, "{message}"),

@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::dictionary::{TokenCursor, TokenProvenance, tokenize};
@@ -25,15 +24,24 @@ pub struct ControlValidation {
 
 pub fn read_control_dict(case_dir: &Path) -> Result<ControlDict> {
     let path = case_dir.join("system").join("controlDict");
-    let content = fs::read_to_string(&path).map_err(|error| {
-        MeshError::InvalidInput(format!(
-            "could not read {}; run initFerrumCase first ({error})",
-            path.display()
-        ))
-    })?;
+    let content = crate::case_input::CaseInput::new(case_dir)
+        .required("system/controlDict")
+        .map_err(append_control_guidance)?;
     let mut control = parse_control_dict_str(&content, &path)?;
     control.path = path;
     Ok(control)
+}
+
+fn append_control_guidance(error: MeshError) -> MeshError {
+    let MeshError::InvalidInput(mut message) = error else {
+        return error;
+    };
+    const GUIDANCE: &str = "; run initFerrumCase first";
+    if message.try_reserve(GUIDANCE.len()).is_err() {
+        return MeshError::OutOfMemory;
+    }
+    message.push_str(GUIDANCE);
+    MeshError::InvalidInput(message)
 }
 
 pub fn validate_control_dict(control: &ControlDict) -> ControlValidation {
