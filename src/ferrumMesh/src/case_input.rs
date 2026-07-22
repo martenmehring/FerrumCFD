@@ -481,17 +481,52 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unix_socket_is_rejected() {
+        use std::os::unix::fs::FileTypeExt;
         use std::os::unix::net::UnixListener;
-        let case = TempCase::new("socket");
+        let base = std::env::var_os("TMPDIR")
+            .map(PathBuf::from)
+            .filter(|path| path.as_os_str().len() < 40 && path.is_dir())
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        let root = base.join(format!("fci-sock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let case = TempCase { root };
         case.mkdir("system");
         let socket = case.root.join("system/controlDict");
-        let _listener = UnixListener::bind(&socket).unwrap();
+        let listener = match UnixListener::bind(&socket) {
+            Ok(listener) => Some(listener),
+            Err(error)
+                if cfg!(target_os = "linux")
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+                    ) =>
+            {
+                use std::os::unix::ffi::OsStrExt;
+                unsafe extern "C" {
+                    fn mknod(path: *const std::ffi::c_char, mode: u32, device: u64) -> i32;
+                }
+                let path = std::ffi::CString::new(socket.as_os_str().as_bytes()).unwrap();
+                // Linux S_IFSOCK creates an inode only; this test performs no networking.
+                let result = unsafe { mknod(path.as_ptr(), 0o140_600, 0) };
+                assert_eq!(result, 0, "mknod socket fixture failed");
+                None
+            }
+            Err(error) => panic!("could not create Unix socket fixture: {error}"),
+        };
+        assert!(
+            fs::symlink_metadata(&socket)
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
         let error = display_error(
             CaseInput::new(&case.root)
                 .required("system/controlDict")
                 .unwrap_err(),
         );
         assert!(error.contains("system/controlDict"));
+        drop(listener);
     }
 
     #[cfg(unix)]
