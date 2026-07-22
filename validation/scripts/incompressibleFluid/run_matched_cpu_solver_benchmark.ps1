@@ -109,7 +109,7 @@ function Write-AsciiFile([string]$Path, [string]$Content) {
 
 function ConvertTo-WslPath([string]$Path) {
     $resolved = (Resolve-Path -LiteralPath $Path).Path
-    if ($resolved -match "^([A-Za-z]):\(.*)$") {
+    if ($resolved -match "^([A-Za-z]):\\(.*)$") {
         $drive = $Matches[1].ToLowerInvariant()
         $rest = $Matches[2].Replace("\", "/")
         return "/mnt/$drive/$rest"
@@ -135,7 +135,7 @@ function Test-WslOpenFoam {
     if ($null -eq (Get-Command wsl -ErrorAction SilentlyContinue)) {
         return $false
     }
-    & wsl bash -lc "source /opt/openfoam13/etc/bashrc 2>/dev/null && test x`$WM_PROJECT_VERSION = x13 && command -v foamRun >/dev/null 2>&1"
+    & wsl bash -lc "source /opt/openfoam13/etc/bashrc 2>/dev/null && env | grep -q '^WM_PROJECT_VERSION=13$' && command -v foamRun >/dev/null 2>&1"
     return $LASTEXITCODE -eq 0
 }
 
@@ -555,7 +555,7 @@ function Invoke-OpenFoamRun(
             $wslLog = ConvertTo-WslPath $logPath
             $quotedCase = ConvertTo-BashSingleQuoted $wslCase
             $quotedLog = ConvertTo-BashSingleQuoted $wslLog
-            $bash = "source /opt/openfoam13/etc/bashrc 2>/dev/null && test x`$WM_PROJECT_VERSION = x13 && cd -- $quotedCase && foamRun -solver incompressibleFluid > $quotedLog 2>&1"
+            $bash = "source /opt/openfoam13/etc/bashrc 2>/dev/null && env | grep -q '^WM_PROJECT_VERSION=13$' && cd -- $quotedCase && foamRun -solver incompressibleFluid > $quotedLog 2>&1"
             & wsl bash -lc $bash
             $exitCode = $LASTEXITCODE
         } finally {
