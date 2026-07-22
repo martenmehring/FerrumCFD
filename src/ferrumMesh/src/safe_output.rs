@@ -589,6 +589,26 @@ mod tests {
     }
 
     #[test]
+    fn rollback_preserves_a_created_directory_that_became_nonempty() {
+        let base = temp_dir("rollback-nonempty");
+        std::fs::create_dir_all(&base).expect("create base");
+        let parent = Dir::open_ambient_dir(&base, ambient_authority()).expect("open base");
+        parent.create_dir("created").expect("create directory");
+        let created_path = base.join("created");
+        std::fs::write(created_path.join("sentinel"), b"preserve").expect("write sentinel");
+        rollback_created_directories(vec![CreatedRootDirectory {
+            parent,
+            name: OsString::from("created"),
+            path: created_path.clone(),
+        }]);
+        assert_eq!(
+            std::fs::read(created_path.join("sentinel")).unwrap(),
+            b"preserve"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn replace_creates_a_new_regular_file() {
         let base = temp_dir("replace");
         let (root, _) = SafeOutputRoot::create(&base).expect("create root");

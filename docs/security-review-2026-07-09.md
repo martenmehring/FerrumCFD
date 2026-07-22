@@ -27,7 +27,7 @@ Status meanings:
 | 10 | Unbounded nonuniform field value loading can exhaust memory | Fixed for the reported numeric-tail amplification | Numeric materialization stops at the declared scalar count and rejects extra numeric values. The broader whole-file parsing concern is tracked in finding 18. |
 | 11 | Unchecked byte-total sum can panic on crafted mesh labels | Fixed | Cell labels are validated first and byte totals use checked accumulation. |
 | 12 | Unbounded runner dry-run preview can exhaust resources | Policy | Preview length is an explicit CLI operator option with a small default. Hosted wrappers must not expose an unrestricted value. |
-| 13 | Unrestricted --planJson path can clobber writable files | Policy | An explicit CLI output path is expected local behavior. Hosted wrappers must supply an isolated approved output path. |
+| 13 | Unrestricted --planJson path can clobber writable files | Fixed | Only an explicit absolute path outside the current working directory is operator-authorized for create-new output; relative and inside-CWD paths remain strict. |
 | 14 | Quadratic fvSolution preflight can DoS untrusted cases | Fixed | Solver-field membership uses precomputed sets instead of repeated all-pairs scans. |
 | 15 | Unbounded recursive fvSchemes/fvSolution parsing can DoS | Fixed | Dictionary parsing rejects nesting beyond 128 levels; a regression test covers excessive nesting. |
 | 16 | Quadratic field-boundary validation can DoS checkFerrumMesh | Fixed | Boundary lookup uses a hash map, reducing matching to linear expected time. |
@@ -43,6 +43,17 @@ Status meanings:
 | 26 | WSL benchmark script allows shell injection via WorkDir | Fixed | Work directories are constrained below the repository target directory and WSL paths are single-quote escaped before `bash -lc`. |
 | 27 | Unchecked run-time write estimate can saturate | Fixed | Write estimates reject non-finite or out-of-range values before integer conversion. |
 | 28 | Backend wrapper accepts missing closing brace | Fixed | EOF before the outer closing brace is an error; regression coverage verifies it. |
+
+An explicit absolute `--planJson` path outside the current working directory is
+operator-authorized for create-new output. Relative paths, paths inside the
+current working directory, solver reports, residual artifacts, and final fields
+remain strict capabilities rooted at the current working directory.
+
+Plan-only parent rollback can follow either missing-parent creation failure or
+final-leaf creation failure. It removes only directories newly created by that
+operation and only while they remain empty, preserves the original error, and
+may leave residue when existing or concurrent content makes a directory
+nonempty. This rollback never applies to strict case roots.
 
 ## Validation
 

@@ -51,7 +51,16 @@ function Write-AsciiFile([string]$Path, [string]$Content) {
 }
 
 function ConvertTo-WslPath([string]$Path) {
-    $resolved = (Resolve-Path -LiteralPath $Path).Path
+    $full = [System.IO.Path]::GetFullPath($Path)
+    if (Test-Path -LiteralPath $full) {
+        $resolved = (Resolve-Path -LiteralPath $full).Path
+    } else {
+        $parent = Split-Path -Parent $full
+        if (!(Test-Path -LiteralPath $parent -PathType Container)) {
+            throw "could not convert '$Path' to a WSL path because its parent does not exist"
+        }
+        $resolved = Join-Path (Resolve-Path -LiteralPath $parent).Path (Split-Path -Leaf $full)
+    }
     if ($resolved -match "^([A-Za-z]):\\(.*)$") {
         $drive = $Matches[1].ToLowerInvariant()
         $rest = $Matches[2].Replace("\", "/")
