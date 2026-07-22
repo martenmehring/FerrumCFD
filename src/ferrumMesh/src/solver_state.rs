@@ -634,12 +634,17 @@ fn components_per_value(kind: SolverStateFieldKind) -> Option<usize> {
     }
 }
 
+const MAX_UNIFORM_COMPONENTS: usize = 3;
+
 fn parse_uniform_components(value: &str) -> Result<Option<Vec<f64>>> {
     let mut values = Vec::new();
     for token in value
         .split(|character: char| character.is_whitespace() || matches!(character, '(' | ')'))
         .filter(|token| !token.is_empty())
     {
+        if values.len() == MAX_UNIFORM_COMPONENTS {
+            return Ok(None);
+        }
         let Ok(number) = token.parse::<f64>() else {
             return Ok(None);
         };
@@ -884,6 +889,33 @@ mod tests {
             warnings
                 .iter()
                 .any(|warning| warning.contains("expected 3"))
+        );
+    }
+
+    #[test]
+    fn rejects_uniform_component_lists_larger_than_openfoam_shapes() {
+        let field = field(
+            "U",
+            "volVectorField",
+            Some(FieldValueSummary::Uniform("( 1 2 3 4 5 6 )".to_string())),
+        );
+        let mesh = mesh(4);
+        let mut warnings = Vec::new();
+
+        let state = build_state_field(&field, Some(&mesh), &mut warnings);
+
+        assert_eq!(state.internal_field.uniform_components, None);
+        assert!(!state.cpu_buffer.materializable);
+        assert_eq!(
+            state.cpu_buffer.status,
+            SolverStateCpuBufferStatus::InvalidShape
+        );
+        assert!(materialize_cpu_buffer(&state).is_none());
+        assert!(materialize_uniform_cpu_buffer(&state).is_none());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("could not be parsed"))
         );
     }
 

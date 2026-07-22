@@ -1,6 +1,6 @@
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 pub struct InitCaseOptions {
     pub case_dir: PathBuf,
@@ -94,29 +94,51 @@ pub fn init_case(options: &InitCaseOptions) -> Result<InitCaseSummary, String> {
 }
 
 fn ensure_dir(path: &Path, summary: &mut InitCaseSummary) -> Result<(), String> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() {
+    let mut current = PathBuf::new();
+
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if matches!(
+            component,
+            Component::Prefix(_) | Component::RootDir | Component::CurDir
+        ) {
+            continue;
+        }
+
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => ensure_real_directory(&current, metadata)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&current)
+                    .map_err(|error| format!("could not create {} ({error})", current.display()))?;
+                let metadata = fs::symlink_metadata(&current).map_err(|error| {
+                    format!(
+                        "could not inspect created directory {} ({error})",
+                        current.display()
+                    )
+                })?;
+                ensure_real_directory(&current, metadata)?;
+                summary.created_dirs.push(current.clone());
+            }
+            Err(error) => {
                 return Err(format!(
-                    "refusing to use symlink as case directory: {}",
-                    path.display()
+                    "could not inspect directory {} ({error})",
+                    current.display()
                 ));
             }
-            if !metadata.is_dir() {
-                return Err(format!("{} exists but is not a directory", path.display()));
-            }
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir_all(path)
-                .map_err(|error| format!("could not create {} ({error})", path.display()))?;
-            summary.created_dirs.push(path.to_path_buf());
-        }
-        Err(error) => {
-            return Err(format!(
-                "could not inspect directory {} ({error})",
-                path.display()
-            ));
-        }
+    }
+    Ok(())
+}
+
+fn ensure_real_directory(path: &Path, metadata: fs::Metadata) -> Result<(), String> {
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "refusing to use symlink as case directory: {}",
+            path.display()
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(format!("{} exists but is not a directory", path.display()));
     }
     Ok(())
 }
@@ -149,12 +171,71 @@ fn write_file(
         }
     }
 
-    let file = File::create(path)
+    if let Some(parent) = path.parent() {
+        ensure_existing_real_directory(parent)?;
+    }
+
+    let file = open_template_file(path, force)
         .map_err(|error| format!("could not write {} ({error})", path.display()))?;
     let mut writer = BufWriter::new(file);
     write(&mut writer).map_err(|error| format!("could not write {} ({error})", path.display()))?;
     summary.written_files.push(path.to_path_buf());
     Ok(())
+}
+
+fn ensure_existing_real_directory(path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("could not inspect directory {} ({error})", path.display()))?;
+    ensure_real_directory(path, metadata)
+}
+
+#[cfg(unix)]
+fn open_template_file(path: &Path, force: bool) -> Result<File, std::io::Error> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = OpenOptions::new();
+    options.write(true).custom_flags(o_no_follow());
+    if force {
+        options.create(true).truncate(true);
+    } else {
+        options.create_new(true);
+    }
+    options.open(path)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn o_no_follow() -> i32 {
+    0o400000
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn o_no_follow() -> i32 {
+    0x0100
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))
+))]
+fn o_no_follow() -> i32 {
+    0x00000100
+}
+
+#[cfg(not(unix))]
+fn open_template_file(path: &Path, force: bool) -> Result<File, std::io::Error> {
+    let mut options = OpenOptions::new();
+    options.write(true);
+    if force {
+        options.create(true).truncate(true);
+    } else {
+        options.create_new(true);
+    }
+    options.open(path)
 }
 
 fn write_case_readme(
@@ -339,4 +420,94 @@ fn write_foam_header(
     writeln!(writer, "}}")?;
     writeln!(writer)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn init_case_rejects_symlinked_case_subdirectories() {
+        let root = temp_dir("symlinked-case-subdir");
+        let case_dir = root.join("case");
+        let outside = root.join("outside-system");
+        fs::create_dir_all(&case_dir).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        if create_directory_symlink(&outside, &case_dir.join("system")).is_err() {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+
+        let error = match init_case(&InitCaseOptions {
+            case_dir: case_dir.clone(),
+            force: false,
+            regions: Vec::new(),
+        }) {
+            Ok(_) => panic!("init_case accepted a symlinked case subdirectory"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("refusing to use symlink as case directory"));
+        assert!(!outside.join("controlDict").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn init_case_rejects_final_path_symlink_even_with_force() {
+        let root = temp_dir("symlinked-case-file");
+        let case_dir = root.join("case");
+        let outside = root.join("outside-controlDict");
+        fs::create_dir_all(case_dir.join("system")).unwrap();
+        fs::create_dir_all(case_dir.join("constant")).unwrap();
+        fs::create_dir_all(case_dir.join("0")).unwrap();
+        fs::write(&outside, "do not clobber").unwrap();
+
+        if create_file_symlink(&outside, &case_dir.join("system").join("controlDict")).is_err() {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+
+        let error = match init_case(&InitCaseOptions {
+            case_dir: case_dir.clone(),
+            force: true,
+            regions: Vec::new(),
+        }) {
+            Ok(_) => panic!("init_case accepted a final path symlink"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("refusing to write case template through symlink"));
+        assert_eq!(fs::read_to_string(outside).unwrap(), "do not clobber");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("ferrum-cli-{label}-{unique}"))
+    }
+
+    #[cfg(unix)]
+    fn create_directory_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_directory_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
+    }
+
+    #[cfg(unix)]
+    fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(target, link)
+    }
 }

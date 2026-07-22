@@ -1,6 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+const MAX_GPU_DEVICE_COUNT: usize = 32;
+const MAX_GPU_DEVICE_LIST_BYTES: usize = 1024;
+
 use crate::dictionary::{TokenCursor, TokenProvenance, tokenize};
 use crate::{MeshError, Result};
 
@@ -572,6 +575,7 @@ fn parse_gpu_block(cursor: &mut TokenCursor) -> Result<GpuConfig> {
                     }
                     validate_word_or_number(device, "GPU device", cursor.path())?;
                 }
+                validate_gpu_device_list(&devices, cursor.path())?;
                 gpu.devices = devices;
             }
             "multiGpu" => {
@@ -695,6 +699,29 @@ fn validate_auto_on_off(value: &str, label: &str, path: &Path) -> Result<()> {
             path.display()
         ))),
     }
+}
+
+fn validate_gpu_device_list(devices: &[String], path: &Path) -> Result<()> {
+    if devices.len() > MAX_GPU_DEVICE_COUNT {
+        return Err(MeshError::InvalidInput(format!(
+            "GPU devices in {} lists {} entries; maximum is {}",
+            path.display(),
+            devices.len(),
+            MAX_GPU_DEVICE_COUNT
+        )));
+    }
+
+    let bytes = devices.iter().map(String::len).sum::<usize>() + devices.len().saturating_sub(1);
+    if bytes > MAX_GPU_DEVICE_LIST_BYTES {
+        return Err(MeshError::InvalidInput(format!(
+            "GPU devices in {} uses {} bytes; maximum is {}",
+            path.display(),
+            bytes,
+            MAX_GPU_DEVICE_LIST_BYTES
+        )));
+    }
+
+    Ok(())
 }
 
 fn validate_gpu_backend(value: &str, path: &Path) -> Result<()> {
@@ -1008,6 +1035,28 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("cpu.threads=16"))
         );
+    }
+
+    #[test]
+    fn rejects_oversized_gpu_device_lists() {
+        let too_many_devices = (0..=super::MAX_GPU_DEVICE_COUNT)
+            .map(|device| device.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let error = parse_backend_config_str(
+            &format!("gpu {{ devices ({too_many_devices}); }}"),
+            Path::new("ferrumBackends"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("maximum"));
+
+        let oversized_device = "a".repeat(super::MAX_GPU_DEVICE_LIST_BYTES + 1);
+        let error = parse_backend_config_str(
+            &format!("gpu {{ devices ({oversized_device}); }}"),
+            Path::new("ferrumBackends"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("maximum"));
     }
 
     #[test]

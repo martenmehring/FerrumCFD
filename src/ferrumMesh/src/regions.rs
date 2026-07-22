@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use crate::{MeshError, Point3, Result};
@@ -92,7 +92,7 @@ pub fn split_regions_by_cell_zones(case_dir: &Path) -> Result<RegionSplitSummary
             .join("constant")
             .join(sanitize_name(&zone.name))
             .join("polyMesh");
-        fs::create_dir_all(&region_dir)?;
+        create_output_dir(&region_dir)?;
         write_region_poly_mesh(&region_dir, &region)?;
 
         summaries.push(RegionSummary {
@@ -701,8 +701,75 @@ fn write_empty_zone_file(path: &Path, class_name: &str, object: &str) -> Result<
     Ok(())
 }
 
+fn create_output_dir(path: &Path) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(MeshError::InvalidInput(format!(
+                        "refusing to write region mesh through symlinked path {}",
+                        current.display()
+                    )));
+                }
+                if !metadata.is_dir() {
+                    return Err(MeshError::InvalidInput(format!(
+                        "region mesh output path {} is not a directory",
+                        current.display()
+                    )));
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => fs::create_dir(&current)?,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn create_output_file(path: &Path) -> Result<File> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(MeshError::InvalidInput(format!(
+                "refusing to overwrite symlinked region mesh file {}",
+                path.display()
+            )));
+        }
+        Ok(metadata) if metadata.is_dir() => {
+            return Err(MeshError::InvalidInput(format!(
+                "region mesh output file {} is a directory",
+                path.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    open_without_following_symlink(&mut options, path)
+}
+
+#[cfg(unix)]
+fn open_without_following_symlink(options: &mut OpenOptions, path: &Path) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    const O_NOFOLLOW: i32 = 0o400000;
+
+    options
+        .custom_flags(O_NOFOLLOW)
+        .open(path)
+        .map_err(Into::into)
+}
+
+#[cfg(not(unix))]
+fn open_without_following_symlink(options: &mut OpenOptions, path: &Path) -> Result<File> {
+    options.open(path).map_err(Into::into)
+}
+
 fn foam_writer(path: &Path, class_name: &str, object: &str) -> Result<BufWriter<File>> {
-    let mut writer = BufWriter::new(File::create(path)?);
+    let mut writer = BufWriter::new(create_output_file(path)?);
     writeln!(writer, "FoamFile")?;
     writeln!(writer, "{{")?;
     writeln!(writer, "    version 2.0;")?;
@@ -1325,5 +1392,64 @@ fn sanitize_name(name: &str) -> String {
         "unnamed".to_string()
     } else {
         sanitized
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    #[cfg(unix)]
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(unix)]
+    fn temp_path(name: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("ferrum_regions_{name}_{suffix}"))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_dir_rejects_symlinked_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_path("symlink_dir");
+        let outside = temp_path("outside_dir");
+        fs::create_dir_all(root.join("constant")).expect("create case constant dir");
+        fs::create_dir_all(&outside).expect("create outside dir");
+        symlink(&outside, root.join("constant").join("zoneA")).expect("create symlink");
+
+        let error = create_output_dir(&root.join("constant").join("zoneA").join("polyMesh"))
+            .expect_err("symlinked output ancestor must be rejected");
+        assert!(error.to_string().contains("symlinked path"));
+        assert!(!outside.join("polyMesh").exists());
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_file_rejects_symlink_without_clobbering_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_path("symlink_file");
+        fs::create_dir_all(&root).expect("create temp dir");
+        let target = root.join("outside_target");
+        fs::write(&target, "original").expect("write target");
+        let link = root.join("points");
+        symlink(&target, &link).expect("create file symlink");
+
+        let error = foam_writer(&link, "vectorField", "points")
+            .expect_err("symlinked output file must be rejected");
+        assert!(error.to_string().contains("symlinked region mesh file"));
+        assert_eq!(
+            fs::read_to_string(&target).expect("read target"),
+            "original"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
