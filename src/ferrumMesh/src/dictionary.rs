@@ -223,13 +223,21 @@ pub mod streaming {
         }
         #[allow(dead_code)]
         pub(crate) fn reject_current(&mut self, detail: &'static str) -> Result<()> {
+            self.reject_current_as(detail)
+        }
+        #[allow(dead_code)]
+        pub(crate) fn reject_current_as<T>(&mut self, detail: &'static str) -> Result<T> {
+            self.reject_at_as(0, detail)
+        }
+        #[allow(dead_code)]
+        pub(crate) fn reject_at_as<T>(&mut self, offset: usize, detail: &'static str) -> Result<T> {
             if self.failure.is_some() {
                 return Err(self.sticky());
             }
             let line = self
                 .tokens
                 .as_slice()
-                .first()
+                .get(offset)
                 .map_or(self.eof_line, |token| token.line);
             Err(self.latch(line, detail))
         }

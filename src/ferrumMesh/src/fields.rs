@@ -2,7 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::dictionary::{TokenCursor, tokenize};
+use crate::dictionary::{
+    MAX_DICTIONARY_NESTING, MAX_DICTIONARY_PAYLOAD_BYTES, MAX_DICTIONARY_TOKENS, Token,
+    TokenCursor, TokenProvenance, tokenize,
+};
 use crate::poly_mesh::PolyMesh;
 use crate::{MeshError, Result};
 
@@ -190,25 +193,49 @@ fn parse_field_file_str(content: &str, path: &Path, region: Option<String>) -> R
     let mut boundary_patches = Vec::new();
 
     while let Some(token) = cursor.peek()? {
-        match token.value.as_str() {
-            "FoamFile" => {
+        #[derive(Clone, Copy)]
+        enum Action {
+            FoamFile,
+            Dimensions,
+            InternalField,
+            BoundaryField,
+            Other,
+            Invalid,
+        }
+        let action = match token.provenance {
+            TokenProvenance::Ordinary => match token.value.as_str() {
+                "FoamFile" => Action::FoamFile,
+                "dimensions" => Action::Dimensions,
+                "internalField" => Action::InternalField,
+                "boundaryField" => Action::BoundaryField,
+                _ => Action::Other,
+            },
+            TokenProvenance::Quoted => Action::Other,
+            TokenProvenance::Structural => Action::Invalid,
+        };
+        match action {
+            Action::FoamFile => {
                 cursor.next_required()?;
                 let metadata = parse_foam_file(&mut cursor)?;
                 class_name = metadata.class_name;
                 object_name = metadata.object_name;
             }
-            "dimensions" => dimensions = Some(parse_dimensions(&mut cursor)?),
-            "internalField" => {
+            Action::Dimensions => dimensions = Some(parse_dimensions(&mut cursor)?),
+            Action::InternalField => {
                 cursor.next_required()?;
-                internal_field = Some(parse_field_value_tokens(
-                    cursor.read_value_until_semicolon()?,
-                ));
+                internal_field = Some(parse_field_value(&mut cursor)?);
             }
-            "boundaryField" => {
+            Action::BoundaryField => {
                 cursor.next_required()?;
                 boundary_patches = parse_boundary_field(&mut cursor)?;
             }
-            _ => cursor.skip_value_or_block()?,
+            Action::Other => {
+                cursor.next_required()?;
+                skip_exact_one(&mut cursor)?;
+            }
+            Action::Invalid => {
+                return cursor.reject_current_as("structural token cannot be a field key");
+            }
         }
     }
 
@@ -237,13 +264,47 @@ fn parse_foam_file(cursor: &mut TokenCursor) -> Result<FoamFileMetadata> {
     let mut class_name = None;
     let mut object_name = None;
 
-    while cursor.peek()?.is_none_or(|token| token.value != "}") {
-        let key = cursor.next_required()?;
-        let value = cursor.read_value_until_semicolon()?;
-        match key.value.as_str() {
-            "class" => class_name = value.first().cloned(),
-            "object" => object_name = value.first().cloned(),
-            _ => {}
+    loop {
+        #[derive(Clone, Copy)]
+        enum Action {
+            End,
+            Class,
+            Object,
+            Other,
+            Invalid,
+        }
+        let action = match cursor.peek()? {
+            None => Action::Invalid,
+            Some(token) if structural(token, "}") => Action::End,
+            Some(token) if token.provenance == TokenProvenance::Structural => Action::Invalid,
+            Some(token)
+                if token.provenance == TokenProvenance::Ordinary && token.value == "class" =>
+            {
+                Action::Class
+            }
+            Some(token)
+                if token.provenance == TokenProvenance::Ordinary && token.value == "object" =>
+            {
+                Action::Object
+            }
+            Some(_) => Action::Other,
+        };
+        match action {
+            Action::End => break,
+            Action::Invalid => return reject(cursor, "invalid FoamFile entry"),
+            Action::Class | Action::Object => {
+                cursor.next_required()?;
+                let scalar = take_scalar_entry(cursor, "invalid FoamFile scalar entry")?;
+                if matches!(action, Action::Class) {
+                    class_name = Some(scalar);
+                } else {
+                    object_name = Some(scalar);
+                }
+            }
+            Action::Other => {
+                cursor.next_required()?;
+                skip_exact_one(cursor)?;
+            }
         }
     }
     cursor.expect("}")?;
@@ -255,18 +316,44 @@ fn parse_foam_file(cursor: &mut TokenCursor) -> Result<FoamFileMetadata> {
 }
 
 fn parse_dimensions(cursor: &mut TokenCursor) -> Result<Vec<String>> {
-    cursor.next_required()?;
-    if cursor.peek()?.is_none_or(|token| token.value != "[") {
-        return cursor.read_value_until_semicolon();
+    {
+        let tokens = cursor.remaining_tokens()?;
+        if tokens.first().is_none_or(|token| {
+            token.provenance != TokenProvenance::Ordinary || token.value != "dimensions"
+        }) {
+            return reject_at(cursor, 0, "expected dimensions entry");
+        }
+        if tokens.get(1).is_none_or(|token| !structural(token, "[")) {
+            return reject_at(cursor, 1, "expected dimensions opener");
+        }
+        for index in 2..9 {
+            let valid = tokens.get(index).is_some_and(|token| {
+                token.provenance == TokenProvenance::Ordinary
+                    && token.value.parse::<f64>().is_ok_and(f64::is_finite)
+            });
+            if !valid {
+                return reject_at(cursor, index, "expected finite dimensions exponent");
+            }
+        }
+        if tokens.get(9).is_none_or(|token| !structural(token, "]")) {
+            return reject_at(cursor, 9, "expected dimensions closer");
+        }
+        if tokens.get(10).is_none_or(|token| !structural(token, ";")) {
+            return reject_at(cursor, 10, "dimensions entry is missing a semicolon");
+        }
     }
 
-    cursor.expect("[")?;
+    cursor.next_required()?;
+    cursor.next_required()?;
     let mut values = Vec::new();
-    while cursor.peek()?.is_none_or(|token| token.value != "]") {
+    if values.try_reserve(7).is_err() {
+        return reject(cursor, "dimensions allocation failed");
+    }
+    for _ in 0..7 {
         values.push(cursor.next_required()?.value);
     }
-    cursor.expect("]")?;
-    cursor.expect_optional(";")?;
+    cursor.next_required()?;
+    cursor.next_required()?;
     Ok(values)
 }
 
@@ -274,10 +361,35 @@ fn parse_boundary_field(cursor: &mut TokenCursor) -> Result<Vec<FieldBoundaryPat
     cursor.expect("{")?;
     let mut patches = Vec::new();
 
-    while cursor.peek()?.is_none_or(|token| token.value != "}") {
-        let name = cursor.next_required()?.value;
-        cursor.expect("{")?;
-        patches.push(parse_boundary_patch(cursor, name)?);
+    loop {
+        #[derive(Clone, Copy)]
+        enum Action {
+            End,
+            Patch,
+            Invalid,
+        }
+        let action = match cursor.remaining_tokens()? {
+            [token, ..] if structural(token, "}") => Action::End,
+            [name, open, ..]
+                if name.provenance != TokenProvenance::Structural && structural(open, "{") =>
+            {
+                Action::Patch
+            }
+            _ => Action::Invalid,
+        };
+        match action {
+            Action::End => break,
+            Action::Invalid => return reject(cursor, "invalid boundary patch header"),
+            Action::Patch => {
+                if patches.try_reserve(1).is_err() {
+                    return reject(cursor, "boundary patch allocation failed");
+                }
+                let name = cursor.next_required()?.value;
+                cursor.expect("{")?;
+                let patch = parse_boundary_patch(cursor, name)?;
+                patches.push(patch);
+            }
+        }
     }
     cursor.expect("}")?;
 
@@ -289,23 +401,49 @@ fn parse_boundary_patch(cursor: &mut TokenCursor, name: String) -> Result<FieldB
     let mut inlet_value = None;
     let mut value = None;
 
-    while cursor.peek()?.is_none_or(|token| token.value != "}") {
-        let key = cursor.next_required()?;
-        match key.value.as_str() {
-            "type" => {
-                patch_type = cursor.read_value_until_semicolon()?.first().cloned();
+    loop {
+        #[derive(Clone, Copy)]
+        enum Action {
+            End,
+            Type,
+            Value,
+            InletValue,
+            Other,
+            Invalid,
+        }
+        let action = match cursor.peek()? {
+            None => Action::Invalid,
+            Some(token) if structural(token, "}") => Action::End,
+            Some(token) if token.provenance == TokenProvenance::Structural => Action::Invalid,
+            Some(token) if token.provenance == TokenProvenance::Ordinary => {
+                match token.value.as_str() {
+                    "type" => Action::Type,
+                    "value" => Action::Value,
+                    "inletValue" => Action::InletValue,
+                    _ => Action::Other,
+                }
             }
-            "value" => {
-                value = Some(parse_field_value_tokens(
-                    cursor.read_value_until_semicolon()?,
-                ));
+            Some(_) => Action::Other,
+        };
+        match action {
+            Action::End => break,
+            Action::Invalid => return reject(cursor, "invalid boundary patch entry"),
+            Action::Type => {
+                cursor.next_required()?;
+                patch_type = Some(take_scalar_entry(cursor, "invalid patch type")?);
             }
-            "inletValue" => {
-                inlet_value = Some(parse_field_value_tokens(
-                    cursor.read_value_until_semicolon()?,
-                ));
+            Action::Value => {
+                cursor.next_required()?;
+                value = Some(parse_field_value(cursor)?);
             }
-            _ => cursor.skip_value_or_block()?,
+            Action::InletValue => {
+                cursor.next_required()?;
+                inlet_value = Some(parse_field_value(cursor)?);
+            }
+            Action::Other => {
+                cursor.next_required()?;
+                skip_exact_one(cursor)?;
+            }
         }
     }
     cursor.expect("}")?;
@@ -318,75 +456,357 @@ fn parse_boundary_patch(cursor: &mut TokenCursor, name: String) -> Result<FieldB
     })
 }
 
-fn parse_field_value_tokens(tokens: Vec<String>) -> FieldValueSummary {
-    let Some(kind) = tokens.first() else {
-        return FieldValueSummary::Other("empty".to_string());
+fn structural(token: &Token, value: &str) -> bool {
+    token.provenance == TokenProvenance::Structural && token.value == value
+}
+fn opener(token: &Token) -> bool {
+    token.provenance == TokenProvenance::Structural
+        && matches!(token.value.as_str(), "(" | "[" | "{")
+}
+fn closer(token: &Token) -> bool {
+    token.provenance == TokenProvenance::Structural
+        && matches!(token.value.as_str(), ")" | "]" | "}")
+}
+fn matching(open: char, close: &str) -> bool {
+    matches!((open, close), ('(', ")") | ('[', "]") | ('{', "}"))
+}
+fn reject<T>(cursor: &mut TokenCursor, detail: &'static str) -> Result<T> {
+    cursor.reject_current_as(detail)
+}
+fn reject_at<T>(cursor: &mut TokenCursor, index: usize, detail: &'static str) -> Result<T> {
+    cursor.reject_at_as(index, detail)
+}
+
+fn balanced_end(
+    tokens: &[Token],
+    start: usize,
+) -> std::result::Result<usize, (usize, &'static str)> {
+    let mut stack = ['\0'; MAX_DICTIONARY_NESTING];
+    let mut depth = 0usize;
+    let mut index = start;
+    loop {
+        let token = tokens
+            .get(index)
+            .ok_or((index, "unterminated dictionary group"))?;
+        if opener(token) {
+            if depth == MAX_DICTIONARY_NESTING {
+                return Err((index, "dictionary nesting limit exceeded"));
+            }
+            stack[depth] = token.value.as_bytes()[0] as char;
+            depth = depth
+                .checked_add(1)
+                .ok_or((index, "dictionary nesting counter overflow"))?;
+        } else if closer(token) {
+            let top = depth
+                .checked_sub(1)
+                .ok_or((index, "unexpected dictionary closing delimiter"))?;
+            if !matching(stack[top], token.value.as_str()) {
+                return Err((index, "mismatched dictionary delimiter"));
+            }
+            depth = top;
+            if depth == 0 {
+                return index
+                    .checked_add(1)
+                    .ok_or((index, "dictionary index overflow"));
+            }
+        }
+        index = index
+            .checked_add(1)
+            .ok_or((index, "dictionary index overflow"))?;
+    }
+}
+
+fn skip_exact_one(cursor: &mut TokenCursor) -> Result<()> {
+    let (end, has_terminator) = {
+        let tokens = cursor.remaining_tokens()?;
+        let first = match tokens.first() {
+            None => return reject(cursor, "dictionary value is missing"),
+            Some(token) if structural(token, ";") || closer(token) => {
+                return reject(cursor, "dictionary value is missing");
+            }
+            Some(token) => token,
+        };
+        let braced = structural(first, "{");
+        let end = if opener(first) {
+            match balanced_end(tokens, 0) {
+                Ok(end) => end,
+                Err((i, d)) => return reject_at(cursor, i, d),
+            }
+        } else {
+            1
+        };
+        let has_terminator = tokens.get(end).is_some_and(|token| structural(token, ";"));
+        if !braced && !has_terminator {
+            return reject_at(cursor, end, "dictionary value is missing a semicolon");
+        }
+        (end, has_terminator)
     };
+    for _ in 0..end {
+        cursor.next_required()?;
+    }
+    if has_terminator {
+        cursor.next_required()?;
+    }
+    Ok(())
+}
 
-    match kind.as_str() {
-        "uniform" => FieldValueSummary::Uniform(join_tokens(&tokens[1..])),
-        "nonuniform" => parse_nonuniform_field_value(&tokens),
-        _ => FieldValueSummary::Other(join_tokens(&tokens)),
+fn take_scalar_entry(cursor: &mut TokenCursor, detail: &'static str) -> Result<String> {
+    let tokens = cursor.remaining_tokens()?;
+    if tokens.len() < 2
+        || tokens[0].provenance != TokenProvenance::Ordinary
+        || !structural(&tokens[1], ";")
+    {
+        return reject(cursor, detail);
+    }
+    let value = cursor.next_required()?.value;
+    cursor.next_required()?;
+    Ok(value)
+}
+
+fn value_end(tokens: &[Token]) -> std::result::Result<usize, (usize, &'static str)> {
+    let mut stack = ['\0'; MAX_DICTIONARY_NESTING];
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate() {
+        if depth == 0 && structural(token, ";") {
+            return if index == 0 {
+                Err((0, "field value is missing"))
+            } else {
+                Ok(index)
+            };
+        }
+        if opener(token) {
+            if depth == MAX_DICTIONARY_NESTING {
+                return Err((index, "field value nesting limit exceeded"));
+            }
+            stack[depth] = token.value.as_bytes()[0] as char;
+            depth = depth
+                .checked_add(1)
+                .ok_or((index, "field value nesting counter overflow"))?;
+        } else if closer(token) {
+            let top = depth
+                .checked_sub(1)
+                .ok_or((index, "unexpected field value closing delimiter"))?;
+            if !matching(stack[top], token.value.as_str()) {
+                return Err((index, "mismatched field value delimiter"));
+            }
+            depth = top;
+        }
+    }
+    Err((tokens.len(), "field value is missing a semicolon"))
+}
+
+fn joined_value(cursor: &mut TokenCursor, start: usize, end: usize) -> Result<String> {
+    let additional = {
+        let tokens = cursor.remaining_tokens()?;
+        let mut bytes = Some(0usize);
+        for token in &tokens[start + 1..end] {
+            bytes = bytes
+                .and_then(|n| n.checked_add(1))
+                .and_then(|n| n.checked_add(token.value.len()));
+        }
+        bytes
+    };
+    let Some(additional) = additional else {
+        return reject(cursor, "field value length overflow");
+    };
+    for _ in 0..start {
+        cursor.next_required()?;
+    }
+    cursor.try_reserve_current_value(additional)?;
+    let mut value = cursor.next_required()?.value;
+    for _ in start + 1..end {
+        value.push(' ');
+        value.push_str(&cursor.next_required()?.value);
+    }
+    cursor.next_required()?;
+    Ok(value)
+}
+
+fn parse_field_value(cursor: &mut TokenCursor) -> Result<FieldValueSummary> {
+    #[derive(Clone, Copy)]
+    enum Action {
+        Uniform,
+        NonUniform,
+        Other,
+        Invalid,
+    }
+    let action = {
+        let tokens = cursor.remaining_tokens()?;
+        match tokens.first() {
+            Some(token)
+                if token.provenance == TokenProvenance::Ordinary && token.value == "uniform" =>
+            {
+                Action::Uniform
+            }
+            Some(token)
+                if token.provenance == TokenProvenance::Ordinary && token.value == "nonuniform" =>
+            {
+                Action::NonUniform
+            }
+            Some(token) if token.provenance == TokenProvenance::Structural => Action::Invalid,
+            Some(_) => Action::Other,
+            None => return reject(cursor, "field value is missing"),
+        }
+    };
+    let end = {
+        let tokens = cursor.remaining_tokens()?;
+        match value_end(tokens) {
+            Ok(v) => v,
+            Err((i, d)) => return reject_at(cursor, i, d),
+        }
+    };
+    match action {
+        Action::Invalid => reject(cursor, "invalid field value"),
+        Action::Other => Ok(FieldValueSummary::Other(joined_value(cursor, 0, end)?)),
+        Action::Uniform => {
+            let valid_end = {
+                let tokens = cursor.remaining_tokens()?;
+                if end < 2 {
+                    return reject_at(cursor, end, "uniform value is missing");
+                }
+                if opener(&tokens[1]) {
+                    match balanced_end(tokens, 1) {
+                        Ok(v) => v,
+                        Err((i, d)) => return reject_at(cursor, i, d),
+                    }
+                } else if tokens[1].provenance != TokenProvenance::Structural {
+                    2
+                } else {
+                    return reject_at(cursor, 1, "invalid uniform value");
+                }
+            };
+            if valid_end != end {
+                return reject_at(cursor, valid_end, "uniform value has trailing tokens");
+            }
+            Ok(FieldValueSummary::Uniform(joined_value(cursor, 1, end)?))
+        }
+        Action::NonUniform => parse_nonuniform(cursor, end),
     }
 }
 
-fn parse_nonuniform_field_value(tokens: &[String]) -> FieldValueSummary {
-    let value_type = tokens.get(1).cloned();
-    let count_index = tokens
-        .iter()
-        .enumerate()
-        .skip(2)
-        .find_map(|(index, token)| token.parse::<usize>().ok().map(|count| (index, count)));
-    let count = count_index.map(|(_, count)| count);
-    let values = count_index.and_then(|(index, count)| {
-        parse_nonuniform_numeric_values(tokens, index + 1, &value_type, count)
-    });
-
-    FieldValueSummary::NonUniform {
-        value_type,
-        count,
-        values,
-    }
-}
-
-fn parse_nonuniform_numeric_values(
-    tokens: &[String],
-    start_index: usize,
-    value_type: &Option<String>,
-    count: usize,
-) -> Option<Vec<f64>> {
-    let components = nonuniform_components_for_type(value_type.as_deref())?;
-    let expected_values = count.checked_mul(components)?;
+fn parse_nonuniform(cursor: &mut TokenCursor, end: usize) -> Result<FieldValueSummary> {
+    let (count, expected) = {
+        let tokens = cursor.remaining_tokens()?;
+        if end < 5 {
+            return reject_at(cursor, end, "incomplete nonuniform value");
+        }
+        let components = if tokens[1].provenance == TokenProvenance::Ordinary
+            && tokens[1].value == "List<scalar>"
+        {
+            1
+        } else if tokens[1].provenance == TokenProvenance::Ordinary
+            && tokens[1].value == "List<vector>"
+        {
+            3
+        } else {
+            return reject_at(cursor, 1, "unsupported nonuniform value type");
+        };
+        if tokens[2].provenance != TokenProvenance::Ordinary {
+            return reject_at(cursor, 2, "invalid nonuniform count");
+        }
+        let count = match tokens[2].value.parse::<usize>() {
+            Ok(v) => v,
+            Err(_) => return reject_at(cursor, 2, "invalid nonuniform count"),
+        };
+        let expected = match count.checked_mul(components) {
+            Some(v) => v,
+            None => return reject_at(cursor, 2, "nonuniform count overflow"),
+        };
+        if count > MAX_DICTIONARY_TOKENS
+            || expected > MAX_DICTIONARY_TOKENS
+            || expected > MAX_DICTIONARY_PAYLOAD_BYTES
+        {
+            return reject_at(cursor, 2, "nonuniform value limit exceeded");
+        }
+        if !structural(&tokens[3], "(") {
+            return reject_at(cursor, 3, "expected nonuniform list opener");
+        }
+        let mut index = 4usize;
+        for _ in 0..count {
+            if components == 3 {
+                if tokens.get(index).is_none_or(|t| !structural(t, "(")) {
+                    return reject_at(cursor, index, "expected vector tuple opener");
+                }
+                index = match index.checked_add(1) {
+                    Some(v) => v,
+                    None => return reject_at(cursor, index, "nonuniform index overflow"),
+                };
+            }
+            for _ in 0..components {
+                let token = match tokens.get(index) {
+                    Some(v) => v,
+                    None => return reject_at(cursor, index, "missing nonuniform numeric value"),
+                };
+                if token.provenance != TokenProvenance::Ordinary {
+                    return reject_at(cursor, index, "invalid nonuniform numeric value");
+                }
+                index = match index.checked_add(1) {
+                    Some(v) => v,
+                    None => return reject_at(cursor, index, "nonuniform index overflow"),
+                };
+            }
+            if components == 3 {
+                if tokens.get(index).is_none_or(|t| !structural(t, ")")) {
+                    return reject_at(cursor, index, "expected vector tuple closer");
+                }
+                index = match index.checked_add(1) {
+                    Some(v) => v,
+                    None => return reject_at(cursor, index, "nonuniform index overflow"),
+                };
+            }
+        }
+        if tokens.get(index).is_none_or(|t| !structural(t, ")")) {
+            return reject_at(cursor, index, "expected nonuniform list closer");
+        }
+        index = match index.checked_add(1) {
+            Some(v) => v,
+            None => return reject_at(cursor, index, "nonuniform index overflow"),
+        };
+        if index != end {
+            return reject_at(cursor, index, "nonuniform value has trailing tokens");
+        }
+        (count, expected)
+    };
     let mut values = Vec::new();
-    for token in &tokens[start_index..] {
-        if matches!(token.as_str(), "(" | ")" | "[" | "]") {
-            continue;
+    if values.try_reserve(expected).is_err() {
+        return reject(cursor, "nonuniform value allocation failed");
+    }
+    let invalid_numeric = {
+        let tokens = cursor.remaining_tokens()?;
+        let mut invalid = None;
+        for (index, token) in tokens.iter().enumerate().take(end).skip(4) {
+            if token.provenance != TokenProvenance::Ordinary {
+                continue;
+            }
+            match token.value.parse::<f64>() {
+                Ok(number) if number.is_finite() => values.push(number),
+                _ => {
+                    invalid = Some(index);
+                    break;
+                }
+            }
         }
-        if values.len() == expected_values {
-            return None;
+        invalid
+    };
+    if let Some(index) = invalid_numeric {
+        return reject_at(cursor, index, "invalid nonuniform numeric value");
+    }
+    if values.len() != expected {
+        return reject(cursor, "nonuniform numeric count mismatch");
+    }
+    let mut type_value = None;
+    for index in 0..end {
+        let token = cursor.next_required()?;
+        if index == 1 {
+            type_value = Some(token.value);
         }
-        values.push(token.parse::<f64>().ok()?);
     }
-    if values.len() == expected_values {
-        Some(values)
-    } else {
-        None
-    }
-}
-
-fn nonuniform_components_for_type(value_type: Option<&str>) -> Option<usize> {
-    match value_type {
-        Some("List<scalar>") | Some("scalarField") | Some("Field<scalar>") => Some(1),
-        Some("List<vector>") | Some("vectorField") | Some("Field<vector>") => Some(3),
-        _ => None,
-    }
-}
-
-fn join_tokens(tokens: &[String]) -> String {
-    if tokens.is_empty() {
-        return "empty".to_string();
-    }
-    tokens.join(" ")
+    cursor.next_required()?;
+    Ok(FieldValueSummary::NonUniform {
+        value_type: type_value,
+        count: Some(count),
+        values: Some(values),
+    })
 }
 
 struct FieldBoundaryValidator<'a> {
@@ -427,11 +847,8 @@ impl<'a> FieldBoundaryValidator<'a> {
             self.mesh_cache.insert(region.clone(), mesh);
         }
 
-        match self
-            .mesh_cache
-            .get(&region)
-            .expect("mesh cache entry exists")
-        {
+        let cached = lookup_mesh_cache(&self.mesh_cache, &region, &mut self.warnings)?;
+        match cached {
             Ok(mesh) => Some(mesh),
             Err(error) => {
                 let label = region
@@ -444,6 +861,27 @@ impl<'a> FieldBoundaryValidator<'a> {
             }
         }
     }
+}
+
+fn lookup_mesh_cache<'a>(
+    cache: &'a HashMap<Option<String>, Result<PolyMesh>>,
+    region: &Option<String>,
+    warnings: &mut Vec<String>,
+) -> Option<&'a Result<PolyMesh>> {
+    if let Some(cached) = cache.get(region) {
+        return Some(cached);
+    }
+    if warnings.try_reserve(1).is_err() {
+        return None;
+    }
+    let detail = "could not validate fields: mesh cache entry is unavailable";
+    let mut warning = String::new();
+    if warning.try_reserve(detail.len()).is_err() {
+        return None;
+    }
+    warning.push_str(detail);
+    warnings.push(warning);
+    None
 }
 
 fn validate_field_boundary_patches(field: &FieldFile, mesh: &PolyMesh, warnings: &mut Vec<String>) {
@@ -522,13 +960,16 @@ fn field_label(field: &FieldFile) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
     use crate::Point3;
     use crate::poly_mesh::{BoundaryPatch, PolyMesh};
+    use crate::{MeshError, Result};
 
     use super::{
-        FieldBoundaryPatch, FieldFile, FieldValueSummary, parse_field_file_str,
+        FieldBoundaryPatch, FieldFile, FieldValueSummary, MAX_DICTIONARY_NESTING,
+        MAX_DICTIONARY_TOKENS, lookup_mesh_cache, parse_field_file_str,
         validate_field_boundary_patches,
     };
 
@@ -710,15 +1151,202 @@ mod tests {
         boundaryField { }
         "#;
 
-        let field = parse_field_file_str(content, Path::new("0/p"), None).unwrap();
+        let error = parse_field_file_str(content, Path::new("0/p"), None).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "line 3: 0/p: expected nonuniform list closer"
+        );
+    }
 
-        match field.internal_field {
-            Some(FieldValueSummary::NonUniform { count, values, .. }) => {
-                assert_eq!(count, Some(1));
-                assert_eq!(values, None);
-            }
-            other => panic!("unexpected field value: {other:?}"),
-        }
+    #[test]
+    fn field_exact_one_and_provenance_are_safe() {
+        let content = r#"FoamFile
+{
+    "class" inert;
+    class volScalarField;
+    "object" inert;
+    object p;
+}
+"FoamFile" ignored;
+unknownScalar inert;
+unknownGroup (alpha [beta {gamma}]);
+unknownBlock { nested inert; }
+"internalField" ignored;
+internalField "uniform";
+"boundaryField" ignored;
+boundaryField
+{
+    inlet
+    {
+        "type" inert;
+        type fixedValue;
+        "value" inert;
+        value "uniform";
+    }
+}
+"#;
+
+        let field = parse_field_file_str(content, Path::new("0/p"), None).unwrap();
+        assert_eq!(field.class_name.as_deref(), Some("volScalarField"));
+        assert_eq!(field.name, "p");
+        assert_eq!(field.boundary_patches.len(), 1);
+        assert_eq!(
+            field.boundary_patches[0].patch_type.as_deref(),
+            Some("fixedValue")
+        );
+        assert!(matches!(
+            field.boundary_patches[0].value,
+            Some(FieldValueSummary::Other(ref value)) if value == "uniform"
+        ));
+        assert!(matches!(
+            field.internal_field,
+            Some(FieldValueSummary::Other(ref value)) if value == "uniform"
+        ));
+
+        assert_parse_error(
+            ";\nFoamFile { class volScalarField; object p; }",
+            1,
+            "structural token cannot be a field key",
+        );
+        assert_parse_error(
+            "FoamFile { class volScalarField; object p; }\nunknown inert\ninternalField uniform 0;\n",
+            3,
+            "dictionary value is missing a semicolon",
+        );
+        assert_parse_error(
+            "FoamFile { class volScalarField; object p; }\nunknown (inert)\ninternalField uniform 0;\n",
+            3,
+            "dictionary value is missing a semicolon",
+        );
+    }
+
+    #[test]
+    fn field_value_planning_rejects_exact_offender_atomically() {
+        assert_parse_error(
+            "FoamFile { class volScalarField; object p; }\ninternalField uniform;\n",
+            2,
+            "uniform value is missing",
+        );
+        assert_parse_error(
+            "FoamFile { class volVectorField; object U; }\ninternalField uniform\n(1 2 3)\ntrailing;\n",
+            4,
+            "uniform value has trailing tokens",
+        );
+        assert_parse_error(
+            "FoamFile { class volVectorField; object U; }\ninternalField uniform (1 2];\n",
+            2,
+            "mismatched dictionary delimiter",
+        );
+
+        let mut too_deep = String::from("internalField uniform ");
+        too_deep.push_str(&"(".repeat(MAX_DICTIONARY_NESTING + 1));
+        too_deep.push('0');
+        too_deep.push_str(&")".repeat(MAX_DICTIONARY_NESTING + 1));
+        too_deep.push(';');
+        assert_parse_error(&too_deep, 1, "dictionary nesting limit exceeded");
+    }
+
+    #[test]
+    fn nonuniform_values_are_capped_and_fail_closed() {
+        let zero = parse_field_file_str(
+            "FoamFile { class volScalarField; object p; }\ninternalField nonuniform List<scalar> 0 ();\nboundaryField {}\n",
+            Path::new("0/p"),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            zero.internal_field,
+            Some(FieldValueSummary::NonUniform {
+                count: Some(0),
+                values: Some(ref values),
+                ..
+            }) if values.is_empty()
+        ));
+
+        assert_parse_error(
+            "FoamFile { class volScalarField; object p; }\ninternalField nonuniform List<scalar> 1 (NaN);\n",
+            2,
+            "invalid nonuniform numeric value",
+        );
+        assert_parse_error(
+            "FoamFile { class volScalarField; object p; }\ninternalField nonuniform List<scalar> \"1\" (1);\n",
+            2,
+            "invalid nonuniform count",
+        );
+        assert_parse_error(
+            "FoamFile { class volVectorField; object U; }\ninternalField nonuniform List<vector> 1 (1 2 3);\n",
+            2,
+            "expected vector tuple opener",
+        );
+        assert_parse_error(
+            "FoamFile { class volVectorField; object U; }\ninternalField nonuniform List<vector> 1 ((1 2));\n",
+            2,
+            "invalid nonuniform numeric value",
+        );
+        assert_parse_error(
+            "FoamFile { class volVectorField; object U; }\ninternalField nonuniform List<vector> 1 ((1 2 3 4));\n",
+            2,
+            "expected vector tuple closer",
+        );
+        assert_parse_error(
+            "FoamFile { class volVectorField; object U; }\ninternalField nonuniform List<vector> 1 (((1 2 3)));\n",
+            2,
+            "invalid nonuniform numeric value",
+        );
+        let overflow = format!(
+            "FoamFile {{ class volVectorField; object U; }}\ninternalField nonuniform List<vector> {} ();\n",
+            usize::MAX
+        );
+        assert_parse_error(&overflow, 2, "nonuniform count overflow");
+
+        let count = MAX_DICTIONARY_TOKENS + 1;
+        let oversized = format!(
+            "FoamFile {{ class volScalarField; object p; }}\ninternalField nonuniform List<scalar> {count} ();\n"
+        );
+        assert_parse_error(&oversized, 2, "nonuniform value limit exceeded");
+    }
+
+    #[test]
+    fn dimensions_patches_and_mesh_cache_fail_atomically() {
+        let quoted = parse_field_file_str(
+            "FoamFile { class volScalarField; object p; }\n\"dimensions\" ignored;\ninternalField uniform 0;\nboundaryField {}\n",
+            Path::new("0/p"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(quoted.dimensions, None);
+
+        assert_parse_error(
+            "FoamFile { class volScalarField; object p; }\ndimensions [0 1 nope 0 0 0 0];\n",
+            2,
+            "expected finite dimensions exponent",
+        );
+        assert_parse_error(
+            "FoamFile { class volScalarField; object p; }\ndimensions [0 1 2\n3 4 5\n];\n",
+            4,
+            "expected finite dimensions exponent",
+        );
+        assert_parse_error(
+            "FoamFile { class volScalarField; object p; }\ndimensions [0 1 2 3 4 5 6]\ninternalField uniform 0;\n",
+            3,
+            "dimensions entry is missing a semicolon",
+        );
+        assert_parse_error(
+            "FoamFile { class volScalarField; object p; }\nboundaryField { { type fixedValue; } }\n",
+            2,
+            "invalid boundary patch header",
+        );
+
+        let cache: HashMap<Option<String>, Result<PolyMesh>> = HashMap::new();
+        let mut warnings = vec!["sentinel".to_string()];
+        assert!(lookup_mesh_cache(&cache, &None, &mut warnings).is_none());
+        assert_eq!(
+            warnings,
+            vec![
+                "sentinel",
+                "could not validate fields: mesh cache entry is unavailable"
+            ]
+        );
     }
 
     #[test]
@@ -793,6 +1421,21 @@ mod tests {
         validate_field_boundary_patches(&field, &mesh, &mut warnings);
 
         assert_eq!(warnings.len(), 3);
+    }
+
+    fn assert_parse_error(content: &str, line: usize, detail: &str) {
+        let error = parse_field_file_str(content, Path::new("0/p"), None).unwrap_err();
+        match error {
+            MeshError::Parse {
+                line: actual_line,
+                message,
+            } => {
+                assert_eq!(actual_line, line);
+                assert_eq!(message, format!("0/p: {detail}"));
+                assert_eq!(message.matches("0/p").count(), 1);
+            }
+            other => panic!("expected parse error, got {other}"),
+        }
     }
 
     fn test_field(boundary_patches: Vec<FieldBoundaryPatch>) -> FieldFile {
