@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::dictionary::{TokenCursor, tokenize};
+use crate::dictionary::{Token, TokenCursor, TokenProvenance, tokenize};
 use crate::regions::InterfaceRegistrySummary;
 use crate::{MeshError, Result};
 
@@ -131,34 +131,62 @@ pub fn validate_interface_config(
 fn parse_interface_config_str(content: &str, path: &Path) -> Result<InterfaceConfig> {
     let mut cursor = tokenize(path, content)?.into_cursor();
     let mut entries = Vec::new();
+    let mut found_interfaces = false;
 
     while let Some(token) = cursor.peek()? {
-        match token.value.as_str() {
-            "FoamFile" => {
+        if token.provenance == TokenProvenance::Structural {
+            return cursor.reject_current_as("unexpected structural token at dictionary root");
+        }
+
+        match (token.provenance, token.value.as_str()) {
+            (TokenProvenance::Ordinary, "FoamFile") => {
                 cursor.next_required()?;
                 cursor.skip_braced_block()?;
             }
-            "interfaces" => {
+            (TokenProvenance::Ordinary, "interfaces") => {
+                if found_interfaces {
+                    return cursor.reject_current_as("duplicate ordinary 'interfaces' block");
+                }
                 cursor.next_required()?;
                 cursor.expect("{")?;
                 entries = parse_interfaces_block(&mut cursor)?;
+                found_interfaces = true;
             }
             _ => {
                 cursor.next_required()?;
+                cursor.skip_exact_value_or_block()?;
             }
         }
     }
 
-    Ok(InterfaceConfig {
-        path: path.to_path_buf(),
-        entries,
-    })
+    if !found_interfaces {
+        return cursor.reject_current_as("missing ordinary 'interfaces' block");
+    }
+
+    let path = copy_path(&mut cursor)?;
+    Ok(InterfaceConfig { path, entries })
 }
 
 fn parse_interfaces_block(cursor: &mut TokenCursor) -> Result<Vec<InterfaceConfigEntry>> {
     let mut entries = Vec::new();
 
-    while cursor.peek()?.is_none_or(|token| token.value != "}") {
+    while !peek_structural(cursor, "}")? {
+        let Some(token) = cursor.peek()? else {
+            return cursor.reject_current_as("unterminated ordinary 'interfaces' block");
+        };
+        if token.provenance != TokenProvenance::Ordinary {
+            return cursor.reject_current_as("interface name must be an ordinary token");
+        }
+        if entries
+            .iter()
+            .any(|entry: &InterfaceConfigEntry| entry.name == token.value)
+        {
+            return cursor.reject_current_as("duplicate interface name");
+        }
+        if entries.try_reserve(1).is_err() {
+            return cursor.reject_current_as("interface entry allocation failed");
+        }
+
         let name = cursor.next_required()?.value;
         cursor.expect("{")?;
         entries.push(parse_interface_entry(cursor, name)?);
@@ -174,100 +202,174 @@ fn parse_interface_entry(cursor: &mut TokenCursor, name: String) -> Result<Inter
     let mut orientation = None;
     let mut model = None;
 
-    while cursor.peek()?.is_none_or(|token| token.value != "}") {
+    while !peek_structural(cursor, "}")? {
+        let Some(token) = cursor.peek()? else {
+            return cursor.reject_current_as("unterminated interface entry");
+        };
+        if token.provenance == TokenProvenance::Structural {
+            return cursor.reject_current_as("interface key must not be structural punctuation");
+        }
+
+        if token.provenance == TokenProvenance::Ordinary {
+            let duplicate = match token.value.as_str() {
+                "regions" => regions.is_some(),
+                "faceZone" => face_zone.is_some(),
+                "orientation" => orientation.is_some(),
+                "model" => model.is_some(),
+                _ => false,
+            };
+            if duplicate {
+                return cursor.reject_current_as("duplicate interface entry key");
+            }
+        }
+
         let key = cursor.next_required()?;
-        match key.value.as_str() {
-            "regions" => regions = Some(read_regions(cursor)?),
-            "faceZone" => {
-                face_zone = Some(cursor.next_required()?);
-                cursor.expect_optional(";")?;
+        match (key.provenance, key.value.as_str()) {
+            (TokenProvenance::Ordinary, "regions") => regions = Some(read_regions(cursor)?),
+            (TokenProvenance::Ordinary, "faceZone") => {
+                face_zone = Some(read_ordinary_scalar(
+                    cursor,
+                    "faceZone value must be an ordinary token",
+                )?);
+                cursor.expect(";")?;
             }
-            "orientation" => {
-                orientation = Some(cursor.next_required()?);
-                cursor.expect_optional(";")?;
+            (TokenProvenance::Ordinary, "orientation") => {
+                orientation = Some(read_ordinary_scalar(
+                    cursor,
+                    "orientation value must be an ordinary token",
+                )?);
+                cursor.expect(";")?;
             }
-            "model" => {
-                model = Some(cursor.next_required()?);
-                cursor.expect_optional(";")?;
+            (TokenProvenance::Ordinary, "model") => {
+                model = Some(read_ordinary_scalar(
+                    cursor,
+                    "model value must be an ordinary token",
+                )?);
+                cursor.expect(";")?;
             }
-            _ => cursor.skip_value_or_block()?,
+            _ => cursor.skip_exact_value_or_block()?,
         }
     }
+    let Some(region_tokens) = regions else {
+        return cursor.reject_current_as("missing ordinary 'regions' in interface entry");
+    };
+    let Some(raw_orientation) = orientation else {
+        return cursor.reject_current_as("missing ordinary 'orientation' in interface entry");
+    };
+    let Some(face_zone) = face_zone else {
+        return cursor.reject_current_as("missing ordinary 'faceZone' in interface entry");
+    };
+    let orientation = parse_orientation(cursor, &raw_orientation, &region_tokens)?;
+    let model = match model {
+        Some(token) => token.value,
+        None => copy_string(cursor, "none", "default interface model allocation failed")?,
+    };
+    let [first_region, second_region] = region_tokens;
+    let regions = [first_region.value, second_region.value];
     cursor.expect("}")?;
-
-    let regions = regions.ok_or_else(|| missing_key(cursor.path(), &name, "regions"))?;
-    let raw_orientation =
-        orientation.ok_or_else(|| missing_key(cursor.path(), &name, "orientation"))?;
-    let orientation = parse_orientation(&raw_orientation.value, &regions, cursor.path())?;
-    let face_zone = face_zone.ok_or_else(|| missing_key(cursor.path(), &name, "faceZone"))?;
 
     Ok(InterfaceConfigEntry {
         name,
         regions,
         face_zone: face_zone.value,
         orientation,
-        model: model.map_or_else(|| "none".to_string(), |token| token.value),
+        model,
     })
 }
 
-fn read_regions(cursor: &mut TokenCursor) -> Result<[String; 2]> {
+fn read_regions(cursor: &mut TokenCursor) -> Result<[Token; 2]> {
     cursor.expect("(")?;
-    let mut values = Vec::new();
-    while cursor.peek()?.is_none_or(|token| token.value != ")") {
-        values.push(cursor.next_required()?.value);
+    let first = read_ordinary_scalar(cursor, "regions must contain exactly two ordinary entries")?;
+    if cursor.peek()?.is_some_and(|token| {
+        token.provenance == TokenProvenance::Ordinary && token.value == first.value
+    }) {
+        return cursor.reject_current_as("regions must name two different ordinary entries");
+    }
+    let second = read_ordinary_scalar(cursor, "regions must contain exactly two ordinary entries")?;
+    if !peek_structural(cursor, ")")? {
+        return cursor.reject_current_as("regions must contain exactly two ordinary entries");
     }
     cursor.expect(")")?;
-    cursor.expect_optional(";")?;
+    cursor.expect(";")?;
 
-    if values.len() != 2 {
-        return Err(MeshError::InvalidInput(format!(
-            "regions must contain exactly two entries in {}",
-            cursor.path().display()
-        )));
+    Ok([first, second])
+}
+
+fn read_ordinary_scalar(cursor: &mut TokenCursor, detail: &'static str) -> Result<Token> {
+    if !cursor
+        .peek()?
+        .is_some_and(|token| token.provenance == TokenProvenance::Ordinary)
+    {
+        return cursor.reject_current_as(detail);
     }
+    cursor.next_required()
+}
 
-    Ok([values[0].clone(), values[1].clone()])
+fn peek_structural(cursor: &mut TokenCursor, value: &str) -> Result<bool> {
+    Ok(cursor.peek()?.is_some_and(|token| {
+        token.provenance == TokenProvenance::Structural && token.value == value
+    }))
 }
 
 fn parse_orientation(
-    value: &str,
-    regions: &[String; 2],
-    path: &Path,
+    cursor: &mut TokenCursor,
+    orientation: &Token,
+    regions: &[Token; 2],
 ) -> Result<InterfaceOrientation> {
-    let first_to_second = format!("{}_to_{}", regions[0], regions[1]);
-    if value == first_to_second {
-        return Ok(InterfaceOrientation {
-            positive_from: regions[0].clone(),
-            positive_to: regions[1].clone(),
-        });
-    }
+    let (from, to) =
+        if orientation_matches(&orientation.value, &regions[0].value, &regions[1].value) {
+            (&regions[0].value, &regions[1].value)
+        } else if orientation_matches(&orientation.value, &regions[1].value, &regions[0].value) {
+            (&regions[1].value, &regions[0].value)
+        } else {
+            return cursor.reject_line_as(
+                orientation.line,
+                "orientation must match the declared ordinary region order",
+            );
+        };
 
-    let second_to_first = format!("{}_to_{}", regions[1], regions[0]);
-    if value == second_to_first {
-        return Ok(InterfaceOrientation {
-            positive_from: regions[1].clone(),
-            positive_to: regions[0].clone(),
-        });
-    }
-
-    Err(MeshError::InvalidInput(format!(
-        "orientation '{}' in {} must be '{}' or '{}'",
-        value,
-        path.display(),
-        first_to_second,
-        second_to_first
-    )))
+    Ok(InterfaceOrientation {
+        positive_from: copy_string(
+            cursor,
+            from,
+            "interface orientation source allocation failed",
+        )?,
+        positive_to: copy_string(
+            cursor,
+            to,
+            "interface orientation destination allocation failed",
+        )?,
+    })
 }
 
 fn same_region_pair(left: &str, right: &str, pair: &[String; 2]) -> bool {
     (left == pair[0] && right == pair[1]) || (left == pair[1] && right == pair[0])
 }
 
-fn missing_key(path: &Path, entry: &str, key: &str) -> MeshError {
-    MeshError::InvalidInput(format!(
-        "missing '{key}' in interface '{entry}' in {}",
-        path.display()
-    ))
+fn orientation_matches(value: &str, from: &str, to: &str) -> bool {
+    value
+        .strip_prefix(from)
+        .and_then(|suffix| suffix.strip_prefix("_to_"))
+        == Some(to)
+}
+
+fn copy_string(cursor: &mut TokenCursor, value: &str, detail: &'static str) -> Result<String> {
+    let mut copy = String::new();
+    if copy.try_reserve(value.len()).is_err() {
+        return cursor.reject_current_as(detail);
+    }
+    copy.push_str(value);
+    Ok(copy)
+}
+
+fn copy_path(cursor: &mut TokenCursor) -> Result<PathBuf> {
+    let required = cursor.path().as_os_str().len();
+    let mut copy = PathBuf::new();
+    if copy.try_reserve(required).is_err() {
+        return cursor.reject_current_as("interface path allocation failed");
+    }
+    copy.push(cursor.path());
+    Ok(copy)
 }
 
 #[cfg(test)]
@@ -275,10 +377,40 @@ mod tests {
     use std::path::Path;
 
     use super::parse_interface_config_str;
+    use crate::MeshError;
+
+    const FIXTURE: &str = "fixture/interfaces";
+
+    fn assert_parse(content: &str, line: usize, detail: &str) {
+        let error = parse_interface_config_str(content, Path::new(FIXTURE)).unwrap_err();
+        let expected_message = format!("{FIXTURE}: {detail}");
+        match &error {
+            MeshError::Parse {
+                line: actual_line,
+                message,
+            } => {
+                assert_eq!(*actual_line, line);
+                assert_eq!(message, &expected_message);
+            }
+            other => panic!("expected Parse error, got {other:?}"),
+        }
+        assert_eq!(
+            error.to_string(),
+            format!("line {line}: {expected_message}")
+        );
+        assert_eq!(error.to_string().matches(FIXTURE).count(), 1);
+    }
+
+    fn entry_with_regions(regions: &str) -> String {
+        format!(
+            "interfaces {{ membrane {{ regions {regions} faceZone membrane_wall; orientation fluid_to_solid; }} }}"
+        )
+    }
 
     #[test]
     fn parses_positive_orientation_as_sign_convention() {
         let content = r#"
+        "FoamFile" { ignored interfaces; }
         FoamFile
         {
             version 2.0;
@@ -298,7 +430,8 @@ mod tests {
         }
         "#;
 
-        let config = parse_interface_config_str(content, Path::new("interfaces")).unwrap();
+        let config = parse_interface_config_str(content, Path::new(FIXTURE)).unwrap();
+        assert_eq!(config.path, Path::new(FIXTURE));
         assert_eq!(config.entries.len(), 1);
         assert_eq!(config.entries[0].orientation.positive_from, "fluid");
         assert_eq!(config.entries[0].orientation.positive_to, "solid");
@@ -312,16 +445,220 @@ mod tests {
         {
             membrane
             {
-                regions (retentate permeate);
-                faceZone membrane_wall;
                 orientation permeate_to_retentate;
+                "model" ignored;
+                faceZone membrane_wall;
+                regions (retentate permeate);
             }
         }
         "#;
 
-        let config = parse_interface_config_str(content, Path::new("interfaces")).unwrap();
+        let config = parse_interface_config_str(content, Path::new(FIXTURE)).unwrap();
         assert_eq!(config.entries[0].orientation.positive_from, "permeate");
         assert_eq!(config.entries[0].orientation.positive_to, "retentate");
         assert_eq!(config.entries[0].model, "none");
+    }
+
+    #[test]
+    fn requires_exactly_one_ordinary_interfaces_block() {
+        assert_parse(
+            "FoamFile { class dictionary; }",
+            1,
+            "missing ordinary 'interfaces' block",
+        );
+        assert_parse(
+            r#""interfaces" { ignored value; }"#,
+            1,
+            "missing ordinary 'interfaces' block",
+        );
+        assert_parse(
+            "interfaces {} \"interfaces\" {} interfaces {}",
+            1,
+            "duplicate ordinary 'interfaces' block",
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_interface_names_and_required_keys() {
+        assert_parse(
+            "interfaces { shared { regions (fluid solid); faceZone first; orientation fluid_to_solid; } shared { regions (fluid solid); faceZone second; orientation fluid_to_solid; } }",
+            1,
+            "duplicate interface name",
+        );
+
+        for duplicate in [
+            "regions (fluid solid); regions (fluid solid);",
+            "faceZone first; faceZone second;",
+            "orientation fluid_to_solid; orientation solid_to_fluid;",
+            "model heatTransfer; model none;",
+        ] {
+            let content = format!(
+                "interfaces {{ shared {{ regions (fluid solid); faceZone first; orientation fluid_to_solid; {duplicate} }} }}"
+            );
+            assert_parse(&content, 1, "duplicate interface entry key");
+        }
+    }
+
+    #[test]
+    fn regions_are_exactly_two_ordinary_tokens_with_a_semicolon() {
+        for regions in [
+            "();",
+            "(fluid);",
+            "(fluid solid gas);",
+            "(fluid \"solid\");",
+        ] {
+            assert_parse(
+                &entry_with_regions(regions),
+                1,
+                "regions must contain exactly two ordinary entries",
+            );
+        }
+
+        assert_parse(
+            &entry_with_regions("(fluid fluid);"),
+            1,
+            "regions must name two different ordinary entries",
+        );
+        assert_parse(
+            &entry_with_regions("(fluid solid)"),
+            1,
+            "unexpected dictionary token",
+        );
+    }
+
+    #[test]
+    fn required_keys_and_scalar_values_are_provenance_safe_and_terminated() {
+        for (entry, detail) in [
+            (
+                r#""regions" (fluid solid); faceZone membrane_wall; orientation fluid_to_solid;"#,
+                "missing ordinary 'regions' in interface entry",
+            ),
+            (
+                r#"regions (fluid solid); "faceZone" membrane_wall; orientation fluid_to_solid;"#,
+                "missing ordinary 'faceZone' in interface entry",
+            ),
+            (
+                r#"regions (fluid solid); faceZone membrane_wall; "orientation" fluid_to_solid;"#,
+                "missing ordinary 'orientation' in interface entry",
+            ),
+        ] {
+            assert_parse(
+                &format!("interfaces {{ membrane {{ {entry} }} }}"),
+                1,
+                detail,
+            );
+        }
+
+        for (entry, detail) in [
+            (
+                r#"regions (fluid solid); faceZone "membrane_wall"; orientation fluid_to_solid;"#,
+                "faceZone value must be an ordinary token",
+            ),
+            (
+                r#"regions (fluid solid); faceZone membrane_wall; orientation "fluid_to_solid";"#,
+                "orientation value must be an ordinary token",
+            ),
+            (
+                r#"regions (fluid solid); faceZone membrane_wall; orientation fluid_to_solid; model "transport";"#,
+                "model value must be an ordinary token",
+            ),
+        ] {
+            assert_parse(
+                &format!("interfaces {{ membrane {{ {entry} }} }}"),
+                1,
+                detail,
+            );
+        }
+
+        for entry in [
+            "regions (fluid solid); faceZone membrane_wall orientation fluid_to_solid;",
+            "regions (fluid solid); faceZone membrane_wall; orientation fluid_to_solid",
+            "regions (fluid solid); faceZone membrane_wall; orientation fluid_to_solid; model transport",
+        ] {
+            assert_parse(
+                &format!("interfaces {{ membrane {{ {entry} }} }}"),
+                1,
+                "unexpected dictionary token",
+            );
+        }
+
+        assert_parse(
+            "interfaces {\nmembrane {\norientation wrong_order;\nregions (fluid solid);\nfaceZone membrane_wall;\n}\n}",
+            3,
+            "orientation must match the declared ordinary region order",
+        );
+        assert_parse(
+            "interfaces {\nmembrane {\norientation wrong_order;\nregions (fluid solid);\n}\n}",
+            5,
+            "missing ordinary 'faceZone' in interface entry",
+        );
+
+        let quoted_optional = parse_interface_config_str(
+            r#"interfaces { membrane { regions (fluid solid); faceZone membrane_wall; orientation fluid_to_solid; "model" transport; } }"#,
+            Path::new(FIXTURE),
+        )
+        .unwrap();
+        assert_eq!(quoted_optional.entries[0].model, "none");
+    }
+
+    #[test]
+    fn exact_unknown_skip_preserves_following_required_sentinels() {
+        let content = r#"
+        preamble { nested (one [two]); }
+        interfaces
+        {
+            membrane
+            {
+                ignoredScalar 17;
+                ignoredGroup (alpha [beta gamma]);
+                ignoredBlock { nested { value 1; } }
+                regions (retentate permeate);
+                faceZone membrane_wall;
+                orientation retentate_to_permeate;
+                model transport;
+            }
+        }
+        trailer finished;
+        "#;
+        let config = parse_interface_config_str(content, Path::new(FIXTURE)).unwrap();
+        assert_eq!(config.entries.len(), 1);
+        assert_eq!(config.entries[0].regions, ["retentate", "permeate"]);
+        assert_eq!(config.entries[0].face_zone, "membrane_wall");
+        assert_eq!(config.entries[0].model, "transport");
+
+        assert_parse(
+            "interfaces { membrane { ignored innocent faceZone hijacked; regions (fluid solid); faceZone membrane_wall; orientation fluid_to_solid; } }",
+            1,
+            "dictionary value is missing a semicolon",
+        );
+        assert_parse(
+            "interfaces { membrane { ignoredGroup (alpha beta) regions (fluid solid); faceZone membrane_wall; orientation fluid_to_solid; } }",
+            1,
+            "dictionary value is missing a semicolon",
+        );
+    }
+
+    #[test]
+    fn structural_punctuation_cannot_be_a_name_or_key() {
+        assert_parse(
+            "interfaces { ; }",
+            1,
+            "interface name must be an ordinary token",
+        );
+        assert_parse(
+            r#"interfaces { "membrane" {} }"#,
+            1,
+            "interface name must be an ordinary token",
+        );
+        assert_parse(
+            "interfaces { membrane { ; } }",
+            1,
+            "interface key must not be structural punctuation",
+        );
+        assert_parse(
+            "interfaces { membrane { regions (fluid solid); faceZone membrane_wall; orientation fluid_to_solid; } } ]",
+            1,
+            "dictionary nesting counter underflow",
+        );
     }
 }

@@ -23,6 +23,10 @@ pub mod streaming {
         pub provenance: TokenProvenance,
     }
 
+    fn unsupported_directive(token: &Token) -> bool {
+        token.provenance == TokenProvenance::Ordinary && token.value.starts_with('#')
+    }
+
     #[derive(Clone)]
     struct Failure {
         line: usize,
@@ -120,6 +124,12 @@ pub mod streaming {
             self.declared
                 .checked_sub(self.committed)
                 .map_or(0, std::convert::identity)
+        }
+
+        pub(crate) fn checked_remaining_bytes(&mut self) -> Result<usize> {
+            self.declared
+                .checked_sub(self.committed)
+                .ok_or_else(|| self.latch(self.line, "dictionary remaining-byte counter underflow"))
         }
 
         pub fn peek(&mut self) -> Result<Option<&Token>> {
@@ -223,13 +233,27 @@ pub mod streaming {
         }
         #[allow(dead_code)]
         pub(crate) fn reject_current(&mut self, detail: &'static str) -> Result<()> {
+            self.reject_current_as(detail)
+        }
+        #[allow(dead_code)]
+        pub(crate) fn reject_current_as<T>(&mut self, detail: &'static str) -> Result<T> {
+            self.reject_at_as(0, detail)
+        }
+        pub(crate) fn reject_line_as<T>(&mut self, line: usize, detail: &'static str) -> Result<T> {
+            if self.failure.is_some() {
+                return Err(self.sticky());
+            }
+            Err(self.latch(line, detail))
+        }
+        #[allow(dead_code)]
+        pub(crate) fn reject_at_as<T>(&mut self, offset: usize, detail: &'static str) -> Result<T> {
             if self.failure.is_some() {
                 return Err(self.sticky());
             }
             let line = self
                 .tokens
                 .as_slice()
-                .first()
+                .get(offset)
                 .map_or(self.eof_line, |token| token.line);
             Err(self.latch(line, detail))
         }
@@ -270,6 +294,9 @@ pub mod streaming {
         }
         pub fn next_required(&mut self) -> Result<Token> {
             match self.next()? {
+                Some(token) if unsupported_directive(&token) => {
+                    Err(self.latch_token(token.line, "unsupported dictionary directive"))
+                }
                 Some(token) => Ok(token),
                 None => Err(self.latch(self.eof_line, "unexpected end of dictionary")),
             }
@@ -322,6 +349,17 @@ pub mod streaming {
             self.read_strict_value()
         }
         pub fn read_strict_value(&mut self) -> Result<Vec<String>> {
+            self.read_strict_value_impl(false)
+        }
+        pub(crate) fn read_provenance_preserving_bare_entry(&mut self) -> Result<Vec<String>> {
+            if self.peek()?.is_some_and(|t| Self::structural(t, ";")) {
+                self.next_required()?;
+                Ok(Vec::new())
+            } else {
+                self.read_strict_value_impl(true)
+            }
+        }
+        fn read_strict_value_impl(&mut self, preserve_quoted: bool) -> Result<Vec<String>> {
             if self
                 .peek()?
                 .is_some_and(|t| Self::structural(t, ";") || Self::closer(t))
@@ -335,7 +373,7 @@ pub mod streaming {
             let mut stack = ['\0'; MAX_DICTIONARY_NESTING];
             let mut depth = 0usize;
             loop {
-                let token = self.next_required()?;
+                let mut token = self.next_required()?;
                 if depth == 0 && Self::structural(&token, ";") {
                     return Ok(values);
                 }
@@ -344,6 +382,19 @@ pub mod streaming {
                 }
                 Self::track_delimiter(&token, &mut stack, &mut depth)
                     .map_err(|detail| self.latch(token.line, detail))?;
+                if preserve_quoted && token.provenance == TokenProvenance::Quoted {
+                    let represented_len = token.value.len().checked_add(2).ok_or_else(|| {
+                        self.latch(token.line, "dictionary token length overflow")
+                    })?;
+                    if represented_len > MAX_TOKEN_BYTES {
+                        return Err(self.latch(token.line, "dictionary token byte limit exceeded"));
+                    }
+                    token.value.try_reserve(2).map_err(|_| {
+                        self.latch(token.line, "dictionary quoted value allocation failed")
+                    })?;
+                    token.value.insert(0, '"');
+                    token.value.push('"');
+                }
                 payload = payload
                     .checked_add(token.value.len())
                     .ok_or_else(|| self.latch(token.line, "dictionary payload length overflow"))?;
@@ -414,6 +465,63 @@ pub mod streaming {
                 Self::track_delimiter(&token, &mut stack, &mut depth)
                     .map_err(|d| self.latch(token.line, d))?;
             }
+        }
+        pub(crate) fn skip_exact_value_or_block(&mut self) -> Result<()> {
+            if self.failure.is_some() {
+                return Err(self.sticky());
+            }
+            let plan = {
+                let tokens = self.tokens.as_slice();
+                (|| -> std::result::Result<(usize, bool), (usize, &'static str)> {
+                    let first = tokens.first().ok_or((0, "dictionary value is missing"))?;
+                    if Self::structural(first, ";") || Self::closer(first) {
+                        return Err((0, "dictionary value is missing"));
+                    }
+                    let braced = Self::structural(first, "{");
+                    let end = if Self::opener(first) {
+                        let mut stack = ['\0'; MAX_DICTIONARY_NESTING];
+                        let mut depth = 0usize;
+                        let mut result = None;
+                        for (index, token) in tokens.iter().enumerate() {
+                            if let Err(detail) =
+                                Self::track_delimiter(token, &mut stack, &mut depth)
+                            {
+                                result = Some(Err((index, detail)));
+                                break;
+                            }
+                            if depth == 0 {
+                                result = Some(
+                                    index
+                                        .checked_add(1)
+                                        .ok_or((index, "dictionary index overflow")),
+                                );
+                                break;
+                            }
+                        }
+                        result.unwrap_or(Err((tokens.len(), "unterminated dictionary group")))?
+                    } else {
+                        1
+                    };
+                    let has_terminator = tokens
+                        .get(end)
+                        .is_some_and(|token| Self::structural(token, ";"));
+                    if !braced && !has_terminator {
+                        return Err((end, "dictionary value is missing a semicolon"));
+                    }
+                    Ok((end, has_terminator))
+                })()
+            };
+            let (end, has_terminator) = match plan {
+                Ok(value) => value,
+                Err((offset, detail)) => return self.reject_at_as(offset, detail),
+            };
+            for _ in 0..end {
+                self.next_required()?;
+            }
+            if has_terminator {
+                self.next_required()?;
+            }
+            Ok(())
         }
         fn is_syntax(value: &str) -> bool {
             matches!(value, "{" | "}" | "(" | ")" | "[" | "]" | ";")
@@ -534,9 +642,162 @@ pub mod streaming {
 
         pub fn next_required(&mut self) -> Result<Token> {
             match self.next()? {
+                Some(token) if unsupported_directive(&token) => {
+                    Err(self.latch(token.line, "unsupported dictionary directive"))
+                }
                 Some(token) => Ok(token),
                 None => Err(self.latch(self.line, "unexpected end of dictionary")),
             }
+        }
+
+        pub(crate) fn expect_optional(&mut self, expected: &str) -> Result<bool> {
+            let provenance = if Self::is_syntax(expected) {
+                TokenProvenance::Structural
+            } else {
+                TokenProvenance::Ordinary
+            };
+            let matches = self
+                .peek()?
+                .is_some_and(|token| token.value == expected && token.provenance == provenance);
+            if matches {
+                self.next_required()?;
+            }
+            Ok(matches)
+        }
+
+        pub(crate) fn reject_current_as<T>(&mut self, detail: &'static str) -> Result<T> {
+            if self.failure.is_some() {
+                return Err(self.sticky());
+            }
+            let eof_line = self.line;
+            let line = self.peek()?.map_or(eof_line, |token| token.line);
+            Err(self.latch(line, detail))
+        }
+
+        pub(crate) fn reject_line_as<T>(&mut self, line: usize, detail: &'static str) -> Result<T> {
+            if self.failure.is_some() {
+                return Err(self.sticky());
+            }
+            Err(self.latch(line, detail))
+        }
+
+        pub(crate) fn discard_exact_value_or_block(&mut self) -> Result<()> {
+            let first = self.next_required()?;
+            if Self::token_is(&first, ";") || Self::token_closer(&first) {
+                return self.reject_line_as(first.line, "dictionary value is missing");
+            }
+
+            if Self::token_opener(&first) {
+                let braced = Self::token_is(&first, "{");
+                let mut stack = ['\0'; MAX_DICTIONARY_NESTING];
+                let mut depth = 0usize;
+                Self::track_token_delimiter(&first, &mut stack, &mut depth)
+                    .map_err(|detail| self.latch(first.line, detail))?;
+                while depth != 0 {
+                    let token = self.next_required()?;
+                    Self::track_token_delimiter(&token, &mut stack, &mut depth)
+                        .map_err(|detail| self.latch(token.line, detail))?;
+                }
+                if braced {
+                    self.expect_optional(";")?;
+                    return Ok(());
+                }
+                if !self.peek()?.is_some_and(|token| Self::token_is(token, ";")) {
+                    return self.reject_current_as("dictionary value is missing a semicolon");
+                }
+                self.next_required()?;
+                return Ok(());
+            }
+
+            if first.provenance == TokenProvenance::Structural {
+                return self.reject_line_as(first.line, "dictionary value is missing");
+            }
+            if !self.peek()?.is_some_and(|token| Self::token_is(token, ";")) {
+                return self.reject_current_as("dictionary value is missing a semicolon");
+            }
+            self.next_required()?;
+            Ok(())
+        }
+
+        pub(crate) fn discard_semicolon_terminated_value_or_block(&mut self) -> Result<()> {
+            let first = self.next_required()?;
+            if Self::token_is(&first, ";") || Self::token_closer(&first) {
+                return self.reject_line_as(first.line, "dictionary value is missing");
+            }
+
+            if Self::token_is(&first, "{") {
+                let mut stack = ['\0'; MAX_DICTIONARY_NESTING];
+                let mut depth = 0usize;
+                Self::track_token_delimiter(&first, &mut stack, &mut depth)
+                    .map_err(|detail| self.latch(first.line, detail))?;
+                while depth != 0 {
+                    let token = self.next_required()?;
+                    Self::track_token_delimiter(&token, &mut stack, &mut depth)
+                        .map_err(|detail| self.latch(token.line, detail))?;
+                }
+                self.expect_optional(";")?;
+                return Ok(());
+            }
+
+            let mut stack = ['\0'; MAX_DICTIONARY_NESTING];
+            let mut depth = 0usize;
+            Self::track_token_delimiter(&first, &mut stack, &mut depth)
+                .map_err(|detail| self.latch(first.line, detail))?;
+            loop {
+                let token = self.next_required()?;
+                if depth == 0 && Self::token_is(&token, ";") {
+                    return Ok(());
+                }
+                if depth == 0 && Self::token_closer(&token) {
+                    return self
+                        .reject_line_as(token.line, "dictionary value is missing a semicolon");
+                }
+                Self::track_token_delimiter(&token, &mut stack, &mut depth)
+                    .map_err(|detail| self.latch(token.line, detail))?;
+            }
+        }
+
+        fn is_syntax(value: &str) -> bool {
+            matches!(value, "{" | "}" | "(" | ")" | "[" | "]" | ";")
+        }
+
+        fn token_is(token: &Token, value: &str) -> bool {
+            token.provenance == TokenProvenance::Structural && token.value == value
+        }
+
+        fn token_opener(token: &Token) -> bool {
+            token.provenance == TokenProvenance::Structural
+                && matches!(token.value.as_str(), "{" | "(" | "[")
+        }
+
+        fn token_closer(token: &Token) -> bool {
+            token.provenance == TokenProvenance::Structural
+                && matches!(token.value.as_str(), "}" | ")" | "]")
+        }
+
+        fn track_token_delimiter(
+            token: &Token,
+            stack: &mut [char; MAX_DICTIONARY_NESTING],
+            depth: &mut usize,
+        ) -> std::result::Result<(), &'static str> {
+            if Self::token_opener(token) {
+                if *depth == MAX_DICTIONARY_NESTING {
+                    return Err("dictionary nesting limit exceeded");
+                }
+                stack[*depth] = token.value.as_bytes()[0] as char;
+                *depth = (*depth)
+                    .checked_add(1)
+                    .ok_or("dictionary nesting counter overflow")?;
+            } else if Self::token_closer(token) {
+                let top = (*depth)
+                    .checked_sub(1)
+                    .ok_or("unexpected dictionary closing delimiter")?;
+                if !Self::matching(stack[top], token.value.as_bytes()[0] as char) {
+                    return Err("mismatched dictionary delimiter");
+                }
+                *depth = top;
+            }
+            Ok(())
         }
 
         pub fn into_batch(mut self) -> Result<TokenBatch> {
@@ -1318,6 +1579,31 @@ pub mod streaming {
                     .unwrap()
                     .is_empty()
             );
+
+            let exact_payload = "a".repeat(MAX_TOKEN_BYTES - 2);
+            let exact_fixture = format!("\"{exact_payload}\";");
+            let exact = super::tokenize(Path::new("quoted-exact"), &exact_fixture)
+                .unwrap()
+                .into_cursor()
+                .read_provenance_preserving_bare_entry()
+                .unwrap();
+            assert_eq!(exact.len(), 1);
+            assert_eq!(exact[0].len(), MAX_TOKEN_BYTES);
+            assert!(exact[0].starts_with('"'));
+            assert!(exact[0].ends_with('"'));
+
+            let over_payload = "a".repeat(MAX_TOKEN_BYTES - 1);
+            let over_fixture = format!("\"{over_payload}\";");
+            let mut over = super::tokenize(Path::new("quoted-over"), &over_fixture)
+                .unwrap()
+                .into_cursor();
+            let first = over.read_provenance_preserving_bare_entry().unwrap_err();
+            assert_parse(
+                &first,
+                1,
+                "quoted-over: dictionary token byte limit exceeded",
+            );
+            assert_eq!(over.next().unwrap_err().to_string(), first.to_string());
         }
 
         #[test]
@@ -1330,12 +1616,68 @@ pub mod streaming {
         }
 
         #[test]
+        fn unsupported_directives_are_line_aware_and_sticky() {
+            let mut streaming = source(b"\n#include \"initialConditions\"\n");
+            let first = streaming.next_required().unwrap_err();
+            assert_parse(&first, 2, "fixture: unsupported dictionary directive");
+            assert_eq!(
+                streaming.next_required().unwrap_err().to_string(),
+                first.to_string()
+            );
+
+            let mut cursor = super::tokenize(Path::new("directive"), "\n#includeFunc residuals\n")
+                .unwrap()
+                .into_cursor();
+            let first = cursor.next_required().unwrap_err();
+            assert_parse(&first, 2, "directive: unsupported dictionary directive");
+            assert_eq!(
+                cursor.next_required().unwrap_err().to_string(),
+                first.to_string()
+            );
+        }
+
+        #[test]
         fn typed_balanced_discard_validates_mixed_delimiters() {
             let mut cursor = super::tokenize(Path::new("typed"), "{([])};")
                 .unwrap()
                 .into_cursor();
             cursor.skip_typed_balanced().unwrap();
             assert!(cursor.next().unwrap().is_none());
+        }
+
+        #[test]
+        fn streaming_semicolon_terminated_discard_is_typed_and_sticky() {
+            for input in [
+                "uniform 0; next;",
+                "(a [b]) tail; next;",
+                "alpha \";\" beta; next;",
+                "{ nested (a [b]); } next;",
+            ] {
+                let mut streaming = source(input.as_bytes());
+                streaming
+                    .discard_semicolon_terminated_value_or_block()
+                    .unwrap();
+                assert_eq!(streaming.next_required().unwrap().value, "next");
+                assert_eq!(streaming.next_required().unwrap().value, ";");
+                assert!(streaming.next().unwrap().is_none());
+            }
+
+            for (input, detail) in [
+                ("uniform 0 }", "dictionary nesting counter underflow"),
+                ("(a];", "mismatched dictionary delimiter"),
+                ("uniform\n#include bad;", "unsupported dictionary directive"),
+            ] {
+                let mut streaming = source(input.as_bytes());
+                let first = streaming
+                    .discard_semicolon_terminated_value_or_block()
+                    .unwrap_err();
+                assert!(first.to_string().contains(detail), "{first}");
+                assert_eq!(
+                    streaming.next_required().unwrap_err().to_string(),
+                    first.to_string()
+                );
+                assert_eq!(first.to_string().matches("fixture").count(), 1);
+            }
         }
 
         #[test]
@@ -1361,6 +1703,34 @@ pub mod streaming {
                 cursor.skip_value_or_block().unwrap();
                 assert_eq!(cursor.next_required().unwrap().value, "next");
             }
+
+            for value in ["scalar; next;", "(a [b]); next;", "[a (b)]; next;"] {
+                let mut cursor = super::tokenize(Path::new("skip-exact"), value)
+                    .unwrap()
+                    .into_cursor();
+                cursor.skip_exact_value_or_block().unwrap();
+                assert_eq!(cursor.next_required().unwrap().value, "next");
+            }
+            for value in ["{ value; } next;", "{ value; }; next;"] {
+                let mut cursor = super::tokenize(Path::new("skip-block"), value)
+                    .unwrap()
+                    .into_cursor();
+                cursor.skip_exact_value_or_block().unwrap();
+                assert_eq!(cursor.next_required().unwrap().value, "next");
+            }
+            for value in ["scalar next;", "(a) next;", "[a] next;"] {
+                let mut cursor = super::tokenize(Path::new("skip-reject"), value)
+                    .unwrap()
+                    .into_cursor();
+                let before = cursor.tokens.as_slice().len();
+                let error = cursor.skip_exact_value_or_block().unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("dictionary value is missing a semicolon")
+                );
+                assert_eq!(cursor.tokens.as_slice().len(), before);
+            }
         }
 
         #[test]
@@ -1385,6 +1755,22 @@ pub mod streaming {
             assert_eq!(current.tokens.as_slice().len(), 2);
             assert_eq!(current.tokens.as_slice()[0].value, "first");
             assert_eq!(current.tokens.as_slice()[1].value, "second");
+
+            let mut explicit = super::tokenize(Path::new("terminal-explicit"), "first\nsecond")
+                .unwrap()
+                .into_cursor();
+            let explicit_error = explicit
+                .reject_line_as::<()>(2, "planned exact-line rejection")
+                .unwrap_err();
+            assert_parse(
+                &explicit_error,
+                2,
+                "terminal-explicit: planned exact-line rejection",
+            );
+            assert_eq!(
+                explicit.next().unwrap_err().to_string(),
+                explicit_error.to_string()
+            );
 
             let mut eof_reserve = super::tokenize(Path::new("terminal-eof-reserve"), "\n\n\n")
                 .unwrap()
@@ -1688,7 +2074,7 @@ pub mod streaming {
 
 pub use streaming::{
     MAX_DICTIONARY_NESTING, MAX_DICTIONARY_PAYLOAD_BYTES, MAX_DICTIONARY_TOKENS, MAX_TOKEN_BYTES,
-    Token, TokenBatch, TokenCursor, TokenProvenance, tokenize, tokenize_reader,
+    Token, TokenBatch, TokenCursor, TokenProvenance, TokenSource, tokenize, tokenize_reader,
 };
 
 #[cfg(test)]

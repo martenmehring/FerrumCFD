@@ -166,33 +166,7 @@ fn parse_control_dict_str(content: &str, path: &Path) -> Result<ControlDict> {
 }
 
 fn skip_control_value(cursor: &mut TokenCursor) -> Result<()> {
-    let balanced = match cursor.peek()? {
-        Some(first) => {
-            if first.provenance == TokenProvenance::Structural
-                && matches!(first.value.as_str(), ";" | "}" | ")" | "]")
-            {
-                return Err(MeshError::InvalidInput(format!(
-                    "unexpected dictionary token in {}",
-                    cursor.path().display()
-                )));
-            }
-            first.provenance == TokenProvenance::Structural
-                && matches!(first.value.as_str(), "{" | "(" | "[")
-        }
-        None => {
-            return Err(MeshError::InvalidInput(format!(
-                "unexpected end of dictionary in {}",
-                cursor.path().display()
-            )));
-        }
-    };
-    if balanced {
-        cursor.skip_typed_balanced()?;
-    } else {
-        cursor.next_required()?;
-        cursor.expect_optional(";")?;
-    }
-    Ok(())
+    cursor.skip_exact_value_or_block()
 }
 
 fn validate_finite_number(label: &str, value: f64, warnings: &mut Vec<String>) {
@@ -384,10 +358,10 @@ mod tests {
     fn quoted_and_unknown_values_preserve_control_sentinels() {
         let control = parse_control_dict_str(
             r#"
-            "application" ignored application ferrumRun;
+            "application" ignored; application ferrumRun;
             unknown { deltaT 99; } deltaT 0.25;
-            list (application swallowed) solver fluid;
-            quotedSemi ";" writeInterval 4;
+            list (application swallowed); solver fluid;
+            quotedSemi ";"; writeInterval 4;
             "#,
             Path::new("controlDict"),
         )
@@ -402,25 +376,92 @@ mod tests {
     #[test]
     fn unknown_entry_cannot_consume_a_structural_delimiter_as_its_value() {
         let error = parse_control_dict_str("unknown ;", Path::new("controlDict")).unwrap_err();
-        assert!(error.to_string().contains("unexpected dictionary token"));
+        assert!(error.to_string().contains("dictionary value is missing"));
+    }
+
+    #[test]
+    fn openfoam_directives_fail_with_a_specific_source_location() {
+        for directive in [
+            "#include \"initialConditions\"",
+            "#includeFunc residuals",
+            "#include \"initialConditions\";",
+            "#includeFunc residuals;",
+        ] {
+            let content = format!("{directive}\napplication ferrumRun;\n");
+            let error = parse_control_dict_str(&content, Path::new("controlDict"))
+                .expect_err("unresolved directives must fail closed");
+            assert_eq!(
+                error.to_string(),
+                "line 1: controlDict: unsupported dictionary directive"
+            );
+        }
+
+        for quoted in [r##""#include" inert;"##, r##""#includeFunc" inert;"##] {
+            let content = format!("{quoted}\napplication ferrumRun;\n");
+            let control = parse_control_dict_str(&content, Path::new("controlDict"))
+                .expect("quoted directive spelling must remain inert data");
+            assert_eq!(control.application.as_deref(), Some("ferrumRun"));
+        }
+
+        let nested = "unknown { #include \"initialConditions\"; }\napplication ferrumRun;\n";
+        let error = parse_control_dict_str(nested, Path::new("controlDict"))
+            .expect_err("discarded blocks cannot hide unsupported directives");
+        assert_eq!(
+            error.to_string(),
+            "line 1: controlDict: unsupported dictionary directive"
+        );
     }
 
     #[test]
     fn quoted_and_unknown_control_value_matrix_preserves_sentinels() {
         for key in ["unknown", r#""unknown""#] {
-            for value in ["scalar;", "(hidden values);", "{ hidden values; };"] {
+            for value in [
+                "scalar;",
+                r#""quoted scalar";"#,
+                "(hidden values);",
+                "[hidden values];",
+                "{ hidden values; }",
+                "{ hidden values; };",
+            ] {
                 let content = format!("{key} {value} application ferrumRun; deltaT 0.125;");
                 let control = parse_control_dict_str(&content, Path::new("controlDict")).unwrap();
                 assert_eq!(control.application.as_deref(), Some("ferrumRun"));
                 assert_eq!(control.delta_t, Some(0.125));
             }
         }
+    }
 
-        for value in ["(hidden values)", "{ hidden values; }"] {
-            let content = format!(r#""unknown" {value} application ferrumRun; deltaT 0.25;"#);
-            let control = parse_control_dict_str(&content, Path::new("controlDict")).unwrap();
-            assert_eq!(control.application.as_deref(), Some("ferrumRun"));
-            assert_eq!(control.delta_t, Some(0.25));
+    #[test]
+    fn unterminated_control_values_cannot_redispatch_reserved_keys() {
+        for content in [
+            "unknown scalar application ferrumRun;",
+            r#""unknown" "scalar" application ferrumRun;"#,
+            "unknown (hidden values) application ferrumRun;",
+            "unknown [hidden values] application ferrumRun;",
+        ] {
+            let error = parse_control_dict_str(content, Path::new("controlDict"))
+                .expect_err("missing structural semicolon must fail before the sentinel");
+            assert!(
+                error
+                    .to_string()
+                    .contains("dictionary value is missing a semicolon"),
+                "unexpected error for {content:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn known_control_scalars_require_structural_semicolons() {
+        for content in [
+            "application ferrumRun solver incompressibleFluid;",
+            "deltaT 0.5 writeInterval 4;",
+        ] {
+            let error = parse_control_dict_str(content, Path::new("controlDict"))
+                .expect_err("known scalar without semicolon must not redispatch its sentinel");
+            assert!(
+                error.to_string().contains("must be a single value"),
+                "unexpected error for {content:?}: {error}"
+            );
         }
     }
 

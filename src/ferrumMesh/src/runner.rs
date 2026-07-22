@@ -315,6 +315,7 @@ mod tests {
 
     use crate::backends::BackendChoice;
     use crate::control::ControlDict;
+    use crate::fields::InitialFieldSet;
     use crate::runtime::{SolverRuntimeData, SolverRuntimeMeshData};
     use crate::solver_plan::{
         SolverBackendPlan, SolverCasePlan, SolverCpuResourcePlan, SolverDimensionality,
@@ -429,6 +430,10 @@ mod tests {
                 region_meshes: Vec::new(),
             },
             fields: SolverFieldPlan { fields: Vec::new() },
+            initial_fields: InitialFieldSet {
+                case_dir: PathBuf::from("case"),
+                fields: Vec::new(),
+            },
             state: SolverStatePlan {
                 fields: Vec::new(),
                 warnings: Vec::new(),

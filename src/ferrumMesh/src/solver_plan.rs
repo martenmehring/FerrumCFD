@@ -5,7 +5,10 @@ use crate::backends::{
     BackendChoice, read_backend_config, validate_backend_policy, validate_backend_resources,
 };
 use crate::control::{ControlDict, read_control_dict, validate_control_dict};
-use crate::fields::{read_initial_fields, validate_initial_field_boundaries};
+use crate::fields::{
+    FieldLoadPolicy, InitialFieldSet, read_initial_fields_with_policy,
+    validate_initial_field_boundaries,
+};
 use crate::interfaces::{read_interface_config, validate_interface_config};
 use crate::numerics::{
     NumericsSection, format_numerics_value, read_fv_schemes, read_fv_solution, validate_fv_schemes,
@@ -27,6 +30,7 @@ pub struct SolverCasePlan {
     pub control: ControlDict,
     pub mesh: SolverMeshPlan,
     pub fields: SolverFieldPlan,
+    pub initial_fields: InitialFieldSet,
     pub state: SolverStatePlan,
     pub runtime_data: SolverRuntimeData,
     pub properties: SolverPropertiesPlan,
@@ -244,7 +248,17 @@ const BUILT_IN_RUN_STAGES: &[(&str, &str)] = &[
     ("chemistry", "nonlinearSolve"),
 ];
 
+/// Builds a solver-ready plan and loads initial-field payloads. Call
+/// `build_solver_case_plan_with_policy(..., FieldLoadPolicy::Summary)` only
+/// for inspection paths that will not execute the solver.
 pub fn build_solver_case_plan(case_dir: &Path) -> Result<SolverCasePlan> {
+    build_solver_case_plan_with_policy(case_dir, FieldLoadPolicy::Full)
+}
+
+pub fn build_solver_case_plan_with_policy(
+    case_dir: &Path,
+    field_policy: FieldLoadPolicy,
+) -> Result<SolverCasePlan> {
     let control = read_control_dict(case_dir)?;
     let mut warnings = Vec::new();
     let control_validation = validate_control_dict(&control);
@@ -279,23 +293,24 @@ pub fn build_solver_case_plan(case_dir: &Path) -> Result<SolverCasePlan> {
         }
     };
 
-    let fields = read_initial_fields(case_dir)?;
+    let mut fields = read_initial_fields_with_policy(case_dir, field_policy)?;
     validate_openfoam_case_structure(case_dir, &fields, &mut warnings);
-    let field_validation = validate_initial_field_boundaries(case_dir, &fields);
+    let field_validation = validate_initial_field_boundaries(case_dir, &fields)?;
     warnings.extend(
         field_validation
             .warnings
             .iter()
             .map(|warning| format!("field boundary: {warning}")),
     );
-    let state = build_solver_state_plan(case_dir, &fields);
+    let state = build_solver_state_plan(case_dir, &fields)?;
     warnings.extend(
         state
             .warnings
             .iter()
             .map(|warning| format!("solver state: {warning}")),
     );
-    let runtime_data = build_solver_runtime_data(case_dir, &mesh, &state)?;
+    let runtime_data =
+        build_solver_runtime_data(case_dir, &mesh, &state, &mut fields, field_policy)?;
     warnings.extend(
         runtime_data
             .warnings
@@ -354,22 +369,14 @@ pub fn build_solver_case_plan(case_dir: &Path) -> Result<SolverCasePlan> {
         );
     }
 
+    let field_plan = build_solver_field_plan(&fields)?;
+
     Ok(SolverCasePlan {
         case_dir: case_dir.to_path_buf(),
         control,
         mesh: build_mesh_plan(&mesh, &patch_validation, region_meshes),
-        fields: SolverFieldPlan {
-            fields: fields
-                .fields
-                .into_iter()
-                .map(|field| SolverFieldEntryPlan {
-                    region: field.region,
-                    name: field.name,
-                    class_name: field.class_name,
-                    boundary_patches: field.boundary_patches.len(),
-                })
-                .collect(),
-        },
+        fields: field_plan,
+        initial_fields: fields,
         state,
         runtime_data,
         properties,
@@ -379,6 +386,37 @@ pub fn build_solver_case_plan(case_dir: &Path) -> Result<SolverCasePlan> {
         run,
         warnings,
     })
+}
+
+fn build_solver_field_plan(fields: &InitialFieldSet) -> Result<SolverFieldPlan> {
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(fields.fields.len())
+        .map_err(|_| {
+            crate::MeshError::InvalidInput("solver field plan allocation failed".to_string())
+        })?;
+    for field in &fields.fields {
+        entries.push(SolverFieldEntryPlan {
+            region: try_clone_optional_string(field.region.as_deref())?,
+            name: try_clone_plan_string(&field.name)?,
+            class_name: try_clone_optional_string(field.class_name.as_deref())?,
+            boundary_patches: field.boundary_patches.len(),
+        });
+    }
+    Ok(SolverFieldPlan { fields: entries })
+}
+
+fn try_clone_plan_string(value: &str) -> Result<String> {
+    let mut cloned = String::new();
+    cloned.try_reserve_exact(value.len()).map_err(|_| {
+        crate::MeshError::InvalidInput("solver plan string allocation failed".to_string())
+    })?;
+    cloned.push_str(value);
+    Ok(cloned)
+}
+
+fn try_clone_optional_string(value: Option<&str>) -> Result<Option<String>> {
+    value.map(try_clone_plan_string).transpose()
 }
 
 fn validate_openfoam_case_structure(
@@ -918,18 +956,21 @@ fn resolve_stage_backend(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::ops::Deref;
     use std::path::Path;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::backends::BackendChoice;
     use crate::control::ControlDict;
-    use crate::fields::{FieldFile, InitialFieldSet};
+    use crate::fields::{FieldFile, FieldLoadPolicy, FieldValueSummary, InitialFieldSet};
     use crate::patches::PatchValidationSummary;
+    use crate::solver_state::SolverStateCpuBufferStatus;
 
     use super::{
         SolverBackendPlan, SolverBackendStagePlan, SolverCpuResourcePlan, SolverDimensionality,
-        SolverGpuResourcePlan, SolverRunStageSource, build_run_plan, classify_dimensionality,
+        SolverGpuResourcePlan, SolverRunStageSource, build_run_plan, build_solver_case_plan,
+        build_solver_case_plan_with_policy, classify_dimensionality,
         validate_openfoam_case_structure,
     };
 
@@ -1031,7 +1072,7 @@ mod tests {
         let case_dir = create_temp_case_dir("missing-openfoam-structure");
         let mut warnings = Vec::new();
         let fields = InitialFieldSet {
-            case_dir: case_dir.clone(),
+            case_dir: case_dir.to_path_buf(),
             fields: Vec::new(),
         };
 
@@ -1063,7 +1104,7 @@ mod tests {
             "incomplete constant/polyMesh (faces/owner/neighbour)"
         ));
 
-        cleanup_temp_case_dir(&case_dir);
+        case_dir.cleanup();
     }
 
     #[test]
@@ -1083,7 +1124,7 @@ mod tests {
         write_file(&case_dir.join("constant/polyMesh/neighbour"), "");
 
         let fields = InitialFieldSet {
-            case_dir: case_dir.clone(),
+            case_dir: case_dir.to_path_buf(),
             fields: vec![
                 FieldFile {
                     path: case_dir.join("0/U"),
@@ -1115,7 +1156,130 @@ mod tests {
             compatibility
         );
 
-        cleanup_temp_case_dir(&case_dir);
+        case_dir.cleanup();
+    }
+
+    #[test]
+    fn public_solver_plan_is_full_while_explicit_summary_is_inspection_only() {
+        let case_dir = create_temp_case_dir("public-field-load-policy");
+        write_solver_ready_case(&case_dir);
+
+        let solver_plan = build_solver_case_plan(&case_dir)
+            .expect("the public solver-plan builder should produce solver-ready runtime data");
+        let velocity = solver_plan
+            .runtime_data
+            .fields
+            .iter()
+            .find(|field| field.region.is_none() && field.name == "U")
+            .expect("runtime velocity field");
+        let pressure = solver_plan
+            .runtime_data
+            .fields
+            .iter()
+            .find(|field| field.region.is_none() && field.name == "p")
+            .expect("runtime pressure field");
+        assert_eq!(velocity.values.as_deref(), Some(&[1.0, 2.0, 3.0][..]));
+        assert_eq!(pressure.values.as_deref(), Some(&[7.0][..]));
+
+        let summary_plan = build_solver_case_plan_with_policy(&case_dir, FieldLoadPolicy::Summary)
+            .expect("the explicit summary policy should retain inspection descriptors");
+        assert_eq!(
+            summary_plan.fields.fields.len(),
+            solver_plan.fields.fields.len()
+        );
+        assert!(
+            summary_plan
+                .initial_fields
+                .fields
+                .iter()
+                .all(|field| matches!(
+                    field.internal_field,
+                    Some(FieldValueSummary::NonUniform { values: None, .. })
+                )),
+            "summary plans should retain field metadata without loading payloads"
+        );
+        assert!(summary_plan.state.fields.iter().all(|field| {
+            field.cpu_buffer.status == SolverStateCpuBufferStatus::NonUniformDataNotLoaded
+                && !field.cpu_buffer.materializable
+        }));
+        assert_eq!(
+            summary_plan.runtime_data.fields.len(),
+            solver_plan.runtime_data.fields.len()
+        );
+        assert!(
+            summary_plan
+                .runtime_data
+                .fields
+                .iter()
+                .all(|field| field.values.is_none())
+        );
+        assert!(summary_plan.runtime_data.warnings.is_empty());
+
+        case_dir.cleanup();
+    }
+
+    #[test]
+    fn solver_plan_accepts_standard_openfoam_auxiliary_boundary_entries() {
+        let case_dir = create_temp_case_dir("openfoam-auxiliary-boundary-entries");
+        write_solver_ready_case(&case_dir);
+        write_file(
+            &case_dir.join("0/U"),
+            r#"
+            FoamFile { class volVectorField; object U; }
+            dimensions [0 1 -1 0 0 0 0];
+            internalField nonuniform vectorField 1 ((1 2 3));
+            boundaryField
+            {
+                walls
+                {
+                    type mixed;
+                    refValue uniform (0 0 0);
+                    refGradient uniform (0 0 0);
+                    valueFraction uniform 1;
+                    value uniform (0 0 0);
+                }
+            }
+            "#,
+        );
+        write_file(
+            &case_dir.join("0/p"),
+            r#"
+            FoamFile { class volScalarField; object p; }
+            dimensions [1 -1 -2 0 0 0 0];
+            internalField nonuniform scalarField 1 (7);
+            boundaryField
+            {
+                walls
+                {
+                    type fixedGradient;
+                    gradient uniform 0;
+                }
+            }
+            "#,
+        );
+
+        let full = build_solver_case_plan(&case_dir)
+            .expect("full solver planning must accept OpenFOAM auxiliary patch entries");
+        assert_eq!(full.runtime_data.fields.len(), 2);
+        assert!(
+            full.runtime_data
+                .fields
+                .iter()
+                .all(|field| field.values.is_some())
+        );
+
+        let summary = build_solver_case_plan_with_policy(&case_dir, FieldLoadPolicy::Summary)
+            .expect("summary planning must accept OpenFOAM auxiliary patch entries");
+        assert_eq!(summary.runtime_data.fields.len(), 2);
+        assert!(
+            summary
+                .runtime_data
+                .fields
+                .iter()
+                .all(|field| field.values.is_none())
+        );
+
+        case_dir.cleanup();
     }
 
     fn patch_summary(empty_patches: usize, wedge_patches: usize) -> PatchValidationSummary {
@@ -1186,7 +1350,31 @@ mod tests {
         }
     }
 
-    fn create_temp_case_dir(name: &str) -> PathBuf {
+    struct TempCaseDir {
+        path: PathBuf,
+    }
+
+    impl TempCaseDir {
+        fn cleanup(self) {
+            fs::remove_dir_all(&self.path).expect("temporary case cleanup");
+        }
+    }
+
+    impl Deref for TempCaseDir {
+        type Target = Path;
+
+        fn deref(&self) -> &Self::Target {
+            &self.path
+        }
+    }
+
+    impl Drop for TempCaseDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn create_temp_case_dir(name: &str) -> TempCaseDir {
         let mut path = std::env::temp_dir();
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1194,17 +1382,105 @@ mod tests {
             .as_nanos();
         path.push(format!("ferrum-openfoam-test-{}-{}", name, nanos));
         fs::create_dir_all(&path).expect("temporary case dir");
-        path
+        TempCaseDir { path }
+    }
+
+    fn write_solver_ready_case(case_dir: &Path) {
+        write_file(
+            &case_dir.join("system/controlDict"),
+            r#"
+            FoamFile { class dictionary; object controlDict; }
+            application ferrumRun;
+            solver incompressibleFluid;
+            startFrom startTime;
+            startTime 0;
+            stopAt endTime;
+            endTime 1;
+            deltaT 1;
+            writeControl timeStep;
+            writeInterval 1;
+            "#,
+        );
+        write_file(
+            &case_dir.join("system/fvSchemes"),
+            r#"
+            FoamFile { class dictionary; object fvSchemes; }
+            ddtSchemes { default steadyState; }
+            gradSchemes { default Gauss linear; }
+            divSchemes { default none; }
+            laplacianSchemes { default Gauss linear corrected; }
+            interpolationSchemes { default linear; }
+            snGradSchemes { default corrected; }
+            "#,
+        );
+        write_file(
+            &case_dir.join("system/fvSolution"),
+            r#"
+            FoamFile { class dictionary; object fvSolution; }
+            solvers
+            {
+                p { solver PCG; preconditioner DIC; tolerance 1e-10; relTol 0; }
+                U { solver smoothSolver; smoother symGaussSeidel; tolerance 1e-10; relTol 0; }
+            }
+            SIMPLE { nNonOrthogonalCorrectors 0; consistent false; }
+            "#,
+        );
+        write_file(
+            &case_dir.join("constant/transportProperties"),
+            r#"
+            FoamFile { class dictionary; object transportProperties; }
+            transportModel Newtonian;
+            nu [0 2 -1 0 0 0 0] 1e-5;
+            rho [1 -3 0 0 0 0 0] 1;
+            "#,
+        );
+        write_file(
+            &case_dir.join("constant/polyMesh/points"),
+            "8\n(\n(0 0 0)\n(1 0 0)\n(1 1 0)\n(0 1 0)\n(0 0 1)\n(1 0 1)\n(1 1 1)\n(0 1 1)\n)\n",
+        );
+        write_file(
+            &case_dir.join("constant/polyMesh/faces"),
+            "6\n(\n4(0 3 2 1)\n4(4 5 6 7)\n4(0 1 5 4)\n4(1 2 6 5)\n4(2 3 7 6)\n4(3 0 4 7)\n)\n",
+        );
+        write_file(
+            &case_dir.join("constant/polyMesh/owner"),
+            "6\n(\n0\n0\n0\n0\n0\n0\n)\n",
+        );
+        write_file(&case_dir.join("constant/polyMesh/neighbour"), "0\n(\n)\n");
+        write_file(
+            &case_dir.join("constant/polyMesh/boundary"),
+            "1\n(\nwalls\n{\ntype wall;\nnFaces 6;\nstartFace 0;\n}\n)\n",
+        );
+        write_file(
+            &case_dir.join("0/U"),
+            r#"
+            FoamFile { class volVectorField; object U; }
+            dimensions [0 1 -1 0 0 0 0];
+            internalField nonuniform vectorField 1 ((1 2 3));
+            boundaryField
+            {
+                walls { type fixedValue; value uniform (0 0 0); }
+            }
+            "#,
+        );
+        write_file(
+            &case_dir.join("0/p"),
+            r#"
+            FoamFile { class volScalarField; object p; }
+            dimensions [1 -1 -2 0 0 0 0];
+            internalField nonuniform scalarField 1 (7);
+            boundaryField
+            {
+                walls { type zeroGradient; }
+            }
+            "#,
+        );
     }
 
     fn write_file(path: &Path, content: &str) {
         let parent = path.parent().expect("test file path has parent");
         fs::create_dir_all(parent).expect("test file parent dir");
         fs::write(path, content).expect("test case file");
-    }
-
-    fn cleanup_temp_case_dir(path: &Path) {
-        let _ = fs::remove_dir_all(path);
     }
 
     fn extract_openfoam_warnings(warnings: &[String]) -> Vec<String> {
