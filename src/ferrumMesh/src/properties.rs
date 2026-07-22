@@ -33,7 +33,7 @@ pub struct PropertyValidation {
 
 pub fn read_case_properties(case_dir: &Path) -> Result<Vec<PropertyDictionary>> {
     let constant_dir = case_dir.join("constant");
-    if !constant_dir.exists() {
+    if !try_path_is_real_directory(&constant_dir)? {
         return Ok(Vec::new());
     }
 
@@ -49,7 +49,7 @@ pub fn read_case_properties(case_dir: &Path) -> Result<Vec<PropertyDictionary>> 
         }
 
         let region = entry.file_name().to_string_lossy().to_string();
-        if region == "polyMesh" || !path.join("polyMesh").is_dir() {
+        if region == "polyMesh" || !try_path_is_real_directory(&path.join("polyMesh"))? {
             continue;
         }
         read_property_dictionaries_in_dir(&path, Some(region), &mut dictionaries)?;
@@ -129,7 +129,25 @@ fn is_property_dictionary_file(path: &Path) -> bool {
         return false;
     };
 
-    !matches!(name, "interfaces" | "ferrumMeshSummary.txt")
+    matches!(
+        name,
+        "transportProperties"
+            | "physicalProperties"
+            | "momentumTransport"
+            | "turbulenceProperties"
+            | "thermophysicalProperties"
+    )
+}
+
+fn try_path_is_real_directory(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_dir()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(MeshError::InvalidInput(format!(
+            "could not inspect {} ({error})",
+            path.display()
+        ))),
+    }
 }
 
 fn read_property_dictionary(path: &Path, region: Option<String>) -> Result<PropertyDictionary> {
@@ -305,9 +323,97 @@ fn dictionary_label(dictionary: &PropertyDictionary) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{format_property_value, parse_property_dictionary_str, validate_properties};
+    use super::{
+        format_property_value, parse_property_dictionary_str, read_case_properties,
+        validate_properties,
+    };
+
+    struct TestCaseDir {
+        path: PathBuf,
+    }
+
+    impl TestCaseDir {
+        fn new(name: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "ferrum-properties-{name}-{}-{unique}",
+                std::process::id()
+            ));
+            fs::create_dir_all(path.join("constant")).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TestCaseDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn reads_only_known_property_dictionary_names() {
+        let case = TestCaseDir::new("allowlist");
+        fs::write(
+            case.path.join("constant/transportProperties"),
+            "nu [0 2 -1 0 0 0 0] 1e-05;",
+        )
+        .unwrap();
+        fs::write(
+            case.path.join("constant/leakDict"),
+            "secret token should not be parsed;",
+        )
+        .unwrap();
+
+        let dictionaries = read_case_properties(&case.path).unwrap();
+
+        assert_eq!(dictionaries.len(), 1);
+        assert_eq!(dictionaries[0].name, "transportProperties");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_property_dictionaries_before_reading() {
+        let case = TestCaseDir::new("symlink");
+        let secret = case.path.join("secret-outside-case");
+        fs::write(&secret, "nu [0 2 -1 0 0 0 0] leaked;").unwrap();
+        std::os::unix::fs::symlink(&secret, case.path.join("constant/transportProperties"))
+            .unwrap();
+
+        let error = read_case_properties(&case.path).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("property dictionary symlinks are not allowed"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ignores_symlinked_constant_directory() {
+        let case = TestCaseDir::new("constant-symlink");
+        fs::remove_dir_all(case.path.join("constant")).unwrap();
+        let outside = case.path.join("outside-constant");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(
+            outside.join("transportProperties"),
+            "nu [0 2 -1 0 0 0 0] leaked;",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, case.path.join("constant")).unwrap();
+
+        let dictionaries = read_case_properties(&case.path).unwrap();
+
+        assert!(dictionaries.is_empty());
+    }
 
     #[test]
     fn parses_dimensioned_transport_properties() {
