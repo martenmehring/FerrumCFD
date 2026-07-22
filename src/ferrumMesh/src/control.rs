@@ -1,8 +1,11 @@
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::dictionary::{TokenCursor, TokenProvenance, tokenize};
 use crate::{MeshError, Result};
+
+const MAX_CONTROL_DICT_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug)]
 pub struct ControlDict {
@@ -25,15 +28,67 @@ pub struct ControlValidation {
 
 pub fn read_control_dict(case_dir: &Path) -> Result<ControlDict> {
     let path = case_dir.join("system").join("controlDict");
-    let content = fs::read_to_string(&path).map_err(|error| {
+    let content = read_control_dict_content(&path)?;
+    let mut control = parse_control_dict_str(&content, &path)?;
+    control.path = path;
+    Ok(control)
+}
+
+fn read_control_dict_content(path: &Path) -> Result<String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        MeshError::InvalidInput(format!(
+            "could not inspect {}; run initFerrumCase first ({error})",
+            path.display()
+        ))
+    })?;
+
+    if metadata.file_type().is_symlink() {
+        return Err(MeshError::InvalidInput(format!(
+            "could not read {}; controlDict must be a regular file, not a symlink",
+            path.display()
+        )));
+    }
+
+    if !metadata.file_type().is_file() {
+        return Err(MeshError::InvalidInput(format!(
+            "could not read {}; controlDict must be a regular file",
+            path.display()
+        )));
+    }
+
+    if metadata.len() > MAX_CONTROL_DICT_BYTES {
+        return Err(MeshError::InvalidInput(format!(
+            "could not read {}; controlDict is larger than the {} byte limit",
+            path.display(),
+            MAX_CONTROL_DICT_BYTES
+        )));
+    }
+
+    let file = File::open(path).map_err(|error| {
         MeshError::InvalidInput(format!(
             "could not read {}; run initFerrumCase first ({error})",
             path.display()
         ))
     })?;
-    let mut control = parse_control_dict_str(&content, &path)?;
-    control.path = path;
-    Ok(control)
+    let mut content = String::new();
+    file.take(MAX_CONTROL_DICT_BYTES + 1)
+        .read_to_string(&mut content)
+        .map_err(|error| {
+            MeshError::InvalidInput(format!(
+                "could not read {}; run initFerrumCase first ({error})",
+                path.display()
+            ))
+        })?;
+
+    if content.len() as u64 > MAX_CONTROL_DICT_BYTES {
+        return Err(MeshError::InvalidInput(format!(
+            "could not read {}; controlDict is larger than the {} byte limit",
+            path.display(),
+            MAX_CONTROL_DICT_BYTES
+        )));
+    }
+
+    Ok(content)
 }
 
 pub fn validate_control_dict(control: &ControlDict) -> ControlValidation {
@@ -242,9 +297,81 @@ impl ControlDictBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{parse_control_dict_str, validate_control_dict};
+    use super::{
+        MAX_CONTROL_DICT_BYTES, parse_control_dict_str, read_control_dict, validate_control_dict,
+    };
+
+    fn unique_case_dir(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("ferrum-control-{name}-{nonce}"))
+    }
+
+    fn write_control_dict(case_dir: &Path, content: &str) -> PathBuf {
+        let system_dir = case_dir.join("system");
+        fs::create_dir_all(&system_dir).expect("system directory should be creatable");
+        let path = system_dir.join("controlDict");
+        fs::write(&path, content).expect("controlDict should be writable");
+        path
+    }
+
+    #[test]
+    fn read_control_dict_rejects_oversized_files_before_parsing() {
+        let case_dir = unique_case_dir("oversized");
+        let oversized = " ".repeat(MAX_CONTROL_DICT_BYTES as usize + 1);
+        write_control_dict(&case_dir, &oversized);
+
+        let error = read_control_dict(&case_dir).expect_err("oversized controlDict must fail");
+
+        assert!(
+            error.to_string().contains("larger than"),
+            "unexpected error: {error}"
+        );
+        fs::remove_dir_all(case_dir).expect("temporary case should be removable");
+    }
+
+    #[test]
+    fn read_control_dict_rejects_non_regular_files() {
+        let case_dir = unique_case_dir("directory");
+        fs::create_dir_all(case_dir.join("system").join("controlDict"))
+            .expect("controlDict directory should be creatable");
+
+        let error = read_control_dict(&case_dir).expect_err("directory controlDict must fail");
+
+        assert!(
+            error.to_string().contains("regular file"),
+            "unexpected error: {error}"
+        );
+        fs::remove_dir_all(case_dir).expect("temporary case should be removable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_control_dict_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let case_dir = unique_case_dir("symlink");
+        let target_dir = unique_case_dir("symlink-target");
+        let target = write_control_dict(&target_dir, "application ferrumRun;");
+        let system_dir = case_dir.join("system");
+        fs::create_dir_all(&system_dir).expect("system directory should be creatable");
+        symlink(&target, system_dir.join("controlDict")).expect("symlink should be creatable");
+
+        let error = read_control_dict(&case_dir).expect_err("symlink controlDict must fail");
+
+        assert!(
+            error.to_string().contains("symlink"),
+            "unexpected error: {error}"
+        );
+        fs::remove_dir_all(case_dir).expect("temporary case should be removable");
+        fs::remove_dir_all(target_dir).expect("temporary target case should be removable");
+    }
 
     #[test]
     fn parses_basic_control_dict() {
