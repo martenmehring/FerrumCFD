@@ -13,6 +13,8 @@ use crate::runtime::{SolverRuntimeData, SolverRuntimeMeshData};
 use crate::solver_state::SolverStateFieldKind;
 use crate::{MeshError, Point3, Result};
 
+const LAMINAR_SIMPLE_MAX_CONTINUITY_GROWTH_PER_STEP: f64 = 100.0;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LaminarSimpleLinearSolver {
     BiCgStab,
@@ -86,6 +88,8 @@ pub struct LaminarSimpleSchemes {
     pub interpolation: LaminarSimpleInterpolationScheme,
     pub sn_grad: LaminarSimpleSnGradScheme,
 }
+
+pub const MAX_NON_ORTHOGONAL_CORRECTORS: usize = 20;
 
 #[derive(Clone, Debug)]
 pub struct LaminarSimpleOptions {
@@ -1207,7 +1211,10 @@ fn solve_laminar_simple_driven(
         let corrected_continuity =
             summarize_continuity(&net_cell_flux(&runtime.mesh, &corrected_phi)?);
         let pressure_correction_update_scale = 1.0;
-        if !is_finite_continuity(corrected_continuity)
+        let pressure_correction_diverged =
+            simple_step_continuity_growth_exceeded(continuity_before, corrected_continuity);
+        if pressure_correction_diverged
+            || !is_finite_continuity(corrected_continuity)
             || !points_are_finite(&corrected_velocity)
             || !scalars_are_finite(&corrected_pressure)
             || !corrected_phi.iter().all(|value| value.is_finite())
@@ -2429,6 +2436,21 @@ fn evaluate_laminar_simple_residual_control(
         momentum_satisfied,
         pressure_satisfied,
     }
+}
+
+fn simple_step_continuity_growth_exceeded(
+    before: ContinuitySummary,
+    after: ContinuitySummary,
+) -> bool {
+    fn component_growth_exceeded(before: f64, after: f64) -> bool {
+        after.is_finite()
+            && before.is_finite()
+            && after > before.max(f64::EPSILON) * LAMINAR_SIMPLE_MAX_CONTINUITY_GROWTH_PER_STEP
+    }
+
+    component_growth_exceeded(before.l2_norm, after.l2_norm)
+        || component_growth_exceeded(before.max_abs, after.max_abs)
+        || component_growth_exceeded(before.sum_abs, after.sum_abs)
 }
 
 fn points_are_finite(values: &[Point3]) -> bool {
@@ -5134,6 +5156,12 @@ fn validate_laminar_simple_options(options: &LaminarSimpleOptions) -> Result<()>
             "laminar SIMPLE iteration limits must be greater than zero".to_string(),
         ));
     }
+    if options.non_orthogonal_correctors > MAX_NON_ORTHOGONAL_CORRECTORS {
+        return Err(invalid_input(format!(
+            "laminar SIMPLE nNonOrthogonalCorrectors must not exceed {MAX_NON_ORTHOGONAL_CORRECTORS}, got {}",
+            options.non_orthogonal_correctors
+        )));
+    }
     if options.min_simple_iterations > options.max_simple_iterations {
         return Err(invalid_input(format!(
             "laminar SIMPLE minSimpleIterations must not exceed maxSimpleIterations, got {} > {}",
@@ -5498,18 +5526,18 @@ mod tests {
     use super::{
         LaminarSimpleConvectionScheme, LaminarSimpleGradientScheme, LaminarSimpleLinearSolver,
         LaminarSimpleMeshCache, LaminarSimpleOptions, LaminarSimplePreconditioner,
-        LaminarSimpleSchemes, LaminarSimpleStopReason, MomentumCsrPattern, ScalarFaceTreatment,
-        ScalarGradientGeometry, VectorFaceTreatment, adjust_phi_hby_a, apply_pressure_reference,
-        assemble_momentum_component_system, assemble_momentum_equation,
-        assemble_variable_scalar_component_system, assemble_variable_scalar_component_system_into,
-        cell_face_adjacency, compute_face_flux, compute_phi_hby_a,
-        consistent_reciprocal_momentum_diagonal, constrained_pressure_treatments,
-        face_diffusion_coefficient, hby_a_from_predicted_velocity, limit_scalar_gradient,
-        net_cell_flux, non_orthogonal_pressure_flux_correction, normalized_residual_norm,
-        pressure_correction_flux, reciprocal_momentum_diagonal, relax_scalar_component_equation,
-        scalar_component_boundary, scalar_gradient, solve_laminar_simple, split_components,
-        subtract_face_fluxes, upwind_face_vector_value, vector_convection_divergence,
-        vector_face_treatments, velocity_from_hby_a, zero,
+        LaminarSimpleSchemes, LaminarSimpleStopReason, MAX_NON_ORTHOGONAL_CORRECTORS,
+        MomentumCsrPattern, ScalarFaceTreatment, ScalarGradientGeometry, VectorFaceTreatment,
+        adjust_phi_hby_a, apply_pressure_reference, assemble_momentum_component_system,
+        assemble_momentum_equation, assemble_variable_scalar_component_system,
+        assemble_variable_scalar_component_system_into, cell_face_adjacency, compute_face_flux,
+        compute_phi_hby_a, consistent_reciprocal_momentum_diagonal,
+        constrained_pressure_treatments, face_diffusion_coefficient, hby_a_from_predicted_velocity,
+        limit_scalar_gradient, net_cell_flux, non_orthogonal_pressure_flux_correction,
+        normalized_residual_norm, pressure_correction_flux, reciprocal_momentum_diagonal,
+        relax_scalar_component_equation, scalar_component_boundary, scalar_gradient,
+        solve_laminar_simple, split_components, subtract_face_fluxes, upwind_face_vector_value,
+        vector_convection_divergence, vector_face_treatments, velocity_from_hby_a, zero,
     };
     use crate::{MeshError, Point3};
 
@@ -6994,6 +7022,28 @@ mod tests {
     }
 
     #[test]
+    fn rejects_excessive_non_orthogonal_correctors() {
+        let mut runtime = two_cell_runtime();
+        let fields = two_cell_fields();
+        let mut options = minimal_laminar_options();
+        options.non_orthogonal_correctors = MAX_NON_ORTHOGONAL_CORRECTORS + 1;
+
+        let error = solve_laminar_simple(&mut runtime, &fields, &options)
+            .expect_err("excessive pressure correctors must be rejected");
+
+        assert!(matches!(
+            error,
+            MeshError::InvalidInput(message)
+                if message
+                    == format!(
+                        "laminar SIMPLE nNonOrthogonalCorrectors must not exceed {}, got {}",
+                        MAX_NON_ORTHOGONAL_CORRECTORS,
+                        MAX_NON_ORTHOGONAL_CORRECTORS + 1
+                    )
+        ));
+    }
+
+    #[test]
     fn missing_pressure_payload_does_not_consume_velocity() {
         let mut runtime = two_cell_runtime();
         runtime.fields[1].values = None;
@@ -7186,6 +7236,55 @@ mod tests {
             report.timing.pressure_pcg_total_seconds
                 <= report.timing.pressure_linear_solve_seconds + 1.0e-9
         );
+    }
+
+    #[test]
+    fn laminar_simple_rejects_large_finite_continuity_growth() {
+        let before = super::ContinuitySummary {
+            l2_norm: 1.0,
+            max_abs: 0.5,
+            sum_abs: 1.25,
+            global_sum: 0.1,
+        };
+        let bounded = super::ContinuitySummary {
+            l2_norm: 100.0,
+            max_abs: 50.0,
+            sum_abs: 125.0,
+            global_sum: 10.0,
+        };
+        let divergent = super::ContinuitySummary {
+            l2_norm: 100.0_f64.next_up(),
+            max_abs: 50.0,
+            sum_abs: 125.0,
+            global_sum: 10.0,
+        };
+
+        assert!(!super::simple_step_continuity_growth_exceeded(
+            before, bounded
+        ));
+        assert!(super::simple_step_continuity_growth_exceeded(
+            before, divergent
+        ));
+    }
+
+    #[test]
+    fn laminar_simple_global_sum_noise_does_not_mask_bounded_continuity() {
+        let before = super::ContinuitySummary {
+            l2_norm: 8.276981e-10,
+            max_abs: 2.0e-10,
+            sum_abs: 1.0e-9,
+            global_sum: 0.0,
+        };
+        let after = super::ContinuitySummary {
+            l2_norm: 8.825281e-10,
+            max_abs: 2.1e-10,
+            sum_abs: 1.1e-9,
+            global_sum: 8.0e-10,
+        };
+
+        assert!(!super::simple_step_continuity_growth_exceeded(
+            before, after
+        ));
     }
 
     #[test]
