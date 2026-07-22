@@ -133,7 +133,9 @@ Multi-region examples:
 Supported field entries for the current parser:
 
 - `FoamFile` metadata, especially `class` and `object`
-- `dimensions [ ... ];`
+- `dimensions [ ... ];` with exactly five legacy or seven current exponents;
+  five-entry sets are normalized with zero electric-current and
+  luminous-intensity terms
 - `internalField uniform ...;`
 - `internalField nonuniform List<scalar> ...;`, `scalarField ...;`, or
   `Field<scalar> ...;` with numeric values
@@ -899,6 +901,12 @@ advance physics, or solve equations.
 Users should normally not edit `flipMap` by hand. `flipMap` belongs to the
 mesh/faceZone definition and is read from the mesh data. Model intent belongs in
 `constant/interfaces`.
+
+`constant/interfaces` is optional: when the file is absent, FerrumCFD treats
+the interface configuration as empty. When the file exists, it must contain
+exactly one unquoted, ordinary `interfaces { ... }` block; optional `FoamFile`
+metadata does not replace that block, and duplicate or quoted `interfaces`
+blocks are rejected.
 
 Example:
 

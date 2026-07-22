@@ -597,6 +597,17 @@ impl std::fmt::Display for LaminarSimpleStopReason {
     }
 }
 
+/// Runs the laminar SIMPLE solver from the initial `U` and `p` payloads stored
+/// in `runtime`.
+///
+/// # One-shot initial payloads
+///
+/// After setup has validated both fields, this call takes ownership of their
+/// runtime payloads before the first solver iteration. Those payloads are not
+/// restored, including when a later solver operation returns an error. A
+/// second call with the same `SolverRuntimeData` therefore fails
+/// deterministically because the initial payloads have already been consumed.
+/// Build a fresh solver plan and runtime for each retry or parameter-sweep run.
 pub fn solve_laminar_simple(
     runtime: &mut SolverRuntimeData,
     fields: &InitialFieldSet,
@@ -605,6 +616,14 @@ pub fn solve_laminar_simple(
     solve_laminar_simple_with_observer(runtime, fields, options, None)
 }
 
+/// Runs the laminar SIMPLE solver and reports each completed iteration to an
+/// optional observer.
+///
+/// This is the observer-enabled form of [`solve_laminar_simple`] and has the
+/// same one-shot ownership contract: after setup validates `U` and `p`, their
+/// runtime payloads are consumed before the first iteration and are not
+/// restored after a later error. Use a fresh plan and runtime for every retry
+/// or parameter-sweep run.
 pub fn solve_laminar_simple_with_observer(
     runtime: &mut SolverRuntimeData,
     fields: &InitialFieldSet,
@@ -7000,6 +7019,64 @@ mod tests {
             .expect("velocity must remain available");
         assert_eq!(velocity.as_ptr(), original_velocity);
         assert_eq!(velocity, &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn later_solver_error_leaves_one_shot_payloads_consumed() {
+        let mut runtime = two_cell_runtime();
+        let fields = two_cell_fields();
+        let mut options = minimal_laminar_options();
+        options.pressure_linear_solver = LaminarSimpleLinearSolver::Gamg;
+        options.pressure_gamg_options = Some(GamgOptions {
+            max_iterations: options.pressure_max_linear_iterations,
+            tolerance: options.pressure_linear_tolerance,
+            n_cells_in_coarsest_level: 1,
+            agglomerator: GamgAgglomerator::FaceAreaPair,
+            direct_solve_coarsest: true,
+            ..GamgOptions::default()
+        });
+        options.profile_gamg = true;
+        options.non_orthogonal_correctors = 1;
+
+        let mut pressure_solves = 0;
+        let error = {
+            let mut invalidate_second_profile =
+                |solve: usize,
+                 report: &mut super::ScalarSolveReport,
+                 _predicted_velocity: &[Point3],
+                 _phi_hby_a: &[f64],
+                 _continuity_star: super::ContinuitySummary| {
+                    pressure_solves += 1;
+                    if solve == 2 {
+                        report.gamg_timing = Some(super::GamgKernelTiming::default());
+                    }
+                };
+            super::solve_laminar_simple_driven(
+                &mut runtime,
+                &fields,
+                &options,
+                None,
+                Some(&mut invalidate_second_profile),
+            )
+            .expect_err("a changed later GAMG profile must fail after payload transfer")
+        };
+
+        assert_eq!(pressure_solves, 2);
+        assert!(matches!(
+            error,
+            MeshError::InvalidInput(message)
+                if message == "GAMG profile hierarchy changed from 2 to 0 levels"
+        ));
+        assert!(runtime.fields.iter().all(|field| field.values.is_none()));
+
+        let second = solve_laminar_simple(&mut runtime, &fields, &options)
+            .expect_err("a failed one-shot run must not restore consumed payloads");
+        assert!(matches!(
+            second,
+            MeshError::InvalidInput(message)
+                if message
+                    == "runtime field 'U' initial payload was already consumed or not loaded"
+        ));
     }
 
     #[test]
