@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::cmp::Ordering;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 
 use crate::fields::{FieldFile, FieldValueSummary, InitialFieldSet};
 use crate::poly_mesh::PolyMesh;
+use crate::{MeshError, Result};
 
 #[derive(Clone, Debug)]
 pub struct SolverStatePlan {
@@ -34,7 +35,7 @@ pub struct SolverStateInternalFieldPlan {
     pub expected_count: Option<usize>,
     pub valid_count: Option<bool>,
     pub uniform_components: Option<Vec<f64>>,
-    pub nonuniform_values: Option<Vec<f64>>,
+    pub loaded_scalars: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -67,6 +68,7 @@ pub enum SolverStateFieldKind {
 pub enum SolverStateValueKind {
     Uniform,
     NonUniform,
+    UnsupportedNonUniform,
     Other,
     Missing,
 }
@@ -104,6 +106,9 @@ impl std::fmt::Display for SolverStateValueKind {
         match self {
             Self::Uniform => formatter.write_str("uniform"),
             Self::NonUniform => formatter.write_str("nonuniform"),
+            // Keep the existing text/JSON value stable while retaining enough
+            // internal provenance to classify an unsupported declaration.
+            Self::UnsupportedNonUniform => formatter.write_str("nonuniform"),
             Self::Other => formatter.write_str("other"),
             Self::Missing => formatter.write_str("missing"),
         }
@@ -133,44 +138,94 @@ impl std::fmt::Display for SolverStateCpuBufferStatus {
     }
 }
 
-pub fn build_solver_state_plan(case_dir: &Path, fields: &InitialFieldSet) -> SolverStatePlan {
-    let mut mesh_cache = HashMap::<Option<String>, MeshCacheEntry>::new();
+pub fn build_solver_state_plan(
+    case_dir: &Path,
+    fields: &InitialFieldSet,
+) -> Result<SolverStatePlan> {
     let mut state_fields = Vec::new();
+    state_fields
+        .try_reserve_exact(fields.fields.len())
+        .map_err(|_| MeshError::InvalidInput("solver-state field allocation failed".to_string()))?;
     let mut warnings = Vec::new();
+    let mut current_region: Option<Option<&str>> = None;
+    let mut current_mesh: Option<Result<PolyMesh>> = None;
+    let mut previous_field: Option<&FieldFile> = None;
 
     for field in &fields.fields {
-        let mesh = mesh_for_field(case_dir, field, &mut mesh_cache, &mut warnings);
-        state_fields.push(build_state_field(field, mesh, &mut warnings));
+        let region = field.region.as_deref();
+        if previous_field.is_some_and(|previous| {
+            previous
+                .region
+                .as_deref()
+                .cmp(&region)
+                .then(previous.name.cmp(&field.name))
+                .then(previous.path.cmp(&field.path))
+                == Ordering::Greater
+        }) {
+            return Err(MeshError::InvalidInput(
+                "initial fields are not in canonical region, name, and path order".to_string(),
+            ));
+        }
+        previous_field = Some(field);
+
+        if current_region != Some(region) {
+            // Assignment evaluates its right-hand side before dropping the old
+            // value. Clear the window first so two full region meshes are never
+            // live while the successor is read.
+            drop(current_mesh.take());
+            current_mesh = Some(PolyMesh::read(&poly_mesh_path(case_dir, region)));
+            current_region = Some(region);
+        }
+
+        let mesh = match current_mesh.as_ref() {
+            Some(Ok(mesh)) => Some(mesh),
+            Some(Err(error)) => {
+                let label = region
+                    .map(|region| format!("region '{region}'"))
+                    .unwrap_or_else(|| "base mesh".to_string());
+                push_warning(
+                    &mut warnings,
+                    format!("could not build solver-state field storage for {label}: {error}"),
+                )?;
+                None
+            }
+            None => {
+                return Err(MeshError::InvalidInput(
+                    "solver-state region mesh window is unavailable".to_string(),
+                ));
+            }
+        };
+        state_fields.push(build_state_field(field, mesh, &mut warnings)?);
     }
 
-    SolverStatePlan {
+    Ok(SolverStatePlan {
         fields: state_fields,
         warnings,
-    }
+    })
 }
 
 fn build_state_field(
     field: &FieldFile,
     mesh: Option<&PolyMesh>,
     warnings: &mut Vec<String>,
-) -> SolverStateFieldPlan {
-    let label = field_label(field);
+) -> Result<SolverStateFieldPlan> {
+    let label = field_label(field)?;
     let kind = SolverStateFieldKind::from_class(field.class_name.as_deref());
     let mesh_cells = mesh.map(PolyMesh::cell_count);
     let mesh_faces = mesh.map(|mesh| mesh.faces.len());
     let expected_count = expected_internal_count(kind, mesh);
 
-    validate_dimensions(field, &label, warnings);
-    let internal_field = build_internal_field_plan(field, kind, expected_count, &label, warnings);
-    let storage = build_storage_plan(kind, expected_count, &label, warnings);
+    validate_dimensions(field, &label, warnings)?;
+    let internal_field = build_internal_field_plan(field, kind, expected_count, &label, warnings)?;
+    let storage = build_storage_plan(kind, expected_count, &label, warnings)?;
     let cpu_buffer = build_cpu_buffer_plan(&internal_field, &storage);
 
-    SolverStateFieldPlan {
-        region: field.region.clone(),
-        name: field.name.clone(),
-        class_name: field.class_name.clone(),
+    Ok(SolverStateFieldPlan {
+        region: try_clone_optional_string(field.region.as_deref())?,
+        name: try_clone_string(&field.name, "solver-state field name allocation failed")?,
+        class_name: try_clone_optional_string(field.class_name.as_deref())?,
         kind,
-        dimensions: field.dimensions.clone(),
+        dimensions: try_clone_optional_string_vec(field.dimensions.as_deref())?,
         mesh_cells,
         mesh_faces,
         internal_field,
@@ -178,7 +233,7 @@ fn build_state_field(
         mesh_boundary_patches: mesh.map(|mesh| mesh.patches.len()),
         storage,
         cpu_buffer,
-    }
+    })
 }
 
 pub fn materialize_cpu_buffer(field: &SolverStateFieldPlan) -> Option<Vec<f64>> {
@@ -188,9 +243,7 @@ pub fn materialize_cpu_buffer(field: &SolverStateFieldPlan) -> Option<Vec<f64>> 
 
     match field.cpu_buffer.status {
         SolverStateCpuBufferStatus::UniformReady => materialize_uniform_cpu_buffer(field),
-        SolverStateCpuBufferStatus::NonUniformReady => {
-            field.internal_field.nonuniform_values.clone()
-        }
+        SolverStateCpuBufferStatus::NonUniformReady => None,
         _ => None,
     }
 }
@@ -211,40 +264,6 @@ pub fn materialize_uniform_cpu_buffer(field: &SolverStateFieldPlan) -> Option<Ve
     Some(buffer)
 }
 
-fn mesh_for_field<'a>(
-    case_dir: &Path,
-    field: &FieldFile,
-    mesh_cache: &'a mut HashMap<Option<String>, MeshCacheEntry>,
-    warnings: &mut Vec<String>,
-) -> Option<&'a PolyMesh> {
-    let region = field.region.clone();
-    if !mesh_cache.contains_key(&region) {
-        let path = poly_mesh_path(case_dir, region.as_deref());
-        let entry = match PolyMesh::read(&path) {
-            Ok(mesh) => MeshCacheEntry::Mesh(mesh),
-            Err(error) => MeshCacheEntry::Error(format!("{error}")),
-        };
-        mesh_cache.insert(region.clone(), entry);
-    }
-
-    match mesh_cache
-        .get(&region)
-        .expect("mesh cache entry exists after insertion")
-    {
-        MeshCacheEntry::Mesh(mesh) => Some(mesh),
-        MeshCacheEntry::Error(error) => {
-            let label = region
-                .as_deref()
-                .map(|region| format!("region '{region}'"))
-                .unwrap_or_else(|| "base mesh".to_string());
-            warnings.push(format!(
-                "could not build solver-state field storage for {label}: {error}"
-            ));
-            None
-        }
-    }
-}
-
 fn poly_mesh_path(case_dir: &Path, region: Option<&str>) -> PathBuf {
     if let Some(region) = region {
         case_dir.join("constant").join(region).join("polyMesh")
@@ -253,15 +272,19 @@ fn poly_mesh_path(case_dir: &Path, region: Option<&str>) -> PathBuf {
     }
 }
 
-fn validate_dimensions(field: &FieldFile, label: &str, warnings: &mut Vec<String>) {
+fn validate_dimensions(field: &FieldFile, label: &str, warnings: &mut Vec<String>) -> Result<()> {
     match &field.dimensions {
         Some(dimensions) if dimensions.len() == 7 => {}
-        Some(dimensions) => warnings.push(format!(
-            "field '{label}' dimensions should contain 7 entries, found {}",
-            dimensions.len()
-        )),
-        None => warnings.push(format!("field '{label}' has no dimensions entry")),
+        Some(dimensions) => push_warning(
+            warnings,
+            format!(
+                "field '{label}' dimensions should contain 7 entries, found {}",
+                dimensions.len()
+            ),
+        )?,
+        None => push_warning(warnings, format!("field '{label}' has no dimensions entry"))?,
     }
+    Ok(())
 }
 
 fn build_internal_field_plan(
@@ -270,54 +293,66 @@ fn build_internal_field_plan(
     expected_count: Option<usize>,
     label: &str,
     warnings: &mut Vec<String>,
-) -> SolverStateInternalFieldPlan {
+) -> Result<SolverStateInternalFieldPlan> {
     match &field.internal_field {
         Some(FieldValueSummary::Uniform(value)) => {
-            let uniform_components = parse_uniform_components(value);
+            let uniform_components = parse_uniform_components(value)?;
             match (&uniform_components, components_per_value(kind)) {
                 (Some(values), Some(expected_components))
                     if values.len() != expected_components =>
                 {
-                    warnings.push(format!(
-                        "field '{label}' uniform internalField has {} components, expected {expected_components} for {kind}",
-                        values.len()
-                    ));
+                    push_warning(
+                        warnings,
+                        format!(
+                            "field '{label}' uniform internalField has {} components, expected {expected_components} for {kind}",
+                            values.len()
+                        ),
+                    )?;
                 }
-                (None, Some(_)) => warnings.push(format!(
-                    "field '{label}' uniform internalField value could not be parsed as numeric components"
-                )),
+                (None, Some(_)) => push_warning(
+                    warnings,
+                    format!(
+                        "field '{label}' uniform internalField value could not be parsed as numeric components"
+                    ),
+                )?,
                 _ => {}
             }
 
-            SolverStateInternalFieldPlan {
+            Ok(SolverStateInternalFieldPlan {
                 kind: SolverStateValueKind::Uniform,
                 value_count: expected_count,
                 expected_count,
                 valid_count: expected_count.map(|_| true),
                 uniform_components,
-                nonuniform_values: None,
-            }
+                loaded_scalars: None,
+            })
         }
         Some(FieldValueSummary::NonUniform {
             value_type,
             count,
             values,
         }) => {
-            let valid_count = count.zip(expected_count).map(|(count, expected)| {
-                if count != expected {
-                    warnings.push(format!(
-                        "field '{label}' internalField count {count} does not match expected {} for {}",
-                        expected, kind
-                    ));
-                    false
-                } else {
-                    true
-                }
-            });
+            let supported_value_type = nonuniform_value_type_is_supported(value_type.as_deref());
+            let valid_count = count
+                .zip(expected_count)
+                .map(|(count, expected)| count == expected);
+            if let (Some(count), Some(expected)) = (count, expected_count)
+                && count != &expected
+            {
+                push_warning(
+                    warnings,
+                    format!(
+                        "field '{label}' internalField count {count} does not match expected {expected} for {kind}"
+                    ),
+                )?;
+            }
             if count.is_none() {
-                warnings.push(format!(
-                    "field '{label}' has nonuniform internalField without a readable value count"
-                ));
+                push_warning(
+                    warnings,
+                    format!(
+                        "field '{label}' has nonuniform internalField without a readable value count"
+                    ),
+                )?;
             }
             validate_nonuniform_values(
                 kind,
@@ -326,34 +361,43 @@ fn build_internal_field_plan(
                 values.as_deref(),
                 label,
                 warnings,
-            );
-            SolverStateInternalFieldPlan {
-                kind: SolverStateValueKind::NonUniform,
+            )?;
+            Ok(SolverStateInternalFieldPlan {
+                kind: if supported_value_type {
+                    SolverStateValueKind::NonUniform
+                } else {
+                    SolverStateValueKind::UnsupportedNonUniform
+                },
                 value_count: *count,
                 expected_count,
                 valid_count,
                 uniform_components: None,
-                nonuniform_values: values.clone(),
-            }
+                loaded_scalars: supported_value_type
+                    .then(|| values.as_ref().map(Vec::len))
+                    .flatten(),
+            })
         }
-        Some(FieldValueSummary::Other(_)) => SolverStateInternalFieldPlan {
+        Some(FieldValueSummary::Other(_)) => Ok(SolverStateInternalFieldPlan {
             kind: SolverStateValueKind::Other,
             value_count: None,
             expected_count,
             valid_count: None,
             uniform_components: None,
-            nonuniform_values: None,
-        },
+            loaded_scalars: None,
+        }),
         None => {
-            warnings.push(format!("field '{label}' has no internalField entry"));
-            SolverStateInternalFieldPlan {
+            push_warning(
+                warnings,
+                format!("field '{label}' has no internalField entry"),
+            )?;
+            Ok(SolverStateInternalFieldPlan {
                 kind: SolverStateValueKind::Missing,
                 value_count: None,
                 expected_count,
                 valid_count: Some(false),
                 uniform_components: None,
-                nonuniform_values: None,
-            }
+                loaded_scalars: None,
+            })
         }
     }
 }
@@ -365,34 +409,42 @@ fn validate_nonuniform_values(
     values: Option<&[f64]>,
     label: &str,
     warnings: &mut Vec<String>,
-) {
+) -> Result<()> {
+    if !nonuniform_value_type_is_supported(value_type) {
+        push_warning(
+            warnings,
+            format!("field '{label}' has an unsupported nonuniform value type"),
+        )?;
+        return Ok(());
+    }
+
     let Some(values) = values else {
-        if count.is_some() && nonuniform_value_type_is_supported(value_type) {
-            warnings.push(format!(
-                "field '{label}' nonuniform internalField numeric values could not be loaded"
-            ));
-        }
-        return;
+        return Ok(());
     };
 
     let Some(components) = components_per_value(kind) else {
-        return;
+        return Ok(());
     };
     let Some(count) = count else {
-        return;
+        return Ok(());
     };
     let Some(expected_values) = count.checked_mul(components) else {
-        warnings.push(format!(
-            "field '{label}' nonuniform internalField value storage size overflowed"
-        ));
-        return;
+        push_warning(
+            warnings,
+            format!("field '{label}' nonuniform internalField value storage size overflowed"),
+        )?;
+        return Ok(());
     };
     if values.len() != expected_values {
-        warnings.push(format!(
-            "field '{label}' nonuniform internalField loaded {} scalar values, expected {expected_values}",
-            values.len()
-        ));
+        push_warning(
+            warnings,
+            format!(
+                "field '{label}' nonuniform internalField loaded {} scalar values, expected {expected_values}",
+                values.len()
+            ),
+        )?;
     }
+    Ok(())
 }
 
 fn nonuniform_value_type_is_supported(value_type: Option<&str>) -> bool {
@@ -423,7 +475,7 @@ fn build_storage_plan(
     expected_count: Option<usize>,
     label: &str,
     warnings: &mut Vec<String>,
-) -> SolverStateStoragePlan {
+) -> Result<SolverStateStoragePlan> {
     match kind {
         SolverStateFieldKind::VolScalar
         | SolverStateFieldKind::VolVector
@@ -434,32 +486,36 @@ fn build_storage_plan(
                 .and_then(|(components, count)| count.checked_mul(components));
             let bytes_f64 = scalar_slots.and_then(|slots| slots.checked_mul(size_of::<f64>()));
             if expected_count.is_some() && scalar_slots.is_none() {
-                warnings.push(format!(
-                    "field '{label}' storage size overflowed while estimating scalar slots"
-                ));
+                push_warning(
+                    warnings,
+                    format!(
+                        "field '{label}' storage size overflowed while estimating scalar slots"
+                    ),
+                )?;
             }
 
-            SolverStateStoragePlan {
+            Ok(SolverStateStoragePlan {
                 cpu_capable: true,
                 gpu_capable: true,
                 components,
                 scalar_slots,
                 bytes_f64,
                 status: SolverStateStorageStatus::Loaded,
-            }
+            })
         }
         SolverStateFieldKind::Other => {
-            warnings.push(format!(
-                "field '{label}' has unsupported class for solver-state storage"
-            ));
-            SolverStateStoragePlan {
+            push_warning(
+                warnings,
+                format!("field '{label}' has unsupported class for solver-state storage"),
+            )?;
+            Ok(SolverStateStoragePlan {
                 cpu_capable: false,
                 gpu_capable: false,
                 components: None,
                 scalar_slots: None,
                 bytes_f64: None,
                 status: SolverStateStorageStatus::UnsupportedClass,
-            }
+            })
         }
     }
 }
@@ -495,17 +551,22 @@ fn build_cpu_buffer_plan(
                     && storage.bytes_f64.is_some()
                     && storage
                         .scalar_slots
-                        .zip(internal_field.nonuniform_values.as_ref())
-                        .is_some_and(|(expected_scalars, values)| values.len() == expected_scalars);
+                        .zip(internal_field.loaded_scalars)
+                        .is_some_and(|(expected_scalars, loaded_scalars)| {
+                            loaded_scalars == expected_scalars
+                        });
                 if valid_shape {
                     SolverStateCpuBufferStatus::NonUniformReady
                 } else if internal_field.valid_count == Some(false)
-                    || internal_field.nonuniform_values.is_some()
+                    || internal_field.loaded_scalars.is_some()
                 {
                     SolverStateCpuBufferStatus::InvalidShape
                 } else {
                     SolverStateCpuBufferStatus::NonUniformDataNotLoaded
                 }
+            }
+            SolverStateValueKind::UnsupportedNonUniform => {
+                SolverStateCpuBufferStatus::UnsupportedInternalField
             }
             SolverStateValueKind::Other => SolverStateCpuBufferStatus::UnsupportedInternalField,
             SolverStateValueKind::Missing => SolverStateCpuBufferStatus::MissingInternalField,
@@ -531,25 +592,88 @@ fn components_per_value(kind: SolverStateFieldKind) -> Option<usize> {
     }
 }
 
-fn parse_uniform_components(value: &str) -> Option<Vec<f64>> {
-    let cleaned = value.replace(['(', ')'], " ");
+fn parse_uniform_components(value: &str) -> Result<Option<Vec<f64>>> {
     let mut values = Vec::new();
-    for token in cleaned.split_whitespace() {
-        values.push(token.parse::<f64>().ok()?);
+    for token in value
+        .split(|character: char| character.is_whitespace() || matches!(character, '(' | ')'))
+        .filter(|token| !token.is_empty())
+    {
+        let Ok(number) = token.parse::<f64>() else {
+            return Ok(None);
+        };
+        if !number.is_finite() {
+            return Ok(None);
+        }
+        values.try_reserve(1).map_err(|_| {
+            MeshError::InvalidInput("uniform component allocation failed".to_string())
+        })?;
+        values.push(number);
     }
     if values.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(values)
+        Ok(Some(values))
     }
 }
 
-fn field_label(field: &FieldFile) -> String {
+fn field_label(field: &FieldFile) -> Result<String> {
     if let Some(region) = &field.region {
-        format!("{region}/{}", field.name)
+        let length = region
+            .len()
+            .checked_add(1)
+            .and_then(|length| length.checked_add(field.name.len()))
+            .ok_or_else(|| MeshError::InvalidInput("field label size overflowed".to_string()))?;
+        let mut label = String::new();
+        label
+            .try_reserve_exact(length)
+            .map_err(|_| MeshError::InvalidInput("field label allocation failed".to_string()))?;
+        label.push_str(region);
+        label.push('/');
+        label.push_str(&field.name);
+        Ok(label)
     } else {
-        field.name.clone()
+        try_clone_string(&field.name, "field label allocation failed")
     }
+}
+
+fn push_warning(warnings: &mut Vec<String>, warning: String) -> Result<()> {
+    warnings.try_reserve(1).map_err(|_| {
+        MeshError::InvalidInput("solver-state warning allocation failed".to_string())
+    })?;
+    warnings.push(warning);
+    Ok(())
+}
+
+fn try_clone_string(value: &str, failure: &str) -> Result<String> {
+    let mut cloned = String::new();
+    cloned
+        .try_reserve_exact(value.len())
+        .map_err(|_| MeshError::InvalidInput(failure.to_string()))?;
+    cloned.push_str(value);
+    Ok(cloned)
+}
+
+fn try_clone_optional_string(value: Option<&str>) -> Result<Option<String>> {
+    value
+        .map(|value| try_clone_string(value, "solver-state string allocation failed"))
+        .transpose()
+}
+
+fn try_clone_optional_string_vec(values: Option<&[String]>) -> Result<Option<Vec<String>>> {
+    let Some(values) = values else {
+        return Ok(None);
+    };
+    let mut cloned = Vec::new();
+    cloned.try_reserve_exact(values.len()).map_err(|_| {
+        MeshError::InvalidInput("solver-state dimensions allocation failed".to_string())
+    })?;
+    for value in values {
+        cloned.push(try_clone_string(
+            value,
+            "solver-state dimension allocation failed",
+        )?);
+    }
+    Ok(Some(cloned))
 }
 
 impl SolverStateFieldKind {
@@ -563,24 +687,27 @@ impl SolverStateFieldKind {
     }
 }
 
-enum MeshCacheEntry {
-    Mesh(PolyMesh),
-    Error(String),
-}
-
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use crate::Point3;
-    use crate::fields::{FieldBoundaryPatch, FieldFile, FieldValueSummary};
+    use crate::fields::{FieldBoundaryPatch, FieldFile, FieldValueSummary, InitialFieldSet};
     use crate::poly_mesh::{BoundaryPatch, PolyMesh};
 
     use super::{
         SolverStateCpuBufferStatus, SolverStateFieldKind, SolverStateStorageStatus,
-        SolverStateValueKind, build_state_field, materialize_cpu_buffer,
+        SolverStateValueKind, build_state_field as try_build_state_field, materialize_cpu_buffer,
         materialize_uniform_cpu_buffer,
     };
+
+    fn build_state_field(
+        field: &FieldFile,
+        mesh: Option<&PolyMesh>,
+        warnings: &mut Vec<String>,
+    ) -> super::SolverStateFieldPlan {
+        try_build_state_field(field, mesh, warnings).expect("solver-state field should build")
+    }
 
     #[test]
     fn accepts_uniform_vol_scalar_as_cell_sized_state() {
@@ -600,7 +727,7 @@ mod tests {
         assert_eq!(state.internal_field.value_count, Some(4));
         assert_eq!(state.internal_field.valid_count, Some(true));
         assert_eq!(state.internal_field.uniform_components, Some(vec![0.0]));
-        assert_eq!(state.internal_field.nonuniform_values, None);
+        assert_eq!(state.internal_field.loaded_scalars, None);
         assert!(state.storage.cpu_capable);
         assert!(state.storage.gpu_capable);
         assert_eq!(state.storage.components, Some(1));
@@ -744,7 +871,7 @@ mod tests {
     }
 
     #[test]
-    fn materializes_nonuniform_scalar_cpu_buffer() {
+    fn records_nonuniform_scalar_payload_without_cloning_it() {
         let field = field(
             "T",
             "volScalarField",
@@ -760,25 +887,19 @@ mod tests {
         let state = build_state_field(&field, Some(&mesh), &mut warnings);
 
         assert_eq!(state.internal_field.kind, SolverStateValueKind::NonUniform);
-        assert_eq!(
-            state.internal_field.nonuniform_values,
-            Some(vec![300.0, 310.0, 320.0, 330.0])
-        );
+        assert_eq!(state.internal_field.loaded_scalars, Some(4));
         assert!(state.cpu_buffer.materializable);
         assert_eq!(
             state.cpu_buffer.status,
             SolverStateCpuBufferStatus::NonUniformReady
         );
-        assert_eq!(
-            materialize_cpu_buffer(&state),
-            Some(vec![300.0, 310.0, 320.0, 330.0])
-        );
+        assert!(materialize_cpu_buffer(&state).is_none());
         assert!(materialize_uniform_cpu_buffer(&state).is_none());
         assert!(warnings.is_empty());
     }
 
     #[test]
-    fn materializes_nonuniform_vector_cpu_buffer() {
+    fn records_nonuniform_vector_payload_without_cloning_it() {
         let field = field(
             "U",
             "volVectorField",
@@ -797,10 +918,8 @@ mod tests {
             state.cpu_buffer.status,
             SolverStateCpuBufferStatus::NonUniformReady
         );
-        assert_eq!(
-            materialize_cpu_buffer(&state),
-            Some(vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0])
-        );
+        assert_eq!(state.internal_field.loaded_scalars, Some(9));
+        assert!(materialize_cpu_buffer(&state).is_none());
         assert!(warnings.is_empty());
     }
 
@@ -861,11 +980,7 @@ mod tests {
         assert_eq!(state.cpu_buffer.bytes_f64, Some(40));
         assert!(materialize_uniform_cpu_buffer(&state).is_none());
         assert!(materialize_cpu_buffer(&state).is_none());
-        assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.contains("could not be loaded"))
-        );
+        assert!(warnings.is_empty());
     }
 
     #[test]
@@ -916,9 +1031,39 @@ mod tests {
         assert!(!state.cpu_buffer.materializable);
         assert_eq!(
             state.cpu_buffer.status,
-            SolverStateCpuBufferStatus::NonUniformDataNotLoaded
+            SolverStateCpuBufferStatus::UnsupportedInternalField
         );
-        assert!(warnings.is_empty());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("unsupported nonuniform value type"))
+        );
+    }
+
+    #[test]
+    fn solver_state_requires_full_canonical_field_order() {
+        let fields = InitialFieldSet {
+            case_dir: PathBuf::from("missing-case"),
+            fields: vec![
+                field(
+                    "z",
+                    "volScalarField",
+                    Some(FieldValueSummary::Uniform("0".to_string())),
+                ),
+                field(
+                    "a",
+                    "volScalarField",
+                    Some(FieldValueSummary::Uniform("0".to_string())),
+                ),
+            ],
+        };
+
+        let error = super::build_solver_state_plan(Path::new("missing-case"), &fields)
+            .expect_err("non-canonical field names must fail before reuse of the mesh window");
+        assert_eq!(
+            error.to_string(),
+            "initial fields are not in canonical region, name, and path order"
+        );
     }
 
     fn field(name: &str, class_name: &str, internal_field: Option<FieldValueSummary>) -> FieldFile {

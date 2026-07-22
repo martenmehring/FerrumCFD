@@ -10,6 +10,7 @@ use crate::linear::{
     preconditioned_conjugate_gradient_solve, symmetric_gauss_seidel_solve,
 };
 use crate::runtime::{SolverRuntimeData, SolverRuntimeMeshData};
+use crate::solver_state::SolverStateFieldKind;
 use crate::{MeshError, Point3, Result};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -597,7 +598,7 @@ impl std::fmt::Display for LaminarSimpleStopReason {
 }
 
 pub fn solve_laminar_simple(
-    runtime: &SolverRuntimeData,
+    runtime: &mut SolverRuntimeData,
     fields: &InitialFieldSet,
     options: &LaminarSimpleOptions,
 ) -> Result<LaminarSimpleReport> {
@@ -605,7 +606,7 @@ pub fn solve_laminar_simple(
 }
 
 pub fn solve_laminar_simple_with_observer(
-    runtime: &SolverRuntimeData,
+    runtime: &mut SolverRuntimeData,
     fields: &InitialFieldSet,
     options: &LaminarSimpleOptions,
     on_iteration: Option<&mut dyn FnMut(&LaminarSimpleIterationSummary)>,
@@ -622,7 +623,7 @@ type PressureReportDriver<'a> =
     &'a mut dyn FnMut(usize, &mut ScalarSolveReport, &[Point3], &[f64], ContinuitySummary);
 
 fn solve_laminar_simple_driven(
-    runtime: &SolverRuntimeData,
+    runtime: &mut SolverRuntimeData,
     fields: &InitialFieldSet,
     options: &LaminarSimpleOptions,
     mut on_iteration: Option<&mut dyn FnMut(&LaminarSimpleIterationSummary)>,
@@ -659,8 +660,7 @@ fn solve_laminar_simple_driven(
     let mut pressure_gamg_workspace = None;
     let mut scalar_solve_workspace = ScalarSolveWorkspace::new(runtime.mesh.cells);
 
-    let mut velocity = runtime_vector_field(runtime, "U")?;
-    let mut pressure = runtime_scalar_field(runtime, "p")?;
+    let (mut velocity, mut pressure) = take_runtime_initial_fields(runtime)?;
     let initial_phi = compute_face_flux(&runtime.mesh, &velocity, &velocity_boundary)?;
     let initial_continuity = summarize_continuity(&net_cell_flux(&runtime.mesh, &initial_phi)?);
     let mut timing = LaminarSimpleTimingAccumulator {
@@ -4224,16 +4224,22 @@ fn fixed_vector_patch_values(
         ))
     })?;
     let values = parse_patch_numeric_values(value, 3, faces, field, &patch.name)?;
-    Ok(values
-        .chunks_exact(3)
-        .map(|chunk| {
-            VectorFaceTreatment::FixedValue(Point3 {
-                x: chunk[0],
-                y: chunk[1],
-                z: chunk[2],
-            })
-        })
-        .collect())
+    let mut treatments = Vec::new();
+    treatments.try_reserve_exact(faces).map_err(|_| {
+        invalid_input(format!(
+            "field '{}' patch '{}' vector boundary allocation failed",
+            field_label(field),
+            patch.name
+        ))
+    })?;
+    for chunk in values.as_slice().chunks_exact(3) {
+        treatments.push(VectorFaceTreatment::FixedValue(Point3 {
+            x: chunk[0],
+            y: chunk[1],
+            z: chunk[2],
+        }));
+    }
+    Ok(treatments)
 }
 
 fn inlet_outlet_vector_patch_values(
@@ -4253,16 +4259,22 @@ fn inlet_outlet_vector_patch_values(
             ))
         })?;
     let values = parse_patch_numeric_values(value, 3, faces, field, &patch.name)?;
-    Ok(values
-        .chunks_exact(3)
-        .map(|chunk| {
-            VectorFaceTreatment::InletOutlet(Point3 {
-                x: chunk[0],
-                y: chunk[1],
-                z: chunk[2],
-            })
-        })
-        .collect())
+    let mut treatments = Vec::new();
+    treatments.try_reserve_exact(faces).map_err(|_| {
+        invalid_input(format!(
+            "field '{}' patch '{}' inlet/outlet boundary allocation failed",
+            field_label(field),
+            patch.name
+        ))
+    })?;
+    for chunk in values.as_slice().chunks_exact(3) {
+        treatments.push(VectorFaceTreatment::InletOutlet(Point3 {
+            x: chunk[0],
+            y: chunk[1],
+            z: chunk[2],
+        }));
+    }
+    Ok(treatments)
 }
 
 fn fixed_scalar_patch_values(
@@ -4278,10 +4290,22 @@ fn fixed_scalar_patch_values(
         ))
     })?;
     let values = parse_patch_numeric_values(value, 1, faces, field, &patch.name)?;
-    Ok(values
-        .into_iter()
-        .map(ScalarFaceTreatment::FixedValue)
-        .collect())
+    let mut treatments = Vec::new();
+    treatments.try_reserve_exact(faces).map_err(|_| {
+        invalid_input(format!(
+            "field '{}' patch '{}' scalar boundary allocation failed",
+            field_label(field),
+            patch.name
+        ))
+    })?;
+    treatments.extend(
+        values
+            .as_slice()
+            .iter()
+            .copied()
+            .map(ScalarFaceTreatment::FixedValue),
+    );
+    Ok(treatments)
 }
 
 fn inlet_outlet_scalar_patch_values(
@@ -4301,19 +4325,45 @@ fn inlet_outlet_scalar_patch_values(
             ))
         })?;
     let values = parse_patch_numeric_values(value, 1, faces, field, &patch.name)?;
-    Ok(values
-        .into_iter()
-        .map(ScalarFaceTreatment::InletOutlet)
-        .collect())
+    let mut treatments = Vec::new();
+    treatments.try_reserve_exact(faces).map_err(|_| {
+        invalid_input(format!(
+            "field '{}' patch '{}' scalar inlet/outlet allocation failed",
+            field_label(field),
+            patch.name
+        ))
+    })?;
+    treatments.extend(
+        values
+            .as_slice()
+            .iter()
+            .copied()
+            .map(ScalarFaceTreatment::InletOutlet),
+    );
+    Ok(treatments)
 }
 
-fn parse_patch_numeric_values(
-    value: &FieldValueSummary,
+enum PatchNumericValues<'a> {
+    Owned(Vec<f64>),
+    Borrowed(&'a [f64]),
+}
+
+impl PatchNumericValues<'_> {
+    fn as_slice(&self) -> &[f64] {
+        match self {
+            Self::Owned(values) => values,
+            Self::Borrowed(values) => values,
+        }
+    }
+}
+
+fn parse_patch_numeric_values<'a>(
+    value: &'a FieldValueSummary,
     components: usize,
     faces: usize,
     field: &FieldFile,
     patch: &str,
-) -> Result<Vec<f64>> {
+) -> Result<PatchNumericValues<'a>> {
     match value {
         FieldValueSummary::Uniform(value) => {
             let values = parse_numbers(value, field, patch)?;
@@ -4326,11 +4376,25 @@ fn parse_patch_numeric_values(
                     components
                 )));
             }
-            let mut expanded = Vec::with_capacity(faces * components);
+            let scalar_slots = faces.checked_mul(components).ok_or_else(|| {
+                invalid_input(format!(
+                    "field '{}' patch '{}' uniform boundary size overflowed",
+                    field_label(field),
+                    patch
+                ))
+            })?;
+            let mut expanded = Vec::new();
+            expanded.try_reserve_exact(scalar_slots).map_err(|_| {
+                invalid_input(format!(
+                    "field '{}' patch '{}' uniform boundary allocation failed",
+                    field_label(field),
+                    patch
+                ))
+            })?;
             for _ in 0..faces {
                 expanded.extend(values.iter().copied());
             }
-            Ok(expanded)
+            Ok(PatchNumericValues::Owned(expanded))
         }
         FieldValueSummary::NonUniform { values, count, .. } => {
             if count.is_some_and(|count| count != faces) {
@@ -4349,7 +4413,13 @@ fn parse_patch_numeric_values(
                     patch
                 ))
             })?;
-            let expected = faces * components;
+            let expected = faces.checked_mul(components).ok_or_else(|| {
+                invalid_input(format!(
+                    "field '{}' patch '{}' nonuniform boundary size overflowed",
+                    field_label(field),
+                    patch
+                ))
+            })?;
             if values.len() != expected {
                 return Err(invalid_input(format!(
                     "field '{}' patch '{}' nonuniform value has {} scalars, expected {}",
@@ -4359,7 +4429,7 @@ fn parse_patch_numeric_values(
                     expected
                 )));
             }
-            Ok(values.clone())
+            Ok(PatchNumericValues::Borrowed(values))
         }
         FieldValueSummary::Other(value) => Err(invalid_input(format!(
             "field '{}' patch '{}' has unsupported value '{}'",
@@ -4404,49 +4474,106 @@ fn field_patch<'a>(
         })
 }
 
-fn runtime_vector_field(runtime: &SolverRuntimeData, name: &str) -> Result<Vec<Point3>> {
-    let buffer = runtime_field(runtime, name, 3)?;
-    Ok(buffer
-        .chunks_exact(3)
-        .map(|chunk| Point3 {
+fn take_runtime_initial_fields(runtime: &mut SolverRuntimeData) -> Result<(Vec<Point3>, Vec<f64>)> {
+    let velocity_index = runtime_field_index(runtime, "U", SolverStateFieldKind::VolVector, 3)?;
+    let pressure_index = runtime_field_index(runtime, "p", SolverStateFieldKind::VolScalar, 1)?;
+    validate_runtime_field(runtime, velocity_index, "U", 3)?;
+    validate_runtime_field(runtime, pressure_index, "p", 1)?;
+
+    // Point3 has no representation guarantee that permits reusing Vec<f64>'s
+    // allocation safely. Build the bounded typed representation while the
+    // original is still borrowed. Every fallible operation therefore finishes
+    // before either one-shot payload is consumed.
+    let velocity_scalars = runtime.fields[velocity_index]
+        .values
+        .as_deref()
+        .ok_or_else(|| {
+            invalid_input(
+                "runtime field 'U' initial payload was already consumed or not loaded".to_string(),
+            )
+        })?;
+    let cells = velocity_scalars.len() / 3;
+    let mut vectors = Vec::new();
+    vectors
+        .try_reserve_exact(cells)
+        .map_err(|_| invalid_input("runtime vector field 'U' allocation failed".to_string()))?;
+    for chunk in velocity_scalars.chunks_exact(3) {
+        vectors.push(Point3 {
             x: chunk[0],
             y: chunk[1],
             z: chunk[2],
-        })
-        .collect())
+        });
+    }
+
+    // Pressure is a Vec<f64> already and moves without changing its pointer.
+    // If this impossible post-preflight branch is reached, U remains intact.
+    let pressure = runtime.fields[pressure_index]
+        .values
+        .take()
+        .ok_or_else(|| {
+            invalid_input(
+                "runtime field 'p' initial payload was already consumed or not loaded".to_string(),
+            )
+        })?;
+    runtime.fields[velocity_index].values = None;
+    Ok((vectors, pressure))
 }
 
-fn runtime_scalar_field(runtime: &SolverRuntimeData, name: &str) -> Result<Vec<f64>> {
-    Ok(runtime_field(runtime, name, 1)?.to_vec())
-}
-
-fn runtime_field<'a>(
-    runtime: &'a SolverRuntimeData,
+fn runtime_field_index(
+    runtime: &SolverRuntimeData,
     name: &str,
+    kind: SolverStateFieldKind,
     components: usize,
-) -> Result<&'a [f64]> {
-    let buffer = runtime
+) -> Result<usize> {
+    runtime
         .fields
         .iter()
-        .find(|field| {
-            field.region.is_none() && field.name == name && field.components == components
+        .position(|field| {
+            field.region.is_none()
+                && field.name == name
+                && field.kind == kind
+                && field.components == components
         })
         .ok_or_else(|| {
             invalid_input(format!(
                 "runtime field '{}' with {} components was not materialized",
                 name, components
             ))
-        })?;
-    let expected = runtime.mesh.cells * components;
-    if buffer.values.len() != expected {
+        })
+}
+
+fn validate_runtime_field(
+    runtime: &SolverRuntimeData,
+    index: usize,
+    name: &str,
+    components: usize,
+) -> Result<()> {
+    let buffer = &runtime.fields[index];
+    let expected = runtime
+        .mesh
+        .cells
+        .checked_mul(components)
+        .ok_or_else(|| invalid_input(format!("runtime field '{name}' size overflowed")))?;
+    let values = buffer.values.as_ref().ok_or_else(|| {
+        invalid_input(format!(
+            "runtime field '{name}' initial payload was already consumed or not loaded"
+        ))
+    })?;
+    let expected_bytes = expected
+        .checked_mul(std::mem::size_of::<f64>())
+        .ok_or_else(|| invalid_input(format!("runtime field '{name}' byte size overflowed")))?;
+    if buffer.scalar_slots != expected
+        || buffer.bytes_f64 != expected_bytes
+        || values.len() != expected
+    {
         return Err(invalid_input(format!(
-            "runtime field '{}' has {} scalars, expected {}",
-            name,
-            buffer.values.len(),
-            expected
+            "runtime field '{name}' has descriptor slots={}, bytes={} and {} scalars, expected slots={expected}, bytes={expected_bytes}",
+            buffer.scalar_slots,
+            buffer.bytes_f64,
+            values.len(),
         )));
     }
-    Ok(buffer.values.as_slice())
+    Ok(())
 }
 
 fn find_field<'a>(
@@ -5365,7 +5492,7 @@ mod tests {
         subtract_face_fluxes, upwind_face_vector_value, vector_convection_divergence,
         vector_face_treatments, velocity_from_hby_a, zero,
     };
-    use crate::Point3;
+    use crate::{MeshError, Point3};
 
     #[test]
     fn vector_momentum_norm_aggregates_residuals_before_normalizing() {
@@ -6784,11 +6911,11 @@ mod tests {
 
     #[test]
     fn runs_minimal_simple_loop_on_two_cells() {
-        let runtime = two_cell_runtime();
+        let mut runtime = two_cell_runtime();
         let fields = two_cell_fields();
         let options = minimal_laminar_options();
 
-        let report = solve_laminar_simple(&runtime, &fields, &options).expect("simple report");
+        let report = solve_laminar_simple(&mut runtime, &fields, &options).expect("simple report");
 
         assert_eq!(report.cells, 2);
         assert!(report.simple_iterations > 0);
@@ -6836,6 +6963,73 @@ mod tests {
         );
         let phase_total: f64 = timing_values[1..].iter().sum();
         assert!(phase_total <= report.timing.solver_total_seconds + 1.0e-9);
+
+        let second = solve_laminar_simple(&mut runtime, &fields, &options)
+            .expect_err("initial fields are one-shot runtime payloads");
+        assert!(matches!(
+            second,
+            MeshError::InvalidInput(message)
+                if message
+                    == "runtime field 'U' initial payload was already consumed or not loaded"
+        ));
+    }
+
+    #[test]
+    fn missing_pressure_payload_does_not_consume_velocity() {
+        let mut runtime = two_cell_runtime();
+        runtime.fields[1].values = None;
+        let original_velocity = runtime.fields[0]
+            .values
+            .as_ref()
+            .expect("velocity payload")
+            .as_ptr();
+
+        let error =
+            solve_laminar_simple(&mut runtime, &two_cell_fields(), &minimal_laminar_options())
+                .expect_err("missing pressure must fail before consuming velocity");
+
+        assert!(matches!(
+            error,
+            MeshError::InvalidInput(message)
+                if message
+                    == "runtime field 'p' initial payload was already consumed or not loaded"
+        ));
+        let velocity = runtime.fields[0]
+            .values
+            .as_ref()
+            .expect("velocity must remain available");
+        assert_eq!(velocity.as_ptr(), original_velocity);
+        assert_eq!(velocity, &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn nonuniform_boundary_numeric_values_are_borrowed() {
+        let field_set = two_cell_fields();
+        let field = &field_set.fields[0];
+        let value = FieldValueSummary::NonUniform {
+            value_type: Some("List<vector>".to_string()),
+            count: Some(1),
+            values: Some(vec![1.0, 2.0, 3.0]),
+        };
+        let source = match &value {
+            FieldValueSummary::NonUniform {
+                values: Some(values),
+                ..
+            } => values.as_ptr(),
+            _ => unreachable!(),
+        };
+
+        let parsed = super::parse_patch_numeric_values(&value, 3, 1, field, "inlet")
+            .expect("nonuniform boundary values");
+        match parsed {
+            super::PatchNumericValues::Borrowed(values) => {
+                assert_eq!(values.as_ptr(), source);
+                assert_eq!(values, &[1.0, 2.0, 3.0]);
+            }
+            super::PatchNumericValues::Owned(_) => {
+                panic!("nonuniform boundary values were copied")
+            }
+        }
     }
 
     #[test]
@@ -6853,7 +7047,7 @@ mod tests {
 
     #[test]
     fn runs_minimal_simple_pressure_correction_with_face_area_gamg() {
-        let runtime = two_cell_runtime();
+        let mut runtime = two_cell_runtime();
         let fields = two_cell_fields();
         let mut options = minimal_laminar_options();
         options.pressure_linear_solver = LaminarSimpleLinearSolver::Gamg;
@@ -6867,7 +7061,7 @@ mod tests {
         });
         options.profile_gamg = true;
 
-        let report = solve_laminar_simple(&runtime, &fields, &options)
+        let report = solve_laminar_simple(&mut runtime, &fields, &options)
             .expect("faceAreaPair GAMG SIMPLE report");
 
         assert!(report.simple_iterations > 0);
@@ -6895,13 +7089,14 @@ mod tests {
 
     #[test]
     fn reports_profiled_pressure_pcg_kernel_work() {
-        let runtime = two_cell_runtime();
+        let mut runtime = two_cell_runtime();
         let fields = two_cell_fields();
         let mut options = minimal_laminar_options();
         options.pressure_linear_solver = LaminarSimpleLinearSolver::Pcg;
         options.pressure_preconditioner = LaminarSimplePreconditioner::IncompleteCholesky;
 
-        let report = solve_laminar_simple(&runtime, &fields, &options).expect("simple PCG report");
+        let report =
+            solve_laminar_simple(&mut runtime, &fields, &options).expect("simple PCG report");
 
         assert!(report.timing.pressure_pcg_total_seconds >= 0.0);
         assert!(report.timing.pressure_preconditioner_update_seconds >= 0.0);
@@ -7153,7 +7348,11 @@ mod tests {
 
     #[test]
     fn pressure_path_rejects_breakdown_but_not_iteration_exhaustion() {
-        let runtime = two_cell_runtime();
+        let mut runtime = two_cell_runtime();
+        let initial_pressure = runtime.fields[1]
+            .values
+            .clone()
+            .expect("initial pressure payload");
         let fields = two_cell_fields();
         let mut options = minimal_laminar_options();
         options.pressure_linear_solver = LaminarSimpleLinearSolver::Pcg;
@@ -7180,7 +7379,7 @@ mod tests {
                     }
                 };
             super::solve_laminar_simple_driven(
-                &runtime,
+                &mut runtime,
                 &fields,
                 &options,
                 None,
@@ -7195,7 +7394,7 @@ mod tests {
             LaminarSimpleStopReason::PressureSolverInvalidState
         );
         assert_eq!(breakdown.simple_iterations, 1);
-        assert_eq!(breakdown.final_pressure, runtime.fields[1].values);
+        assert_eq!(breakdown.final_pressure, initial_pressure);
         let expected_velocity = expected_velocity.unwrap();
         assert_eq!(breakdown.final_velocity.len(), expected_velocity.len());
         for (actual, expected) in breakdown.final_velocity.iter().zip(&expected_velocity) {
@@ -7258,8 +7457,9 @@ mod tests {
                     report.termination = IterativeSolveTermination::MaxIterations;
                 }
             };
+        let mut exhaustion_runtime = two_cell_runtime();
         let exhausted = super::solve_laminar_simple_driven(
-            &runtime,
+            &mut exhaustion_runtime,
             &fields,
             &options,
             None,
@@ -7396,7 +7596,7 @@ mod tests {
                     components: 3,
                     scalar_slots: 6,
                     bytes_f64: 48,
-                    values: vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                    values: Some(vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0]),
                 },
                 SolverRuntimeFieldBuffer {
                     region: None,
@@ -7405,7 +7605,7 @@ mod tests {
                     components: 1,
                     scalar_slots: 2,
                     bytes_f64: 16,
-                    values: vec![1.0, 0.0],
+                    values: Some(vec![1.0, 0.0]),
                 },
             ],
             warnings: Vec::new(),
