@@ -53,6 +53,10 @@ function Get-FullPath([string]$Path) {
     return [System.IO.Path]::GetFullPath($Path)
 }
 
+function Get-ResolvedPath([string]$Path) {
+    return (Resolve-Path -LiteralPath $Path).ProviderPath
+}
+
 function Test-IsPathUnder([string]$Child, [string]$Parent) {
     $childFull = Get-FullPath $Child
     $parentFull = (Get-FullPath $Parent).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
@@ -61,12 +65,55 @@ function Test-IsPathUnder([string]$Child, [string]$Parent) {
         $childFull.StartsWith($parentFull + [System.IO.Path]::AltDirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)
 }
 
+function Test-IsResolvedPathUnder([string]$Child, [string]$Parent) {
+    $childFull = Get-ResolvedPath $Child
+    $parentFull = (Get-ResolvedPath $Parent).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+    return $childFull.Equals($parentFull, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $childFull.StartsWith($parentFull + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $childFull.StartsWith($parentFull + [System.IO.Path]::AltDirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Assert-ExistingPathIsRegularDirectory([string]$Path, [string]$Description) {
+    if (!(Test-Path -LiteralPath $Path -PathType Container)) {
+        throw "$Description must be an existing directory: $Path"
+    }
+    $item = Get-Item -LiteralPath $Path -Force
+    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$Description must not be a symlink or reparse point: $Path"
+    }
+}
+
+function New-ContainedDirectory([string]$Path, [string]$AllowedRoot, [string]$Description) {
+    if (!(Test-IsPathUnder $Path $AllowedRoot)) {
+        throw "$Description must be inside the repository target directory: $AllowedRoot"
+    }
+
+    $existing = $Path
+    while (!(Test-Path -LiteralPath $existing)) {
+        $parent = Split-Path -Parent $existing
+        if ([string]::IsNullOrWhiteSpace($parent) -or $parent -eq $existing) {
+            throw "cannot find an existing parent for '$Path'"
+        }
+        $existing = $parent
+    }
+
+    if (!(Test-IsResolvedPathUnder $existing $AllowedRoot)) {
+        throw "$Description existing parent resolves outside '$AllowedRoot': $existing"
+    }
+
+    New-Item -ItemType Directory -Force -Path $Path | Out-Null
+    Assert-ExistingPathIsRegularDirectory $Path $Description
+    if (!(Test-IsResolvedPathUnder $Path $AllowedRoot)) {
+        throw "$Description resolves outside '$AllowedRoot': $Path"
+    }
+}
+
 function Remove-DirectoryIfExists([string]$Path, [string]$AllowedRoot) {
     if (!(Test-Path -LiteralPath $Path)) {
         return
     }
-    if (!(Test-IsPathUnder $Path $AllowedRoot)) {
-        throw "refusing to remove '$Path' because it is outside '$AllowedRoot'"
+    if (!(Test-IsResolvedPathUnder $Path $AllowedRoot)) {
+        throw "refusing to remove '$Path' because it resolves outside '$AllowedRoot'"
     }
     Remove-Item -LiteralPath $Path -Recurse -Force
 }
@@ -114,15 +161,16 @@ function Write-StudyMarkdown($Path, $Rows, $Summary) {
 }
 
 $targetRoot = Join-Path $RepoRoot "target"
-if (!(Test-IsPathUnder $StudyRoot $targetRoot)) {
-    throw "StudyRoot must be inside the repository target directory: $targetRoot"
-}
+New-ContainedDirectory $targetRoot $RepoRoot "Target root"
+New-ContainedDirectory $StudyRoot $targetRoot "StudyRoot"
 
 $casesRoot = Join-Path $StudyRoot "cases"
 $resultsRoot = Join-Path $StudyRoot "results"
 $openFoamRoot = Join-Path $StudyRoot "openfoam"
 $logsRoot = Join-Path $StudyRoot "logs"
-New-Item -ItemType Directory -Force -Path $casesRoot, $resultsRoot, $openFoamRoot, $logsRoot | Out-Null
+foreach ($directory in @($casesRoot, $resultsRoot, $openFoamRoot, $logsRoot)) {
+    New-ContainedDirectory $directory $StudyRoot "benchmark output directory"
+}
 
 $generator = Join-Path $PSScriptRoot "generate_laminar_pipe_case.ps1"
 $runOpenFoam = Join-Path $PSScriptRoot "run_openfoam_laminar_pipe.ps1"
