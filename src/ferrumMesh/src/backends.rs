@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::dictionary::{TokenCursor, TokenProvenance, tokenize};
@@ -100,13 +99,11 @@ impl std::fmt::Display for BackendChoice {
 
 pub fn read_backend_config(case_dir: &Path) -> Result<Option<BackendConfig>> {
     let path = case_dir.join("system").join("ferrumBackends");
-    if !path.exists() {
+    let Some(content) =
+        crate::case_input::CaseInput::new(case_dir).optional("system/ferrumBackends")?
+    else {
         return Ok(None);
-    }
-
-    let content = fs::read_to_string(&path).map_err(|error| {
-        MeshError::InvalidInput(format!("could not read {} ({error})", path.display()))
-    })?;
+    };
     let mut config = parse_backend_config_str(&content, &path)?;
     config.path = path;
     Ok(Some(config))
