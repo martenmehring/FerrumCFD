@@ -2433,6 +2433,21 @@ fn evaluate_laminar_simple_residual_control(
     }
 }
 
+fn simple_step_continuity_growth_exceeded(
+    before: ContinuitySummary,
+    after: ContinuitySummary,
+) -> bool {
+    fn component_growth_exceeded(before: f64, after: f64) -> bool {
+        after.is_finite()
+            && before.is_finite()
+            && after > before.max(f64::EPSILON) * LAMINAR_SIMPLE_MAX_CONTINUITY_GROWTH_PER_STEP
+    }
+
+    component_growth_exceeded(before.l2_norm, after.l2_norm)
+        || component_growth_exceeded(before.max_abs, after.max_abs)
+        || component_growth_exceeded(before.sum_abs, after.sum_abs)
+}
+
 fn points_are_finite(values: &[Point3]) -> bool {
     values
         .iter()
@@ -7216,6 +7231,55 @@ mod tests {
             report.timing.pressure_pcg_total_seconds
                 <= report.timing.pressure_linear_solve_seconds + 1.0e-9
         );
+    }
+
+    #[test]
+    fn laminar_simple_rejects_large_finite_continuity_growth() {
+        let before = super::ContinuitySummary {
+            l2_norm: 1.0,
+            max_abs: 0.5,
+            sum_abs: 1.25,
+            global_sum: 0.1,
+        };
+        let bounded = super::ContinuitySummary {
+            l2_norm: 100.0,
+            max_abs: 50.0,
+            sum_abs: 125.0,
+            global_sum: 10.0,
+        };
+        let divergent = super::ContinuitySummary {
+            l2_norm: 100.0_f64.next_up(),
+            max_abs: 50.0,
+            sum_abs: 125.0,
+            global_sum: 10.0,
+        };
+
+        assert!(!super::simple_step_continuity_growth_exceeded(
+            before, bounded
+        ));
+        assert!(super::simple_step_continuity_growth_exceeded(
+            before, divergent
+        ));
+    }
+
+    #[test]
+    fn laminar_simple_global_sum_noise_does_not_mask_bounded_continuity() {
+        let before = super::ContinuitySummary {
+            l2_norm: 8.276981e-10,
+            max_abs: 2.0e-10,
+            sum_abs: 1.0e-9,
+            global_sum: 0.0,
+        };
+        let after = super::ContinuitySummary {
+            l2_norm: 8.825281e-10,
+            max_abs: 2.1e-10,
+            sum_abs: 1.1e-9,
+            global_sum: 8.0e-10,
+        };
+
+        assert!(!super::simple_step_continuity_growth_exceeded(
+            before, after
+        ));
     }
 
     #[test]
