@@ -877,6 +877,13 @@ dimension-vector shape, but solver modules will later decide which properties
 are required for each physics model.
 
 With `--planJson <file>`, the same solver-neutral plan is also written as JSON.
+Only an explicit absolute path outside the current working directory authorizes
+a trusted create-new plan destination. Relative and inside-directory plan paths,
+and every solver output, remain strictly rooted at the current working directory.
+If plan-only creation fails while creating a missing parent or the final leaf,
+rollback removes only newly created empty directories, preserves the original
+error, and may leave nonempty residue. Existing or concurrent content is never
+deleted, and this rollback does not apply to strict case roots.
 That file is intended for future run managers, GUI tools, benchmark scripts,
 and CPU/GPU solver launch code. The text preflight remains the normal
 human-readable output.

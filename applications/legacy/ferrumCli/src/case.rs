@@ -20,13 +20,12 @@ pub struct InitCaseSummary {
 }
 
 pub fn init_case(options: &InitCaseOptions) -> Result<InitCaseSummary, String> {
-    let (output, created_dirs) =
-        SafeOutputRoot::create_trusted(&options.case_dir).map_err(|error| {
-            format!(
-                "could not safely open or create case directory {} ({error})",
-                options.case_dir.display()
-            )
-        })?;
+    let (output, created_dirs) = SafeOutputRoot::create(&options.case_dir).map_err(|error| {
+        format!(
+            "could not safely open or create case directory {} ({error})",
+            options.case_dir.display()
+        )
+    })?;
     let mut summary = InitCaseSummary {
         case_dir: options.case_dir.clone(),
         created_dirs,
@@ -344,7 +343,95 @@ fn write_foam_header(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::FileTypeExt;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(unix)]
+    fn inventory(root: &Path) -> Vec<(PathBuf, &'static str, Vec<u8>)> {
+        fn visit(base: &Path, path: &Path, entries: &mut Vec<(PathBuf, &'static str, Vec<u8>)>) {
+            let mut children: Vec<_> = fs::read_dir(path)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            children.sort();
+            for child in children {
+                let metadata = fs::symlink_metadata(&child).unwrap();
+                let kind = if metadata.is_dir() {
+                    "dir"
+                } else if metadata.is_file() {
+                    "file"
+                } else if metadata.file_type().is_symlink() {
+                    "symlink"
+                } else if metadata.file_type().is_socket() {
+                    "socket"
+                } else {
+                    "other"
+                };
+                let bytes = if metadata.is_file() {
+                    fs::read(&child).unwrap()
+                } else {
+                    Vec::new()
+                };
+                entries.push((child.strip_prefix(base).unwrap().to_path_buf(), kind, bytes));
+                if metadata.is_dir() {
+                    visit(base, &child, entries);
+                }
+            }
+        }
+        let mut entries = Vec::new();
+        visit(root, root, &mut entries);
+        entries
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_case_rejects_linked_case_root_without_mutating_target() {
+        let root = temp_dir("linked-case-root");
+        let target = root.join("target");
+        let case_dir = root.join("case");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("sentinel"), b"preserve me").unwrap();
+        create_directory_symlink(&target, &case_dir).unwrap();
+        let before = inventory(&target);
+
+        assert!(
+            init_case(&InitCaseOptions {
+                case_dir,
+                force: true,
+                regions: Vec::new()
+            })
+            .is_err()
+        );
+        assert_eq!(inventory(&target), before);
+        assert!(!target.join("system").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_case_rejects_missing_case_below_linked_ancestor_without_mutating_target() {
+        let root = temp_dir("linked-case-ancestor");
+        let target = root.join("target");
+        let linked = root.join("linked");
+        let case_dir = linked.join("missing-case");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("sentinel"), b"preserve me").unwrap();
+        create_directory_symlink(&target, &linked).unwrap();
+        let before = inventory(&target);
+
+        assert!(
+            init_case(&InitCaseOptions {
+                case_dir: case_dir.clone(),
+                force: true,
+                regions: Vec::new()
+            })
+            .is_err()
+        );
+        assert_eq!(inventory(&target), before);
+        assert!(!case_dir.exists());
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn init_case_rejects_symlinked_case_subdirectories() {

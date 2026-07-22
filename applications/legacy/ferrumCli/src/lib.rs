@@ -956,23 +956,34 @@ fn run_laminar_simple_solve(
         format_scientific(report.fields.pressure.max),
         format_scientific(report.fields.pressure.l2_norm)
     );
-    let output_root_path = env::current_dir()
-        .map_err(|error| format!("could not resolve the solver output root ({error})"))?;
-    let output_root = SafeOutputRoot::open_trusted(&output_root_path).map_err(|error| {
-        format!(
-            "could not safely open solver output root {} ({error})",
-            output_root_path.display()
-        )
-    })?;
+    let needs_output_root = solve.solve_residual_csv.is_some()
+        || solve.solve_residual_plot.is_some()
+        || solve.report_json.is_some()
+        || solve.report_markdown.is_some()
+        || solve.write_final_fields.is_some();
+    let output_root = if needs_output_root {
+        let path = env::current_dir()
+            .map_err(|error| format!("could not resolve the solver output root ({error})"))?;
+        Some(SafeOutputRoot::open_existing(&path).map_err(|error| {
+            format!(
+                "could not safely open solver output root {} ({error})",
+                path.display()
+            )
+        })?)
+    } else {
+        None
+    };
+    let output_root = output_root.as_ref();
 
     let mut residual_csv_path = solve.solve_residual_csv.clone();
     if let Some(path) = &solve.solve_residual_csv {
-        write_laminar_simple_residual_csv(&report, &output_root, path).map_err(|error| {
-            format!(
-                "could not write laminar SIMPLE residual history CSV to {} ({error})",
-                path.display()
-            )
-        })?;
+        write_laminar_simple_residual_csv(&report, output_root.expect("output requested"), path)
+            .map_err(|error| {
+                format!(
+                    "could not write laminar SIMPLE residual history CSV to {} ({error})",
+                    path.display()
+                )
+            })?;
         println!("wrote laminar SIMPLE residual CSV: {}", path.display());
     }
     if let Some(plot_path) = &solve.solve_residual_plot {
@@ -981,20 +992,27 @@ fn run_laminar_simple_solve(
         }
         if let Some(csv_path) = &residual_csv_path {
             if solve.solve_residual_csv.is_none() {
-                write_laminar_simple_residual_csv(&report, &output_root, csv_path).map_err(
-                    |error| {
-                        format!(
-                            "could not write temporary residual history CSV to {} ({error})",
-                            csv_path.display()
-                        )
-                    },
-                )?;
+                write_laminar_simple_residual_csv(
+                    &report,
+                    output_root.expect("output requested"),
+                    csv_path,
+                )
+                .map_err(|error| {
+                    format!(
+                        "could not write temporary residual history CSV to {} ({error})",
+                        csv_path.display()
+                    )
+                })?;
                 println!(
                     "wrote temporary residual CSV for plotting: {}",
                     csv_path.display()
                 );
             }
-            match write_laminar_simple_residual_plot(&output_root, csv_path, plot_path) {
+            match write_laminar_simple_residual_plot(
+                output_root.expect("output requested"),
+                csv_path,
+                plot_path,
+            ) {
                 Ok(()) => {
                     println!(
                         "wrote laminar SIMPLE residual plot: {}",
@@ -1026,13 +1044,18 @@ fn run_laminar_simple_solve(
         report.boundary_summary.pressure_zero_gradient_faces
     );
     if let Some(output_dir) = &solve.write_final_fields {
-        write_laminar_simple_fields(&plan.initial_fields, &report, &output_root, output_dir)
-            .map_err(|error| {
-                format!(
-                    "could not write laminar SIMPLE fields to {} ({error})",
-                    output_dir.display()
-                )
-            })?;
+        write_laminar_simple_fields(
+            &plan.initial_fields,
+            &report,
+            output_root.expect("output requested"),
+            output_dir,
+        )
+        .map_err(|error| {
+            format!(
+                "could not write laminar SIMPLE fields to {} ({error})",
+                output_dir.display()
+            )
+        })?;
         println!(
             "wrote laminar SIMPLE final fields: {}",
             output_dir.display()
@@ -1047,7 +1070,7 @@ fn run_laminar_simple_solve(
             &options,
             &report,
             wall_clock_seconds,
-            &output_root,
+            output_root.expect("output requested"),
             path,
         )
         .map_err(|error| {
@@ -1064,7 +1087,7 @@ fn run_laminar_simple_solve(
             &options,
             &report,
             wall_clock_seconds,
-            &output_root,
+            output_root.expect("output requested"),
             path,
         )
         .map_err(|error| {
@@ -3206,7 +3229,7 @@ fn write_solver_plan_json_in_root(
     trusted_root: &Path,
     path: &Path,
 ) -> std::io::Result<()> {
-    let output = SafeOutputRoot::open_trusted(trusted_root)?;
+    let output = SafeOutputRoot::open_existing(trusted_root)?;
     let file = open_create_new_operator_output_file(&output, path)?;
     let mut writer = BufWriter::new(file);
 

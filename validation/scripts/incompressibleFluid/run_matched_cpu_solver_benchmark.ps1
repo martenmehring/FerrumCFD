@@ -16,6 +16,7 @@ $RepoRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScript
 if ([string]::IsNullOrWhiteSpace($OutRoot)) {
     $OutRoot = Join-Path $RepoRoot "target\benchmarks\matched_cpu_solver\$PressureSolver"
 }
+$OutRoot = [System.IO.Path]::GetFullPath($OutRoot)
 if ($WarmupRuns -lt 0) {
     throw "WarmupRuns must be zero or greater"
 }
@@ -108,7 +109,16 @@ function Write-AsciiFile([string]$Path, [string]$Content) {
 }
 
 function ConvertTo-WslPath([string]$Path) {
-    $resolved = (Resolve-Path -LiteralPath $Path).Path
+    $full = [System.IO.Path]::GetFullPath($Path)
+    if (Test-Path -LiteralPath $full) {
+        $resolved = (Resolve-Path -LiteralPath $full).Path
+    } else {
+        $parent = Split-Path -Parent $full
+        if (!(Test-Path -LiteralPath $parent -PathType Container)) {
+            throw "could not convert '$Path' to a WSL path because its parent does not exist"
+        }
+        $resolved = Join-Path (Resolve-Path -LiteralPath $parent).Path (Split-Path -Leaf $full)
+    }
     if ($resolved -match "^([A-Za-z]):\\(.*)$") {
         $drive = $Matches[1].ToLowerInvariant()
         $rest = $Matches[2].Replace("\", "/")
@@ -463,6 +473,7 @@ function Invoke-FerrumRun(
     [string]$RunRoot,
     $CanonicalMeshHashes
 ) {
+    $RunRoot = [System.IO.Path]::GetFullPath($RunRoot)
     $workingCase = Join-Path $RunRoot "case"
     New-FerrumWorkingCase $Case $workingCase | Out-Null
     Assert-HashesEqual $CanonicalMeshHashes (Get-PolyMeshHashes $workingCase) "$($Case.name) Ferrum working"
@@ -477,11 +488,13 @@ function Invoke-FerrumRun(
     )
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $previousErrorActionPreference = $ErrorActionPreference
+    Push-Location $RunRoot
     try {
         $ErrorActionPreference = "Continue"
         & $Executable @arguments *> $logPath
         $exitCode = $LASTEXITCODE
     } finally {
+        Pop-Location
         $ErrorActionPreference = $previousErrorActionPreference
         $stopwatch.Stop()
     }
@@ -489,6 +502,12 @@ function Invoke-FerrumRun(
         throw "Ferrum run failed for $($Case.name) with exit code $exitCode. See $logPath"
     }
     $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
+    if ([string]::IsNullOrWhiteSpace([string]$report.outerConvergence.status) -or
+        @("Invalid", "NotEvaluated", "Failed") -contains [string]$report.outerConvergence.status -or
+        @("MomentumSolverInvalidState", "PressureSolverInvalidState", "SolverInvalidState") -contains [string]$report.solve.stopReason -or
+        @($report.history | Where-Object { $_.pressureCorrectionAccepted -ne $true }).Count -ne 0) {
+        throw "Ferrum report contains an invalid outer solve result"
+    }
     $expectedSolver = if ($PressureSolver -eq "gamg") { "GAMG" } else { "pcg" }
     if (!([string]$report.options.pressureLinearSolver).Equals($expectedSolver, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "Ferrum used pressure solver '$($report.options.pressureLinearSolver)', expected '$expectedSolver'"
@@ -530,6 +549,7 @@ function Invoke-OpenFoamRun(
     [string]$RunRoot,
     $CanonicalMeshHashes
 ) {
+    $RunRoot = [System.IO.Path]::GetFullPath($RunRoot)
     $working = New-OpenFoamWorkingCase $Case (Join-Path $RunRoot "case") $CanonicalMeshHashes
     $workingCase = $working.root
     $logPath = Join-Path $RunRoot "openfoam.log"
