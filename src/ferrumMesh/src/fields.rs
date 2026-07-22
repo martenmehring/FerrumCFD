@@ -517,37 +517,7 @@ fn balanced_end(
 }
 
 fn skip_exact_one(cursor: &mut TokenCursor) -> Result<()> {
-    let (end, has_terminator) = {
-        let tokens = cursor.remaining_tokens()?;
-        let first = match tokens.first() {
-            None => return reject(cursor, "dictionary value is missing"),
-            Some(token) if structural(token, ";") || closer(token) => {
-                return reject(cursor, "dictionary value is missing");
-            }
-            Some(token) => token,
-        };
-        let braced = structural(first, "{");
-        let end = if opener(first) {
-            match balanced_end(tokens, 0) {
-                Ok(end) => end,
-                Err((i, d)) => return reject_at(cursor, i, d),
-            }
-        } else {
-            1
-        };
-        let has_terminator = tokens.get(end).is_some_and(|token| structural(token, ";"));
-        if !braced && !has_terminator {
-            return reject_at(cursor, end, "dictionary value is missing a semicolon");
-        }
-        (end, has_terminator)
-    };
-    for _ in 0..end {
-        cursor.next_required()?;
-    }
-    if has_terminator {
-        cursor.next_required()?;
-    }
-    Ok(())
+    cursor.skip_exact_value_or_block()
 }
 
 fn take_scalar_entry(cursor: &mut TokenCursor, detail: &'static str) -> Result<String> {

@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::dictionary::{MAX_DICTIONARY_NESTING, TokenCursor, tokenize};
+use crate::dictionary::{MAX_DICTIONARY_NESTING, Token, TokenCursor, TokenProvenance, tokenize};
 use crate::{MeshError, Result};
 
 #[derive(Debug)]
@@ -149,23 +149,23 @@ fn parse_property_dictionary_str(
     let mut sections = Vec::new();
 
     while let Some(token) = cursor.peek()? {
-        if token.value == ";" {
+        if structural(token, ";") {
             cursor.next_required()?;
             continue;
         }
-        if token.value == "FoamFile" {
+        if ordinary(token, "FoamFile") {
             cursor.next_required()?;
             cursor.skip_braced_block()?;
             continue;
         }
 
-        let key = cursor.next_required()?;
-        if cursor.peek()?.is_some_and(|token| token.value == "{") {
-            sections.push(parse_property_section(&mut cursor, key.value, 1)?);
+        let key = take_name(&mut cursor)?;
+        if cursor.peek()?.is_some_and(|token| structural(token, "{")) {
+            sections.push(parse_property_section(&mut cursor, key, 1)?);
         } else {
             entries.push(PropertyEntry {
-                key: key.value,
-                value: cursor.read_bare_entry()?,
+                key,
+                value: cursor.read_provenance_preserving_bare_entry()?,
             });
         }
     }
@@ -197,19 +197,19 @@ fn parse_property_section(
     let mut entries = Vec::new();
     let mut sections = Vec::new();
 
-    while cursor.peek()?.is_none_or(|token| token.value != "}") {
-        if cursor.peek()?.is_some_and(|token| token.value == ";") {
+    while !cursor.peek()?.is_some_and(|token| structural(token, "}")) {
+        if cursor.peek()?.is_some_and(|token| structural(token, ";")) {
             cursor.next_required()?;
             continue;
         }
 
-        let key = cursor.next_required()?;
-        if cursor.peek()?.is_some_and(|token| token.value == "{") {
-            sections.push(parse_property_section(cursor, key.value, depth + 1)?);
+        let key = take_name(cursor)?;
+        if cursor.peek()?.is_some_and(|token| structural(token, "{")) {
+            sections.push(parse_property_section(cursor, key, depth + 1)?);
         } else {
             entries.push(PropertyEntry {
-                key: key.value,
-                value: cursor.read_bare_entry()?,
+                key,
+                value: cursor.read_provenance_preserving_bare_entry()?,
             });
         }
     }
@@ -221,6 +221,35 @@ fn parse_property_section(
         entries,
         sections,
     })
+}
+
+fn structural(token: &Token, expected: &str) -> bool {
+    token.provenance == TokenProvenance::Structural && token.value == expected
+}
+
+fn ordinary(token: &Token, expected: &str) -> bool {
+    token.provenance == TokenProvenance::Ordinary && token.value == expected
+}
+
+fn take_name(cursor: &mut TokenCursor) -> Result<String> {
+    if cursor
+        .peek()?
+        .is_some_and(|token| token.provenance == TokenProvenance::Structural)
+    {
+        return cursor.reject_current_as("property name must not be structural punctuation");
+    }
+    let quoted = cursor
+        .peek()?
+        .is_some_and(|token| token.provenance == TokenProvenance::Quoted);
+    if quoted {
+        cursor.try_reserve_current_value(2)?;
+    }
+    let mut token = cursor.next_required()?;
+    if quoted {
+        token.value.insert(0, '"');
+        token.value.push('"');
+    }
+    Ok(token.value)
 }
 
 fn validate_section_entries(
@@ -358,5 +387,45 @@ mod tests {
 
         assert_eq!(validation.warnings.len(), 1);
         assert!(validation.warnings[0].contains("has no entries"));
+    }
+
+    #[test]
+    fn quoted_property_keys_and_brackets_are_inert() {
+        let dictionary = parse_property_dictionary_str(
+            r#"
+            "FoamFile" { class dictionary; }
+            "nu" "[" 0 2 -1 0 0 0 0 "]" 1e-05;
+            nu "[" 0 2 -1 0 0 0 0 "]" 1e-05;
+            marker ";";
+            ";" inert;
+            rho [1 -3 0 0 0 0 0] 1.2;
+            "#,
+            Path::new("transportProperties"),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(dictionary.sections[0].name, "\"FoamFile\"");
+        assert_eq!(dictionary.entries[0].key, "\"nu\"");
+        assert_eq!(dictionary.entries[0].value[0], "\"[\"");
+        assert_eq!(dictionary.entries[0].value[8], "\"]\"");
+        assert_eq!(dictionary.entries[1].value[0], "\"[\"");
+        assert_eq!(dictionary.entries[2].value, ["\";\""]);
+        assert_eq!(dictionary.entries[3].key, "\";\"");
+        assert!(validate_properties(&[dictionary]).warnings.is_empty());
+    }
+
+    #[test]
+    fn quoted_closer_does_not_close_property_section() {
+        let dictionary = parse_property_dictionary_str(
+            r#"section { "}" inert; after 1; }"#,
+            Path::new("transportProperties"),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(dictionary.sections[0].entries.len(), 2);
+        assert_eq!(dictionary.sections[0].entries[0].key, "\"}\"");
+        assert_eq!(dictionary.sections[0].entries[1].key, "after");
     }
 }
