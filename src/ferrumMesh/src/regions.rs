@@ -1396,7 +1396,10 @@ mod tests {
         let output = SafeOutputRoot::open_existing(&root).expect("open output root");
         let error = foam_writer(&output, Path::new("points"), "vectorField", "points")
             .expect_err("symlinked output file must be rejected");
-        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        match error {
+            MeshError::Io(error) => assert_ne!(error.kind(), std::io::ErrorKind::NotFound),
+            other => panic!("expected an I/O rejection, got {other}"),
+        }
         assert_eq!(
             fs::read_to_string(&target).expect("read target"),
             "original"
