@@ -5,7 +5,10 @@ use crate::backends::{
     BackendChoice, read_backend_config, validate_backend_policy, validate_backend_resources,
 };
 use crate::control::{ControlDict, read_control_dict, validate_control_dict};
-use crate::fields::{read_initial_fields, validate_initial_field_boundaries};
+use crate::fields::{
+    FieldLoadPolicy, InitialFieldSet, read_initial_fields_with_policy,
+    validate_initial_field_boundaries,
+};
 use crate::interfaces::{read_interface_config, validate_interface_config};
 use crate::numerics::{
     NumericsSection, format_numerics_value, read_fv_schemes, read_fv_solution, validate_fv_schemes,
@@ -27,6 +30,7 @@ pub struct SolverCasePlan {
     pub control: ControlDict,
     pub mesh: SolverMeshPlan,
     pub fields: SolverFieldPlan,
+    pub initial_fields: InitialFieldSet,
     pub state: SolverStatePlan,
     pub runtime_data: SolverRuntimeData,
     pub properties: SolverPropertiesPlan,
@@ -245,6 +249,13 @@ const BUILT_IN_RUN_STAGES: &[(&str, &str)] = &[
 ];
 
 pub fn build_solver_case_plan(case_dir: &Path) -> Result<SolverCasePlan> {
+    build_solver_case_plan_with_policy(case_dir, FieldLoadPolicy::Summary)
+}
+
+pub fn build_solver_case_plan_with_policy(
+    case_dir: &Path,
+    field_policy: FieldLoadPolicy,
+) -> Result<SolverCasePlan> {
     let control = read_control_dict(case_dir)?;
     let mut warnings = Vec::new();
     let control_validation = validate_control_dict(&control);
@@ -279,23 +290,24 @@ pub fn build_solver_case_plan(case_dir: &Path) -> Result<SolverCasePlan> {
         }
     };
 
-    let fields = read_initial_fields(case_dir)?;
+    let mut fields = read_initial_fields_with_policy(case_dir, field_policy)?;
     validate_openfoam_case_structure(case_dir, &fields, &mut warnings);
-    let field_validation = validate_initial_field_boundaries(case_dir, &fields);
+    let field_validation = validate_initial_field_boundaries(case_dir, &fields)?;
     warnings.extend(
         field_validation
             .warnings
             .iter()
             .map(|warning| format!("field boundary: {warning}")),
     );
-    let state = build_solver_state_plan(case_dir, &fields);
+    let state = build_solver_state_plan(case_dir, &fields)?;
     warnings.extend(
         state
             .warnings
             .iter()
             .map(|warning| format!("solver state: {warning}")),
     );
-    let runtime_data = build_solver_runtime_data(case_dir, &mesh, &state)?;
+    let runtime_data =
+        build_solver_runtime_data(case_dir, &mesh, &state, &mut fields, field_policy)?;
     warnings.extend(
         runtime_data
             .warnings
@@ -354,22 +366,14 @@ pub fn build_solver_case_plan(case_dir: &Path) -> Result<SolverCasePlan> {
         );
     }
 
+    let field_plan = build_solver_field_plan(&fields)?;
+
     Ok(SolverCasePlan {
         case_dir: case_dir.to_path_buf(),
         control,
         mesh: build_mesh_plan(&mesh, &patch_validation, region_meshes),
-        fields: SolverFieldPlan {
-            fields: fields
-                .fields
-                .into_iter()
-                .map(|field| SolverFieldEntryPlan {
-                    region: field.region,
-                    name: field.name,
-                    class_name: field.class_name,
-                    boundary_patches: field.boundary_patches.len(),
-                })
-                .collect(),
-        },
+        fields: field_plan,
+        initial_fields: fields,
         state,
         runtime_data,
         properties,
@@ -379,6 +383,37 @@ pub fn build_solver_case_plan(case_dir: &Path) -> Result<SolverCasePlan> {
         run,
         warnings,
     })
+}
+
+fn build_solver_field_plan(fields: &InitialFieldSet) -> Result<SolverFieldPlan> {
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(fields.fields.len())
+        .map_err(|_| {
+            crate::MeshError::InvalidInput("solver field plan allocation failed".to_string())
+        })?;
+    for field in &fields.fields {
+        entries.push(SolverFieldEntryPlan {
+            region: try_clone_optional_string(field.region.as_deref())?,
+            name: try_clone_plan_string(&field.name)?,
+            class_name: try_clone_optional_string(field.class_name.as_deref())?,
+            boundary_patches: field.boundary_patches.len(),
+        });
+    }
+    Ok(SolverFieldPlan { fields: entries })
+}
+
+fn try_clone_plan_string(value: &str) -> Result<String> {
+    let mut cloned = String::new();
+    cloned.try_reserve_exact(value.len()).map_err(|_| {
+        crate::MeshError::InvalidInput("solver plan string allocation failed".to_string())
+    })?;
+    cloned.push_str(value);
+    Ok(cloned)
+}
+
+fn try_clone_optional_string(value: Option<&str>) -> Result<Option<String>> {
+    value.map(try_clone_plan_string).transpose()
 }
 
 fn validate_openfoam_case_structure(

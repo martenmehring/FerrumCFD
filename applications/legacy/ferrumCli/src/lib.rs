@@ -18,8 +18,8 @@ use ferrum_mesh::diffusion::{
     scalar_diffusion_options_from_field,
 };
 use ferrum_mesh::fields::{
-    FieldBoundaryValidationSummary, FieldFile, FieldValueSummary, InitialFieldSet,
-    read_initial_fields, validate_initial_field_boundaries,
+    FieldBoundaryValidationSummary, FieldFile, FieldLoadPolicy, FieldValueSummary, InitialFieldSet,
+    read_initial_fields_with_policy, validate_initial_field_boundaries,
 };
 use ferrum_mesh::flow::{
     ContinuitySummary, FaceFluxDiagnosticSummary, FlowBoundarySummary, FlowOperatorSummary,
@@ -52,7 +52,7 @@ use ferrum_mesh::runtime::SolverRuntimeData;
 use ferrum_mesh::solver_plan::{
     SolverBackendPlan, SolverCasePlan, SolverFieldPlan, SolverInterfacePlan, SolverMeshPlan,
     SolverNumericsDictionaryPlan, SolverNumericsPlan, SolverPropertiesPlan, SolverRunPlan,
-    build_solver_case_plan,
+    build_solver_case_plan_with_policy,
 };
 use ferrum_mesh::solver_state::SolverStatePlan;
 
@@ -251,9 +251,10 @@ fn check_mesh(args: Vec<String>) -> Result<(), String> {
     print_interface_registry(&interfaces);
     print_interface_config(&case_dir, &interfaces)?;
     print_backend_config(&case_dir)?;
-    let fields = read_initial_fields(&case_dir).map_err(|error| error.to_string())?;
+    let fields = read_initial_fields_with_policy(&case_dir, FieldLoadPolicy::Summary)
+        .map_err(|error| error.to_string())?;
     print_initial_fields(&fields);
-    print_field_boundary_validation(&case_dir, &fields);
+    print_field_boundary_validation(&case_dir, &fields)?;
     print_geometry_summary(&case_dir)?;
     print_patch_validation(&case_dir)?;
 
@@ -535,7 +536,20 @@ fn solve_case_with_contract(
         }
         SolverInvocation::IncompressibleFluidExecute => parse_incompressible_fluid_args(&args)?,
     };
-    let plan = build_solver_case_plan(&options.case_dir).map_err(|error| error.to_string())?;
+    if options.scalar_diffusion_solve.is_some() && options.laminar_simple_solve.is_some() {
+        return Err(
+            "scalar diffusion and incompressibleFluid solves cannot share one-shot initial field buffers in one invocation"
+                .to_string(),
+        );
+    }
+    let field_policy =
+        if options.scalar_diffusion_solve.is_some() || options.laminar_simple_solve.is_some() {
+            FieldLoadPolicy::Full
+        } else {
+            FieldLoadPolicy::Summary
+        };
+    let mut plan = build_solver_case_plan_with_policy(&options.case_dir, field_policy)
+        .map_err(|error| error.to_string())?;
     if let Some((module, required_section)) = required_module_section {
         validate_module_execution_contract(&plan, module, required_section)?;
     }
@@ -550,10 +564,10 @@ fn solve_case_with_contract(
         print_solver_runner_dry_run(&dry_run);
     }
     if let Some(solve) = &options.scalar_diffusion_solve {
-        run_scalar_diffusion_solve(&plan, solve)?;
+        run_scalar_diffusion_solve(&mut plan, solve)?;
     }
     if let Some(solve) = &options.laminar_simple_solve {
-        run_laminar_simple_solve(&plan, solve)?;
+        run_laminar_simple_solve(&mut plan, solve)?;
     }
     if let Some(path) = options.plan_json {
         write_solver_plan_json(&plan, dispatch.as_ref(), &path).map_err(|error| {
@@ -688,10 +702,9 @@ fn validate_laminar_transport_regime(plan: &SolverCasePlan) -> Result<(), String
 }
 
 fn run_laminar_simple_solve(
-    plan: &SolverCasePlan,
+    plan: &mut SolverCasePlan,
     solve: &LaminarSimpleSolveArgs,
 ) -> Result<(), String> {
-    let fields = read_initial_fields(&plan.case_dir).map_err(|error| error.to_string())?;
     let options = resolve_laminar_simple_options(plan, solve)?;
 
     let started = Instant::now();
@@ -721,14 +734,14 @@ fn run_laminar_simple_solve(
             let _ = std::io::stdout().flush();
         };
         solve_laminar_simple_with_observer(
-            &plan.runtime_data,
-            &fields,
+            &mut plan.runtime_data,
+            &plan.initial_fields,
             &options,
             Some(&mut print_iteration),
         )
         .map_err(|error| error.to_string())?
     } else {
-        solve_laminar_simple(&plan.runtime_data, &fields, &options)
+        solve_laminar_simple(&mut plan.runtime_data, &plan.initial_fields, &options)
             .map_err(|error| error.to_string())?
     };
     let wall_clock_seconds = started.elapsed().as_secs_f64();
@@ -997,12 +1010,14 @@ fn run_laminar_simple_solve(
         report.boundary_summary.pressure_zero_gradient_faces
     );
     if let Some(output_dir) = &solve.write_final_fields {
-        write_laminar_simple_fields(&fields, &report, output_dir).map_err(|error| {
-            format!(
-                "could not write laminar SIMPLE fields to {} ({error})",
-                output_dir.display()
-            )
-        })?;
+        write_laminar_simple_fields(&plan.initial_fields, &report, output_dir).map_err(
+            |error| {
+                format!(
+                    "could not write laminar SIMPLE fields to {} ({error})",
+                    output_dir.display()
+                )
+            },
+        )?;
         println!(
             "wrote laminar SIMPLE final fields: {}",
             output_dir.display()
@@ -2465,11 +2480,10 @@ fn parse_openfoam_laminar_preconditioner(
 }
 
 fn run_scalar_diffusion_solve(
-    plan: &SolverCasePlan,
+    plan: &mut SolverCasePlan,
     solve: &ScalarDiffusionSolveArgs,
 ) -> Result<(), String> {
-    let fields = read_initial_fields(&plan.case_dir).map_err(|error| error.to_string())?;
-    let field = find_field_selection(&fields, &solve.field)?;
+    let field = find_field_selection(&plan.initial_fields, &solve.field)?;
     let options = scalar_diffusion_options_from_field(field, solve.diffusivity, solve.source)
         .map_err(|error| error.to_string())?;
     let system = assemble_scalar_diffusion_system(&plan.runtime_data.mesh, &options)
@@ -2568,9 +2582,12 @@ fn runtime_initial_guess<'a>(plan: &'a SolverCasePlan, field: &FieldFile) -> Opt
             buffer.region == field.region
                 && buffer.name == field.name
                 && buffer.components == 1
-                && buffer.values.len() == plan.runtime_data.mesh.cells
+                && buffer
+                    .values
+                    .as_ref()
+                    .is_some_and(|values| values.len() == plan.runtime_data.mesh.cells)
         })
-        .map(|buffer| buffer.values.as_slice())
+        .and_then(|buffer| buffer.values.as_deref())
 }
 
 fn field_label(field: &FieldFile) -> String {
@@ -2830,13 +2847,7 @@ fn print_solver_state_plan(plan: &SolverStatePlan) {
             format_optional_usize(field.storage.scalar_slots),
             format_optional_usize(field.storage.bytes_f64),
             format_optional_f64_list(field.internal_field.uniform_components.as_deref()),
-            format_optional_usize(
-                field
-                    .internal_field
-                    .nonuniform_values
-                    .as_ref()
-                    .map(Vec::len)
-            ),
+            format_optional_usize(field.internal_field.loaded_scalars),
             field.boundary_patches,
             format_optional_usize(field.mesh_boundary_patches),
             yes_no(field.storage.cpu_capable),
@@ -2922,7 +2933,7 @@ fn print_solver_runtime_data(runtime: &SolverRuntimeData) {
                 field.components,
                 field.scalar_slots,
                 field.bytes_f64,
-                field.values.len()
+                field.values.as_ref().map_or(0, Vec::len)
             );
         }
     }
@@ -3115,13 +3126,7 @@ fn print_solver_runner_state(plan: &SolverStatePlan) {
             format_optional_usize(field.storage.scalar_slots),
             format_optional_usize(field.storage.bytes_f64),
             format_optional_f64_list(field.internal_field.uniform_components.as_deref()),
-            format_optional_usize(
-                field
-                    .internal_field
-                    .nonuniform_values
-                    .as_ref()
-                    .map(Vec::len)
-            ),
+            format_optional_usize(field.internal_field.loaded_scalars),
             yes_no(field.storage.cpu_capable),
             yes_no(field.storage.gpu_capable),
             field.storage.status,
@@ -5647,14 +5652,7 @@ fn write_json_solver_state(writer: &mut impl Write, plan: &SolverStatePlan) -> s
         write_json_optional_f64_array(writer, field.internal_field.uniform_components.as_deref())?;
         writeln!(writer, ",")?;
         write_json_key(writer, 10, "loadedScalars")?;
-        write_json_optional_usize(
-            writer,
-            field
-                .internal_field
-                .nonuniform_values
-                .as_ref()
-                .map(Vec::len),
-        )?;
+        write_json_optional_usize(writer, field.internal_field.loaded_scalars)?;
         writeln!(writer)?;
         write_indent(writer, 8)?;
         writeln!(writer, "}},")?;
@@ -6508,9 +6506,14 @@ fn print_initial_field(field: &FieldFile) {
     }
 }
 
-fn print_field_boundary_validation(case_dir: &Path, fields: &InitialFieldSet) {
-    let summary = validate_initial_field_boundaries(case_dir, fields);
+fn print_field_boundary_validation(
+    case_dir: &Path,
+    fields: &InitialFieldSet,
+) -> Result<(), String> {
+    let summary =
+        validate_initial_field_boundaries(case_dir, fields).map_err(|error| error.to_string())?;
     print_field_boundary_validation_summary(&summary);
+    Ok(())
 }
 
 fn print_field_boundary_validation_summary(summary: &FieldBoundaryValidationSummary) {
@@ -6716,6 +6719,7 @@ fn parse_solver_args_for_invocation(
 ) -> Result<SolverArgs, String> {
     let mut case_dir = PathBuf::from(".");
     let mut plan_json = None;
+    let mut inspection_only = false;
     let mut runner_dry_run = false;
     let mut max_runner_steps = SolverRunnerDryRunOptions::default().max_steps;
     let mut scalar_diffusion_field = None;
@@ -6768,6 +6772,7 @@ fn parse_solver_args_for_invocation(
                 index += 2;
             }
             "-preflight" | "--preflight" | "-dryRun" | "--dry-run" => {
+                inspection_only = true;
                 index += 1;
             }
             "-planJson" | "--planJson" | "-plan-json" | "--plan-json" => {
@@ -6778,6 +6783,7 @@ fn parse_solver_args_for_invocation(
                 index += 2;
             }
             "-runnerDryRun" | "--runnerDryRun" | "-runner-dry-run" | "--runner-dry-run" => {
+                inspection_only = true;
                 runner_dry_run = true;
                 index += 1;
             }
@@ -7189,6 +7195,12 @@ fn parse_solver_args_for_invocation(
     } else {
         None
     };
+    if inspection_only && (scalar_diffusion_solve.is_some() || laminar_simple_solve.is_some()) {
+        return Err(
+            "inspection modes (--preflight/--runnerDryRun) cannot be combined with equation solves"
+                .to_string(),
+        );
+    }
     if laminar_simple_solve.is_none() && shared_flow_option_seen {
         return Err("--mu requires ferrumRun -solver incompressibleFluid".to_string());
     }
@@ -7567,6 +7579,7 @@ fn print_solver_usage() {
     println!("options:");
     println!("  --planJson <file>    also write the solver-neutral plan as JSON");
     println!("  --runnerDryRun       preview the future solver runner without solving equations");
+    println!("  inspection modes cannot be combined with --solveScalarDiffusion");
     println!("  --maxRunnerSteps <n> limit runner dry-run preview steps (default: 3)");
     println!("  --solveScalarDiffusion <field> assemble and solve one CPU scalar diffusion system");
 
@@ -7692,13 +7705,33 @@ mod tests {
     }
 
     #[test]
-    fn incompressible_plan_only_modes_do_not_select_the_simple_kernel() {
-        for mode in ["--preflight", "--runnerDryRun"] {
+    fn inspection_modes_do_not_select_or_mix_with_solver_kernels() {
+        for mode in [
+            "-preflight",
+            "--preflight",
+            "-dryRun",
+            "--dry-run",
+            "-runnerDryRun",
+            "--runnerDryRun",
+            "-runner-dry-run",
+            "--runner-dry-run",
+        ] {
             let parsed = parse_incompressible_fluid_plan_args(&[mode.to_string()])
                 .expect("incompressibleFluid plan-only args should parse");
 
             assert!(parsed.laminar_simple_solve.is_none(), "mode: {mode}");
             assert!(parsed.scalar_diffusion_solve.is_none(), "mode: {mode}");
+
+            let error = parse_solver_args(&[
+                mode.to_string(),
+                "--solveScalarDiffusion".to_string(),
+                "T".to_string(),
+            ])
+            .expect_err("inspection and scalar solve modes must be mutually exclusive");
+            assert!(
+                error.contains("cannot be combined"),
+                "mode: {mode}: {error}"
+            );
         }
     }
 
@@ -8709,6 +8742,10 @@ mod tests {
                 region_meshes: Vec::new(),
             },
             fields: SolverFieldPlan { fields: Vec::new() },
+            initial_fields: ferrum_mesh::fields::InitialFieldSet {
+                case_dir: PathBuf::from("case"),
+                fields: Vec::new(),
+            },
             state: ferrum_mesh::solver_state::SolverStatePlan {
                 fields: Vec::new(),
                 warnings: Vec::new(),
@@ -9264,7 +9301,7 @@ mod tests {
                     expected_count: Some(4),
                     valid_count: Some(true),
                     uniform_components: Some(vec![0.0]),
-                    nonuniform_values: None,
+                    loaded_scalars: None,
                 },
                 boundary_patches: 1,
                 mesh_boundary_patches: Some(1),
