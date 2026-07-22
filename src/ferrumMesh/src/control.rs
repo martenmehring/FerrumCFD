@@ -380,6 +380,39 @@ mod tests {
     }
 
     #[test]
+    fn openfoam_directives_fail_with_a_specific_source_location() {
+        for directive in [
+            "#include \"initialConditions\"",
+            "#includeFunc residuals",
+            "#include \"initialConditions\";",
+            "#includeFunc residuals;",
+        ] {
+            let content = format!("{directive}\napplication ferrumRun;\n");
+            let error = parse_control_dict_str(&content, Path::new("controlDict"))
+                .expect_err("unresolved directives must fail closed");
+            assert_eq!(
+                error.to_string(),
+                "line 1: controlDict: unsupported dictionary directive"
+            );
+        }
+
+        for quoted in [r##""#include" inert;"##, r##""#includeFunc" inert;"##] {
+            let content = format!("{quoted}\napplication ferrumRun;\n");
+            let control = parse_control_dict_str(&content, Path::new("controlDict"))
+                .expect("quoted directive spelling must remain inert data");
+            assert_eq!(control.application.as_deref(), Some("ferrumRun"));
+        }
+
+        let nested = "unknown { #include \"initialConditions\"; }\napplication ferrumRun;\n";
+        let error = parse_control_dict_str(nested, Path::new("controlDict"))
+            .expect_err("discarded blocks cannot hide unsupported directives");
+        assert_eq!(
+            error.to_string(),
+            "line 1: controlDict: unsupported dictionary directive"
+        );
+    }
+
+    #[test]
     fn quoted_and_unknown_control_value_matrix_preserves_sentinels() {
         for key in ["unknown", r#""unknown""#] {
             for value in [

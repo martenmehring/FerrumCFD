@@ -1,7 +1,9 @@
 use std::mem::size_of;
 use std::path::Path;
 
-use crate::fields::{FieldLoadPolicy, FieldValueSummary, InitialFieldSet};
+use crate::fields::{
+    FieldLoadPolicy, FieldValueSummary, InitialFieldSet, nonuniform_value_type_components,
+};
 use crate::geometry::compute_poly_mesh_geometry;
 use crate::poly_mesh::PolyMesh;
 use crate::solver_state::{
@@ -82,21 +84,17 @@ pub fn build_solver_runtime_data(
     for (source_index, field) in state.fields.iter().enumerate() {
         let label = try_runtime_field_label(field.region.as_deref(), &field.name)?;
         let Some(components) = field.storage.components else {
-            if policy == FieldLoadPolicy::Full {
-                push_runtime_warning(
-                    &mut warnings,
-                    format!("field '{label}' has no component count for runtime buffer"),
-                )?;
-            }
+            push_runtime_warning(
+                &mut warnings,
+                format!("field '{label}' has no component count for runtime buffer"),
+            )?;
             continue;
         };
         let Some(scalar_slots) = field.storage.scalar_slots else {
-            if policy == FieldLoadPolicy::Full {
-                push_runtime_warning(
-                    &mut warnings,
-                    format!("field '{label}' has no scalar-slot count for runtime buffer"),
-                )?;
-            }
+            push_runtime_warning(
+                &mut warnings,
+                format!("field '{label}' has no scalar-slot count for runtime buffer"),
+            )?;
             continue;
         };
         let Some(bytes_f64) = scalar_slots.checked_mul(size_of::<f64>()) else {
@@ -105,24 +103,30 @@ pub fn build_solver_runtime_data(
             )));
         };
 
-        let (values, nonuniform_source) = match policy {
-            FieldLoadPolicy::Summary => (None, None),
-            FieldLoadPolicy::Full => match field.cpu_buffer.status {
-                SolverStateCpuBufferStatus::UniformReady => {
-                    (Some(materialize_uniform(field, scalar_slots)?), None)
-                }
-                SolverStateCpuBufferStatus::NonUniformReady => (None, Some(source_index)),
-                _ => {
-                    push_runtime_warning(
-                        &mut warnings,
-                        format!(
-                            "field '{label}' is not materializable as a CPU f64 buffer: {}",
-                            field.cpu_buffer.status
-                        ),
-                    )?;
-                    continue;
-                }
+        let (values, nonuniform_source) = match field.cpu_buffer.status {
+            SolverStateCpuBufferStatus::UniformReady => match policy {
+                FieldLoadPolicy::Summary => (None, None),
+                FieldLoadPolicy::Full => (Some(materialize_uniform(field, scalar_slots)?), None),
             },
+            SolverStateCpuBufferStatus::NonUniformReady => match policy {
+                FieldLoadPolicy::Summary => (None, None),
+                FieldLoadPolicy::Full => (None, Some(source_index)),
+            },
+            SolverStateCpuBufferStatus::NonUniformDataNotLoaded
+                if policy == FieldLoadPolicy::Summary =>
+            {
+                (None, None)
+            }
+            _ => {
+                push_runtime_warning(
+                    &mut warnings,
+                    format!(
+                        "field '{label}' is not materializable as a CPU f64 buffer: {}",
+                        field.cpu_buffer.status
+                    ),
+                )?;
+                continue;
+            }
         };
 
         let region = try_clone_optional_string(field.region.as_deref())?;
@@ -139,7 +143,7 @@ pub fn build_solver_runtime_data(
         nonuniform_sources.push(nonuniform_source);
     }
 
-    if policy == FieldLoadPolicy::Full && fields.is_empty() && !state.fields.is_empty() {
+    if fields.is_empty() && !state.fields.is_empty() {
         push_runtime_warning(
             &mut warnings,
             format!(
@@ -313,12 +317,7 @@ fn preflight_runtime_descriptor(
         || planned.internal_field.uniform_components != uniform_components
         || planned.internal_field.loaded_scalars != loaded_scalars
         || planned.cpu_buffer.status != status
-        || planned.cpu_buffer.materializable
-            != matches!(
-                status,
-                SolverStateCpuBufferStatus::UniformReady
-                    | SolverStateCpuBufferStatus::NonUniformReady
-            )
+        || planned.cpu_buffer.materializable != (status == SolverStateCpuBufferStatus::UniformReady)
     {
         return Err(runtime_descriptor_mismatch(
             label,
@@ -383,7 +382,7 @@ fn expected_internal_descriptor(
             count,
             values,
         }) => {
-            let supported = runtime_nonuniform_type_is_supported(value_type.as_deref());
+            let supported = nonuniform_value_type_components(value_type.as_deref()).is_some();
             let valid_count = count
                 .zip(expected_count)
                 .map(|(count, expected)| count == expected);
@@ -435,7 +434,7 @@ fn source_internal_kind(source: &crate::fields::FieldFile) -> SolverStateValueKi
     match &source.internal_field {
         Some(FieldValueSummary::Uniform(_)) => SolverStateValueKind::Uniform,
         Some(FieldValueSummary::NonUniform { value_type, .. })
-            if runtime_nonuniform_type_is_supported(value_type.as_deref()) =>
+            if nonuniform_value_type_components(value_type.as_deref()).is_some() =>
         {
             SolverStateValueKind::NonUniform
         }
@@ -463,7 +462,7 @@ fn source_loaded_scalars(source: &crate::fields::FieldFile) -> Option<usize> {
     match &source.internal_field {
         Some(FieldValueSummary::NonUniform {
             value_type, values, ..
-        }) if runtime_nonuniform_type_is_supported(value_type.as_deref()) => {
+        }) if nonuniform_value_type_components(value_type.as_deref()).is_some() => {
             values.as_ref().map(Vec::len)
         }
         _ => None,
@@ -505,18 +504,6 @@ fn runtime_components(kind: SolverStateFieldKind) -> Option<usize> {
         SolverStateFieldKind::VolVector => Some(3),
         SolverStateFieldKind::Other => None,
     }
-}
-
-fn runtime_nonuniform_type_is_supported(value_type: Option<&str>) -> bool {
-    matches!(
-        value_type,
-        Some("List<scalar>")
-            | Some("scalarField")
-            | Some("Field<scalar>")
-            | Some("List<vector>")
-            | Some("vectorField")
-            | Some("Field<vector>")
-    )
 }
 
 fn runtime_descriptor_mismatch(label: &str, detail: &str) -> MeshError {
@@ -682,77 +669,7 @@ mod tests {
     #[test]
     fn builds_runtime_mesh_geometry_and_uniform_field_buffer() {
         let mesh = unit_cube_mesh();
-        let state = SolverStatePlan {
-            fields: vec![
-                SolverStateFieldPlan {
-                    region: None,
-                    name: "p".to_string(),
-                    class_name: Some("volScalarField".to_string()),
-                    kind: SolverStateFieldKind::VolScalar,
-                    dimensions: None,
-                    mesh_cells: Some(1),
-                    mesh_faces: Some(6),
-                    internal_field: SolverStateInternalFieldPlan {
-                        kind: SolverStateValueKind::Uniform,
-                        value_count: Some(1),
-                        expected_count: Some(1),
-                        valid_count: Some(true),
-                        uniform_components: Some(vec![7.0]),
-                        loaded_scalars: None,
-                    },
-                    boundary_patches: 0,
-                    mesh_boundary_patches: Some(1),
-                    storage: SolverStateStoragePlan {
-                        cpu_capable: true,
-                        gpu_capable: true,
-                        components: Some(1),
-                        scalar_slots: Some(1),
-                        bytes_f64: Some(8),
-                        status: SolverStateStorageStatus::Loaded,
-                    },
-                    cpu_buffer: SolverStateCpuBufferPlan {
-                        materializable: true,
-                        scalar_slots: Some(1),
-                        bytes_f64: Some(8),
-                        status: SolverStateCpuBufferStatus::UniformReady,
-                    },
-                },
-                SolverStateFieldPlan {
-                    region: None,
-                    name: "T".to_string(),
-                    class_name: Some("volScalarField".to_string()),
-                    kind: SolverStateFieldKind::VolScalar,
-                    dimensions: None,
-                    mesh_cells: Some(1),
-                    mesh_faces: Some(6),
-                    internal_field: SolverStateInternalFieldPlan {
-                        kind: SolverStateValueKind::NonUniform,
-                        value_count: Some(1),
-                        expected_count: Some(1),
-                        valid_count: Some(true),
-                        uniform_components: None,
-                        loaded_scalars: Some(1),
-                    },
-                    boundary_patches: 0,
-                    mesh_boundary_patches: Some(1),
-                    storage: SolverStateStoragePlan {
-                        cpu_capable: true,
-                        gpu_capable: true,
-                        components: Some(1),
-                        scalar_slots: Some(1),
-                        bytes_f64: Some(8),
-                        status: SolverStateStorageStatus::Loaded,
-                    },
-                    cpu_buffer: SolverStateCpuBufferPlan {
-                        materializable: true,
-                        scalar_slots: Some(1),
-                        bytes_f64: Some(8),
-                        status: SolverStateCpuBufferStatus::NonUniformReady,
-                    },
-                },
-            ],
-            warnings: Vec::new(),
-        };
+        let state = runtime_state();
         let mut full_fields = initial_fields();
         let source_pointer = match &full_fields.fields[1].internal_field {
             Some(FieldValueSummary::NonUniform {
@@ -833,6 +750,263 @@ mod tests {
         };
         assert_eq!(preserved.as_ptr(), original_pointer);
         assert_eq!(preserved, &[300.0]);
+    }
+
+    #[test]
+    fn rejects_nonuniform_materializable_claim_before_transfer() {
+        let mesh = unit_cube_mesh();
+        let mut state = runtime_state();
+        state.fields[1].cpu_buffer.materializable = true;
+        let mut fields = initial_fields();
+        let original_pointer = match &fields.fields[1].internal_field {
+            Some(FieldValueSummary::NonUniform {
+                values: Some(values),
+                ..
+            }) => values.as_ptr(),
+            _ => panic!("nonuniform fixture missing"),
+        };
+
+        let error = build_solver_runtime_data(
+            Path::new("case"),
+            &mesh,
+            &state,
+            &mut fields,
+            FieldLoadPolicy::Full,
+        )
+        .expect_err("nonuniform state cannot claim direct materializability");
+
+        assert_eq!(
+            error.to_string(),
+            "field 'T' runtime descriptor mismatch: internal-field status or source provenance"
+        );
+        let preserved = match &fields.fields[1].internal_field {
+            Some(FieldValueSummary::NonUniform {
+                values: Some(values),
+                ..
+            }) => values,
+            _ => panic!("descriptor rejection consumed the nonuniform source"),
+        };
+        assert_eq!(preserved.as_ptr(), original_pointer);
+        assert_eq!(preserved, &[300.0]);
+    }
+
+    #[test]
+    fn full_policy_warns_and_omits_unloaded_nonuniform_descriptor() {
+        let mesh = unit_cube_mesh();
+        let mut state = runtime_state();
+        state.fields[1].internal_field.loaded_scalars = None;
+        state.fields[1].cpu_buffer.status = SolverStateCpuBufferStatus::NonUniformDataNotLoaded;
+        let mut fields = initial_fields();
+        let Some(FieldValueSummary::NonUniform { values, .. }) =
+            fields.fields[1].internal_field.as_mut()
+        else {
+            panic!("nonuniform summary fixture missing");
+        };
+        *values = None;
+
+        let runtime = build_solver_runtime_data(
+            Path::new("case"),
+            &mesh,
+            &state,
+            &mut fields,
+            FieldLoadPolicy::Full,
+        )
+        .expect("full runtime should omit an unloaded nonuniform payload");
+
+        assert_eq!(
+            runtime
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["p"]
+        );
+        assert_eq!(
+            runtime.warnings,
+            vec!["field 'T' is not materializable as a CPU f64 buffer: nonuniform-data-not-loaded"]
+        );
+    }
+
+    #[test]
+    fn summary_and_full_select_and_warn_for_invalid_fields_identically() {
+        let mesh = unit_cube_mesh();
+        let mut full_state = runtime_state();
+        full_state.fields.push(invalid_uniform_vector_state());
+
+        let mut full_fields = initial_fields();
+        full_fields.fields.push(invalid_uniform_vector_field());
+        let full = build_solver_runtime_data(
+            Path::new("case"),
+            &mesh,
+            &full_state,
+            &mut full_fields,
+            FieldLoadPolicy::Full,
+        )
+        .expect("full runtime should reject only the invalid field");
+
+        let mut summary_state = runtime_state();
+        summary_state.fields[1].internal_field.loaded_scalars = None;
+        summary_state.fields[1].cpu_buffer.status =
+            SolverStateCpuBufferStatus::NonUniformDataNotLoaded;
+        summary_state.fields.push(invalid_uniform_vector_state());
+        let mut summary_fields = initial_fields();
+        let Some(FieldValueSummary::NonUniform { values, .. }) =
+            summary_fields.fields[1].internal_field.as_mut()
+        else {
+            panic!("nonuniform summary fixture missing");
+        };
+        *values = None;
+        summary_fields.fields.push(invalid_uniform_vector_field());
+        let summary = build_solver_runtime_data(
+            Path::new("case"),
+            &mesh,
+            &summary_state,
+            &mut summary_fields,
+            FieldLoadPolicy::Summary,
+        )
+        .expect("summary runtime should reject only the invalid field");
+
+        let full_names = full
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>();
+        let summary_names = summary
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(full_names, vec!["p", "T"]);
+        assert_eq!(summary_names, full_names);
+        assert_eq!(
+            full.warnings,
+            vec!["field 'U' is not materializable as a CPU f64 buffer: invalid-shape"]
+        );
+        assert_eq!(summary.warnings, full.warnings);
+        assert!(full.fields.iter().all(|field| field.values.is_some()));
+        assert!(summary.fields.iter().all(|field| field.values.is_none()));
+    }
+
+    fn runtime_state() -> SolverStatePlan {
+        SolverStatePlan {
+            fields: vec![
+                SolverStateFieldPlan {
+                    region: None,
+                    name: "p".to_string(),
+                    class_name: Some("volScalarField".to_string()),
+                    kind: SolverStateFieldKind::VolScalar,
+                    dimensions: None,
+                    mesh_cells: Some(1),
+                    mesh_faces: Some(6),
+                    internal_field: SolverStateInternalFieldPlan {
+                        kind: SolverStateValueKind::Uniform,
+                        value_count: Some(1),
+                        expected_count: Some(1),
+                        valid_count: Some(true),
+                        uniform_components: Some(vec![7.0]),
+                        loaded_scalars: None,
+                    },
+                    boundary_patches: 0,
+                    mesh_boundary_patches: Some(1),
+                    storage: SolverStateStoragePlan {
+                        cpu_capable: true,
+                        gpu_capable: true,
+                        components: Some(1),
+                        scalar_slots: Some(1),
+                        bytes_f64: Some(8),
+                        status: SolverStateStorageStatus::Loaded,
+                    },
+                    cpu_buffer: SolverStateCpuBufferPlan {
+                        materializable: true,
+                        scalar_slots: Some(1),
+                        bytes_f64: Some(8),
+                        status: SolverStateCpuBufferStatus::UniformReady,
+                    },
+                },
+                SolverStateFieldPlan {
+                    region: None,
+                    name: "T".to_string(),
+                    class_name: Some("volScalarField".to_string()),
+                    kind: SolverStateFieldKind::VolScalar,
+                    dimensions: None,
+                    mesh_cells: Some(1),
+                    mesh_faces: Some(6),
+                    internal_field: SolverStateInternalFieldPlan {
+                        kind: SolverStateValueKind::NonUniform,
+                        value_count: Some(1),
+                        expected_count: Some(1),
+                        valid_count: Some(true),
+                        uniform_components: None,
+                        loaded_scalars: Some(1),
+                    },
+                    boundary_patches: 0,
+                    mesh_boundary_patches: Some(1),
+                    storage: SolverStateStoragePlan {
+                        cpu_capable: true,
+                        gpu_capable: true,
+                        components: Some(1),
+                        scalar_slots: Some(1),
+                        bytes_f64: Some(8),
+                        status: SolverStateStorageStatus::Loaded,
+                    },
+                    cpu_buffer: SolverStateCpuBufferPlan {
+                        materializable: false,
+                        scalar_slots: Some(1),
+                        bytes_f64: Some(8),
+                        status: SolverStateCpuBufferStatus::NonUniformReady,
+                    },
+                },
+            ],
+            warnings: Vec::new(),
+        }
+    }
+
+    fn invalid_uniform_vector_state() -> SolverStateFieldPlan {
+        SolverStateFieldPlan {
+            region: None,
+            name: "U".to_string(),
+            class_name: Some("volVectorField".to_string()),
+            kind: SolverStateFieldKind::VolVector,
+            dimensions: None,
+            mesh_cells: Some(1),
+            mesh_faces: Some(6),
+            internal_field: SolverStateInternalFieldPlan {
+                kind: SolverStateValueKind::Uniform,
+                value_count: Some(1),
+                expected_count: Some(1),
+                valid_count: Some(true),
+                uniform_components: Some(vec![1.0, 2.0]),
+                loaded_scalars: None,
+            },
+            boundary_patches: 0,
+            mesh_boundary_patches: Some(1),
+            storage: SolverStateStoragePlan {
+                cpu_capable: true,
+                gpu_capable: true,
+                components: Some(3),
+                scalar_slots: Some(3),
+                bytes_f64: Some(24),
+                status: SolverStateStorageStatus::Loaded,
+            },
+            cpu_buffer: SolverStateCpuBufferPlan {
+                materializable: false,
+                scalar_slots: Some(3),
+                bytes_f64: Some(24),
+                status: SolverStateCpuBufferStatus::InvalidShape,
+            },
+        }
+    }
+
+    fn invalid_uniform_vector_field() -> FieldFile {
+        FieldFile {
+            path: PathBuf::from("case/0/U"),
+            region: None,
+            name: "U".to_string(),
+            class_name: Some("volVectorField".to_string()),
+            dimensions: None,
+            internal_field: Some(FieldValueSummary::Uniform("(1 2)".to_string())),
+            boundary_patches: Vec::new(),
+        }
     }
 
     fn initial_fields() -> InitialFieldSet {

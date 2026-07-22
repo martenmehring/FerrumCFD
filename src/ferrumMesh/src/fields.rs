@@ -62,6 +62,14 @@ pub enum FieldLoadPolicy {
 
 const MAX_RETAINED_FIELD_VALUE_BYTES: usize = MAX_TOKEN_BYTES;
 
+pub(crate) fn nonuniform_value_type_components(value_type: Option<&str>) -> Option<usize> {
+    match value_type {
+        Some("List<scalar>" | "scalarField" | "Field<scalar>") => Some(1),
+        Some("List<vector>" | "vectorField" | "Field<vector>") => Some(3),
+        _ => None,
+    }
+}
+
 impl std::fmt::Display for FieldValueSummary {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -829,15 +837,12 @@ fn parse_nonuniform<R: BufRead>(
     policy: FieldLoadPolicy,
 ) -> Result<FieldValueSummary> {
     let value_type = source.next_required()?;
-    let components = if value_type.provenance == TokenProvenance::Ordinary
-        && value_type.value == "List<scalar>"
-    {
-        1
-    } else if value_type.provenance == TokenProvenance::Ordinary
-        && value_type.value == "List<vector>"
-    {
-        3
+    let components = if value_type.provenance == TokenProvenance::Ordinary {
+        nonuniform_value_type_components(Some(value_type.value.as_str()))
     } else {
+        None
+    };
+    let Some(components) = components else {
         return source.reject_line_as(value_type.line, "unsupported nonuniform value type");
     };
 
@@ -1548,6 +1553,104 @@ mod tests {
     }
 
     #[test]
+    fn parses_all_supported_nonuniform_type_aliases() {
+        let cases = [
+            ("volScalarField", "p", "List<scalar>", "1 2", 2),
+            ("volScalarField", "p", "scalarField", "1 2", 2),
+            ("volScalarField", "p", "Field<scalar>", "1 2", 2),
+            ("volVectorField", "U", "List<vector>", "(1 2 3) (4 5 6)", 6),
+            ("volVectorField", "U", "vectorField", "(1 2 3) (4 5 6)", 6),
+            ("volVectorField", "U", "Field<vector>", "(1 2 3) (4 5 6)", 6),
+        ];
+
+        for (class_name, object, value_type, values, scalar_count) in cases {
+            let content = format!(
+                "FoamFile {{ class {class_name}; object {object}; }}\n\
+                 internalField nonuniform {value_type} 2 ({values});\n\
+                 boundaryField {{}}\n"
+            );
+            let path = Path::new("0/field");
+            let full =
+                parse_field_file_str_with_policy(&content, path, None, FieldLoadPolicy::Full)
+                    .unwrap();
+            let summary =
+                parse_field_file_str_with_policy(&content, path, None, FieldLoadPolicy::Summary)
+                    .unwrap();
+
+            assert!(matches!(
+                full.internal_field,
+                Some(FieldValueSummary::NonUniform {
+                    value_type: Some(ref parsed_type),
+                    count: Some(2),
+                    values: Some(ref parsed_values),
+                }) if parsed_type == value_type && parsed_values.len() == scalar_count
+            ));
+            assert!(matches!(
+                summary.internal_field,
+                Some(FieldValueSummary::NonUniform {
+                    value_type: Some(ref parsed_type),
+                    count: Some(2),
+                    values: None,
+                }) if parsed_type == value_type
+            ));
+        }
+
+        for unsupported in [
+            r#""scalarField""#,
+            r#""Field<scalar>""#,
+            "List<label>",
+            "List<tensor>",
+            "Field<scalar",
+        ] {
+            let content = format!(
+                "FoamFile {{ class volScalarField; object p; }}\n\
+                 internalField nonuniform {unsupported} 1 (7);\n\
+                 boundaryField {{}}\n"
+            );
+            assert_parse_error(&content, 2, "unsupported nonuniform value type");
+        }
+    }
+
+    #[test]
+    fn field_directives_fail_closed_without_activating_quoted_spellings() {
+        for directive in [
+            "#include \"initialConditions\"",
+            "#includeFunc residuals",
+            "#include \"initialConditions\";",
+            "#includeFunc residuals;",
+        ] {
+            let content = format!(
+                "FoamFile {{ class volScalarField; object p; }}\n\
+                 {directive}\n\
+                 internalField uniform 0;\n\
+                 boundaryField {{}}\n"
+            );
+            assert_parse_error(&content, 2, "unsupported dictionary directive");
+        }
+
+        for quoted in [r##""#include" inert;"##, r##""#includeFunc" inert;"##] {
+            let content = format!(
+                "FoamFile {{ class volScalarField; object p; }}\n\
+                 {quoted}\n\
+                 internalField uniform 0;\n\
+                 boundaryField {{}}\n"
+            );
+            let field = parse_field_file_str(&content, Path::new("0/p"), None)
+                .expect("quoted directive spelling must remain inert data");
+            assert_eq!(field.name, "p");
+        }
+
+        assert_parse_error(
+            "FoamFile { class volScalarField; object p; }\n\
+             unknown { #include \"initialConditions\"; }\n\
+             internalField uniform 0;\n\
+             boundaryField {}\n",
+            2,
+            "unsupported dictionary directive",
+        );
+    }
+
+    #[test]
     fn rejects_nonuniform_numeric_tail_beyond_declared_count() {
         let content = r#"
         FoamFile { class volScalarField; object p; }
@@ -1624,8 +1727,8 @@ boundaryField
         );
         assert_parse_error(
             "FoamFile { class volScalarField; object p; }\n#includeFunc residuals\ninternalField uniform 0;\n",
-            3,
-            "dictionary value is missing a semicolon",
+            2,
+            "unsupported dictionary directive",
         );
 
         let repetitions = MAX_DICTIONARY_TOKENS / 3 + 1;
