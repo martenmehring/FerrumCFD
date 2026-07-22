@@ -1,6 +1,10 @@
-use std::fs::{self, File, OpenOptions};
+#[cfg(test)]
+use std::fs;
+use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
+
+use ferrum_mesh::safe_output::{SafeOutputEntry, SafeOutputRoot};
 
 pub struct InitCaseOptions {
     pub case_dir: PathBuf,
@@ -16,75 +20,78 @@ pub struct InitCaseSummary {
 }
 
 pub fn init_case(options: &InitCaseOptions) -> Result<InitCaseSummary, String> {
+    let (output, created_dirs) = SafeOutputRoot::create(&options.case_dir).map_err(|error| {
+        format!(
+            "could not safely open or create case directory {} ({error})",
+            options.case_dir.display()
+        )
+    })?;
     let mut summary = InitCaseSummary {
         case_dir: options.case_dir.clone(),
-        created_dirs: Vec::new(),
+        created_dirs,
         written_files: Vec::new(),
         skipped_files: Vec::new(),
     };
 
-    ensure_dir(&options.case_dir, &mut summary)?;
-    ensure_dir(&options.case_dir.join("0"), &mut summary)?;
-    ensure_dir(&options.case_dir.join("constant"), &mut summary)?;
-    ensure_dir(
-        &options.case_dir.join("constant").join("polyMesh"),
-        &mut summary,
-    )?;
-    ensure_dir(&options.case_dir.join("system"), &mut summary)?;
+    ensure_dir(&output, Path::new("0"), &mut summary)?;
+    ensure_dir(&output, Path::new("constant"), &mut summary)?;
+    ensure_dir(&output, Path::new("constant/polyMesh"), &mut summary)?;
+    ensure_dir(&output, Path::new("system"), &mut summary)?;
 
     for region in &options.regions {
-        ensure_dir(&options.case_dir.join("0").join(region), &mut summary)?;
+        ensure_dir(&output, &PathBuf::from("0").join(region), &mut summary)?;
         ensure_dir(
-            &options
-                .case_dir
-                .join("constant")
-                .join(region)
-                .join("polyMesh"),
+            &output,
+            &PathBuf::from("constant").join(region).join("polyMesh"),
             &mut summary,
         )?;
     }
 
     write_file(
-        &options.case_dir.join("README.md"),
+        &output,
+        Path::new("README.md"),
         options.force,
         &mut summary,
         |writer| write_case_readme(writer, &options.regions),
     )?;
     write_file(
-        &options.case_dir.join("system").join("controlDict"),
+        &output,
+        Path::new("system/controlDict"),
         options.force,
         &mut summary,
         write_control_dict,
     )?;
     write_file(
-        &options.case_dir.join("system").join("fvSchemes"),
+        &output,
+        Path::new("system/fvSchemes"),
         options.force,
         &mut summary,
         write_fv_schemes,
     )?;
     write_file(
-        &options.case_dir.join("system").join("fvSolution"),
+        &output,
+        Path::new("system/fvSolution"),
         options.force,
         &mut summary,
         write_fv_solution,
     )?;
     write_file(
-        &options.case_dir.join("system").join("ferrumBackends"),
+        &output,
+        Path::new("system/ferrumBackends"),
         options.force,
         &mut summary,
         write_ferrum_backends,
     )?;
     write_file(
-        &options.case_dir.join("constant").join("interfaces"),
+        &output,
+        Path::new("constant/interfaces"),
         options.force,
         &mut summary,
         write_interfaces,
     )?;
     write_file(
-        &options
-            .case_dir
-            .join("constant")
-            .join("transportProperties"),
+        &output,
+        Path::new("constant/transportProperties"),
         options.force,
         &mut summary,
         write_transport_properties,
@@ -93,149 +100,60 @@ pub fn init_case(options: &InitCaseOptions) -> Result<InitCaseSummary, String> {
     Ok(summary)
 }
 
-fn ensure_dir(path: &Path, summary: &mut InitCaseSummary) -> Result<(), String> {
-    let mut current = PathBuf::new();
-
-    for component in path.components() {
-        current.push(component.as_os_str());
-        if matches!(
-            component,
-            Component::Prefix(_) | Component::RootDir | Component::CurDir
-        ) {
-            continue;
-        }
-
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) => ensure_real_directory(&current, metadata)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir(&current)
-                    .map_err(|error| format!("could not create {} ({error})", current.display()))?;
-                let metadata = fs::symlink_metadata(&current).map_err(|error| {
-                    format!(
-                        "could not inspect created directory {} ({error})",
-                        current.display()
-                    )
-                })?;
-                ensure_real_directory(&current, metadata)?;
-                summary.created_dirs.push(current.clone());
-            }
-            Err(error) => {
-                return Err(format!(
-                    "could not inspect directory {} ({error})",
-                    current.display()
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn ensure_real_directory(path: &Path, metadata: fs::Metadata) -> Result<(), String> {
-    if metadata.file_type().is_symlink() {
-        return Err(format!(
-            "refusing to use symlink as case directory: {}",
-            path.display()
-        ));
-    }
-    if !metadata.is_dir() {
-        return Err(format!("{} exists but is not a directory", path.display()));
-    }
+fn ensure_dir(
+    output: &SafeOutputRoot,
+    relative: &Path,
+    summary: &mut InitCaseSummary,
+) -> Result<(), String> {
+    let created = output.ensure_dir(relative).map_err(|error| {
+        format!(
+            "could not safely create case directory {} ({error})",
+            output.path().join(relative).display()
+        )
+    })?;
+    summary.created_dirs.extend(created);
     Ok(())
 }
 
 fn write_file(
-    path: &Path,
+    output: &SafeOutputRoot,
+    relative: &Path,
     force: bool,
     summary: &mut InitCaseSummary,
     write: impl FnOnce(&mut BufWriter<File>) -> Result<(), std::io::Error>,
 ) -> Result<(), String> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() {
-                return Err(format!(
-                    "refusing to write case template through symlink: {}",
-                    path.display()
-                ));
-            }
-            if !force {
-                summary.skipped_files.push(path.to_path_buf());
-                return Ok(());
-            }
+    let display = summary.case_dir.join(relative);
+    let existing = output.entry(relative).map_err(|error| {
+        format!(
+            "could not safely inspect output file {} ({error})",
+            display.display()
+        )
+    })?;
+    match existing {
+        Some(SafeOutputEntry::File) if !force => {
+            summary.skipped_files.push(display);
+            return Ok(());
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
+        Some(SafeOutputEntry::Directory | SafeOutputEntry::Other) => {
             return Err(format!(
-                "could not inspect output file {} ({error})",
-                path.display()
+                "refusing to replace non-regular case template output {}",
+                display.display()
             ));
         }
+        Some(SafeOutputEntry::File) | None => {}
     }
 
-    if let Some(parent) = path.parent() {
-        ensure_existing_real_directory(parent)?;
+    let file = if force {
+        output.open_replace_regular(relative)
+    } else {
+        output.open_create_new(relative)
     }
-
-    let file = open_template_file(path, force)
-        .map_err(|error| format!("could not write {} ({error})", path.display()))?;
+    .map_err(|error| format!("could not safely write {} ({error})", display.display()))?;
     let mut writer = BufWriter::new(file);
-    write(&mut writer).map_err(|error| format!("could not write {} ({error})", path.display()))?;
-    summary.written_files.push(path.to_path_buf());
+    write(&mut writer)
+        .map_err(|error| format!("could not write {} ({error})", display.display()))?;
+    summary.written_files.push(display);
     Ok(())
-}
-
-fn ensure_existing_real_directory(path: &Path) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| format!("could not inspect directory {} ({error})", path.display()))?;
-    ensure_real_directory(path, metadata)
-}
-
-#[cfg(unix)]
-fn open_template_file(path: &Path, force: bool) -> Result<File, std::io::Error> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut options = OpenOptions::new();
-    options.write(true).custom_flags(o_no_follow());
-    if force {
-        options.create(true).truncate(true);
-    } else {
-        options.create_new(true);
-    }
-    options.open(path)
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn o_no_follow() -> i32 {
-    0o400000
-}
-
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-fn o_no_follow() -> i32 {
-    0x0100
-}
-
-#[cfg(all(
-    unix,
-    not(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "macos",
-        target_os = "ios"
-    ))
-))]
-fn o_no_follow() -> i32 {
-    0x00000100
-}
-
-#[cfg(not(unix))]
-fn open_template_file(path: &Path, force: bool) -> Result<File, std::io::Error> {
-    let mut options = OpenOptions::new();
-    options.write(true);
-    if force {
-        options.create(true).truncate(true);
-    } else {
-        options.create_new(true);
-    }
-    options.open(path)
 }
 
 fn write_case_readme(
@@ -449,7 +367,7 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(error.contains("refusing to use symlink as case directory"));
+        assert!(error.contains("could not safely create case directory"));
         assert!(!outside.join("controlDict").exists());
         let _ = fs::remove_dir_all(root);
     }
@@ -478,8 +396,30 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(error.contains("refusing to write case template through symlink"));
+        assert!(error.contains("refusing to replace non-regular case template output"));
         assert_eq!(fs::read_to_string(outside).unwrap(), "do not clobber");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn init_case_force_replaces_regular_templates() {
+        let root = temp_dir("force-regular");
+        let case_dir = root.join("case");
+        fs::create_dir_all(case_dir.join("system")).unwrap();
+        fs::create_dir_all(case_dir.join("constant/polyMesh")).unwrap();
+        fs::create_dir_all(case_dir.join("0")).unwrap();
+        fs::write(case_dir.join("system/controlDict"), "old").unwrap();
+
+        init_case(&InitCaseOptions {
+            case_dir: case_dir.clone(),
+            force: true,
+            regions: Vec::new(),
+        })
+        .expect("regular templates should be replaceable with force");
+
+        let control = fs::read_to_string(case_dir.join("system/controlDict")).unwrap();
+        assert!(control.contains("application ferrumRun;"));
+        assert!(!control.contains("old"));
         let _ = fs::remove_dir_all(root);
     }
 
