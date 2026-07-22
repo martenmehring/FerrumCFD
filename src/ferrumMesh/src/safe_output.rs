@@ -1,4 +1,4 @@
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
@@ -24,7 +24,7 @@ pub struct SafeOutputRoot {
 impl SafeOutputRoot {
     /// Opens an existing directory without following any ancestor links.
     pub fn open_existing(path: &Path) -> io::Result<Self> {
-        let (dir, absolute, _) = open_absolute_directory(path, false)?;
+        let (dir, absolute, _) = open_absolute_directory_strict(path, false)?;
         Ok(Self {
             dir,
             path: absolute,
@@ -32,9 +32,8 @@ impl SafeOutputRoot {
     }
 
     /// Opens or creates a directory without following any ancestor links.
-    /// The returned paths are the directories created by this call.
     pub fn create(path: &Path) -> io::Result<(Self, Vec<PathBuf>)> {
-        let (dir, absolute, created) = open_absolute_directory(path, true)?;
+        let (dir, absolute, created) = open_absolute_directory_strict(path, true)?;
         Ok((
             Self {
                 dir,
@@ -44,8 +43,78 @@ impl SafeOutputRoot {
         ))
     }
 
+    /// Opens an existing operator-supplied directory as a trusted root.
+    ///
+    /// Links in `path` itself are followed while acquiring the root
+    /// capability. Every relative descent below that capability remains
+    /// no-follow.
+    pub fn open_trusted(path: &Path) -> io::Result<Self> {
+        let (dir, absolute, _) = open_absolute_directory_trusted(path, false)?;
+        Ok(Self {
+            dir,
+            path: absolute,
+        })
+    }
+
+    /// Opens or creates an operator-supplied directory as a trusted root.
+    ///
+    /// An existing prefix of `path` may contain links. Missing components
+    /// below the opened prefix are created one at a time with no-follow
+    /// checks. The returned paths are the directories created by this call.
+    pub fn create_trusted(path: &Path) -> io::Result<(Self, Vec<PathBuf>)> {
+        let (dir, absolute, created) = open_absolute_directory_trusted(path, true)?;
+        Ok((
+            Self {
+                dir,
+                path: absolute,
+            },
+            created,
+        ))
+    }
+
+    /// Creates a new file at an operator-supplied absolute path.
+    ///
+    /// Missing parent directories are created below the deepest trusted
+    /// existing ancestor. If file creation fails, directories created by this
+    /// call are removed through their retained parent capabilities.
+    pub fn open_create_new_trusted_absolute(path: &Path) -> io::Result<std::fs::File> {
+        if !path.is_absolute() {
+            return Err(invalid_path(
+                "trusted operator output path must be absolute",
+            ));
+        }
+        let absolute = lexical_absolute(path)?;
+        validate_absolute(&absolute)?;
+        let file_name = absolute
+            .file_name()
+            .ok_or_else(|| invalid_path("absolute output path has no file name"))?;
+        validate_name(file_name)?;
+        let parent = absolute
+            .parent()
+            .ok_or_else(|| invalid_path("absolute output path has no parent directory"))?;
+        let (dir, parent_path, created) =
+            open_absolute_directory_trusted_with_handles(parent, true)?;
+        let root = Self {
+            dir,
+            path: parent_path,
+        };
+        match root.open_create_new(Path::new(file_name)) {
+            Ok(file) => Ok(file),
+            Err(error) => {
+                drop(root);
+                rollback_created_directories(created);
+                Err(error)
+            }
+        }
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Validates a relative file path without touching the filesystem.
+    pub fn validate_file_path(&self, relative: &Path) -> io::Result<()> {
+        validate_relative(relative, false)
     }
 
     /// Ensures a relative directory exists below this root and returns the
@@ -53,14 +122,14 @@ impl SafeOutputRoot {
     pub fn ensure_dir(&self, relative: &Path) -> io::Result<Vec<PathBuf>> {
         validate_relative(relative, true)?;
         let mut current = self.dir.try_clone()?;
-        let mut display = self.path.clone();
+        let mut display = try_path_buf(&self.path)?;
         let mut created = Vec::new();
 
         for component in relative.components() {
             let Component::Normal(piece) = component else {
                 continue;
             };
-            display.push(piece);
+            try_push_path(&mut display, Path::new(piece))?;
             current = open_or_create_child(&current, piece, true, &display, &mut created)?;
         }
         Ok(created)
@@ -125,21 +194,24 @@ impl SafeOutputRoot {
         validate_name(name)?;
         let parent_path = relative.parent().unwrap_or_else(|| Path::new(""));
         let mut parent = self.dir.try_clone()?;
-        let mut display = self.path.clone();
+        let mut display = try_path_buf(&self.path)?;
         let mut ignored_created = Vec::new();
 
         for component in parent_path.components() {
             let Component::Normal(piece) = component else {
                 continue;
             };
-            display.push(piece);
+            try_push_path(&mut display, Path::new(piece))?;
             parent = open_or_create_child(&parent, piece, create, &display, &mut ignored_created)?;
         }
         Ok((parent, name))
     }
 }
 
-fn open_absolute_directory(path: &Path, create: bool) -> io::Result<(Dir, PathBuf, Vec<PathBuf>)> {
+fn open_absolute_directory_strict(
+    path: &Path,
+    create: bool,
+) -> io::Result<(Dir, PathBuf, Vec<PathBuf>)> {
     let absolute = lexical_absolute(path)?;
     validate_absolute(&absolute)?;
 
@@ -152,20 +224,159 @@ fn open_absolute_directory(path: &Path, create: bool) -> io::Result<(Dir, PathBu
         let Component::Normal(piece) = component else {
             continue;
         };
-        validate_name(piece)?;
-        display.push(piece);
+        try_push_path(&mut display, Path::new(piece))?;
         current = open_or_create_child(&current, piece, create, &display, &mut created)?;
     }
     Ok((current, display, created))
 }
 
+fn open_absolute_directory_trusted(
+    path: &Path,
+    create: bool,
+) -> io::Result<(Dir, PathBuf, Vec<PathBuf>)> {
+    let (dir, absolute, created) = open_absolute_directory_trusted_with_handles(path, create)?;
+    let mut created_paths = Vec::new();
+    if created_paths.try_reserve_exact(created.len()).is_err() {
+        drop(dir);
+        rollback_created_directories(created);
+        return Err(out_of_memory());
+    }
+    for entry in created {
+        created_paths.push(entry.path);
+    }
+    Ok((dir, absolute, created_paths))
+}
+
+fn open_absolute_directory_trusted_with_handles(
+    path: &Path,
+    create: bool,
+) -> io::Result<(Dir, PathBuf, Vec<CreatedRootDirectory>)> {
+    let absolute = lexical_absolute(path)?;
+    validate_absolute(&absolute)?;
+
+    match Dir::open_ambient_dir(&absolute, ambient_authority()) {
+        Ok(dir) => return Ok((dir, absolute, Vec::new())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound && create => {}
+        Err(error) => return Err(error),
+    }
+
+    let (mut current, mut display, missing) = open_deepest_trusted_ancestor(&absolute)?;
+    let mut created = Vec::new();
+    created
+        .try_reserve_exact(missing.len())
+        .map_err(|_| out_of_memory())?;
+    for piece in missing.iter().rev() {
+        if let Err(error) = try_push_path(&mut display, Path::new(piece)) {
+            drop(current);
+            rollback_created_directories(created);
+            return Err(error);
+        }
+        match open_or_create_root_child(&current, piece, &display, &mut created) {
+            Ok(child) => current = child,
+            Err(error) => {
+                drop(current);
+                rollback_created_directories(created);
+                return Err(error);
+            }
+        }
+    }
+    Ok((current, absolute, created))
+}
+
+/// Opens the deepest existing prefix of an operator-supplied trusted root.
+/// The returned missing components are ordered from the requested leaf back
+/// toward that prefix so callers can create them by iterating in reverse.
+fn open_deepest_trusted_ancestor(path: &Path) -> io::Result<(Dir, PathBuf, Vec<OsString>)> {
+    let mut candidate = try_path_buf(path)?;
+    let mut missing = Vec::new();
+
+    loop {
+        match Dir::open_ambient_dir(&candidate, ambient_authority()) {
+            Ok(dir) => return Ok((dir, candidate, missing)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+
+        let name = try_os_string(
+            candidate
+                .file_name()
+                .ok_or_else(|| invalid_path("could not find an existing output root ancestor"))?,
+        )?;
+        if !candidate.pop() {
+            return Err(invalid_path(
+                "could not find an existing output root ancestor",
+            ));
+        }
+        missing.try_reserve(1).map_err(|_| out_of_memory())?;
+        missing.push(name);
+    }
+}
+
+struct CreatedRootDirectory {
+    parent: Dir,
+    name: OsString,
+    path: PathBuf,
+}
+
+fn open_or_create_root_child(
+    parent: &Dir,
+    name: &OsStr,
+    display: &Path,
+    created: &mut Vec<CreatedRootDirectory>,
+) -> io::Result<Dir> {
+    match parent.open_dir_nofollow(name) {
+        Ok(dir) => Ok(dir),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            created.try_reserve(1).map_err(|_| out_of_memory())?;
+            let rollback_parent = parent.try_clone()?;
+            let rollback_name = try_os_string(name)?;
+            let rollback_path = try_path_buf(display)?;
+            match parent.create_dir(name) {
+                Ok(()) => {
+                    let child = match parent.open_dir_nofollow(name) {
+                        Ok(child) => child,
+                        Err(error) => {
+                            let _ = rollback_parent.remove_dir(name);
+                            return Err(error);
+                        }
+                    };
+                    created.push(CreatedRootDirectory {
+                        parent: rollback_parent,
+                        name: rollback_name,
+                        path: rollback_path,
+                    });
+                    Ok(child)
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    // The authoritative no-follow open rejects a link or
+                    // reparse point installed by a racing process.
+                    parent.open_dir_nofollow(name)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn rollback_created_directories(mut created: Vec<CreatedRootDirectory>) {
+    while let Some(entry) = created.pop() {
+        let _ = entry.parent.remove_dir(&entry.name);
+    }
+}
+
 fn lexical_absolute(path: &Path) -> io::Result<PathBuf> {
     let joined = if path.is_absolute() {
-        path.to_path_buf()
+        try_path_buf(path)?
     } else {
-        std::env::current_dir()?.join(path)
+        let mut current = std::env::current_dir()?;
+        try_push_path(&mut current, path)?;
+        current
     };
     let mut normalized = PathBuf::new();
+    normalized
+        .try_reserve(joined.as_os_str().len())
+        .map_err(|_| out_of_memory())?;
     for component in joined.components() {
         match component {
             Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
@@ -196,8 +407,10 @@ fn open_or_create_child(
     match parent.open_dir_nofollow(name) {
         Ok(dir) => Ok(dir),
         Err(error) if error.kind() == io::ErrorKind::NotFound && create => {
+            created.try_reserve(1).map_err(|_| out_of_memory())?;
+            let created_path = try_path_buf(display)?;
             match parent.create_dir(name) {
-                Ok(()) => created.push(display.to_path_buf()),
+                Ok(()) => created.push(created_path),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error),
             }
@@ -275,6 +488,9 @@ fn validate_name(name: &OsStr) -> io::Result<()> {
 
 fn absolute_anchor(path: &Path) -> io::Result<PathBuf> {
     let mut anchor = PathBuf::new();
+    anchor
+        .try_reserve(path.as_os_str().len())
+        .map_err(|_| out_of_memory())?;
     for component in path.components() {
         match component {
             Component::Prefix(prefix) => anchor.push(prefix.as_os_str()),
@@ -291,6 +507,39 @@ fn absolute_anchor(path: &Path) -> io::Result<PathBuf> {
     } else {
         Ok(anchor)
     }
+}
+
+fn try_os_string(value: &OsStr) -> io::Result<OsString> {
+    let mut owned = OsString::new();
+    owned
+        .try_reserve(value.len())
+        .map_err(|_| out_of_memory())?;
+    owned.push(value);
+    Ok(owned)
+}
+
+fn try_path_buf(value: &Path) -> io::Result<PathBuf> {
+    let mut owned = PathBuf::new();
+    owned
+        .try_reserve(value.as_os_str().len())
+        .map_err(|_| out_of_memory())?;
+    owned.push(value);
+    Ok(owned)
+}
+
+fn try_push_path(target: &mut PathBuf, value: &Path) -> io::Result<()> {
+    let reserve = value
+        .as_os_str()
+        .len()
+        .checked_add(1)
+        .ok_or_else(out_of_memory)?;
+    target.try_reserve(reserve).map_err(|_| out_of_memory())?;
+    target.push(value);
+    Ok(())
+}
+
+fn out_of_memory() -> io::Error {
+    io::Error::from(io::ErrorKind::OutOfMemory)
 }
 
 fn invalid_path(message: &'static str) -> io::Error {
@@ -321,6 +570,21 @@ mod tests {
             std::fs::read(base.join("nested/result.json")).expect("read output"),
             b"original"
         );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn trusted_absolute_create_new_rolls_back_new_parents_on_leaf_failure() {
+        let base = temp_dir("trusted-absolute-rollback");
+        std::fs::create_dir_all(&base).expect("create base");
+        let created_parent = base.join("new-parent");
+        let oversized_leaf = "x".repeat(300);
+        let path = created_parent.join(oversized_leaf);
+
+        SafeOutputRoot::open_create_new_trusted_absolute(&path)
+            .expect_err("oversized leaf must fail after safe parent creation");
+
+        assert!(!created_parent.exists());
         let _ = std::fs::remove_dir_all(base);
     }
 
@@ -416,6 +680,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(outside);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn opens_trusted_symlink_root_but_rejects_links_below_it() {
+        use std::os::unix::fs::symlink;
+
+        let base = temp_dir("trusted-symlink-root");
+        let target = temp_dir("trusted-symlink-target");
+        let outside = temp_dir("trusted-symlink-outside");
+        std::fs::create_dir_all(&base).expect("create base");
+        std::fs::create_dir_all(&target).expect("create target root");
+        std::fs::create_dir_all(&outside).expect("create outside");
+        symlink(&target, base.join("trusted")).expect("create trusted ancestor link");
+
+        let trusted_root = base.join("trusted");
+        assert!(SafeOutputRoot::open_existing(&trusted_root).is_err());
+        let root = SafeOutputRoot::open_trusted(&trusted_root).expect("open trusted linked root");
+        root.open_create_new(Path::new("result"))
+            .expect("create inside trusted root");
+        assert_eq!(root.path(), trusted_root);
+        assert!(target.join("result").is_file());
+
+        symlink(&outside, target.join("linked")).expect("create descendant link");
+        assert!(root.open_create_new(Path::new("linked/escaped")).is_err());
+        assert!(!outside.join("escaped").exists());
+
+        let _ = std::fs::remove_dir_all(base);
+        let _ = std::fs::remove_dir_all(target);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn creates_missing_root_below_trusted_symlinked_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let base = temp_dir("create-trusted-symlink-ancestor");
+        let target = temp_dir("create-trusted-symlink-target");
+        std::fs::create_dir_all(&base).expect("create base");
+        std::fs::create_dir_all(&target).expect("create target");
+        symlink(&target, base.join("trusted")).expect("create trusted ancestor link");
+
+        let trusted_root = base.join("trusted/new/nested");
+        let (root, created) =
+            SafeOutputRoot::create_trusted(&trusted_root).expect("create linked root");
+        root.open_create_new(Path::new("result"))
+            .expect("create inside linked root");
+
+        assert_eq!(
+            created,
+            vec![base.join("trusted/new"), base.join("trusted/new/nested")]
+        );
+        assert!(target.join("new/nested/result").is_file());
+
+        let _ = std::fs::remove_dir_all(base);
+        let _ = std::fs::remove_dir_all(target);
+    }
+
     #[cfg(windows)]
     #[test]
     fn rejects_windows_reparse_output_ancestor() {
@@ -462,7 +783,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn rejects_windows_junction_as_output_root() {
+    fn accepts_windows_junction_as_trusted_output_root() {
         let base = temp_dir("junction-root");
         let outside = temp_dir("junction-root-outside");
         std::fs::create_dir_all(&base).expect("create base");
@@ -475,10 +796,44 @@ mod tests {
         }
 
         assert!(SafeOutputRoot::open_existing(&junction).is_err());
+        let root = SafeOutputRoot::open_trusted(&junction).expect("open trusted junction root");
+        root.open_create_new(Path::new("result"))
+            .expect("create inside trusted junction root");
+        assert!(outside.join("result").is_file());
 
         let _ = std::fs::remove_dir(&junction);
         let _ = std::fs::remove_dir_all(base);
         let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn creates_missing_root_below_trusted_windows_junction() {
+        let base = temp_dir("create-junction-root");
+        let target = temp_dir("create-junction-target");
+        std::fs::create_dir_all(&base).expect("create base");
+        std::fs::create_dir_all(&target).expect("create target");
+        let junction = base.join("trusted");
+        if create_windows_junction(&target, &junction).is_err() {
+            let _ = std::fs::remove_dir_all(base);
+            let _ = std::fs::remove_dir_all(target);
+            return;
+        }
+
+        let trusted_root = junction.join("new/nested");
+        let (root, created) =
+            SafeOutputRoot::create_trusted(&trusted_root).expect("create linked root");
+        root.open_create_new(Path::new("result"))
+            .expect("create inside linked root");
+        assert_eq!(
+            created,
+            vec![junction.join("new"), junction.join("new/nested")]
+        );
+        assert!(target.join("new/nested/result").is_file());
+
+        let _ = std::fs::remove_dir(&junction);
+        let _ = std::fs::remove_dir_all(base);
+        let _ = std::fs::remove_dir_all(target);
     }
 
     #[cfg(any(unix, windows))]

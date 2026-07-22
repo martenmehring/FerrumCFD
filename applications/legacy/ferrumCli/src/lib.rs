@@ -50,7 +50,7 @@ use ferrum_mesh::runner::{
     SolverRunnerDryRunOptions, build_solver_runner_dry_run,
 };
 use ferrum_mesh::runtime::SolverRuntimeData;
-use ferrum_mesh::safe_output::SafeOutputRoot;
+use ferrum_mesh::safe_output::{SafeOutputEntry, SafeOutputRoot};
 use ferrum_mesh::solver_plan::{
     SolverBackendPlan, SolverCasePlan, SolverFieldPlan, SolverInterfacePlan, SolverMeshPlan,
     SolverNumericsDictionaryPlan, SolverNumericsPlan, SolverPropertiesPlan, SolverRunPlan,
@@ -61,7 +61,7 @@ use ferrum_mesh::solver_state::SolverStatePlan;
 const FERRUM_DEFAULT_LDU_TOLERANCE: f64 = 1.0e-6;
 const FERRUM_DEFAULT_LDU_MAX_ITERATIONS: usize = 1_000;
 const FERRUM_MAX_CASE_LDU_MAX_ITERATIONS: usize = FERRUM_DEFAULT_LDU_MAX_ITERATIONS;
-const FERRUM_MAX_CASE_SIMPLE_ITERATIONS: usize = 1_000;
+const FERRUM_MAX_CASE_SIMPLE_ITERATIONS: usize = 10_000;
 
 pub fn run_ferrum() -> i32 {
     let args = env::args().skip(1).collect::<Vec<_>>();
@@ -956,9 +956,18 @@ fn run_laminar_simple_solve(
         format_scientific(report.fields.pressure.max),
         format_scientific(report.fields.pressure.l2_norm)
     );
+    let output_root_path = env::current_dir()
+        .map_err(|error| format!("could not resolve the solver output root ({error})"))?;
+    let output_root = SafeOutputRoot::open_trusted(&output_root_path).map_err(|error| {
+        format!(
+            "could not safely open solver output root {} ({error})",
+            output_root_path.display()
+        )
+    })?;
+
     let mut residual_csv_path = solve.solve_residual_csv.clone();
     if let Some(path) = &solve.solve_residual_csv {
-        write_laminar_simple_residual_csv(&report, path).map_err(|error| {
+        write_laminar_simple_residual_csv(&report, &output_root, path).map_err(|error| {
             format!(
                 "could not write laminar SIMPLE residual history CSV to {} ({error})",
                 path.display()
@@ -972,18 +981,20 @@ fn run_laminar_simple_solve(
         }
         if let Some(csv_path) = &residual_csv_path {
             if solve.solve_residual_csv.is_none() {
-                write_laminar_simple_residual_csv(&report, csv_path).map_err(|error| {
-                    format!(
-                        "could not write temporary residual history CSV to {} ({error})",
-                        csv_path.display()
-                    )
-                })?;
+                write_laminar_simple_residual_csv(&report, &output_root, csv_path).map_err(
+                    |error| {
+                        format!(
+                            "could not write temporary residual history CSV to {} ({error})",
+                            csv_path.display()
+                        )
+                    },
+                )?;
                 println!(
                     "wrote temporary residual CSV for plotting: {}",
                     csv_path.display()
                 );
             }
-            match write_laminar_simple_residual_plot(csv_path, plot_path) {
+            match write_laminar_simple_residual_plot(&output_root, csv_path, plot_path) {
                 Ok(()) => {
                     println!(
                         "wrote laminar SIMPLE residual plot: {}",
@@ -1015,14 +1026,13 @@ fn run_laminar_simple_solve(
         report.boundary_summary.pressure_zero_gradient_faces
     );
     if let Some(output_dir) = &solve.write_final_fields {
-        write_laminar_simple_fields(&plan.initial_fields, &report, output_dir).map_err(
-            |error| {
+        write_laminar_simple_fields(&plan.initial_fields, &report, &output_root, output_dir)
+            .map_err(|error| {
                 format!(
                     "could not write laminar SIMPLE fields to {} ({error})",
                     output_dir.display()
                 )
-            },
-        )?;
+            })?;
         println!(
             "wrote laminar SIMPLE final fields: {}",
             output_dir.display()
@@ -1032,23 +1042,37 @@ fn run_laminar_simple_solve(
     }
 
     if let Some(path) = &solve.report_json {
-        write_laminar_simple_report_json(plan, &options, &report, wall_clock_seconds, path)
-            .map_err(|error| {
-                format!(
-                    "could not write laminar SIMPLE report JSON to {} ({error})",
-                    path.display()
-                )
-            })?;
+        write_laminar_simple_report_json(
+            plan,
+            &options,
+            &report,
+            wall_clock_seconds,
+            &output_root,
+            path,
+        )
+        .map_err(|error| {
+            format!(
+                "could not write laminar SIMPLE report JSON to {} ({error})",
+                path.display()
+            )
+        })?;
         println!("wrote laminar SIMPLE report json: {}", path.display());
     }
     if let Some(path) = &solve.report_markdown {
-        write_laminar_simple_report_markdown(plan, &options, &report, wall_clock_seconds, path)
-            .map_err(|error| {
-                format!(
-                    "could not write laminar SIMPLE report Markdown to {} ({error})",
-                    path.display()
-                )
-            })?;
+        write_laminar_simple_report_markdown(
+            plan,
+            &options,
+            &report,
+            wall_clock_seconds,
+            &output_root,
+            path,
+        )
+        .map_err(|error| {
+            format!(
+                "could not write laminar SIMPLE report Markdown to {} ({error})",
+                path.display()
+            )
+        })?;
         println!("wrote laminar SIMPLE report markdown: {}", path.display());
     }
     print_laminar_simple_convergence_feedback(&report, &options);
@@ -1058,10 +1082,10 @@ fn run_laminar_simple_solve(
 
 fn write_laminar_simple_residual_csv(
     report: &LaminarSimpleReport,
+    output_root: &SafeOutputRoot,
     path: &Path,
 ) -> std::io::Result<()> {
-    ensure_parent_dir(path)?;
-    let file = File::create(path)?;
+    let file = open_replace_output_file(output_root, path)?;
     let mut writer = BufWriter::new(file);
 
     writeln!(
@@ -1398,7 +1422,11 @@ fn format_ratio(value: Option<f64>) -> String {
         .unwrap_or_else(|| "n/a".to_string())
 }
 
-fn write_laminar_simple_residual_plot(csv_path: &Path, plot_path: &Path) -> std::io::Result<()> {
+fn write_laminar_simple_residual_plot(
+    output_root: &SafeOutputRoot,
+    csv_path: &Path,
+    plot_path: &Path,
+) -> std::io::Result<()> {
     let wants_svg = plot_path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -1410,10 +1438,11 @@ fn write_laminar_simple_residual_plot(csv_path: &Path, plot_path: &Path) -> std:
         ));
     }
 
-    write_laminar_simple_residual_plot_svg(csv_path, plot_path)
+    write_laminar_simple_residual_plot_svg(output_root, csv_path, plot_path)
 }
 
 fn write_laminar_simple_residual_plot_svg(
+    output_root: &SafeOutputRoot,
     csv_path: &Path,
     plot_path: &Path,
 ) -> std::io::Result<()> {
@@ -1629,9 +1658,8 @@ fn write_laminar_simple_residual_plot_svg(
     svg.push_str("  </g>\n");
     svg.push_str("</svg>\n");
 
-    ensure_parent_dir(plot_path)?;
-    std::fs::write(plot_path, svg)?;
-    Ok(())
+    let mut file = open_replace_output_file(output_root, plot_path)?;
+    file.write_all(svg.as_bytes())
 }
 
 fn resolve_laminar_simple_options(
@@ -3178,20 +3206,8 @@ fn write_solver_plan_json_in_root(
     trusted_root: &Path,
     path: &Path,
 ) -> std::io::Result<()> {
-    let output = SafeOutputRoot::open_existing(trusted_root)?;
-    let relative = if path.is_absolute() {
-        path.strip_prefix(output.path())
-            .map_err(|_| {
-                Error::new(
-                    ErrorKind::PermissionDenied,
-                    "solver plan output must remain below the process working directory",
-                )
-            })?
-            .to_path_buf()
-    } else {
-        path.to_path_buf()
-    };
-    let file = output.open_create_new(&relative)?;
+    let output = SafeOutputRoot::open_trusted(trusted_root)?;
+    let file = open_create_new_operator_output_file(&output, path)?;
     let mut writer = BufWriter::new(file);
 
     writeln!(writer, "{{")?;
@@ -3235,10 +3251,10 @@ fn write_laminar_simple_report_json(
     options: &LaminarSimpleOptions,
     report: &LaminarSimpleReport,
     wall_clock_seconds: f64,
+    output_root: &SafeOutputRoot,
     path: &Path,
 ) -> std::io::Result<()> {
-    ensure_parent_dir(path)?;
-    let file = File::create(path)?;
+    let file = open_replace_output_file(output_root, path)?;
     let mut writer = BufWriter::new(file);
 
     writeln!(writer, "{{")?;
@@ -4575,10 +4591,10 @@ fn write_laminar_simple_report_markdown(
     options: &LaminarSimpleOptions,
     report: &LaminarSimpleReport,
     wall_clock_seconds: f64,
+    output_root: &SafeOutputRoot,
     path: &Path,
 ) -> std::io::Result<()> {
-    ensure_parent_dir(path)?;
-    let file = File::create(path)?;
+    let file = open_replace_output_file(output_root, path)?;
     let mut writer = BufWriter::new(file);
 
     writeln!(writer, "# incompressibleFluid Solver Report")?;
@@ -5193,6 +5209,7 @@ fn write_markdown_face_flux_diagnostic(
 fn write_laminar_simple_fields(
     fields: &InitialFieldSet,
     report: &LaminarSimpleReport,
+    output_root: &SafeOutputRoot,
     output_dir: &Path,
 ) -> std::io::Result<()> {
     if report.final_velocity.len() != report.cells {
@@ -5224,19 +5241,28 @@ fn write_laminar_simple_fields(
         ));
     }
 
-    std::fs::create_dir_all(output_dir)?;
-    let location = openfoam_output_location(output_dir);
     let velocity_field = solver_initial_field(fields, "U", "volVectorField")?;
     let pressure_field = solver_initial_field(fields, "p", "volScalarField")?;
+    let relative_output_dir = relative_output_path(output_root, output_dir)?;
+    let location = openfoam_output_location(output_dir)?;
+    let velocity_path = fallible_join_output_path(&relative_output_dir, "U")?;
+    let pressure_path = fallible_join_output_path(&relative_output_dir, "p")?;
+    output_root.validate_file_path(&velocity_path)?;
+    output_root.validate_file_path(&pressure_path)?;
+    validate_replace_output_entry(output_root, &velocity_path)?;
+    validate_replace_output_entry(output_root, &pressure_path)?;
+    output_root.ensure_dir(&relative_output_dir)?;
 
     write_openfoam_vector_field(
-        &output_dir.join("U"),
+        output_root,
+        &velocity_path,
         velocity_field,
         &location,
         &report.final_velocity,
     )?;
     write_openfoam_scalar_field(
-        &output_dir.join("p"),
+        output_root,
+        &pressure_path,
         pressure_field,
         &location,
         &report.final_pressure,
@@ -5271,13 +5297,13 @@ fn solver_initial_field<'a>(
 }
 
 fn write_openfoam_vector_field(
+    output_root: &SafeOutputRoot,
     path: &Path,
     source_field: &FieldFile,
     location: &str,
     values: &[Point3],
 ) -> std::io::Result<()> {
-    ensure_parent_dir(path)?;
-    let file = File::create(path)?;
+    let file = open_replace_output_file(output_root, path)?;
     let mut writer = BufWriter::new(file);
 
     write_openfoam_field_header(
@@ -5312,13 +5338,13 @@ fn write_openfoam_vector_field(
 }
 
 fn write_openfoam_scalar_field(
+    output_root: &SafeOutputRoot,
     path: &Path,
     source_field: &FieldFile,
     location: &str,
     values: &[f64],
 ) -> std::io::Result<()> {
-    ensure_parent_dir(path)?;
-    let file = File::create(path)?;
+    let file = open_replace_output_file(output_root, path)?;
     let mut writer = BufWriter::new(file);
 
     write_openfoam_field_header(
@@ -5483,11 +5509,17 @@ fn openfoam_nonuniform_components(value_type: &str) -> Option<usize> {
     }
 }
 
-fn openfoam_output_location(output_dir: &Path) -> String {
-    output_dir
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| output_dir.display().to_string())
+fn openfoam_output_location(output_dir: &Path) -> std::io::Result<String> {
+    let source = output_dir.file_name().unwrap_or(output_dir.as_os_str());
+    let value = source
+        .to_str()
+        .ok_or_else(|| Error::from(ErrorKind::InvalidInput))?;
+    let mut location = String::new();
+    location
+        .try_reserve_exact(value.len())
+        .map_err(|_| Error::from(ErrorKind::OutOfMemory))?;
+    location.push_str(value);
+    Ok(location)
 }
 
 fn escape_openfoam_string(value: &str) -> String {
@@ -5506,13 +5538,84 @@ fn invalid_field_data(message: String) -> Error {
     Error::new(ErrorKind::InvalidData, message)
 }
 
-fn ensure_parent_dir(path: &Path) -> std::io::Result<()> {
-    if let Some(parent) = path.parent()
+fn relative_output_path(output_root: &SafeOutputRoot, path: &Path) -> std::io::Result<PathBuf> {
+    let relative = if path.is_absolute() {
+        path.strip_prefix(output_root.path()).map_err(|_| {
+            Error::new(
+                ErrorKind::PermissionDenied,
+                "output path must remain below the trusted output root",
+            )
+        })?
+    } else {
+        path
+    };
+    let reserve = relative
+        .as_os_str()
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| Error::from(ErrorKind::OutOfMemory))?;
+    let mut owned = PathBuf::new();
+    owned
+        .try_reserve(reserve)
+        .map_err(|_| Error::from(ErrorKind::OutOfMemory))?;
+    owned.push(relative);
+    Ok(owned)
+}
+
+fn fallible_join_output_path(base: &Path, leaf: &str) -> std::io::Result<PathBuf> {
+    let reserve = base
+        .as_os_str()
+        .len()
+        .checked_add(leaf.len())
+        .and_then(|size| size.checked_add(1))
+        .ok_or_else(|| Error::from(ErrorKind::OutOfMemory))?;
+    let mut path = PathBuf::new();
+    path.try_reserve(reserve)
+        .map_err(|_| Error::from(ErrorKind::OutOfMemory))?;
+    path.push(base);
+    path.push(leaf);
+    Ok(path)
+}
+
+fn open_replace_output_file(output_root: &SafeOutputRoot, path: &Path) -> std::io::Result<File> {
+    let relative = relative_output_path(output_root, path)?;
+    output_root.validate_file_path(&relative)?;
+    if let Some(parent) = relative.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent)?;
+        output_root.ensure_dir(parent)?;
     }
-    Ok(())
+    output_root.open_replace_regular(&relative)
+}
+
+fn open_create_new_operator_output_file(
+    default_root: &SafeOutputRoot,
+    path: &Path,
+) -> std::io::Result<File> {
+    if !path.is_absolute() || path.starts_with(default_root.path()) {
+        let relative = relative_output_path(default_root, path)?;
+        return default_root.open_create_new(&relative);
+    }
+
+    SafeOutputRoot::open_create_new_trusted_absolute(path)
+}
+
+fn validate_replace_output_entry(
+    output_root: &SafeOutputRoot,
+    relative: &Path,
+) -> std::io::Result<()> {
+    let entry = match output_root.entry(relative) {
+        Ok(entry) => entry,
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    match entry {
+        None | Some(SafeOutputEntry::File) => Ok(()),
+        Some(SafeOutputEntry::Directory | SafeOutputEntry::Other) => Err(Error::new(
+            ErrorKind::InvalidInput,
+            "output path is not a regular file",
+        )),
+    }
 }
 
 fn write_json_control(writer: &mut impl Write, plan: &SolverCasePlan) -> std::io::Result<()> {
@@ -7683,8 +7786,8 @@ mod tests {
     use super::{
         ContinuitySummary, FERRUM_MAX_CASE_SIMPLE_ITERATIONS, LaminarSimpleIterationSummary,
         LaminarSimpleOptions, LaminarSimpleResidualControlSummary, LaminarSimpleSchemes,
-        MAX_RUNNER_DRY_RUN_STEPS, ScalarDiffusionLinearSolver, SolverNumericsDictionaryPlan,
-        SolverSelectionSource, estimate_iterations_to_convergence,
+        MAX_RUNNER_DRY_RUN_STEPS, SafeOutputRoot, ScalarDiffusionLinearSolver,
+        SolverNumericsDictionaryPlan, SolverSelectionSource, estimate_iterations_to_convergence,
         estimate_simple_iterations_to_convergence, numerics_dictionary_number,
         numerics_dictionary_usize, numerics_dictionary_value, openfoam_gamg_options,
         outer_convergence_status_for_reason, parse_ferrum_run_args,
@@ -7695,7 +7798,8 @@ mod tests {
         resolve_laminar_simple_convection_scheme, resolve_laminar_simple_options,
         resolve_solver_dispatch, resolved_gradient_scheme_value, run_ferrum_subcommand,
         validate_laminar_residual_control_dictionary, validate_module_execution_contract,
-        write_json_solver_state, write_json_string, write_laminar_simple_residual_plot,
+        write_json_solver_state, write_json_string, write_laminar_simple_fields,
+        write_laminar_simple_residual_csv, write_laminar_simple_residual_plot,
         write_solver_plan_json_in_root,
     };
     use ferrum_mesh::backends::BackendChoice;
@@ -8090,7 +8194,9 @@ mod tests {
         )
         .expect("residual CSV fixture should be written");
 
-        write_laminar_simple_residual_plot(&csv_path, &svg_path)
+        let output_root = SafeOutputRoot::open_existing(&std::env::temp_dir())
+            .expect("temporary output root should open");
+        write_laminar_simple_residual_plot(&output_root, &csv_path, &svg_path)
             .expect("native SVG residual plot should be written");
         let svg = std::fs::read_to_string(&svg_path).expect("SVG should be readable");
 
@@ -8121,7 +8227,9 @@ mod tests {
         )
         .expect("residual CSV fixture should be written");
 
-        write_laminar_simple_residual_plot(&csv_path, &svg_path)
+        let output_root = SafeOutputRoot::open_existing(&std::env::temp_dir())
+            .expect("temporary output root should open");
+        write_laminar_simple_residual_plot(&output_root, &csv_path, &svg_path)
             .expect("mixed-case SVG extension should use native rendering");
         let svg = std::fs::read_to_string(&svg_path).expect("SVG should be readable");
 
@@ -8144,7 +8252,9 @@ mod tests {
         let csv_path = std::env::temp_dir().join(format!("ferrum-residuals-{unique}.csv"));
         let png_path = std::env::temp_dir().join(format!("ferrum-residuals-{unique}.png"));
 
-        let error = write_laminar_simple_residual_plot(&csv_path, &png_path)
+        let output_root = SafeOutputRoot::open_existing(&std::env::temp_dir())
+            .expect("temporary output root should open");
+        let error = write_laminar_simple_residual_plot(&output_root, &csv_path, &png_path)
             .expect_err("non-SVG residual plots must be rejected");
 
         assert_eq!(error.kind(), ErrorKind::InvalidInput);
@@ -8153,6 +8263,397 @@ mod tests {
             "native residual plots require an output path with the .svg extension"
         );
         assert!(!png_path.exists());
+    }
+
+    #[test]
+    fn simple_report_and_field_outputs_replace_regular_files() {
+        let base = output_test_dir("replace");
+        std::fs::create_dir_all(base.join("fields/1"))
+            .expect("field output directory should be created");
+        std::fs::write(base.join("fields/1/U"), "old U").expect("old U should be written");
+        std::fs::write(base.join("fields/1/p"), "old p").expect("old p should be written");
+        std::fs::create_dir_all(base.join("reports"))
+            .expect("report output directory should be created");
+        std::fs::write(base.join("reports/residual.csv"), "old report")
+            .expect("old report should be written");
+        let output_root = SafeOutputRoot::open_existing(&base).expect("output root should open");
+        let report = output_test_report();
+
+        write_laminar_simple_residual_csv(&report, &output_root, Path::new("reports/residual.csv"))
+            .expect("regular report should be replaced");
+        write_laminar_simple_fields(
+            &output_test_fields(),
+            &report,
+            &output_root,
+            Path::new("fields/1"),
+        )
+        .expect("regular field outputs should be replaced");
+
+        assert!(
+            std::fs::read_to_string(base.join("reports/residual.csv"))
+                .expect("report should be readable")
+                .starts_with("iteration,continuityBeforeL2")
+        );
+        assert!(
+            std::fs::read_to_string(base.join("fields/1/U"))
+                .expect("U should be readable")
+                .contains("internalField nonuniform List<vector>")
+        );
+        assert!(
+            std::fs::read_to_string(base.join("fields/1/p"))
+                .expect("p should be readable")
+                .contains("internalField nonuniform List<scalar>")
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn simple_report_output_rejects_root_escape() {
+        let base = output_test_dir("escape-root");
+        let outside = output_test_dir("escape-outside");
+        std::fs::create_dir_all(&base).expect("output root should be created");
+        std::fs::create_dir_all(&outside).expect("outside root should be created");
+        let output_root = SafeOutputRoot::open_existing(&base).expect("output root should open");
+        let report = output_test_report();
+
+        let parent_error =
+            write_laminar_simple_residual_csv(&report, &output_root, Path::new("../escaped.csv"))
+                .expect_err("parent traversal must be rejected");
+        let absolute_error =
+            write_laminar_simple_residual_csv(&report, &output_root, &outside.join("escaped.csv"))
+                .expect_err("absolute root escape must be rejected");
+
+        assert_eq!(parent_error.kind(), ErrorKind::InvalidInput);
+        assert_eq!(absolute_error.kind(), ErrorKind::PermissionDenied);
+        assert!(
+            !base
+                .parent()
+                .unwrap_or(Path::new(""))
+                .join("escaped.csv")
+                .exists()
+        );
+        assert!(!outside.join("escaped.csv").exists());
+        let _ = std::fs::remove_dir_all(base);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn simple_report_output_detaches_external_hard_link() {
+        let base = output_test_dir("report-hard-link");
+        let outside = output_test_dir("report-hard-link-outside");
+        std::fs::create_dir_all(&base).expect("output root should be created");
+        std::fs::create_dir_all(&outside).expect("outside root should be created");
+        let target = outside.join("target.csv");
+        std::fs::write(&target, "external").expect("outside target should be written");
+        std::fs::hard_link(&target, base.join("report.csv"))
+            .expect("hard link fixture should be created");
+        let output_root = SafeOutputRoot::open_existing(&base).expect("output root should open");
+
+        write_laminar_simple_residual_csv(
+            &output_test_report(),
+            &output_root,
+            Path::new("report.csv"),
+        )
+        .expect("local hard-link entry should be replaced");
+
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("outside target should be readable"),
+            "external"
+        );
+        assert!(
+            std::fs::read_to_string(base.join("report.csv"))
+                .expect("replacement report should be readable")
+                .starts_with("iteration,continuityBeforeL2")
+        );
+        let _ = std::fs::remove_dir_all(base);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn simple_report_output_rejects_final_symlink_without_external_mutation() {
+        let base = output_test_dir("report-symlink");
+        let outside = output_test_dir("report-symlink-outside");
+        std::fs::create_dir_all(&base).expect("output root should be created");
+        std::fs::create_dir_all(&outside).expect("outside root should be created");
+        let target = outside.join("target.csv");
+        let link = base.join("report.csv");
+        std::fs::write(&target, "external").expect("outside target should be written");
+        if create_output_file_symlink(&target, &link).is_err() {
+            let _ = std::fs::remove_dir_all(base);
+            let _ = std::fs::remove_dir_all(outside);
+            return;
+        }
+        let output_root = SafeOutputRoot::open_existing(&base).expect("output root should open");
+
+        write_laminar_simple_residual_csv(
+            &output_test_report(),
+            &output_root,
+            Path::new("report.csv"),
+        )
+        .expect_err("final report symlink must be rejected");
+
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("outside target should be readable"),
+            "external"
+        );
+        let _ = std::fs::remove_dir_all(base);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn simple_field_outputs_preflight_both_files_before_replacement() {
+        let base = output_test_dir("field-symlink");
+        let outside = output_test_dir("field-symlink-outside");
+        std::fs::create_dir_all(base.join("fields"))
+            .expect("field output directory should be created");
+        std::fs::create_dir_all(&outside).expect("outside root should be created");
+        std::fs::write(base.join("fields/U"), "old U").expect("old U should be written");
+        let target = outside.join("target-p");
+        let link = base.join("fields/p");
+        std::fs::write(&target, "external p").expect("outside target should be written");
+        if create_output_file_symlink(&target, &link).is_err() {
+            let _ = std::fs::remove_dir_all(base);
+            let _ = std::fs::remove_dir_all(outside);
+            return;
+        }
+        let output_root = SafeOutputRoot::open_existing(&base).expect("output root should open");
+
+        write_laminar_simple_fields(
+            &output_test_fields(),
+            &output_test_report(),
+            &output_root,
+            Path::new("fields"),
+        )
+        .expect_err("p symlink must reject the field output set");
+
+        assert_eq!(
+            std::fs::read_to_string(base.join("fields/U")).expect("U should be readable"),
+            "old U"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("outside target should be readable"),
+            "external p"
+        );
+        let _ = std::fs::remove_dir_all(base);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn simple_field_outputs_validate_sources_before_creating_directories() {
+        let base = output_test_dir("field-source-preflight");
+        std::fs::create_dir_all(&base).expect("output root should be created");
+        let output_root = SafeOutputRoot::open_existing(&base).expect("output root should open");
+        let mut fields = output_test_fields();
+        fields
+            .fields
+            .retain(|field| field.name != "p" || field.region.is_some());
+
+        write_laminar_simple_fields(
+            &fields,
+            &output_test_report(),
+            &output_root,
+            Path::new("new/1"),
+        )
+        .expect_err("missing p field must reject the output set");
+
+        assert!(!base.join("new").exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn simple_report_output_rejects_fifo_without_blocking() {
+        let base = output_test_dir("report-fifo");
+        std::fs::create_dir_all(&base).expect("output root should be created");
+        let fifo = base.join("report.csv");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo should run");
+        assert!(status.success(), "mkfifo should create the fixture");
+        let output_root = SafeOutputRoot::open_existing(&base).expect("output root should open");
+
+        write_laminar_simple_residual_csv(
+            &output_test_report(),
+            &output_root,
+            Path::new("report.csv"),
+        )
+        .expect_err("FIFO report path must be rejected");
+
+        assert!(fifo.exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn simple_field_output_rejects_symlinked_ancestor() {
+        let base = output_test_dir("field-ancestor");
+        let outside = output_test_dir("field-ancestor-outside");
+        std::fs::create_dir_all(&base).expect("output root should be created");
+        std::fs::create_dir_all(&outside).expect("outside root should be created");
+        std::os::unix::fs::symlink(&outside, base.join("linked"))
+            .expect("symlink fixture should be created");
+        let output_root = SafeOutputRoot::open_existing(&base).expect("output root should open");
+
+        write_laminar_simple_fields(
+            &output_test_fields(),
+            &output_test_report(),
+            &output_root,
+            Path::new("linked/1"),
+        )
+        .expect_err("symlinked output ancestor must be rejected");
+
+        assert!(!outside.join("1/U").exists());
+        assert!(!outside.join("1/p").exists());
+        let _ = std::fs::remove_dir_all(base);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn simple_field_output_rejects_windows_junction_ancestor() {
+        let base = output_test_dir("field-junction");
+        let outside = output_test_dir("field-junction-outside");
+        std::fs::create_dir_all(&base).expect("output root should be created");
+        std::fs::create_dir_all(&outside).expect("outside root should be created");
+        let junction = base.join("linked");
+        if create_output_junction(&outside, &junction).is_err() {
+            let _ = std::fs::remove_dir_all(base);
+            let _ = std::fs::remove_dir_all(outside);
+            return;
+        }
+        let output_root = SafeOutputRoot::open_existing(&base).expect("output root should open");
+
+        write_laminar_simple_fields(
+            &output_test_fields(),
+            &output_test_report(),
+            &output_root,
+            Path::new("linked/1"),
+        )
+        .expect_err("junction output ancestor must be rejected");
+
+        assert!(!outside.join("1/U").exists());
+        assert!(!outside.join("1/p").exists());
+        let _ = std::fs::remove_dir(&junction);
+        let _ = std::fs::remove_dir_all(base);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    fn output_test_fields() -> ferrum_mesh::fields::InitialFieldSet {
+        ferrum_mesh::fields::InitialFieldSet {
+            case_dir: PathBuf::from("case"),
+            fields: vec![
+                ferrum_mesh::fields::FieldFile {
+                    path: PathBuf::from("case/0/U"),
+                    region: None,
+                    name: "U".to_string(),
+                    class_name: Some("volVectorField".to_string()),
+                    dimensions: Some(vec![
+                        "0".to_string(),
+                        "1".to_string(),
+                        "-1".to_string(),
+                        "0".to_string(),
+                        "0".to_string(),
+                        "0".to_string(),
+                        "0".to_string(),
+                    ]),
+                    internal_field: None,
+                    boundary_patches: Vec::new(),
+                },
+                ferrum_mesh::fields::FieldFile {
+                    path: PathBuf::from("case/0/p"),
+                    region: None,
+                    name: "p".to_string(),
+                    class_name: Some("volScalarField".to_string()),
+                    dimensions: Some(vec![
+                        "1".to_string(),
+                        "-1".to_string(),
+                        "-2".to_string(),
+                        "0".to_string(),
+                        "0".to_string(),
+                        "0".to_string(),
+                        "0".to_string(),
+                    ]),
+                    internal_field: None,
+                    boundary_patches: Vec::new(),
+                },
+            ],
+        }
+    }
+
+    fn output_test_report() -> ferrum_mesh::flow::LaminarSimpleReport {
+        ferrum_mesh::flow::LaminarSimpleReport {
+            cells: 1,
+            faces: 0,
+            internal_faces: 0,
+            boundary_faces: 0,
+            simple_iterations: 0,
+            converged: false,
+            stop_reason: LaminarSimpleStopReason::MaxIterationsReached,
+            initial_continuity: Default::default(),
+            final_continuity: Default::default(),
+            final_momentum_initial_normalized_residual_norm: 0.0,
+            final_momentum_residual_norm: 0.0,
+            final_momentum_normalized_residual_norm: 0.0,
+            final_pressure_correction_initial_normalized_residual_norm: 0.0,
+            final_pressure_correction_residual_norm: 0.0,
+            final_pressure_correction_normalized_residual_norm: 0.0,
+            residual_control: Default::default(),
+            total_momentum_linear_iterations: 0,
+            total_pressure_linear_iterations: 0,
+            linear_solve_summary: Default::default(),
+            operator_summary: Default::default(),
+            boundary_summary: Default::default(),
+            pressure_assembly: None,
+            timing: Default::default(),
+            fields: Default::default(),
+            final_velocity: vec![ferrum_mesh::Point3 {
+                x: 1.0,
+                y: 0.0,
+                z: 0.0,
+            }],
+            final_pressure: vec![1.0],
+            history: Vec::new(),
+        }
+    }
+
+    fn output_test_dir(label: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "ferrum-cli-output-{label}-{}-{unique}",
+            std::process::id()
+        ))
+    }
+
+    #[cfg(unix)]
+    fn create_output_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_output_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_output_junction(target: &Path, link: &Path) -> std::io::Result<()> {
+        let status = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(link)
+            .arg(target)
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other("mklink /J failed"))
+        }
     }
 
     #[test]
@@ -8366,7 +8867,28 @@ mod tests {
         rejected.run.estimated_steps = Some(FERRUM_MAX_CASE_SIMPLE_ITERATIONS + 1);
         let error = resolve_laminar_simple_options(&rejected, &solve)
             .expect_err("controlDict SIMPLE iterations above the cap must fail");
-        assert!(error.contains("case-file safety cap of 1000"));
+        assert!(error.contains("case-file safety cap of 10000"));
+    }
+
+    #[test]
+    fn laminar_simple_accepts_two_thousand_control_dict_iterations() {
+        let parsed = parse_incompressible_fluid_args(&[]).expect("solver args should parse");
+        let solve = parsed
+            .laminar_simple_solve
+            .expect("laminar SIMPLE solve args");
+        let mut plan = laminar_simple_test_plan(1000.0, 0.001002);
+        plan.control.start_time = Some(0.0);
+        plan.control.end_time = Some(2_000.0);
+        plan.control.delta_t = Some(1.0);
+        plan.run.start_time = Some(0.0);
+        plan.run.end_time = Some(2_000.0);
+        plan.run.delta_t = Some(1.0);
+        plan.run.estimated_steps = Some(2_000);
+
+        let options = resolve_laminar_simple_options(&plan, &solve)
+            .expect("2,000 controlDict-derived SIMPLE iterations should resolve");
+
+        assert_eq!(options.max_simple_iterations, 2_000);
     }
 
     #[test]
@@ -9254,7 +9776,7 @@ mod tests {
     }
 
     #[test]
-    fn solver_plan_json_rejects_parent_and_absolute_root_escape() {
+    fn solver_plan_json_rejects_relative_parent_escape() {
         let plan = laminar_simple_test_plan(1000.0, 0.001);
         let base = std::env::temp_dir().join(format!(
             "ferrum-plan-root-{}-{}",
@@ -9270,14 +9792,97 @@ mod tests {
         let parent_error =
             write_solver_plan_json_in_root(&plan, None, &trusted, Path::new("../escaped.json"))
                 .expect_err("parent traversal must be rejected");
-        let absolute_error =
-            write_solver_plan_json_in_root(&plan, None, &trusted, &base.join("outside.json"))
-                .expect_err("absolute escape must be rejected");
 
         assert_eq!(parent_error.kind(), std::io::ErrorKind::InvalidInput);
-        assert_eq!(absolute_error.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(!base.join("escaped.json").exists());
-        assert!(!base.join("outside.json").exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn solver_plan_json_writes_absolute_path_outside_working_directory() {
+        let plan = laminar_simple_test_plan(1000.0, 0.001);
+        let base = output_test_dir("plan-absolute");
+        let trusted = base.join("trusted");
+        std::fs::create_dir_all(&trusted).expect("trusted root should be created");
+        let path = base.join("outside/nested/plan.json");
+
+        write_solver_plan_json_in_root(&plan, None, &trusted, &path)
+            .expect("trusted absolute plan path should be written outside the working directory");
+
+        let json = std::fs::read_to_string(&path).expect("solver plan should be readable");
+        assert!(json.contains("\"schemaVersion\": 2"));
+        assert!(json.contains("\"caseDir\": \"case\""));
+        assert!(base.join("outside/nested").is_dir());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn solver_plan_json_absolute_path_does_not_clobber_existing_file() {
+        let plan = laminar_simple_test_plan(1000.0, 0.001);
+        let base = output_test_dir("plan-absolute-existing");
+        let trusted = base.join("trusted");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&trusted).expect("trusted root should be created");
+        std::fs::create_dir_all(&outside).expect("outside root should be created");
+        let path = outside.join("plan.json");
+        std::fs::write(&path, "do-not-clobber").expect("existing plan should be written");
+
+        let error = write_solver_plan_json_in_root(&plan, None, &trusted, &path)
+            .expect_err("existing absolute plan path must not be clobbered");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("existing plan should remain readable"),
+            "do-not-clobber"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn solver_plan_json_absolute_path_rejects_final_symlink() {
+        let plan = laminar_simple_test_plan(1000.0, 0.001);
+        let base = output_test_dir("plan-absolute-symlink");
+        let trusted = base.join("trusted");
+        let outside = base.join("outside");
+        let target_root = base.join("target");
+        std::fs::create_dir_all(&trusted).expect("trusted root should be created");
+        std::fs::create_dir_all(&outside).expect("outside root should be created");
+        std::fs::create_dir_all(&target_root).expect("target root should be created");
+        let target = target_root.join("target.json");
+        let link = outside.join("plan.json");
+        std::fs::write(&target, "do-not-clobber").expect("target should be written");
+        if create_output_file_symlink(&target, &link).is_err() {
+            let _ = std::fs::remove_dir_all(base);
+            return;
+        }
+
+        write_solver_plan_json_in_root(&plan, None, &trusted, &link)
+            .expect_err("absolute plan symlink must not be followed");
+
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("target should remain readable"),
+            "do-not-clobber"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn solver_plan_json_absolute_path_rejects_windows_ads() {
+        let plan = laminar_simple_test_plan(1000.0, 0.001);
+        let base = output_test_dir("plan-absolute-ads");
+        let trusted = base.join("trusted");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&trusted).expect("trusted root should be created");
+        std::fs::create_dir_all(&outside).expect("outside root should be created");
+        let path = outside.join("plan.json:stream");
+
+        let error = write_solver_plan_json_in_root(&plan, None, &trusted, &path)
+            .expect_err("absolute plan ADS path must be rejected");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!outside.join("plan.json").exists());
         let _ = std::fs::remove_dir_all(base);
     }
 
