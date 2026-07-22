@@ -1,7 +1,7 @@
 mod case;
 
 use std::env;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Error, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -3144,8 +3144,7 @@ fn write_solver_plan_json(
     dispatch: Option<&SolverDispatch>,
     path: &Path,
 ) -> std::io::Result<()> {
-    ensure_parent_dir(path)?;
-    let file = File::create(path)?;
+    let file = create_new_output_file(path)?;
     let mut writer = BufWriter::new(file);
 
     writeln!(writer, "{{")?;
@@ -5467,6 +5466,11 @@ fn ensure_parent_dir(path: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     Ok(())
+}
+
+fn create_new_output_file(path: &Path) -> std::io::Result<File> {
+    ensure_parent_dir(path)?;
+    OpenOptions::new().write(true).create_new(true).open(path)
 }
 
 fn write_json_control(writer: &mut impl Write, plan: &SolverCasePlan) -> std::io::Result<()> {
@@ -9021,6 +9025,55 @@ mod tests {
         assert!(json.contains("\"dispatch\""));
         assert!(json.contains("\"module\": \"incompressibleFluid\""));
         assert!(json.contains("\"source\": \"cli\""));
+    }
+
+    #[test]
+    fn solver_plan_json_does_not_clobber_existing_file() {
+        let plan = laminar_simple_test_plan(1000.0, 0.001);
+        let path = std::env::temp_dir().join(format!(
+            "ferrum-plan-existing-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after Unix epoch")
+                .as_nanos()
+        ));
+        std::fs::write(&path, "do-not-clobber").expect("existing file should be created");
+
+        let error = write_solver_plan_json(&plan, None, &path)
+            .expect_err("existing plan path must not be clobbered");
+        let contents = std::fs::read_to_string(&path).expect("existing file should be readable");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(contents, "do-not-clobber");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn solver_plan_json_rejects_symlink_path() {
+        let plan = laminar_simple_test_plan(1000.0, 0.001);
+        let base = std::env::temp_dir().join(format!(
+            "ferrum-plan-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after Unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).expect("temp directory should be created");
+        let target = base.join("target.json");
+        let link = base.join("plan.json");
+        std::fs::write(&target, "do-not-clobber").expect("target should be created");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink should be created");
+
+        let error = write_solver_plan_json(&plan, None, &link)
+            .expect_err("symlink plan path must not be followed");
+        let contents = std::fs::read_to_string(&target).expect("target should be readable");
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(contents, "do-not-clobber");
     }
 
     #[test]
