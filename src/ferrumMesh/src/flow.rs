@@ -87,6 +87,8 @@ pub struct LaminarSimpleSchemes {
     pub sn_grad: LaminarSimpleSnGradScheme,
 }
 
+pub const MAX_NON_ORTHOGONAL_CORRECTORS: usize = 20;
+
 #[derive(Clone, Debug)]
 pub struct LaminarSimpleOptions {
     pub density: f64,
@@ -5134,6 +5136,12 @@ fn validate_laminar_simple_options(options: &LaminarSimpleOptions) -> Result<()>
             "laminar SIMPLE iteration limits must be greater than zero".to_string(),
         ));
     }
+    if options.non_orthogonal_correctors > MAX_NON_ORTHOGONAL_CORRECTORS {
+        return Err(invalid_input(format!(
+            "laminar SIMPLE nNonOrthogonalCorrectors must not exceed {MAX_NON_ORTHOGONAL_CORRECTORS}, got {}",
+            options.non_orthogonal_correctors
+        )));
+    }
     if options.min_simple_iterations > options.max_simple_iterations {
         return Err(invalid_input(format!(
             "laminar SIMPLE minSimpleIterations must not exceed maxSimpleIterations, got {} > {}",
@@ -5498,18 +5506,18 @@ mod tests {
     use super::{
         LaminarSimpleConvectionScheme, LaminarSimpleGradientScheme, LaminarSimpleLinearSolver,
         LaminarSimpleMeshCache, LaminarSimpleOptions, LaminarSimplePreconditioner,
-        LaminarSimpleSchemes, LaminarSimpleStopReason, MomentumCsrPattern, ScalarFaceTreatment,
-        ScalarGradientGeometry, VectorFaceTreatment, adjust_phi_hby_a, apply_pressure_reference,
-        assemble_momentum_component_system, assemble_momentum_equation,
-        assemble_variable_scalar_component_system, assemble_variable_scalar_component_system_into,
-        cell_face_adjacency, compute_face_flux, compute_phi_hby_a,
-        consistent_reciprocal_momentum_diagonal, constrained_pressure_treatments,
-        face_diffusion_coefficient, hby_a_from_predicted_velocity, limit_scalar_gradient,
-        net_cell_flux, non_orthogonal_pressure_flux_correction, normalized_residual_norm,
-        pressure_correction_flux, reciprocal_momentum_diagonal, relax_scalar_component_equation,
-        scalar_component_boundary, scalar_gradient, solve_laminar_simple, split_components,
-        subtract_face_fluxes, upwind_face_vector_value, vector_convection_divergence,
-        vector_face_treatments, velocity_from_hby_a, zero,
+        LaminarSimpleSchemes, LaminarSimpleStopReason, MAX_NON_ORTHOGONAL_CORRECTORS,
+        MomentumCsrPattern, ScalarFaceTreatment, ScalarGradientGeometry, VectorFaceTreatment,
+        adjust_phi_hby_a, apply_pressure_reference, assemble_momentum_component_system,
+        assemble_momentum_equation, assemble_variable_scalar_component_system,
+        assemble_variable_scalar_component_system_into, cell_face_adjacency, compute_face_flux,
+        compute_phi_hby_a, consistent_reciprocal_momentum_diagonal,
+        constrained_pressure_treatments, face_diffusion_coefficient, hby_a_from_predicted_velocity,
+        limit_scalar_gradient, net_cell_flux, non_orthogonal_pressure_flux_correction,
+        normalized_residual_norm, pressure_correction_flux, reciprocal_momentum_diagonal,
+        relax_scalar_component_equation, scalar_component_boundary, scalar_gradient,
+        solve_laminar_simple, split_components, subtract_face_fluxes, upwind_face_vector_value,
+        vector_convection_divergence, vector_face_treatments, velocity_from_hby_a, zero,
     };
     use crate::{MeshError, Point3};
 
@@ -6990,6 +6998,28 @@ mod tests {
             MeshError::InvalidInput(message)
                 if message
                     == "runtime field 'U' initial payload was already consumed or not loaded"
+        ));
+    }
+
+    #[test]
+    fn rejects_excessive_non_orthogonal_correctors() {
+        let mut runtime = two_cell_runtime();
+        let fields = two_cell_fields();
+        let mut options = minimal_laminar_options();
+        options.non_orthogonal_correctors = MAX_NON_ORTHOGONAL_CORRECTORS + 1;
+
+        let error = solve_laminar_simple(&mut runtime, &fields, &options)
+            .expect_err("excessive pressure correctors must be rejected");
+
+        assert!(matches!(
+            error,
+            MeshError::InvalidInput(message)
+                if message
+                    == format!(
+                        "laminar SIMPLE nNonOrthogonalCorrectors must not exceed {}, got {}",
+                        MAX_NON_ORTHOGONAL_CORRECTORS,
+                        MAX_NON_ORTHOGONAL_CORRECTORS + 1
+                    )
         ));
     }
 
