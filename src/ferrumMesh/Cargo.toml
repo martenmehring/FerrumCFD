@@ -9,3 +9,7 @@ authors.workspace = true
 name = "ferrum_mesh"
 path = "src/lib.rs"
 
+[dependencies]
+cap-fs-ext = "=4.0.2"
+cap-std = "=4.0.2"
+
