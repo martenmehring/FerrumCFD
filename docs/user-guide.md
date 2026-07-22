@@ -135,10 +135,15 @@ Supported field entries for the current parser:
 - `FoamFile` metadata, especially `class` and `object`
 - `dimensions [ ... ];`
 - `internalField uniform ...;`
-- `internalField nonuniform List<scalar> ...;` with numeric values
-- `internalField nonuniform List<vector> ...;` with flattened numeric values
-- other `internalField nonuniform List<...> ...;` forms as a summary
+- `internalField nonuniform List<scalar> ...;`, `scalarField ...;`, or
+  `Field<scalar> ...;` with numeric values
+- `internalField nonuniform List<vector> ...;`, `vectorField ...;`, or
+  `Field<vector> ...;` with vector values
 - `boundaryField { patch { type ...; value ...; } }`
+
+Only those six exact, unquoted nonuniform type names are accepted. Dictionary
+directives such as `#include` and `#includeFunc` are not resolved yet and are
+rejected with their source path and line instead of being silently skipped.
 
 Example:
 
@@ -522,19 +527,22 @@ field region, class, internal value count, expected count, components, f64 slot
 count, byte estimate, boundary patch counts, and whether the field storage is
 CPU/GPU-capable. Uniform scalar/vector values are parsed into numeric
 components when possible. Correctly shaped uniform fields are marked as
-materializable CPU f64 buffers. Nonuniform `List<scalar>` and `List<vector>`
-fields are count-checked and loaded into flattened f64 buffers when their value
-count matches the mesh. Other nonuniform value types remain summary-only until
-their type-specific loader exists. This still does not solve equations or
-change field values.
+state-materializable CPU f64 buffers. The normal preflight uses Summary mode:
+all six supported nonuniform scalar/vector type names are count-checked and
+reported, but their payloads are not retained. A real solve uses Full mode and
+moves a correctly shaped nonuniform source buffer into runtime storage without
+cloning it. Unsupported nonuniform types are rejected by the field parser.
+This still does not solve equations or change field values.
 
 The preflight also prepares solver runtime data. It builds compact
 owner/neighbour connectivity, patch face ranges, cell centres, face centres,
-owner-oriented face-area vectors, positive cell volumes, and materialized CPU
-f64 buffers for fields that passed the solver-state checks. `--planJson` writes
-a `runtimeData` summary with array sizes and buffer sizes, but it intentionally
-does not dump the full geometry or field arrays into JSON. These runtime arrays
-are the handoff point for the future CPU/GPU equation kernels.
+owner-oriented face-area vectors, positive cell volumes, and descriptors for
+fields that passed the solver-state checks. Summary mode leaves every field
+payload absent; Full solve mode materializes uniform values and transfers
+validated nonuniform buffers. `--planJson` writes a `runtimeData` summary with
+array sizes and buffer sizes, but it intentionally does not dump the full
+geometry or field arrays into JSON. These runtime arrays are the handoff point
+for the CPU/GPU equation kernels.
 
 FerrumCFD also contains the first executable CPU linear algebra foundation:
 CSR matrices, matrix-vector products, residual calculation, Jacobi,
@@ -878,8 +886,11 @@ events. It also prints runtime handles derived from `system/ferrumBackends`,
 including CPU thread policy, CPU linear-solver availability, and GPU
 backend/device metadata. GPU stages are reported as planned dispatch only until
 executable GPU solver kernels exist. The same dry-run output also lists the
-solver-state fields that would be available to the future runner, including
-whether an initial field can already be materialized into a CPU buffer.
+solver-state fields that would be available to the future runner. A uniform
+field is state-materializable because its complete value is carried by the
+plan. A validated nonuniform field is transfer-ready instead: its source
+buffer is moved once into the full runtime without cloning it. Summary plans
+retain the same field descriptors but deliberately omit payloads.
 `--maxRunnerSteps <n>` limits the preview length. This does not update fields,
 advance physics, or solve equations.
 

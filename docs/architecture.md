@@ -174,6 +174,19 @@ compatibility bridge. It currently reads `FoamFile`, `dimensions`,
 `internalField`, and `boundaryField`. Existing executable cases must remain
 usable until native-format parity tests pass.
 
+The bridge accepts the exact unquoted nonuniform type names `List<scalar>`,
+`scalarField`, `Field<scalar>`, `List<vector>`, `vectorField`, and
+`Field<vector>`. It currently rejects OpenFOAM dictionary directives such as
+`#include` and `#includeFunc` with a path- and line-aware error. Resolving those
+directives safely requires a separately bounded include stack; silently
+skipping them could change physics inputs and is not permitted.
+
+Solver-state `materializable` means that a self-contained state plan can build
+the CPU buffer directly, which currently applies to valid uniform fields.
+Valid nonuniform fields are transfer-ready: the full runtime takes ownership
+of the already validated source allocation exactly once, while Summary mode
+retains descriptors without values.
+
 `checkFerrumMesh` validates field boundary entries against mesh patches. This
 is deliberately solver-neutral: it checks names and special patch
 compatibility such as `empty` fields on `empty` mesh patches, but it does not
@@ -384,10 +397,11 @@ nonuniform data is supplied; surface fields must match face counts. The state
 layer should estimate component counts, f64 slot counts, and byte footprints so
 CPU/GPU buffers can later be allocated reproducibly. It reports CPU/GPU storage
 capability and marks correctly shaped uniform fields as CPU-buffer
-materializable. Nonuniform `List<scalar>` and `List<vector>` fields are loaded
-as flattened CPU-buffer values when their counts and component shapes match.
-Other nonuniform field types remain count-checked only until type-specific
-loaders exist. None of this implies that solver kernels exist or have run.
+materializable. Summary plans count-check the six supported exact nonuniform
+scalar/vector type names but retain no values. Full solve plans validate those
+payloads and transfer the source allocation once into runtime storage without
+cloning it. Unsupported nonuniform types are rejected rather than represented
+as summary-only fields. None of this implies that solver kernels have run.
 
 `--runnerDryRun` is the first runner boundary. It expands the run plan into a
 capped sequence of time-step starts, stage dispatch decisions, and planned

@@ -2,7 +2,9 @@ use std::cmp::Ordering;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 
-use crate::fields::{FieldFile, FieldValueSummary, InitialFieldSet};
+use crate::fields::{
+    FieldFile, FieldValueSummary, InitialFieldSet, nonuniform_value_type_components,
+};
 use crate::poly_mesh::PolyMesh;
 use crate::{MeshError, Result};
 
@@ -50,6 +52,9 @@ pub struct SolverStateStoragePlan {
 
 #[derive(Clone, Debug)]
 pub struct SolverStateCpuBufferPlan {
+    /// True only when `materialize_cpu_buffer` can build the buffer from this
+    /// self-contained state plan. Valid nonuniform payloads remain owned by
+    /// `InitialFieldSet` until their one-shot transfer into runtime data.
     pub materializable: bool,
     pub scalar_slots: Option<usize>,
     pub bytes_f64: Option<usize>,
@@ -82,6 +87,8 @@ pub enum SolverStateStorageStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SolverStateCpuBufferStatus {
     UniformReady,
+    /// Shape and source payload are valid for one-shot runtime transfer. The
+    /// payload is intentionally not cloned into `SolverStateFieldPlan`.
     NonUniformReady,
     NonUniformDataNotLoaded,
     UnsupportedClass,
@@ -332,7 +339,8 @@ fn build_internal_field_plan(
             count,
             values,
         }) => {
-            let supported_value_type = nonuniform_value_type_is_supported(value_type.as_deref());
+            let supported_value_type =
+                nonuniform_value_type_components(value_type.as_deref()).is_some();
             let valid_count = count
                 .zip(expected_count)
                 .map(|(count, expected)| count == expected);
@@ -410,7 +418,7 @@ fn validate_nonuniform_values(
     label: &str,
     warnings: &mut Vec<String>,
 ) -> Result<()> {
-    if !nonuniform_value_type_is_supported(value_type) {
+    if nonuniform_value_type_components(value_type).is_none() {
         push_warning(
             warnings,
             format!("field '{label}' has an unsupported nonuniform value type"),
@@ -445,18 +453,6 @@ fn validate_nonuniform_values(
         )?;
     }
     Ok(())
-}
-
-fn nonuniform_value_type_is_supported(value_type: Option<&str>) -> bool {
-    matches!(
-        value_type,
-        Some("List<scalar>")
-            | Some("scalarField")
-            | Some("Field<scalar>")
-            | Some("List<vector>")
-            | Some("vectorField")
-            | Some("Field<vector>")
-    )
 }
 
 fn expected_internal_count(kind: SolverStateFieldKind, mesh: Option<&PolyMesh>) -> Option<usize> {
@@ -574,10 +570,7 @@ fn build_cpu_buffer_plan(
     };
 
     SolverStateCpuBufferPlan {
-        materializable: matches!(
-            status,
-            SolverStateCpuBufferStatus::UniformReady | SolverStateCpuBufferStatus::NonUniformReady
-        ),
+        materializable: status == SolverStateCpuBufferStatus::UniformReady,
         scalar_slots: storage.scalar_slots,
         bytes_f64: storage.bytes_f64,
         status,
@@ -782,8 +775,10 @@ mod tests {
         let mut warnings = Vec::new();
 
         let state = build_state_field(&field, Some(&mesh), &mut warnings);
-        let buffer = materialize_cpu_buffer(&state).expect("uniform scalar materializes");
+        let materialized = materialize_cpu_buffer(&state);
 
+        assert_eq!(state.cpu_buffer.materializable, materialized.is_some());
+        let buffer = materialized.expect("uniform scalar materializes");
         assert_eq!(buffer, vec![7.0, 7.0, 7.0, 7.0]);
         assert_eq!(
             materialize_uniform_cpu_buffer(&state),
@@ -802,8 +797,10 @@ mod tests {
         let mut warnings = Vec::new();
 
         let state = build_state_field(&field, Some(&mesh), &mut warnings);
-        let buffer = materialize_cpu_buffer(&state).expect("uniform vector materializes");
+        let materialized = materialize_cpu_buffer(&state);
 
+        assert_eq!(state.cpu_buffer.materializable, materialized.is_some());
+        let buffer = materialized.expect("uniform vector materializes");
         assert_eq!(buffer, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
     }
 
@@ -828,6 +825,10 @@ mod tests {
         assert_eq!(
             state.cpu_buffer.status,
             SolverStateCpuBufferStatus::InvalidShape
+        );
+        assert_eq!(
+            state.cpu_buffer.materializable,
+            materialize_cpu_buffer(&state).is_some()
         );
         assert!(materialize_uniform_cpu_buffer(&state).is_none());
         assert!(
@@ -888,7 +889,7 @@ mod tests {
 
         assert_eq!(state.internal_field.kind, SolverStateValueKind::NonUniform);
         assert_eq!(state.internal_field.loaded_scalars, Some(4));
-        assert!(state.cpu_buffer.materializable);
+        assert!(!state.cpu_buffer.materializable);
         assert_eq!(
             state.cpu_buffer.status,
             SolverStateCpuBufferStatus::NonUniformReady
@@ -919,7 +920,9 @@ mod tests {
             SolverStateCpuBufferStatus::NonUniformReady
         );
         assert_eq!(state.internal_field.loaded_scalars, Some(9));
+        assert!(!state.cpu_buffer.materializable);
         assert!(materialize_cpu_buffer(&state).is_none());
+        assert!(materialize_uniform_cpu_buffer(&state).is_none());
         assert!(warnings.is_empty());
     }
 
