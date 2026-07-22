@@ -1203,9 +1203,13 @@ fn validate_field_boundary_patches(
     }
 
     let mut mesh_patch_names = HashSet::new();
-    mesh_patch_names.try_reserve(mesh.patches.len()).map_err(|_| {
-        MeshError::InvalidInput("field validation mesh patch lookup allocation failed".to_owned())
-    })?;
+    mesh_patch_names
+        .try_reserve(mesh.patches.len())
+        .map_err(|_| {
+            MeshError::InvalidInput(
+                "field validation mesh patch lookup allocation failed".to_owned(),
+            )
+        })?;
     for patch in &mesh.patches {
         mesh_patch_names.insert(patch.name.as_str());
         let Some(field_patch) = field_patches_by_name.get(patch.name.as_str()).copied() else {
