@@ -903,8 +903,14 @@ fn parse_nonuniform<R: BufRead>(
     let mut values = match policy {
         FieldLoadPolicy::Summary => None,
         FieldLoadPolicy::Full => {
-            if expected.checked_mul(size_of::<f64>()).is_none() {
+            let Some(retained_bytes) = expected.checked_mul(size_of::<f64>()) else {
                 return source.reject_line_as(count_token.line, "nonuniform storage size overflow");
+            };
+            if retained_bytes > MAX_RETAINED_FIELD_VALUE_BYTES {
+                return source.reject_line_as(
+                    count_token.line,
+                    "nonuniform retained value storage exceeds byte limit",
+                );
             }
             let mut values = Vec::new();
             if values.try_reserve_exact(expected).is_err() {
@@ -2003,6 +2009,29 @@ boundaryField
         ] {
             assert_parse_error(impossible, 2, "nonuniform count exceeds remaining input");
         }
+        let retained_limit_count = MAX_RETAINED_FIELD_VALUE_BYTES / size_of::<f64>();
+        let over_retained_limit = retained_limit_count + 1;
+        let over_retained_values = "0 ".repeat(over_retained_limit);
+        let over_retained = format!(
+            "FoamFile {{ class volScalarField; object p; }}\ninternalField nonuniform List<scalar> {over_retained_limit} ({over_retained_values});\n"
+        );
+        assert_parse_error(
+            &over_retained,
+            2,
+            "nonuniform retained value storage exceeds byte limit",
+        );
+        let summary = parse_field_file_str_with_policy(
+            &over_retained,
+            Path::new("0/p"),
+            None,
+            FieldLoadPolicy::Summary,
+        )
+        .unwrap();
+        assert!(matches!(
+            summary.internal_field,
+            Some(FieldValueSummary::NonUniform { values: None, .. })
+        ));
+
         assert_eq!(nonuniform_layout(usize::MAX, 3), None);
     }
 
