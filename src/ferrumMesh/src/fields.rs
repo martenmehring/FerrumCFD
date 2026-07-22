@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 #[cfg(test)]
 use std::io::Cursor;
@@ -1181,25 +1182,33 @@ fn validate_field_boundary_patches(
     mesh: &PolyMesh,
     warnings: &mut Vec<String>,
 ) -> Result<()> {
-    for (index, patch) in field.boundary_patches.iter().enumerate() {
-        if field.boundary_patches[..index]
-            .iter()
-            .any(|seen| seen.name == patch.name)
-        {
+    let mut field_patches_by_name = HashMap::new();
+    field_patches_by_name
+        .try_reserve(field.boundary_patches.len())
+        .map_err(|_| {
+            MeshError::InvalidInput(
+                "field validation boundary patch lookup allocation failed".to_owned(),
+            )
+        })?;
+    for patch in &field.boundary_patches {
+        if field_patches_by_name.contains_key(patch.name.as_str()) {
             push_field_warning(
                 warnings,
                 field,
                 &["' has duplicate boundaryField entry '", &patch.name, "'"],
             )?;
+        } else {
+            field_patches_by_name.insert(patch.name.as_str(), patch);
         }
     }
 
+    let mut mesh_patch_names = HashSet::new();
+    mesh_patch_names.try_reserve(mesh.patches.len()).map_err(|_| {
+        MeshError::InvalidInput("field validation mesh patch lookup allocation failed".to_owned())
+    })?;
     for patch in &mesh.patches {
-        let Some(field_patch) = field
-            .boundary_patches
-            .iter()
-            .find(|candidate| candidate.name == patch.name)
-        else {
+        mesh_patch_names.insert(patch.name.as_str());
+        let Some(field_patch) = field_patches_by_name.get(patch.name.as_str()).copied() else {
             push_field_warning(
                 warnings,
                 field,
@@ -1216,11 +1225,7 @@ fn validate_field_boundary_patches(
     }
 
     for field_patch in &field.boundary_patches {
-        if !mesh
-            .patches
-            .iter()
-            .any(|patch| patch.name == field_patch.name)
-        {
+        if !mesh_patch_names.contains(field_patch.name.as_str()) {
             push_field_warning(
                 warnings,
                 field,
