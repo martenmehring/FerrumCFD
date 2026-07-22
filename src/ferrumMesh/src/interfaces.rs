@@ -1,9 +1,12 @@
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::dictionary::{Token, TokenCursor, TokenProvenance, tokenize};
 use crate::regions::InterfaceRegistrySummary;
 use crate::{MeshError, Result};
+
+const MAX_INTERFACE_CONFIG_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug)]
 pub struct InterfaceConfig {
@@ -44,11 +47,54 @@ pub struct ValidatedInterfaceConfigEntry {
 
 pub fn read_interface_config(case_dir: &Path) -> Result<Option<InterfaceConfig>> {
     let path = case_dir.join("constant").join("interfaces");
-    if !path.exists() {
-        return Ok(None);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(MeshError::InvalidInput(format!(
+                "could not inspect {} ({error})",
+                path.display()
+            )));
+        }
+    };
+    if !metadata.file_type().is_file() {
+        return Err(MeshError::InvalidInput(format!(
+            "{} must be a regular file",
+            path.display()
+        )));
+    }
+    if metadata.len() > MAX_INTERFACE_CONFIG_BYTES {
+        return Err(MeshError::InvalidInput(format!(
+            "{} exceeds the {} byte interface config limit",
+            path.display(),
+            MAX_INTERFACE_CONFIG_BYTES
+        )));
     }
 
-    let content = fs::read_to_string(&path).map_err(|error| {
+    let mut file = fs::File::open(&path).map_err(|error| {
+        MeshError::InvalidInput(format!("could not read {} ({error})", path.display()))
+    })?;
+    let opened_metadata = file.metadata().map_err(|error| {
+        MeshError::InvalidInput(format!("could not inspect {} ({error})", path.display()))
+    })?;
+    if !opened_metadata.file_type().is_file() {
+        return Err(MeshError::InvalidInput(format!(
+            "{} must be a regular file",
+            path.display()
+        )));
+    }
+    if opened_metadata.len() != metadata.len() {
+        return Err(MeshError::InvalidInput(format!(
+            "{} changed while opening interface config",
+            path.display()
+        )));
+    }
+
+    let mut content = String::new();
+    content
+        .try_reserve(opened_metadata.len() as usize)
+        .map_err(|_| MeshError::InvalidInput("interface config allocation failed".to_owned()))?;
+    file.read_to_string(&mut content).map_err(|error| {
         MeshError::InvalidInput(format!("could not read {} ({error})", path.display()))
     })?;
     let mut config = parse_interface_config_str(&content, &path)?;
@@ -374,9 +420,11 @@ fn copy_path(cursor: &mut TokenCursor) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::parse_interface_config_str;
+    use super::{MAX_INTERFACE_CONFIG_BYTES, parse_interface_config_str, read_interface_config};
     use crate::MeshError;
 
     const FIXTURE: &str = "fixture/interfaces";
@@ -405,6 +453,58 @@ mod tests {
         format!(
             "interfaces {{ membrane {{ regions {regions} faceZone membrane_wall; orientation fluid_to_solid; }} }}"
         )
+    }
+
+    fn temp_case_dir(name: &str) -> std::path::PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "ferrum_interface_config_{name}_{}_{}",
+            std::process::id(),
+            stamp
+        ));
+        fs::create_dir_all(path.join("constant")).expect("create temporary case");
+        path
+    }
+
+    #[test]
+    fn read_interface_config_requires_regular_bounded_file() {
+        let case_dir = temp_case_dir("bounded");
+        let config_path = case_dir.join("constant").join("interfaces");
+
+        assert!(read_interface_config(&case_dir).unwrap().is_none());
+
+        fs::create_dir(&config_path).expect("create directory in place of config");
+        let error = read_interface_config(&case_dir).unwrap_err();
+        assert!(error.to_string().contains("must be a regular file"));
+        fs::remove_dir(&config_path).expect("remove directory config");
+
+        fs::write(
+            &config_path,
+            vec![b' '; MAX_INTERFACE_CONFIG_BYTES as usize + 1],
+        )
+        .expect("write oversized config");
+        let error = read_interface_config(&case_dir).unwrap_err();
+        assert!(error.to_string().contains("interface config limit"));
+
+        fs::remove_dir_all(&case_dir).expect("remove temporary case");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_interface_config_rejects_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let case_dir = temp_case_dir("symlink");
+        let config_path = case_dir.join("constant").join("interfaces");
+        symlink("/dev/zero", &config_path).expect("create config symlink");
+
+        let error = read_interface_config(&case_dir).unwrap_err();
+        assert!(error.to_string().contains("must be a regular file"));
+
+        fs::remove_dir_all(&case_dir).expect("remove temporary case");
     }
 
     #[test]
