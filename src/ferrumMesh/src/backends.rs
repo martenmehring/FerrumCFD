@@ -3,6 +3,13 @@ use std::path::{Path, PathBuf};
 
 const MAX_GPU_DEVICE_COUNT: usize = 32;
 const MAX_GPU_DEVICE_LIST_BYTES: usize = 1024;
+const MAX_BACKEND_SECTION_COUNT: usize = 256;
+const MAX_BACKEND_STAGE_COUNT: usize = 4096;
+const MAX_BACKEND_POLICY_PAYLOAD_BYTES: usize = 1024 * 1024;
+const MAX_BACKEND_VALIDATION_WARNINGS: usize = 256;
+const MAX_BACKEND_VALIDATION_WARNING_BYTES: usize = 64 * 1024;
+const BACKEND_VALIDATION_TRUNCATED_WARNING: &str =
+    "backend validation warning output was truncated at configured safety limits";
 
 use crate::dictionary::{TokenCursor, TokenProvenance, tokenize};
 use crate::{MeshError, Result};
@@ -124,115 +131,391 @@ pub fn validate_backend_resources(config: &BackendConfig) -> BackendResourceVali
     }
 
     let mixed_execution = uses_cpu && uses_gpu;
-    let mut warnings = Vec::new();
+    let mut warnings = BackendWarningCollector::production();
     if uses_cpu && !config.cpu_explicit {
-        warnings.push(
-            "CPU execution is selected or possible, but no explicit cpu resource block was provided"
-                .to_string(),
-        );
+        warnings.push(&[BackendWarningPart::Text(
+            "CPU execution is selected or possible, but no explicit cpu resource block was provided",
+        )]);
     }
     if uses_gpu && !config.gpu_explicit {
-        warnings.push(
-            "GPU execution is selected or possible, but no explicit gpu resource block was provided"
-                .to_string(),
-        );
+        warnings.push(&[BackendWarningPart::Text(
+            "GPU execution is selected or possible, but no explicit gpu resource block was provided",
+        )]);
     }
     if mixed_execution && (!config.cpu_explicit || !config.gpu_explicit) {
-        warnings.push(
-            "mixed CPU/GPU execution should specify both cpu and gpu resources explicitly"
-                .to_string(),
-        );
+        warnings.push(&[BackendWarningPart::Text(
+            "mixed CPU/GPU execution should specify both cpu and gpu resources explicitly",
+        )]);
     }
 
     BackendResourceValidation {
         uses_cpu,
         uses_gpu,
         mixed_execution,
-        warnings,
+        warnings: warnings.finish(),
     }
 }
 
 pub fn validate_backend_policy(config: &BackendConfig) -> BackendPolicyValidation {
-    let mut warnings = Vec::new();
-    warn_duplicate_sections(config, &mut warnings);
-    warn_duplicate_steps(config, &mut warnings);
-    warn_unknown_builtin_policy_entries(config, &mut warnings);
-    warn_inconsistent_resource_policy(config, &mut warnings);
+    let mut warnings = BackendWarningCollector::production();
+    if warn_duplicate_sections(config, &mut warnings)
+        && warn_duplicate_steps(config, &mut warnings)
+        && warn_unknown_builtin_policy_entries(config, &mut warnings)
+    {
+        warn_inconsistent_resource_policy(config, &mut warnings);
+    }
 
-    BackendPolicyValidation { warnings }
+    BackendPolicyValidation {
+        warnings: warnings.finish(),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BackendWarningLimits {
+    count: usize,
+    payload_bytes: usize,
+}
+
+const BACKEND_WARNING_LIMITS: BackendWarningLimits = BackendWarningLimits {
+    count: MAX_BACKEND_VALIDATION_WARNINGS,
+    payload_bytes: MAX_BACKEND_VALIDATION_WARNING_BYTES,
+};
+
+enum BackendWarningPart<'a> {
+    Text(&'a str),
+    Number(usize),
+}
+
+struct BackendWarningCollector {
+    warnings: Vec<String>,
+    payload_bytes: usize,
+    limits: BackendWarningLimits,
+    truncated: bool,
+}
+
+impl BackendWarningCollector {
+    fn production() -> Self {
+        Self::with_limits(BACKEND_WARNING_LIMITS)
+    }
+
+    fn with_limits(limits: BackendWarningLimits) -> Self {
+        Self {
+            warnings: Vec::new(),
+            payload_bytes: 0,
+            limits,
+            truncated: false,
+        }
+    }
+
+    fn push(&mut self, parts: &[BackendWarningPart<'_>]) -> bool {
+        if self.truncated {
+            return false;
+        }
+
+        let Some(message_bytes) = parts.iter().try_fold(0usize, |bytes, part| {
+            let part_bytes = match part {
+                BackendWarningPart::Text(text) => text.len(),
+                BackendWarningPart::Number(value) => decimal_usize_len(*value),
+            };
+            bytes.checked_add(part_bytes)
+        }) else {
+            self.truncate();
+            return false;
+        };
+        let Some(next_payload_bytes) = self.payload_bytes.checked_add(message_bytes) else {
+            self.truncate();
+            return false;
+        };
+        let Some(next_count) = self.warnings.len().checked_add(1) else {
+            self.truncate();
+            return false;
+        };
+        if next_count > self.limits.count || next_payload_bytes > self.limits.payload_bytes {
+            self.truncate();
+            return false;
+        }
+
+        let mut message = String::new();
+        if message.try_reserve_exact(message_bytes).is_err() {
+            self.truncate();
+            return false;
+        }
+        for part in parts {
+            match part {
+                BackendWarningPart::Text(text) => message.push_str(text),
+                BackendWarningPart::Number(value) => push_decimal_usize(&mut message, *value),
+            }
+        }
+        if self.warnings.try_reserve(1).is_err() {
+            self.truncate();
+            return false;
+        }
+        self.warnings.push(message);
+        self.payload_bytes = next_payload_bytes;
+        true
+    }
+
+    fn truncate(&mut self) {
+        if self.truncated {
+            return;
+        }
+        self.truncated = true;
+
+        let sentinel_bytes = BACKEND_VALIDATION_TRUNCATED_WARNING.len();
+        if self.limits.count == 0 || sentinel_bytes > self.limits.payload_bytes {
+            self.warnings.clear();
+            self.payload_bytes = 0;
+            return;
+        }
+
+        let mut sentinel = String::new();
+        if sentinel.try_reserve_exact(sentinel_bytes).is_err() {
+            return;
+        }
+        sentinel.push_str(BACKEND_VALIDATION_TRUNCATED_WARNING);
+
+        while self.warnings.len() >= self.limits.count
+            || self
+                .payload_bytes
+                .checked_add(sentinel_bytes)
+                .is_none_or(|bytes| bytes > self.limits.payload_bytes)
+        {
+            let Some(removed) = self.warnings.pop() else {
+                break;
+            };
+            let Some(payload_bytes) = self.payload_bytes.checked_sub(removed.len()) else {
+                self.warnings.clear();
+                self.payload_bytes = 0;
+                return;
+            };
+            self.payload_bytes = payload_bytes;
+        }
+        let Some(next_payload_bytes) = self.payload_bytes.checked_add(sentinel_bytes) else {
+            return;
+        };
+        if self.warnings.len() < self.warnings.capacity() || self.warnings.try_reserve(1).is_ok() {
+            self.warnings.push(sentinel);
+            self.payload_bytes = next_payload_bytes;
+        }
+    }
+
+    fn finish(self) -> Vec<String> {
+        self.warnings
+    }
+}
+
+fn decimal_usize_len(mut value: usize) -> usize {
+    let mut digits = 1;
+    while value >= 10 {
+        value /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+fn push_decimal_usize(target: &mut String, mut value: usize) {
+    let mut digits = [0u8; 40];
+    let mut index = digits.len();
+    loop {
+        index -= 1;
+        digits[index] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    for digit in &digits[index..] {
+        target.push(char::from(*digit));
+    }
+}
+
+fn try_copy_backend_string(value: &str) -> Result<String> {
+    let mut owned = String::new();
+    owned
+        .try_reserve_exact(value.len())
+        .map_err(|_| MeshError::OutOfMemory)?;
+    owned.push_str(value);
+    Ok(owned)
+}
+
+fn backend_limit_error(message: &'static str) -> Result<MeshError> {
+    Ok(MeshError::InvalidInput(try_copy_backend_string(message)?))
+}
+
+#[derive(Default)]
+struct BackendPolicyBudget {
+    sections: usize,
+    stages: usize,
+    payload_bytes: usize,
+}
+
+impl BackendPolicyBudget {
+    fn add_section(&mut self, name_bytes: usize) -> Result<()> {
+        let sections = self.sections.checked_add(1).ok_or(MeshError::OutOfMemory)?;
+        if sections > MAX_BACKEND_SECTION_COUNT {
+            return Err(backend_limit_error(
+                "backend policy section count exceeds maximum of 256",
+            )?);
+        }
+        let payload_bytes = self
+            .payload_bytes
+            .checked_add(name_bytes)
+            .ok_or(MeshError::OutOfMemory)?;
+        if payload_bytes > MAX_BACKEND_POLICY_PAYLOAD_BYTES {
+            return Err(backend_limit_error(
+                "backend policy retained payload exceeds maximum of 1048576 bytes",
+            )?);
+        }
+        self.sections = sections;
+        self.payload_bytes = payload_bytes;
+        Ok(())
+    }
+
+    fn add_stage(&mut self, step_bytes: usize) -> Result<()> {
+        let stages = self.stages.checked_add(1).ok_or(MeshError::OutOfMemory)?;
+        if stages > MAX_BACKEND_STAGE_COUNT {
+            return Err(backend_limit_error(
+                "backend policy stage count exceeds maximum of 4096",
+            )?);
+        }
+        let payload_bytes = self
+            .payload_bytes
+            .checked_add(step_bytes)
+            .ok_or(MeshError::OutOfMemory)?;
+        if payload_bytes > MAX_BACKEND_POLICY_PAYLOAD_BYTES {
+            return Err(backend_limit_error(
+                "backend policy retained payload exceeds maximum of 1048576 bytes",
+            )?);
+        }
+        self.stages = stages;
+        self.payload_bytes = payload_bytes;
+        Ok(())
+    }
 }
 
 fn choice_can_use_cpu(choice: BackendChoice) -> bool {
     matches!(choice, BackendChoice::Cpu | BackendChoice::Auto)
 }
 
-fn warn_duplicate_sections(config: &BackendConfig, warnings: &mut Vec<String>) {
+fn warn_duplicate_sections(config: &BackendConfig, warnings: &mut BackendWarningCollector) -> bool {
     let mut counts = HashMap::<&str, usize>::new();
+    if counts.try_reserve(config.sections.len()).is_err() {
+        warnings.truncate();
+        return false;
+    }
     for section in &config.sections {
-        *counts.entry(section.name.as_str()).or_insert(0) += 1;
+        let count = counts.entry(section.name.as_str()).or_insert(0);
+        let Some(next_count) = count.checked_add(1) else {
+            warnings.truncate();
+            return false;
+        };
+        *count = next_count;
     }
 
     for (section, count) in counts {
-        if count > 1 {
-            warnings.push(format!(
-                "backend section '{section}' appears {count} times; merge duplicate sections to avoid ambiguous stage policy"
-            ));
+        if count > 1
+            && !warnings.push(&[
+                BackendWarningPart::Text("backend section '"),
+                BackendWarningPart::Text(section),
+                BackendWarningPart::Text("' appears "),
+                BackendWarningPart::Number(count),
+                BackendWarningPart::Text(
+                    " times; merge duplicate sections to avoid ambiguous stage policy",
+                ),
+            ])
+        {
+            return false;
         }
     }
+    true
 }
 
-fn warn_duplicate_steps(config: &BackendConfig, warnings: &mut Vec<String>) {
+fn warn_duplicate_steps(config: &BackendConfig, warnings: &mut BackendWarningCollector) -> bool {
     for section in &config.sections {
         let mut seen = HashSet::<&str>::new();
+        if seen.try_reserve(section.entries.len()).is_err() {
+            warnings.truncate();
+            return false;
+        }
         for entry in &section.entries {
-            if !seen.insert(entry.step.as_str()) {
-                warnings.push(format!(
-                    "backend stage '{}.{}' is configured more than once",
-                    section.name, entry.step
-                ));
+            if !seen.insert(entry.step.as_str())
+                && !warnings.push(&[
+                    BackendWarningPart::Text("backend stage '"),
+                    BackendWarningPart::Text(&section.name),
+                    BackendWarningPart::Text("."),
+                    BackendWarningPart::Text(&entry.step),
+                    BackendWarningPart::Text("' is configured more than once"),
+                ])
+            {
+                return false;
             }
         }
     }
+    true
 }
 
-fn warn_unknown_builtin_policy_entries(config: &BackendConfig, warnings: &mut Vec<String>) {
+fn warn_unknown_builtin_policy_entries(
+    config: &BackendConfig,
+    warnings: &mut BackendWarningCollector,
+) -> bool {
     for section in &config.sections {
         let Some(known_steps) = known_backend_steps(&section.name) else {
-            warnings.push(format!(
-                "backend section '{}' is not a known built-in section; custom sections are allowed but are not consumed by current solver preflight",
-                section.name
-            ));
+            if !warnings.push(&[
+                BackendWarningPart::Text("backend section '"),
+                BackendWarningPart::Text(&section.name),
+                BackendWarningPart::Text(
+                    "' is not a known built-in section; custom sections are allowed but are not consumed by current solver preflight",
+                ),
+            ]) {
+                return false;
+            }
             continue;
         };
 
         for entry in &section.entries {
-            if !known_steps.contains(&entry.step.as_str()) {
-                warnings.push(format!(
-                    "backend stage '{}.{}' is not a known built-in stage",
-                    section.name, entry.step
-                ));
+            if !known_steps.contains(&entry.step.as_str())
+                && !warnings.push(&[
+                    BackendWarningPart::Text("backend stage '"),
+                    BackendWarningPart::Text(&section.name),
+                    BackendWarningPart::Text("."),
+                    BackendWarningPart::Text(&entry.step),
+                    BackendWarningPart::Text("' is not a known built-in stage"),
+                ])
+            {
+                return false;
             }
         }
     }
+    true
 }
 
-fn warn_inconsistent_resource_policy(config: &BackendConfig, warnings: &mut Vec<String>) {
+fn warn_inconsistent_resource_policy(
+    config: &BackendConfig,
+    warnings: &mut BackendWarningCollector,
+) -> bool {
     let numeric_devices = config
         .gpu
         .devices
         .iter()
         .filter(|device| device.as_str() != "auto")
         .count();
-    if numeric_devices > 1 && config.gpu.multi_gpu == "off" {
-        warnings.push(format!(
-            "gpu.devices selects {numeric_devices} devices but gpu.multiGpu is off"
-        ));
+    if numeric_devices > 1
+        && config.gpu.multi_gpu == "off"
+        && !warnings.push(&[
+            BackendWarningPart::Text("gpu.devices selects "),
+            BackendWarningPart::Number(numeric_devices),
+            BackendWarningPart::Text(" devices but gpu.multiGpu is off"),
+        ])
+    {
+        return false;
     }
-    if config.gpu.multi_gpu == "on" && config.gpu.devices.iter().any(|device| device == "auto") {
-        warnings.push(
-            "gpu.multiGpu is on but gpu.devices contains auto; list explicit device ids for reproducible multi-GPU runs"
-                .to_string(),
-        );
+    if config.gpu.multi_gpu == "on"
+        && config.gpu.devices.iter().any(|device| device == "auto")
+        && !warnings.push(&[BackendWarningPart::Text(
+            "gpu.multiGpu is on but gpu.devices contains auto; list explicit device ids for reproducible multi-GPU runs",
+        )])
+    {
+        return false;
     }
 
     if let (Some(cpus), Some(cores_per_cpu), Some(threads)) = (
@@ -240,16 +523,29 @@ fn warn_inconsistent_resource_policy(config: &BackendConfig, warnings: &mut Vec<
         parse_explicit_usize(&config.cpu.cores_per_cpu),
         parse_explicit_usize(&config.cpu.threads),
     ) {
-        let declared_cores = cpus.saturating_mul(cores_per_cpu);
-        if declared_cores > 0 && threads > declared_cores {
-            warnings.push(format!(
-                "cpu.threads={threads} exceeds declared physical core budget cpus*coresPerCpu={declared_cores}"
-            ));
+        let Some(declared_cores) = cpus.checked_mul(cores_per_cpu) else {
+            return warnings.push(&[BackendWarningPart::Text(
+                "cpu declared physical core budget cpus*coresPerCpu exceeds supported numeric range",
+            )]);
+        };
+        if declared_cores > 0
+            && threads > declared_cores
+            && !warnings.push(&[
+                BackendWarningPart::Text("cpu.threads="),
+                BackendWarningPart::Number(threads),
+                BackendWarningPart::Text(
+                    " exceeds declared physical core budget cpus*coresPerCpu=",
+                ),
+                BackendWarningPart::Number(declared_cores),
+            ])
+        {
+            return false;
         }
     }
+    true
 }
 
-fn known_backend_steps(section: &str) -> Option<HashSet<&'static str>> {
+fn known_backend_steps(section: &str) -> Option<&'static [&'static str]> {
     let steps = match section {
         "mesh" => ["import", "checks"].as_slice(),
         "interfaces" => ["flux", "coupling", "sourceTerms"].as_slice(),
@@ -267,7 +563,7 @@ fn known_backend_steps(section: &str) -> Option<HashSet<&'static str>> {
         _ => return None,
     };
 
-    Some(steps.iter().copied().collect())
+    Some(steps)
 }
 
 fn parse_explicit_usize(value: &str) -> Option<usize> {
@@ -385,16 +681,24 @@ fn parse_backend_entry(cursor: &mut TokenCursor, builder: &mut BackendConfigBuil
             }) =>
         {
             cursor.expect("{")?;
+            builder.budget.add_section(key.value.len())?;
+            let section = parse_backend_section(cursor, key.value, &mut builder.budget)?;
             builder
                 .sections
-                .push(parse_backend_section(cursor, key.value)?);
+                .try_reserve(1)
+                .map_err(|_| MeshError::OutOfMemory)?;
+            builder.sections.push(section);
         }
         _ => skip_backend_value(cursor)?,
     }
     Ok(())
 }
 
-fn parse_backend_section(cursor: &mut TokenCursor, name: String) -> Result<BackendSection> {
+fn parse_backend_section(
+    cursor: &mut TokenCursor,
+    name: String,
+    budget: &mut BackendPolicyBudget,
+) -> Result<BackendSection> {
     let mut entries = Vec::new();
     let known_steps = known_backend_steps(&name);
 
@@ -419,7 +723,7 @@ fn parse_backend_section(cursor: &mut TokenCursor, name: String) -> Result<Backe
         }) {
             if known_steps
                 .as_ref()
-                .is_some_and(|steps| steps.contains(step.value.as_str()))
+                .is_some_and(|steps| steps.contains(&step.value.as_str()))
             {
                 return Err(MeshError::InvalidInput(format!(
                     "unexpected dictionary token in {}",
@@ -448,6 +752,8 @@ fn parse_backend_section(cursor: &mut TokenCursor, name: String) -> Result<Backe
         let choice = cursor.next_required()?;
         let choice = parse_backend_choice(&choice.value, cursor.path())?;
         cursor.expect(";")?;
+        budget.add_stage(step.value.len())?;
+        entries.try_reserve(1).map_err(|_| MeshError::OutOfMemory)?;
         entries.push(BackendSelection {
             step: step.value,
             choice,
@@ -484,27 +790,27 @@ fn parse_cpu_block(cursor: &mut TokenCursor) -> Result<CpuConfig> {
         let values = cursor.read_value_until_semicolon()?;
         match key.value.as_str() {
             "cpus" => {
-                let value = single_value(&values, "CPU cpus", cursor.path())?;
+                let value = single_value(values, "CPU cpus", cursor.path())?;
                 validate_auto_or_positive_integer(&value, "CPU cpus", cursor.path())?;
                 cpu.cpus = value;
             }
             "coresPerCpu" => {
-                let value = single_value(&values, "CPU coresPerCpu", cursor.path())?;
+                let value = single_value(values, "CPU coresPerCpu", cursor.path())?;
                 validate_auto_or_positive_integer(&value, "CPU coresPerCpu", cursor.path())?;
                 cpu.cores_per_cpu = value;
             }
             "threads" => {
-                let value = single_value(&values, "CPU threads", cursor.path())?;
+                let value = single_value(values, "CPU threads", cursor.path())?;
                 validate_auto_or_positive_integer(&value, "CPU threads", cursor.path())?;
                 cpu.threads = value;
             }
             "threadPinning" => {
-                let value = single_value(&values, "CPU threadPinning", cursor.path())?;
+                let value = single_value(values, "CPU threadPinning", cursor.path())?;
                 validate_auto_on_off(&value, "CPU threadPinning", cursor.path())?;
                 cpu.thread_pinning = value;
             }
             "numa" => {
-                let value = single_value(&values, "CPU numa", cursor.path())?;
+                let value = single_value(values, "CPU numa", cursor.path())?;
                 validate_auto_on_off(&value, "CPU numa", cursor.path())?;
                 cpu.numa = value;
             }
@@ -551,14 +857,20 @@ fn parse_gpu_block(cursor: &mut TokenCursor) -> Result<GpuConfig> {
         let values = cursor.read_value_until_semicolon()?;
         match key.value.as_str() {
             "backend" => {
-                let value = single_value(&values, "GPU backend", cursor.path())?;
+                let value = single_value(values, "GPU backend", cursor.path())?;
                 validate_gpu_backend(&value, cursor.path())?;
                 gpu.backend = value;
             }
             "device" => {
-                let value = single_value(&values, "GPU device", cursor.path())?;
+                let value = single_value(values, "GPU device", cursor.path())?;
+                validate_gpu_device_list(std::slice::from_ref(&value), cursor.path())?;
                 validate_word_or_number(&value, "GPU device", cursor.path())?;
-                gpu.devices = vec![value];
+                let mut devices = Vec::new();
+                devices
+                    .try_reserve_exact(1)
+                    .map_err(|_| MeshError::OutOfMemory)?;
+                devices.push(value);
+                gpu.devices = devices;
             }
             "devices" => {
                 let raw_quoted_parentheses = !structurally_grouped
@@ -567,24 +879,22 @@ fn parse_gpu_block(cursor: &mut TokenCursor) -> Result<GpuConfig> {
                     && values.len() == 3
                     && values.first().map(String::as_str) == Some("(")
                     && values.last().map(String::as_str) == Some(")");
-                let devices =
-                    value_list(&values, structurally_grouped, "GPU devices", cursor.path())?;
-                for (index, device) in devices.iter().enumerate() {
-                    if raw_quoted_parentheses && (index == 0 || index + 1 == devices.len()) {
-                        continue;
-                    }
-                    validate_word_or_number(device, "GPU device", cursor.path())?;
-                }
-                validate_gpu_device_list(&devices, cursor.path())?;
+                let devices = value_list(
+                    values,
+                    structurally_grouped,
+                    raw_quoted_parentheses,
+                    "GPU devices",
+                    cursor.path(),
+                )?;
                 gpu.devices = devices;
             }
             "multiGpu" => {
-                let value = single_value(&values, "GPU multiGpu", cursor.path())?;
+                let value = single_value(values, "GPU multiGpu", cursor.path())?;
                 validate_auto_on_off(&value, "GPU multiGpu", cursor.path())?;
                 gpu.multi_gpu = value;
             }
             "precision" => {
-                let value = single_value(&values, "GPU precision", cursor.path())?;
+                let value = single_value(values, "GPU precision", cursor.path())?;
                 validate_precision(&value, cursor.path())?;
                 gpu.precision = value;
             }
@@ -609,9 +919,14 @@ fn parse_backend_choice(value: &str, path: &Path) -> Result<BackendChoice> {
     }
 }
 
-fn single_value(values: &[String], label: &str, path: &Path) -> Result<String> {
+fn single_value(mut values: Vec<String>, label: &str, path: &Path) -> Result<String> {
     if values.len() == 1 {
-        return Ok(values[0].clone());
+        return values.pop().ok_or_else(|| {
+            MeshError::InvalidInput(format!(
+                "{label} in {} must be a single value",
+                path.display()
+            ))
+        });
     }
 
     Err(MeshError::InvalidInput(format!(
@@ -621,8 +936,9 @@ fn single_value(values: &[String], label: &str, path: &Path) -> Result<String> {
 }
 
 fn value_list(
-    values: &[String],
+    mut values: Vec<String>,
     structurally_grouped: bool,
+    raw_quoted_parentheses: bool,
     label: &str,
     path: &Path,
 ) -> Result<Vec<String>> {
@@ -633,34 +949,52 @@ fn value_list(
         )));
     }
 
-    if structurally_grouped
+    let (start, end) = if structurally_grouped
         && values.first().map(String::as_str) == Some("(")
         && values.last().map(String::as_str) == Some(")")
     {
-        let values = values[1..values.len() - 1].to_vec();
-        if values.is_empty() {
+        let end = values.len().checked_sub(1).ok_or(MeshError::OutOfMemory)?;
+        if end <= 1 {
             return Err(MeshError::InvalidInput(format!(
                 "{label} in {} must not be empty",
                 path.display()
             )));
         }
-        return Ok(values);
-    }
-
-    if values.first().map(String::as_str) == Some("(")
+        (1, end)
+    } else if values.first().map(String::as_str) == Some("(")
         && values.last().map(String::as_str) == Some(")")
     {
-        return Ok(values.to_vec());
+        (0, values.len())
+    } else if values.len() == 1 {
+        (0, 1)
+    } else {
+        return Err(MeshError::InvalidInput(format!(
+            "{label} in {} must be a single value or parenthesized list",
+            path.display()
+        )));
+    };
+
+    let selected = &values[start..end];
+    validate_gpu_device_list(selected, path)?;
+    for (index, device) in selected.iter().enumerate() {
+        if raw_quoted_parentheses && (index == 0 || index + 1 == selected.len()) {
+            continue;
+        }
+        validate_word_or_number(device, "GPU device", path)?;
     }
 
-    if values.len() == 1 {
-        return Ok(vec![values[0].clone()]);
+    if start == 0 && end == values.len() {
+        return Ok(values);
     }
-
-    Err(MeshError::InvalidInput(format!(
-        "{label} in {} must be a single value or parenthesized list",
-        path.display()
-    )))
+    let selected_count = end.checked_sub(start).ok_or(MeshError::OutOfMemory)?;
+    let mut selected_values = Vec::new();
+    selected_values
+        .try_reserve_exact(selected_count)
+        .map_err(|_| MeshError::OutOfMemory)?;
+    for value in values.drain(start..end) {
+        selected_values.push(value);
+    }
+    Ok(selected_values)
 }
 
 fn skip_backend_value(cursor: &mut TokenCursor) -> Result<()> {
@@ -711,7 +1045,14 @@ fn validate_gpu_device_list(devices: &[String], path: &Path) -> Result<()> {
         )));
     }
 
-    let bytes = devices.iter().map(String::len).sum::<usize>() + devices.len().saturating_sub(1);
+    let Some(separators) = devices.len().checked_sub(1) else {
+        return Err(backend_limit_error("GPU devices must not be empty")?);
+    };
+    let bytes = devices.iter().try_fold(separators, |bytes, device| {
+        bytes
+            .checked_add(device.len())
+            .ok_or(MeshError::OutOfMemory)
+    })?;
     if bytes > MAX_GPU_DEVICE_LIST_BYTES {
         return Err(MeshError::InvalidInput(format!(
             "GPU devices in {} uses {} bytes; maximum is {}",
@@ -769,6 +1110,7 @@ struct BackendConfigBuilder {
     gpu: GpuConfig,
     cpu_explicit: bool,
     gpu_explicit: bool,
+    budget: BackendPolicyBudget,
 }
 
 impl BackendConfigBuilder {
@@ -781,6 +1123,7 @@ impl BackendConfigBuilder {
             gpu: GpuConfig::default(),
             cpu_explicit: false,
             gpu_explicit: false,
+            budget: BackendPolicyBudget::default(),
         }
     }
 
@@ -801,7 +1144,38 @@ impl BackendConfigBuilder {
 mod tests {
     use std::path::Path;
 
-    use super::{BackendChoice, parse_backend_config_str};
+    use super::{
+        BACKEND_VALIDATION_TRUNCATED_WARNING, BackendChoice, BackendConfig, BackendSection,
+        BackendSelection, CpuConfig, GpuConfig, MAX_BACKEND_POLICY_PAYLOAD_BYTES,
+        MAX_BACKEND_SECTION_COUNT, MAX_BACKEND_STAGE_COUNT, MAX_BACKEND_VALIDATION_WARNING_BYTES,
+        MAX_BACKEND_VALIDATION_WARNINGS, MAX_GPU_DEVICE_COUNT, MAX_GPU_DEVICE_LIST_BYTES,
+        parse_backend_config_str, validate_backend_policy,
+    };
+
+    fn policy_config(sections: Vec<BackendSection>) -> BackendConfig {
+        BackendConfig {
+            path: Path::new("ferrumBackends").to_path_buf(),
+            default: BackendChoice::Cpu,
+            sections,
+            cpu: CpuConfig::default(),
+            gpu: GpuConfig::default(),
+            cpu_explicit: false,
+            gpu_explicit: false,
+        }
+    }
+
+    fn repeated_known_step_config(entry_count: usize) -> BackendConfig {
+        let entries = (0..entry_count)
+            .map(|_| BackendSelection {
+                step: "residual".to_string(),
+                choice: BackendChoice::Cpu,
+            })
+            .collect();
+        policy_config(vec![BackendSection {
+            name: "flow".to_string(),
+            entries,
+        }])
+    }
 
     #[test]
     fn parses_template_backend_config() {
@@ -1034,6 +1408,234 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("cpu.threads=16"))
+        );
+    }
+
+    #[test]
+    fn backend_warning_payload_cap_is_exact_and_one_over_has_no_prefix() {
+        const PREFIX: &str = "backend section '";
+        const SUFFIX: &str = "' is not a known built-in section; custom sections are allowed but are not consumed by current solver preflight";
+        let fixed_bytes = PREFIX.len() + SUFFIX.len();
+        let exact_name = "x".repeat(MAX_BACKEND_VALIDATION_WARNING_BYTES - fixed_bytes);
+        let exact = validate_backend_policy(&policy_config(vec![BackendSection {
+            name: exact_name,
+            entries: Vec::new(),
+        }]));
+        assert_eq!(exact.warnings.len(), 1);
+        assert_eq!(
+            exact.warnings[0].len(),
+            MAX_BACKEND_VALIDATION_WARNING_BYTES
+        );
+        assert!(exact.warnings[0].starts_with(PREFIX));
+        assert!(exact.warnings[0].ends_with(SUFFIX));
+
+        let one_over_name = "x".repeat(MAX_BACKEND_VALIDATION_WARNING_BYTES - fixed_bytes + 1);
+        let one_over = validate_backend_policy(&policy_config(vec![BackendSection {
+            name: one_over_name,
+            entries: Vec::new(),
+        }]));
+        assert_eq!(one_over.warnings.len(), 1);
+        assert_eq!(one_over.warnings[0], BACKEND_VALIDATION_TRUNCATED_WARNING);
+        assert!(!one_over.warnings[0].starts_with(PREFIX));
+    }
+
+    #[test]
+    fn backend_warning_count_cap_is_exact_for_duplicate_steps() {
+        const DUPLICATE_WARNING: &str =
+            "backend stage 'flow.residual' is configured more than once";
+        let exact = validate_backend_policy(&repeated_known_step_config(
+            MAX_BACKEND_VALIDATION_WARNINGS + 1,
+        ));
+        assert_eq!(exact.warnings.len(), MAX_BACKEND_VALIDATION_WARNINGS);
+        assert!(
+            exact
+                .warnings
+                .iter()
+                .all(|warning| warning == DUPLICATE_WARNING)
+        );
+
+        let one_over = validate_backend_policy(&repeated_known_step_config(
+            MAX_BACKEND_VALIDATION_WARNINGS + 2,
+        ));
+        assert_eq!(one_over.warnings.len(), MAX_BACKEND_VALIDATION_WARNINGS);
+        assert_eq!(
+            one_over.warnings.last().map(String::as_str),
+            Some(BACKEND_VALIDATION_TRUNCATED_WARNING)
+        );
+        assert!(
+            one_over.warnings[..one_over.warnings.len() - 1]
+                .iter()
+                .all(|warning| warning == DUPLICATE_WARNING)
+        );
+    }
+
+    #[test]
+    fn backend_warning_count_cap_bounds_many_unknown_sections_without_prefix() {
+        let sections = (0..=MAX_BACKEND_VALIDATION_WARNINGS)
+            .map(|index| BackendSection {
+                name: format!("unknown-{index}"),
+                entries: Vec::new(),
+            })
+            .collect();
+        let validation = validate_backend_policy(&policy_config(sections));
+
+        assert_eq!(validation.warnings.len(), MAX_BACKEND_VALIDATION_WARNINGS);
+        assert_eq!(
+            validation.warnings.last().map(String::as_str),
+            Some(BACKEND_VALIDATION_TRUNCATED_WARNING)
+        );
+        assert!(
+            validation.warnings[..validation.warnings.len() - 1]
+                .iter()
+                .all(|warning| warning.ends_with(
+                    "' is not a known built-in section; custom sections are allowed but are not consumed by current solver preflight"
+                ))
+        );
+        assert!(
+            validation
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("unknown-256"))
+        );
+        assert!(
+            validation.warnings.iter().map(String::len).sum::<usize>()
+                <= MAX_BACKEND_VALIDATION_WARNING_BYTES
+        );
+    }
+
+    #[test]
+    fn backend_section_count_cap_is_exact_and_one_over_returns_no_prefix() {
+        let exact_input = (0..MAX_BACKEND_SECTION_COUNT)
+            .map(|index| format!("custom{index} {{}}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let exact = parse_backend_config_str(&exact_input, Path::new("ferrumBackends")).unwrap();
+        assert_eq!(exact.sections.len(), MAX_BACKEND_SECTION_COUNT);
+
+        let one_over_input = format!("{exact_input} custom{} {{}}", MAX_BACKEND_SECTION_COUNT);
+        let error = parse_backend_config_str(&one_over_input, Path::new("ferrumBackends"))
+            .expect_err("one section over the retained limit must reject the whole config");
+        assert_eq!(
+            error.to_string(),
+            "backend policy section count exceeds maximum of 256"
+        );
+    }
+
+    #[test]
+    fn backend_stage_count_cap_is_exact_and_one_over_returns_no_prefix() {
+        let exact_entries = "residual cpu; ".repeat(MAX_BACKEND_STAGE_COUNT);
+        let exact_input = format!("flow {{ {exact_entries} }}");
+        let exact = parse_backend_config_str(&exact_input, Path::new("ferrumBackends")).unwrap();
+        assert_eq!(exact.sections[0].entries.len(), MAX_BACKEND_STAGE_COUNT);
+
+        let one_over_input = format!("flow {{ {exact_entries} residual cpu; }}");
+        let error = parse_backend_config_str(&one_over_input, Path::new("ferrumBackends"))
+            .expect_err("one stage over the retained limit must reject the whole config");
+        assert_eq!(
+            error.to_string(),
+            "backend policy stage count exceeds maximum of 4096"
+        );
+    }
+
+    #[test]
+    fn backend_policy_payload_cap_is_exact_and_one_over_returns_no_prefix() {
+        let first_name = "a".repeat(MAX_BACKEND_POLICY_PAYLOAD_BYTES / 2);
+        let second_name = "b".repeat(MAX_BACKEND_POLICY_PAYLOAD_BYTES - first_name.len());
+        let exact_input = format!("{first_name} {{}} {second_name} {{}}");
+        let exact = parse_backend_config_str(&exact_input, Path::new("ferrumBackends")).unwrap();
+        assert_eq!(exact.sections.len(), 2);
+        assert_eq!(
+            exact
+                .sections
+                .iter()
+                .map(|section| section.name.len())
+                .sum::<usize>(),
+            MAX_BACKEND_POLICY_PAYLOAD_BYTES
+        );
+
+        let one_over_input = format!("{first_name} {{}} {second_name}x {{}}");
+        let error = parse_backend_config_str(&one_over_input, Path::new("ferrumBackends"))
+            .expect_err("one retained byte over the limit must reject the whole config");
+        assert_eq!(
+            error.to_string(),
+            "backend policy retained payload exceeds maximum of 1048576 bytes"
+        );
+    }
+
+    #[test]
+    fn singular_gpu_device_uses_the_same_exact_payload_cap_as_devices() {
+        let exact_device = "d".repeat(MAX_GPU_DEVICE_LIST_BYTES);
+        let exact = parse_backend_config_str(
+            &format!("gpu {{ device {exact_device}; }}"),
+            Path::new("ferrumBackends"),
+        )
+        .unwrap();
+        assert_eq!(exact.gpu.devices, vec![exact_device]);
+
+        let one_over_device = "d".repeat(MAX_GPU_DEVICE_LIST_BYTES + 1);
+        let error = parse_backend_config_str(
+            &format!("gpu {{ device ok; device {one_over_device}; }}"),
+            Path::new("ferrumBackends"),
+        )
+        .expect_err("the singular alias must not bypass the device payload limit");
+        let display = error.to_string();
+        assert!(display.contains("uses 1025 bytes; maximum is 1024"));
+        assert!(!display.contains(&one_over_device));
+
+        let invalid_one_over_device = "!".repeat(MAX_GPU_DEVICE_LIST_BYTES + 1);
+        let error = parse_backend_config_str(
+            &format!("gpu {{ device {invalid_one_over_device}; }}"),
+            Path::new("ferrumBackends"),
+        )
+        .expect_err("the payload cap must run before attacker-controlled word diagnostics");
+        let display = error.to_string();
+        assert!(display.contains("uses 1025 bytes; maximum is 1024"));
+        assert!(!display.contains(&invalid_one_over_device));
+    }
+
+    #[test]
+    fn plural_gpu_device_count_and_payload_caps_are_exact_before_collection() {
+        let exact_devices = (0..MAX_GPU_DEVICE_COUNT)
+            .map(|index| index.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let exact = parse_backend_config_str(
+            &format!("gpu {{ devices ({exact_devices}); }}"),
+            Path::new("ferrumBackends"),
+        )
+        .unwrap();
+        assert_eq!(exact.gpu.devices.len(), MAX_GPU_DEVICE_COUNT);
+
+        let one_over_devices = format!("{exact_devices} {}", MAX_GPU_DEVICE_COUNT);
+        let error = parse_backend_config_str(
+            &format!("gpu {{ devices ({one_over_devices}); }}"),
+            Path::new("ferrumBackends"),
+        )
+        .expect_err("the collection must reject before growing past its count cap");
+        assert!(
+            error
+                .to_string()
+                .contains("lists 33 entries; maximum is 32")
+        );
+
+        let exact_payload = "p".repeat(MAX_GPU_DEVICE_LIST_BYTES);
+        let exact = parse_backend_config_str(
+            &format!("gpu {{ devices ({exact_payload}); }}"),
+            Path::new("ferrumBackends"),
+        )
+        .unwrap();
+        assert_eq!(exact.gpu.devices, vec![exact_payload]);
+
+        let one_over_payload = "p".repeat(MAX_GPU_DEVICE_LIST_BYTES + 1);
+        let error = parse_backend_config_str(
+            &format!("gpu {{ devices ({one_over_payload}); }}"),
+            Path::new("ferrumBackends"),
+        )
+        .expect_err("the collection must reject before copying an oversized payload");
+        assert!(
+            error
+                .to_string()
+                .contains("uses 1025 bytes; maximum is 1024")
         );
     }
 

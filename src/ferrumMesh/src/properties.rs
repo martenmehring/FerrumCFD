@@ -1,8 +1,213 @@
+use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::case_input::CaseInput;
 use crate::dictionary::{MAX_DICTIONARY_NESTING, Token, TokenCursor, TokenProvenance, tokenize};
 use crate::{MeshError, Result};
+
+pub const MAX_PROPERTY_REGIONS: usize = 256;
+pub const MAX_PROPERTY_DICTIONARIES: usize = 1_024;
+pub const MAX_PROPERTY_DISCOVERY_ENTRIES: usize = 4_096;
+pub const MAX_RETAINED_PROPERTY_CONTENT_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct PropertyLimits {
+    regions: usize,
+    dictionaries: usize,
+    discovery_entries: usize,
+    retained_content_bytes: usize,
+}
+
+const PROPERTY_LIMITS: PropertyLimits = PropertyLimits {
+    regions: MAX_PROPERTY_REGIONS,
+    dictionaries: MAX_PROPERTY_DICTIONARIES,
+    discovery_entries: MAX_PROPERTY_DISCOVERY_ENTRIES,
+    retained_content_bytes: MAX_RETAINED_PROPERTY_CONTENT_BYTES,
+};
+
+struct PropertyBudget {
+    limits: PropertyLimits,
+    regions: usize,
+    dictionaries: usize,
+    discovery_entries: usize,
+    retained_content_bytes: usize,
+}
+
+impl PropertyBudget {
+    fn new(limits: PropertyLimits) -> Self {
+        Self {
+            limits,
+            regions: 0,
+            dictionaries: 0,
+            discovery_entries: 0,
+            retained_content_bytes: 0,
+        }
+    }
+
+    fn add_region(&mut self, path: &Path) -> Result<()> {
+        self.regions = checked_bounded_add(
+            self.regions,
+            1,
+            self.limits.regions,
+            path,
+            "property region count",
+        )?;
+        Ok(())
+    }
+
+    fn add_dictionary(&mut self, path: &Path) -> Result<()> {
+        self.dictionaries = checked_bounded_add(
+            self.dictionaries,
+            1,
+            self.limits.dictionaries,
+            path,
+            "property dictionary count",
+        )?;
+        Ok(())
+    }
+
+    fn add_discovery_entry(&mut self, path: &Path) -> Result<()> {
+        self.discovery_entries = checked_bounded_add(
+            self.discovery_entries,
+            1,
+            self.limits.discovery_entries,
+            path,
+            "property discovery entry count",
+        )?;
+        Ok(())
+    }
+
+    fn retain_content(&mut self, path: &Path, bytes: usize) -> Result<()> {
+        self.retained_content_bytes = checked_bounded_add(
+            self.retained_content_bytes,
+            bytes,
+            self.limits.retained_content_bytes,
+            path,
+            "retained property content bytes",
+        )?;
+        Ok(())
+    }
+}
+
+fn try_copy_string(value: &str) -> Result<String> {
+    let mut copy = String::new();
+    copy.try_reserve_exact(value.len())
+        .map_err(|_| MeshError::OutOfMemory)?;
+    copy.push_str(value);
+    Ok(copy)
+}
+
+fn try_copy_path(path: &Path) -> Result<PathBuf> {
+    let source = path.as_os_str();
+    let mut copy = OsString::new();
+    copy.try_reserve_exact(source.len())
+        .map_err(|_| MeshError::OutOfMemory)?;
+    copy.push(source);
+    Ok(PathBuf::from(copy))
+}
+
+fn try_join_path(parent: &Path, child: &OsStr) -> Result<PathBuf> {
+    let additional = child.len().checked_add(1).ok_or(MeshError::OutOfMemory)?;
+    let mut joined = try_copy_path(parent)?;
+    joined
+        .try_reserve_exact(additional)
+        .map_err(|_| MeshError::OutOfMemory)?;
+    joined.push(child);
+    Ok(joined)
+}
+
+fn try_path_display(path: &Path) -> Result<String> {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    let capacity = lossy_utf8_length(bytes)?;
+    let mut display = String::new();
+    display
+        .try_reserve_exact(capacity)
+        .map_err(|_| MeshError::OutOfMemory)?;
+    append_lossy_utf8(&mut display, bytes);
+    Ok(display)
+}
+
+fn lossy_utf8_length(mut bytes: &[u8]) -> Result<usize> {
+    let mut length = 0usize;
+    loop {
+        match std::str::from_utf8(bytes) {
+            Ok(valid) => {
+                return length
+                    .checked_add(valid.len())
+                    .ok_or(MeshError::OutOfMemory);
+            }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                length = length
+                    .checked_add(valid)
+                    .and_then(|value| value.checked_add(char::REPLACEMENT_CHARACTER.len_utf8()))
+                    .ok_or(MeshError::OutOfMemory)?;
+                let invalid = error.error_len().unwrap_or(bytes.len() - valid);
+                let consumed = valid.checked_add(invalid).ok_or(MeshError::OutOfMemory)?;
+                bytes = &bytes[consumed..];
+            }
+        }
+    }
+}
+
+fn append_lossy_utf8(output: &mut String, mut bytes: &[u8]) {
+    loop {
+        match std::str::from_utf8(bytes) {
+            Ok(valid) => {
+                output.push_str(valid);
+                return;
+            }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                // SAFETY: `valid_up_to` is the length of a valid UTF-8 prefix.
+                output.push_str(unsafe { std::str::from_utf8_unchecked(&bytes[..valid]) });
+                output.push(char::REPLACEMENT_CHARACTER);
+                let invalid = error.error_len().unwrap_or(bytes.len() - valid);
+                bytes = &bytes[valid + invalid..];
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct CountingWriter {
+    len: usize,
+}
+
+impl fmt::Write for CountingWriter {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        self.len = self.len.checked_add(value.len()).ok_or(fmt::Error)?;
+        Ok(())
+    }
+}
+
+fn try_invalid_input(arguments: fmt::Arguments<'_>) -> Result<MeshError> {
+    let mut counter = CountingWriter::default();
+    fmt::write(&mut counter, arguments).map_err(|_| MeshError::OutOfMemory)?;
+    let mut message = String::new();
+    message
+        .try_reserve_exact(counter.len)
+        .map_err(|_| MeshError::OutOfMemory)?;
+    fmt::write(&mut message, arguments).map_err(|_| MeshError::OutOfMemory)?;
+    Ok(MeshError::InvalidInput(message))
+}
+
+fn property_path_error(prefix: &str, path: &Path) -> Result<MeshError> {
+    let display = try_path_display(path)?;
+    try_invalid_input(format_args!("{prefix}{display}"))
+}
+
+fn property_io_error(path: &Path, source: &std::io::Error) -> MeshError {
+    let display = match try_path_display(path) {
+        Ok(display) => display,
+        Err(error) => return error,
+    };
+    match try_invalid_input(format_args!("could not inspect {display} ({source})")) {
+        Ok(error) | Err(error) => error,
+    }
+}
 
 #[derive(Debug)]
 pub struct PropertyDictionary {
@@ -32,30 +237,31 @@ pub struct PropertyValidation {
 }
 
 pub fn read_case_properties(case_dir: &Path) -> Result<Vec<PropertyDictionary>> {
-    let constant_dir = case_dir.join("constant");
+    read_case_properties_with_limits(case_dir, PROPERTY_LIMITS)
+}
+
+fn read_case_properties_with_limits(
+    case_dir: &Path,
+    limits: PropertyLimits,
+) -> Result<Vec<PropertyDictionary>> {
+    let constant_dir = try_join_path(case_dir, OsStr::new("constant"))?;
     if !try_path_is_real_directory(&constant_dir)? {
         return Ok(Vec::new());
     }
 
+    let input = CaseInput::new(case_dir);
     let mut dictionaries = Vec::new();
-    read_property_dictionaries_in_dir(&constant_dir, None, &mut dictionaries)?;
+    let mut budget = PropertyBudget::new(limits);
+    read_property_dictionaries_in_dir(
+        &constant_dir,
+        None,
+        true,
+        &input,
+        &mut budget,
+        &mut dictionaries,
+    )?;
 
-    for entry in fs::read_dir(&constant_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        if file_type.is_symlink() || !file_type.is_dir() {
-            continue;
-        }
-
-        let region = entry.file_name().to_string_lossy().to_string();
-        if region == "polyMesh" || !try_path_is_real_directory(&path.join("polyMesh"))? {
-            continue;
-        }
-        read_property_dictionaries_in_dir(&path, Some(region), &mut dictionaries)?;
-    }
-
-    dictionaries.sort_by(|left, right| {
+    dictionaries.sort_unstable_by(|left, right| {
         left.region
             .cmp(&right.region)
             .then(left.name.cmp(&right.name))
@@ -102,30 +308,94 @@ pub fn validate_properties(dictionaries: &[PropertyDictionary]) -> PropertyValid
 
 fn read_property_dictionaries_in_dir(
     dir: &Path,
-    region: Option<String>,
+    region: Option<&str>,
+    discover_regions: bool,
+    input: &CaseInput,
+    budget: &mut PropertyBudget,
     dictionaries: &mut Vec<PropertyDictionary>,
 ) -> Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let file_type = entry.file_type()?;
+    let entries = fs::read_dir(dir).map_err(|error| property_io_error(dir, &error))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| property_io_error(dir, &error))?;
+        let file_name = entry.file_name();
+        let path = try_join_path(dir, &file_name)?;
+        budget.add_discovery_entry(&path)?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| property_io_error(&path, &error))?;
         if file_type.is_symlink() {
-            return Err(MeshError::InvalidInput(format!(
-                "property dictionary symlinks are not allowed: {}",
-                path.display()
-            )));
+            return Err(property_path_error(
+                "property dictionary symlinks are not allowed: ",
+                &path,
+            )?);
         }
-        if !file_type.is_file() || !is_property_dictionary_file(&path) {
+        if discover_regions && file_type.is_dir() {
+            let Some(child_region) = file_name.to_str() else {
+                return Err(property_path_error(
+                    "property dictionary region name is not valid UTF-8: ",
+                    &path,
+                )?);
+            };
+            let poly_mesh = try_join_path(&path, OsStr::new("polyMesh"))?;
+            if child_region != "polyMesh" && try_path_is_real_directory(&poly_mesh)? {
+                budget.add_region(&path)?;
+                read_property_dictionaries_in_dir(
+                    &path,
+                    Some(child_region),
+                    false,
+                    input,
+                    budget,
+                    dictionaries,
+                )?;
+            }
+            continue;
+        }
+        if !file_type.is_file() || !is_property_dictionary_file(&file_name) {
             continue;
         }
 
-        dictionaries.push(read_property_dictionary(&path, region.clone())?);
+        let Some(name) = file_name.to_str() else {
+            return Err(property_path_error(
+                "property dictionary name is not valid UTF-8: ",
+                &path,
+            )?);
+        };
+        budget.add_dictionary(&path)?;
+        dictionaries
+            .try_reserve(1)
+            .map_err(|_| MeshError::OutOfMemory)?;
+        let logical = property_logical_path(region, name)?;
+        let dictionary = read_property_dictionary(input, &logical, &path, region, budget)?;
+        dictionaries.push(dictionary);
     }
     Ok(())
 }
 
-fn is_property_dictionary_file(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+fn property_logical_path(region: Option<&str>, name: &str) -> Result<String> {
+    let region_bytes = match region {
+        Some(value) => value.len().checked_add(1).ok_or(MeshError::OutOfMemory)?,
+        None => 0,
+    };
+    let capacity = "constant/"
+        .len()
+        .checked_add(region_bytes)
+        .and_then(|length| length.checked_add(name.len()))
+        .ok_or(MeshError::OutOfMemory)?;
+    let mut logical = String::new();
+    logical
+        .try_reserve_exact(capacity)
+        .map_err(|_| MeshError::OutOfMemory)?;
+    logical.push_str("constant/");
+    if let Some(region) = region {
+        logical.push_str(region);
+        logical.push('/');
+    }
+    logical.push_str(name);
+    Ok(logical)
+}
+
+fn is_property_dictionary_file(file_name: &OsStr) -> bool {
+    let Some(name) = file_name.to_str() else {
         return false;
     };
 
@@ -143,18 +413,27 @@ fn try_path_is_real_directory(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => Ok(metadata.file_type().is_dir()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(MeshError::InvalidInput(format!(
-            "could not inspect {} ({error})",
-            path.display()
-        ))),
+        Err(error) => Err(property_io_error(path, &error)),
     }
 }
 
-fn read_property_dictionary(path: &Path, region: Option<String>) -> Result<PropertyDictionary> {
-    let content = fs::read_to_string(path).map_err(|error| {
-        MeshError::InvalidInput(format!("could not read {} ({error})", path.display()))
-    })?;
-    parse_property_dictionary_str(&content, path, region)
+fn read_property_dictionary(
+    input: &CaseInput,
+    logical: &str,
+    path: &Path,
+    region: Option<&str>,
+    budget: &mut PropertyBudget,
+) -> Result<PropertyDictionary> {
+    let content = input.required(logical)?;
+    budget.retain_content(path, content.len())?;
+    parse_property_dictionary_str(&content, path, copy_region(region)?)
+}
+
+fn copy_region(region: Option<&str>) -> Result<Option<String>> {
+    let Some(region) = region else {
+        return Ok(None);
+    };
+    Ok(Some(try_copy_string(region)?))
 }
 
 fn parse_property_dictionary_str(
@@ -162,6 +441,17 @@ fn parse_property_dictionary_str(
     path: &Path,
     region: Option<String>,
 ) -> Result<PropertyDictionary> {
+    let dictionary_path = try_copy_path(path)?;
+    let name = match path.file_name().and_then(OsStr::to_str) {
+        Some(name) => try_copy_string(name)?,
+        None if path.file_name().is_none() => try_copy_string("unknown")?,
+        None => {
+            return Err(property_path_error(
+                "property dictionary name is not valid UTF-8: ",
+                path,
+            )?);
+        }
+    };
     let mut cursor = tokenize(path, content)?.into_cursor();
     let mut entries = Vec::new();
     let mut sections = Vec::new();
@@ -179,22 +469,27 @@ fn parse_property_dictionary_str(
 
         let key = take_name(&mut cursor)?;
         if cursor.peek()?.is_some_and(|token| structural(token, "{")) {
-            sections.push(parse_property_section(&mut cursor, key, 1)?);
+            if sections.try_reserve(1).is_err() {
+                return cursor.reject_current_as("property section allocation failed");
+            }
+            let section = parse_property_section(&mut cursor, key, 1)?;
+            sections.push(section);
         } else {
-            entries.push(PropertyEntry {
+            if entries.try_reserve(1).is_err() {
+                return cursor.reject_current_as("property entry allocation failed");
+            }
+            let entry = PropertyEntry {
                 key,
                 value: cursor.read_provenance_preserving_bare_entry()?,
-            });
+            };
+            entries.push(entry);
         }
     }
 
     Ok(PropertyDictionary {
-        path: path.to_path_buf(),
+        path: dictionary_path,
         region,
-        name: path
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown".to_string()),
+        name,
         entries,
         sections,
     })
@@ -206,10 +501,10 @@ fn parse_property_section(
     depth: usize,
 ) -> Result<PropertySection> {
     if depth > MAX_DICTIONARY_NESTING {
-        return Err(MeshError::InvalidInput(format!(
-            "property dictionary nesting exceeds {MAX_DICTIONARY_NESTING} levels in {}",
-            cursor.path().display()
-        )));
+        let display = try_path_display(cursor.path())?;
+        return Err(try_invalid_input(format_args!(
+            "property dictionary nesting exceeds {MAX_DICTIONARY_NESTING} levels in {display}"
+        ))?);
     }
     cursor.expect("{")?;
     let mut entries = Vec::new();
@@ -223,12 +518,21 @@ fn parse_property_section(
 
         let key = take_name(cursor)?;
         if cursor.peek()?.is_some_and(|token| structural(token, "{")) {
-            sections.push(parse_property_section(cursor, key, depth + 1)?);
+            if sections.try_reserve(1).is_err() {
+                return cursor.reject_current_as("property section allocation failed");
+            }
+            let next_depth = depth.checked_add(1).ok_or(MeshError::OutOfMemory)?;
+            let section = parse_property_section(cursor, key, next_depth)?;
+            sections.push(section);
         } else {
-            entries.push(PropertyEntry {
+            if entries.try_reserve(1).is_err() {
+                return cursor.reject_current_as("property entry allocation failed");
+            }
+            let entry = PropertyEntry {
                 key,
                 value: cursor.read_provenance_preserving_bare_entry()?,
-            });
+            };
+            entries.push(entry);
         }
     }
     cursor.expect("}")?;
@@ -321,6 +625,29 @@ fn dictionary_label(dictionary: &PropertyDictionary) -> String {
     }
 }
 
+fn checked_bounded_add(
+    current: usize,
+    additional: usize,
+    limit: usize,
+    path: &Path,
+    label: &str,
+) -> Result<usize> {
+    let Some(next) = current.checked_add(additional) else {
+        return Err(property_limit_error(path, label, limit)?);
+    };
+    if next > limit {
+        return Err(property_limit_error(path, label, limit)?);
+    }
+    Ok(next)
+}
+
+fn property_limit_error(path: &Path, label: &str, limit: usize) -> Result<MeshError> {
+    let display = try_path_display(path)?;
+    try_invalid_input(format_args!(
+        "{label} exceeds limit {limit} while reading {display}"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -328,7 +655,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        format_property_value, parse_property_dictionary_str, read_case_properties,
+        MAX_PROPERTY_DICTIONARIES, MAX_PROPERTY_DISCOVERY_ENTRIES, MAX_PROPERTY_REGIONS,
+        MAX_RETAINED_PROPERTY_CONTENT_BYTES, PropertyLimits, format_property_value,
+        parse_property_dictionary_str, read_case_properties, read_case_properties_with_limits,
         validate_properties,
     };
 
@@ -394,6 +723,163 @@ mod tests {
                 .contains("property dictionary symlinks are not allowed"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn rejects_oversized_property_dictionary_before_parsing() {
+        let case = TestCaseDir::new("oversized");
+        let path = case.path.join("constant/transportProperties");
+        fs::File::create(&path)
+            .unwrap()
+            .set_len(16 * 1024 * 1024 + 1)
+            .unwrap();
+
+        let error = read_case_properties(&case.path).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("constant/transportProperties"));
+        assert_eq!(message.matches("constant/transportProperties").count(), 1);
+    }
+
+    #[test]
+    fn reads_region_property_through_capability_scope() {
+        let case = TestCaseDir::new("region");
+        fs::create_dir_all(case.path.join("constant/fluid/polyMesh")).unwrap();
+        fs::write(
+            case.path.join("constant/fluid/transportProperties"),
+            "nu [0 2 -1 0 0 0 0] 1e-05;",
+        )
+        .unwrap();
+
+        let dictionaries = read_case_properties(&case.path).unwrap();
+
+        assert_eq!(dictionaries.len(), 1);
+        assert_eq!(dictionaries[0].region.as_deref(), Some("fluid"));
+        assert_eq!(dictionaries[0].name, "transportProperties");
+    }
+
+    #[test]
+    fn property_region_count_cap_is_exact() {
+        let case = TestCaseDir::new("region-count-cap");
+        let limits = PropertyLimits {
+            regions: 1,
+            dictionaries: MAX_PROPERTY_DICTIONARIES,
+            discovery_entries: MAX_PROPERTY_DISCOVERY_ENTRIES,
+            retained_content_bytes: MAX_RETAINED_PROPERTY_CONTENT_BYTES,
+        };
+        fs::create_dir_all(case.path.join("constant/region0/polyMesh")).unwrap();
+
+        assert!(read_case_properties_with_limits(&case.path, limits).is_ok());
+
+        fs::create_dir_all(case.path.join("constant/region1/polyMesh")).unwrap();
+        let message = read_case_properties_with_limits(&case.path, limits)
+            .unwrap_err()
+            .to_string();
+        let root = case.path.display().to_string();
+
+        assert!(message.contains("property region count exceeds limit 1"));
+        assert_eq!(message.matches(&root).count(), 1);
+    }
+
+    #[test]
+    fn property_dictionary_count_cap_is_exact() {
+        let case = TestCaseDir::new("dictionary-count-cap");
+        let limits = PropertyLimits {
+            regions: MAX_PROPERTY_REGIONS,
+            dictionaries: 1,
+            discovery_entries: MAX_PROPERTY_DISCOVERY_ENTRIES,
+            retained_content_bytes: MAX_RETAINED_PROPERTY_CONTENT_BYTES,
+        };
+        fs::write(case.path.join("constant/transportProperties"), "nu 1;").unwrap();
+
+        assert_eq!(
+            read_case_properties_with_limits(&case.path, limits)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        fs::write(case.path.join("constant/physicalProperties"), "rho 1;").unwrap();
+        let message = read_case_properties_with_limits(&case.path, limits)
+            .unwrap_err()
+            .to_string();
+        let root = case.path.display().to_string();
+
+        assert!(message.contains("property dictionary count exceeds limit 1"));
+        assert_eq!(message.matches(&root).count(), 1);
+    }
+
+    #[test]
+    fn property_discovery_entry_cap_is_aggregate_and_exact() {
+        let case = TestCaseDir::new("discovery-entry-cap");
+        let region = case.path.join("constant/region");
+        let limits = PropertyLimits {
+            regions: MAX_PROPERTY_REGIONS,
+            dictionaries: MAX_PROPERTY_DICTIONARIES,
+            discovery_entries: 2,
+            retained_content_bytes: MAX_RETAINED_PROPERTY_CONTENT_BYTES,
+        };
+        fs::create_dir_all(region.join("polyMesh")).unwrap();
+
+        assert!(read_case_properties_with_limits(&case.path, limits).is_ok());
+
+        fs::write(region.join("ignored-entry"), "ignored").unwrap();
+        let message = read_case_properties_with_limits(&case.path, limits)
+            .unwrap_err()
+            .to_string();
+        let root = case.path.display().to_string();
+
+        assert!(message.contains("property discovery entry count exceeds limit 2"));
+        assert_eq!(message.matches(&root).count(), 1);
+    }
+
+    #[test]
+    fn retained_property_content_byte_cap_is_exact() {
+        let case = TestCaseDir::new("retained-content-cap");
+        let first = case.path.join("constant/transportProperties");
+        let second = case.path.join("constant/physicalProperties");
+        let limits = PropertyLimits {
+            regions: MAX_PROPERTY_REGIONS,
+            dictionaries: MAX_PROPERTY_DICTIONARIES,
+            discovery_entries: MAX_PROPERTY_DISCOVERY_ENTRIES,
+            retained_content_bytes: 2,
+        };
+        fs::write(&first, ";").unwrap();
+        fs::write(&second, ";").unwrap();
+
+        assert_eq!(
+            read_case_properties_with_limits(&case.path, limits)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        fs::write(&second, ";;").unwrap();
+        let message = read_case_properties_with_limits(&case.path, limits)
+            .unwrap_err()
+            .to_string();
+        let root = case.path.display().to_string();
+
+        assert!(message.contains("retained property content bytes exceeds limit 2"));
+        assert_eq!(message.matches(&root).count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_utf8_property_name_has_single_lossy_path_diagnostic() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = PathBuf::from(OsString::from_vec(
+            b"constant/transportProperties-\xff".to_vec(),
+        ));
+        let message = parse_property_dictionary_str("", &path, None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(message.starts_with("property dictionary name is not valid UTF-8: "));
+        assert_eq!(message.matches("constant/transportProperties-").count(), 1);
+        assert_eq!(message.matches(char::REPLACEMENT_CHARACTER).count(), 1);
     }
 
     #[cfg(unix)]

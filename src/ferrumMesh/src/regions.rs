@@ -1,8 +1,9 @@
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, ErrorKind, Write};
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+use crate::safe_output::SafeOutputRoot;
 use crate::{MeshError, Point3, Result};
 
 #[derive(Debug)]
@@ -65,6 +66,7 @@ pub struct BoundaryFaceZoneSummary {
 pub fn split_regions_by_cell_zones(case_dir: &Path) -> Result<RegionSplitSummary> {
     let poly_mesh_dir = case_dir.join("constant").join("polyMesh");
     let mesh = PolyMesh::read(&poly_mesh_dir)?;
+    let output = SafeOutputRoot::open_existing(case_dir)?;
 
     if mesh.cell_zones.is_empty() {
         return Err(MeshError::InvalidInput(format!(
@@ -88,12 +90,12 @@ pub fn split_regions_by_cell_zones(case_dir: &Path) -> Result<RegionSplitSummary
             &face_zone_by_face,
             &boundary_by_face,
         )?;
-        let region_dir = case_dir
-            .join("constant")
+        let region_relative = PathBuf::from("constant")
             .join(sanitize_name(&zone.name))
             .join("polyMesh");
-        create_output_dir(&region_dir)?;
-        write_region_poly_mesh(&region_dir, &region)?;
+        output.ensure_dir(&region_relative)?;
+        write_region_poly_mesh(&output, &region_relative, &region)?;
+        let region_dir = case_dir.join(&region_relative);
 
         summaries.push(RegionSummary {
             name: zone.name.clone(),
@@ -609,23 +611,24 @@ fn map_nodes(
         .collect()
 }
 
-fn write_region_poly_mesh(path: &Path, region: &RegionMesh) -> Result<()> {
-    write_points(&path.join("points"), &region.points)?;
-    write_faces(&path.join("faces"), &region.faces)?;
-    write_owner(&path.join("owner"), &region.faces)?;
+fn write_region_poly_mesh(output: &SafeOutputRoot, path: &Path, region: &RegionMesh) -> Result<()> {
+    write_points(output, &path.join("points"), &region.points)?;
+    write_faces(output, &path.join("faces"), &region.faces)?;
+    write_owner(output, &path.join("owner"), &region.faces)?;
     write_neighbour(
+        output,
         &path.join("neighbour"),
         &region.faces,
         region.internal_faces,
     )?;
-    write_boundary(&path.join("boundary"), &region.patches)?;
-    write_empty_zone_file(&path.join("faceZones"), "faceZoneMesh", "faceZones")?;
-    write_empty_zone_file(&path.join("cellZones"), "cellZoneMesh", "cellZones")?;
+    write_boundary(output, &path.join("boundary"), &region.patches)?;
+    write_empty_zone_file(output, &path.join("faceZones"), "faceZoneMesh", "faceZones")?;
+    write_empty_zone_file(output, &path.join("cellZones"), "cellZoneMesh", "cellZones")?;
     Ok(())
 }
 
-fn write_points(path: &Path, points: &[Point3]) -> Result<()> {
-    let mut writer = foam_writer(path, "vectorField", "points")?;
+fn write_points(output: &SafeOutputRoot, path: &Path, points: &[Point3]) -> Result<()> {
+    let mut writer = foam_writer(output, path, "vectorField", "points")?;
     writeln!(writer, "{}", points.len())?;
     writeln!(writer, "(")?;
     for point in points {
@@ -635,8 +638,8 @@ fn write_points(path: &Path, points: &[Point3]) -> Result<()> {
     Ok(())
 }
 
-fn write_faces(path: &Path, faces: &[RegionFace]) -> Result<()> {
-    let mut writer = foam_writer(path, "faceList", "faces")?;
+fn write_faces(output: &SafeOutputRoot, path: &Path, faces: &[RegionFace]) -> Result<()> {
+    let mut writer = foam_writer(output, path, "faceList", "faces")?;
     writeln!(writer, "{}", faces.len())?;
     writeln!(writer, "(")?;
     for face in faces {
@@ -653,8 +656,8 @@ fn write_faces(path: &Path, faces: &[RegionFace]) -> Result<()> {
     Ok(())
 }
 
-fn write_owner(path: &Path, faces: &[RegionFace]) -> Result<()> {
-    let mut writer = foam_writer(path, "labelList", "owner")?;
+fn write_owner(output: &SafeOutputRoot, path: &Path, faces: &[RegionFace]) -> Result<()> {
+    let mut writer = foam_writer(output, path, "labelList", "owner")?;
     writeln!(writer, "{}", faces.len())?;
     writeln!(writer, "(")?;
     for face in faces {
@@ -664,8 +667,13 @@ fn write_owner(path: &Path, faces: &[RegionFace]) -> Result<()> {
     Ok(())
 }
 
-fn write_neighbour(path: &Path, faces: &[RegionFace], internal_faces: usize) -> Result<()> {
-    let mut writer = foam_writer(path, "labelList", "neighbour")?;
+fn write_neighbour(
+    output: &SafeOutputRoot,
+    path: &Path,
+    faces: &[RegionFace],
+    internal_faces: usize,
+) -> Result<()> {
+    let mut writer = foam_writer(output, path, "labelList", "neighbour")?;
     writeln!(writer, "{internal_faces}")?;
     writeln!(writer, "(")?;
     for face in faces.iter().take(internal_faces) {
@@ -677,8 +685,8 @@ fn write_neighbour(path: &Path, faces: &[RegionFace], internal_faces: usize) -> 
     Ok(())
 }
 
-fn write_boundary(path: &Path, patches: &[RegionPatch]) -> Result<()> {
-    let mut writer = foam_writer(path, "polyBoundaryMesh", "boundary")?;
+fn write_boundary(output: &SafeOutputRoot, path: &Path, patches: &[RegionPatch]) -> Result<()> {
+    let mut writer = foam_writer(output, path, "polyBoundaryMesh", "boundary")?;
     writeln!(writer, "{}", patches.len())?;
     writeln!(writer, "(")?;
     for patch in patches {
@@ -693,83 +701,26 @@ fn write_boundary(path: &Path, patches: &[RegionPatch]) -> Result<()> {
     Ok(())
 }
 
-fn write_empty_zone_file(path: &Path, class_name: &str, object: &str) -> Result<()> {
-    let mut writer = foam_writer(path, class_name, object)?;
+fn write_empty_zone_file(
+    output: &SafeOutputRoot,
+    path: &Path,
+    class_name: &str,
+    object: &str,
+) -> Result<()> {
+    let mut writer = foam_writer(output, path, class_name, object)?;
     writeln!(writer, "0")?;
     writeln!(writer, "(")?;
     writeln!(writer, ")")?;
     Ok(())
 }
 
-fn create_output_dir(path: &Path) -> Result<()> {
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        current.push(component);
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink() {
-                    return Err(MeshError::InvalidInput(format!(
-                        "refusing to write region mesh through symlinked path {}",
-                        current.display()
-                    )));
-                }
-                if !metadata.is_dir() {
-                    return Err(MeshError::InvalidInput(format!(
-                        "region mesh output path {} is not a directory",
-                        current.display()
-                    )));
-                }
-            }
-            Err(error) if error.kind() == ErrorKind::NotFound => fs::create_dir(&current)?,
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(())
-}
-
-fn create_output_file(path: &Path) -> Result<File> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(MeshError::InvalidInput(format!(
-                "refusing to overwrite symlinked region mesh file {}",
-                path.display()
-            )));
-        }
-        Ok(metadata) if metadata.is_dir() => {
-            return Err(MeshError::InvalidInput(format!(
-                "region mesh output file {} is a directory",
-                path.display()
-            )));
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    open_without_following_symlink(&mut options, path)
-}
-
-#[cfg(unix)]
-fn open_without_following_symlink(options: &mut OpenOptions, path: &Path) -> Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    const O_NOFOLLOW: i32 = 0o400000;
-
-    options
-        .custom_flags(O_NOFOLLOW)
-        .open(path)
-        .map_err(Into::into)
-}
-
-#[cfg(not(unix))]
-fn open_without_following_symlink(options: &mut OpenOptions, path: &Path) -> Result<File> {
-    options.open(path).map_err(Into::into)
-}
-
-fn foam_writer(path: &Path, class_name: &str, object: &str) -> Result<BufWriter<File>> {
-    let mut writer = BufWriter::new(create_output_file(path)?);
+fn foam_writer(
+    output: &SafeOutputRoot,
+    path: &Path,
+    class_name: &str,
+    object: &str,
+) -> Result<BufWriter<File>> {
+    let mut writer = BufWriter::new(output.open_replace_regular(path)?);
     writeln!(writer, "FoamFile")?;
     writeln!(writer, "{{")?;
     writeln!(writer, "    version 2.0;")?;
@@ -1395,13 +1346,11 @@ fn sanitize_name(name: &str) -> String {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[cfg(unix)]
     fn temp_path(name: &str) -> PathBuf {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1421,9 +1370,11 @@ mod tests {
         fs::create_dir_all(&outside).expect("create outside dir");
         symlink(&outside, root.join("constant").join("zoneA")).expect("create symlink");
 
-        let error = create_output_dir(&root.join("constant").join("zoneA").join("polyMesh"))
+        let output = SafeOutputRoot::open_existing(&root).expect("open output root");
+        let error = output
+            .ensure_dir(Path::new("constant/zoneA/polyMesh"))
             .expect_err("symlinked output ancestor must be rejected");
-        assert!(error.to_string().contains("symlinked path"));
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
         assert!(!outside.join("polyMesh").exists());
 
         let _ = fs::remove_dir_all(&root);
@@ -1442,14 +1393,45 @@ mod tests {
         let link = root.join("points");
         symlink(&target, &link).expect("create file symlink");
 
-        let error = foam_writer(&link, "vectorField", "points")
+        let output = SafeOutputRoot::open_existing(&root).expect("open output root");
+        let error = foam_writer(&output, Path::new("points"), "vectorField", "points")
             .expect_err("symlinked output file must be rejected");
-        assert!(error.to_string().contains("symlinked region mesh file"));
+        match error {
+            MeshError::Io(error) => assert_ne!(error.kind(), std::io::ErrorKind::NotFound),
+            other => panic!("expected an I/O rejection, got {other}"),
+        }
         assert_eq!(
             fs::read_to_string(&target).expect("read target"),
             "original"
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn output_dir_rejects_windows_reparse_ancestor() {
+        use std::os::windows::fs::symlink_dir;
+
+        let root = temp_path("reparse_dir");
+        let outside = temp_path("outside_reparse_dir");
+        fs::create_dir_all(root.join("constant")).expect("create case constant dir");
+        fs::create_dir_all(&outside).expect("create outside dir");
+        if symlink_dir(&outside, root.join("constant").join("zoneA")).is_err() {
+            let _ = fs::remove_dir_all(&root);
+            let _ = fs::remove_dir_all(&outside);
+            return;
+        }
+
+        let output = SafeOutputRoot::open_existing(&root).expect("open output root");
+        assert!(
+            output
+                .ensure_dir(Path::new("constant/zoneA/polyMesh"))
+                .is_err()
+        );
+        assert!(!outside.join("polyMesh").exists());
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
     }
 }
