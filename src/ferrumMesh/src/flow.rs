@@ -13,6 +13,8 @@ use crate::runtime::{SolverRuntimeData, SolverRuntimeMeshData};
 use crate::solver_state::SolverStateFieldKind;
 use crate::{MeshError, Point3, Result};
 
+const LAMINAR_SIMPLE_MAX_CONTINUITY_GROWTH_PER_STEP: f64 = 100.0;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LaminarSimpleLinearSolver {
     BiCgStab,
@@ -1209,7 +1211,10 @@ fn solve_laminar_simple_driven(
         let corrected_continuity =
             summarize_continuity(&net_cell_flux(&runtime.mesh, &corrected_phi)?);
         let pressure_correction_update_scale = 1.0;
-        if !is_finite_continuity(corrected_continuity)
+        let pressure_correction_diverged =
+            simple_step_continuity_growth_exceeded(continuity_before, corrected_continuity);
+        if pressure_correction_diverged
+            || !is_finite_continuity(corrected_continuity)
             || !points_are_finite(&corrected_velocity)
             || !scalars_are_finite(&corrected_pressure)
             || !corrected_phi.iter().all(|value| value.is_finite())
