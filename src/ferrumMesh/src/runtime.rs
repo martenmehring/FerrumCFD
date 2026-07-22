@@ -152,56 +152,7 @@ pub fn build_solver_runtime_data(
     }
 
     if policy == FieldLoadPolicy::Full {
-        // Recheck every commit slot immediately before mutation. This makes an
-        // invariant regression an ordinary pre-commit error rather than a
-        // partial transfer or an indexing panic.
-        for (runtime_index, source_index) in nonuniform_sources.iter().copied().enumerate() {
-            let Some(source_index) = source_index else {
-                continue;
-            };
-            let source_ready = initial_fields
-                .fields
-                .get(source_index)
-                .and_then(|source| source.internal_field.as_ref())
-                .is_some_and(|value| {
-                    matches!(
-                        value,
-                        FieldValueSummary::NonUniform {
-                            values: Some(_),
-                            ..
-                        }
-                    )
-                });
-            if fields.get(runtime_index).is_none() || !source_ready {
-                return Err(MeshError::InvalidInput(
-                    "runtime nonuniform commit invariant changed before transfer".to_string(),
-                ));
-            }
-        }
-
-        // Every operation above is fallible; this commit pass is deliberately
-        // allocation-free. Preflight proved every marked source has the exact
-        // shape, so moving the Vec cannot fail and preserves its allocation.
-        for (runtime_index, source_index) in nonuniform_sources.iter().copied().enumerate() {
-            let Some(source_index) = source_index else {
-                continue;
-            };
-            let moved = initial_fields
-                .fields
-                .get_mut(source_index)
-                .and_then(|source| source.internal_field.as_mut())
-                .and_then(|value| match value {
-                    FieldValueSummary::NonUniform { values, .. } => values.take(),
-                    _ => None,
-                });
-            debug_assert!(
-                moved.is_some(),
-                "preflighted nonuniform payload disappeared"
-            );
-            if let Some(values) = moved {
-                fields[runtime_index].values = Some(values);
-            }
-        }
+        transfer_preflighted_nonuniform_payloads(&mut fields, &nonuniform_sources, initial_fields)?;
         discard_remaining_internal_payloads(initial_fields);
     }
 
@@ -210,6 +161,76 @@ pub fn build_solver_runtime_data(
         fields,
         warnings,
     })
+}
+
+fn transfer_preflighted_nonuniform_payloads(
+    fields: &mut [SolverRuntimeFieldBuffer],
+    nonuniform_sources: &[Option<usize>],
+    initial_fields: &mut InitialFieldSet,
+) -> Result<()> {
+    let invariant_message =
+        try_clone_runtime_string("runtime nonuniform commit invariant changed before transfer")?;
+    if fields.len() != nonuniform_sources.len() {
+        return Err(MeshError::InvalidInput(invariant_message));
+    }
+
+    // Validate the complete transfer table before taking any source payload.
+    // Source indices originate from a single enumerate pass, so requiring a
+    // strict order also proves uniqueness without allocating a side table.
+    let mut previous_source = None;
+    for (runtime_index, source_index) in nonuniform_sources.iter().copied().enumerate() {
+        let Some(source_index) = source_index else {
+            continue;
+        };
+        if previous_source.is_some_and(|previous| source_index <= previous) {
+            return Err(MeshError::InvalidInput(invariant_message));
+        }
+        previous_source = Some(source_index);
+
+        let Some(target) = fields.get(runtime_index) else {
+            return Err(MeshError::InvalidInput(invariant_message));
+        };
+        let source_values = initial_fields
+            .fields
+            .get(source_index)
+            .and_then(|source| source.internal_field.as_ref())
+            .and_then(|value| match value {
+                FieldValueSummary::NonUniform {
+                    values: Some(values),
+                    ..
+                } => Some(values),
+                _ => None,
+            });
+        if target.values.is_some()
+            || source_values.is_none_or(|values| values.len() != target.scalar_slots)
+        {
+            return Err(MeshError::InvalidInput(invariant_message));
+        }
+    }
+
+    // The error text and every fallible allocation were prepared above. This
+    // commit pass only moves Vec ownership, preserving each allocation.
+    for (runtime_index, source_index) in nonuniform_sources.iter().copied().enumerate() {
+        let Some(source_index) = source_index else {
+            continue;
+        };
+        let Some(target) = fields.get_mut(runtime_index) else {
+            return Err(MeshError::InvalidInput(invariant_message));
+        };
+        let moved = initial_fields
+            .fields
+            .get_mut(source_index)
+            .and_then(|source| source.internal_field.as_mut())
+            .and_then(|value| match value {
+                FieldValueSummary::NonUniform { values, .. } => values.take(),
+                _ => None,
+            });
+        let Some(values) = moved else {
+            return Err(MeshError::InvalidInput(invariant_message));
+        };
+        target.values = Some(values);
+    }
+    Ok(())
 }
 
 fn preflight_runtime_fields(
@@ -473,7 +494,10 @@ mod tests {
         SolverStateStoragePlan, SolverStateStorageStatus, SolverStateValueKind,
     };
 
-    use super::build_solver_runtime_data;
+    use super::{
+        SolverRuntimeFieldBuffer, build_solver_runtime_data,
+        transfer_preflighted_nonuniform_payloads,
+    };
 
     #[test]
     fn builds_runtime_mesh_geometry_and_uniform_field_buffer() {
@@ -741,6 +765,99 @@ mod tests {
             };
             assert_eq!(values.as_ptr(), expected_pointer);
             assert_eq!(values, &[300.0]);
+        }
+    }
+
+    #[test]
+    fn nonuniform_commit_helper_is_hard_and_all_or_nothing() {
+        fn target(name: &str) -> SolverRuntimeFieldBuffer {
+            SolverRuntimeFieldBuffer {
+                region: None,
+                name: name.to_string(),
+                kind: SolverStateFieldKind::VolScalar,
+                components: 1,
+                scalar_slots: 1,
+                bytes_f64: 8,
+                values: None,
+            }
+        }
+
+        let mut sources = initial_fields();
+        sources.fields.remove(0);
+        sources.fields[0].name = "A".to_string();
+        sources.fields.push(FieldFile {
+            path: PathBuf::from("case/0/B"),
+            region: None,
+            name: "B".to_string(),
+            class_name: Some("volScalarField".to_string()),
+            dimensions: None,
+            internal_field: Some(FieldValueSummary::NonUniform {
+                value_type: Some("List<scalar>".to_string()),
+                count: Some(1),
+                values: None,
+            }),
+            boundary_patches: Vec::new(),
+        });
+        let first_pointer = match &sources.fields[0].internal_field {
+            Some(FieldValueSummary::NonUniform {
+                values: Some(values),
+                ..
+            }) => values.as_ptr(),
+            _ => panic!("first nonuniform fixture missing"),
+        };
+        let mut targets = vec![target("A"), target("B")];
+
+        let error = transfer_preflighted_nonuniform_payloads(
+            &mut targets,
+            &[Some(0), Some(1)],
+            &mut sources,
+        )
+        .expect_err("missing later payload must fail before any transfer");
+        assert_eq!(
+            error.to_string(),
+            "runtime nonuniform commit invariant changed before transfer"
+        );
+        assert!(targets.iter().all(|target| target.values.is_none()));
+        let preserved = match &sources.fields[0].internal_field {
+            Some(FieldValueSummary::NonUniform {
+                values: Some(values),
+                ..
+            }) => values,
+            _ => panic!("failed commit consumed first source"),
+        };
+        assert_eq!(preserved.as_ptr(), first_pointer);
+
+        let Some(FieldValueSummary::NonUniform { values, .. }) =
+            sources.fields[1].internal_field.as_mut()
+        else {
+            panic!("second nonuniform fixture missing");
+        };
+        *values = Some(vec![301.0]);
+        let pointers = sources
+            .fields
+            .iter()
+            .map(|field| match &field.internal_field {
+                Some(FieldValueSummary::NonUniform {
+                    values: Some(values),
+                    ..
+                }) => values.as_ptr(),
+                _ => panic!("ready nonuniform fixture missing"),
+            })
+            .collect::<Vec<_>>();
+
+        transfer_preflighted_nonuniform_payloads(&mut targets, &[Some(0), Some(1)], &mut sources)
+            .expect("validated nonuniform payloads must move without allocation");
+        for ((target, expected_pointer), source) in
+            targets.iter().zip(pointers).zip(&sources.fields)
+        {
+            assert_eq!(
+                target.values.as_ref().map(Vec::as_ptr),
+                Some(expected_pointer)
+            );
+            assert!(matches!(
+                source.internal_field,
+                Some(FieldValueSummary::NonUniform { values: None, .. })
+            ));
         }
     }
 

@@ -126,7 +126,7 @@ pub mod streaming {
                 .map_or(0, std::convert::identity)
         }
 
-        pub(crate) fn checked_remaining(&mut self) -> Result<usize> {
+        pub(crate) fn checked_remaining_bytes(&mut self) -> Result<usize> {
             self.declared
                 .checked_sub(self.committed)
                 .ok_or_else(|| self.latch(self.line, "dictionary remaining-byte counter underflow"))
@@ -238,6 +238,12 @@ pub mod streaming {
         #[allow(dead_code)]
         pub(crate) fn reject_current_as<T>(&mut self, detail: &'static str) -> Result<T> {
             self.reject_at_as(0, detail)
+        }
+        pub(crate) fn reject_line_as<T>(&mut self, line: usize, detail: &'static str) -> Result<T> {
+            if self.failure.is_some() {
+                return Err(self.sticky());
+            }
+            Err(self.latch(line, detail))
         }
         #[allow(dead_code)]
         pub(crate) fn reject_at_as<T>(&mut self, offset: usize, detail: &'static str) -> Result<T> {
@@ -711,6 +717,44 @@ pub mod streaming {
             }
             self.next_required()?;
             Ok(())
+        }
+
+        pub(crate) fn discard_semicolon_terminated_value_or_block(&mut self) -> Result<()> {
+            let first = self.next_required()?;
+            if Self::token_is(&first, ";") || Self::token_closer(&first) {
+                return self.reject_line_as(first.line, "dictionary value is missing");
+            }
+
+            if Self::token_is(&first, "{") {
+                let mut stack = ['\0'; MAX_DICTIONARY_NESTING];
+                let mut depth = 0usize;
+                Self::track_token_delimiter(&first, &mut stack, &mut depth)
+                    .map_err(|detail| self.latch(first.line, detail))?;
+                while depth != 0 {
+                    let token = self.next_required()?;
+                    Self::track_token_delimiter(&token, &mut stack, &mut depth)
+                        .map_err(|detail| self.latch(token.line, detail))?;
+                }
+                self.expect_optional(";")?;
+                return Ok(());
+            }
+
+            let mut stack = ['\0'; MAX_DICTIONARY_NESTING];
+            let mut depth = 0usize;
+            Self::track_token_delimiter(&first, &mut stack, &mut depth)
+                .map_err(|detail| self.latch(first.line, detail))?;
+            loop {
+                let token = self.next_required()?;
+                if depth == 0 && Self::token_is(&token, ";") {
+                    return Ok(());
+                }
+                if depth == 0 && Self::token_closer(&token) {
+                    return self
+                        .reject_line_as(token.line, "dictionary value is missing a semicolon");
+                }
+                Self::track_token_delimiter(&token, &mut stack, &mut depth)
+                    .map_err(|detail| self.latch(token.line, detail))?;
+            }
         }
 
         fn is_syntax(value: &str) -> bool {
@@ -1602,6 +1646,41 @@ pub mod streaming {
         }
 
         #[test]
+        fn streaming_semicolon_terminated_discard_is_typed_and_sticky() {
+            for input in [
+                "uniform 0; next;",
+                "(a [b]) tail; next;",
+                "alpha \";\" beta; next;",
+                "{ nested (a [b]); } next;",
+            ] {
+                let mut streaming = source(input.as_bytes());
+                streaming
+                    .discard_semicolon_terminated_value_or_block()
+                    .unwrap();
+                assert_eq!(streaming.next_required().unwrap().value, "next");
+                assert_eq!(streaming.next_required().unwrap().value, ";");
+                assert!(streaming.next().unwrap().is_none());
+            }
+
+            for (input, detail) in [
+                ("uniform 0 }", "dictionary nesting counter underflow"),
+                ("(a];", "mismatched dictionary delimiter"),
+                ("uniform\n#include bad;", "unsupported dictionary directive"),
+            ] {
+                let mut streaming = source(input.as_bytes());
+                let first = streaming
+                    .discard_semicolon_terminated_value_or_block()
+                    .unwrap_err();
+                assert!(first.to_string().contains(detail), "{first}");
+                assert_eq!(
+                    streaming.next_required().unwrap_err().to_string(),
+                    first.to_string()
+                );
+                assert_eq!(first.to_string().matches("fixture").count(), 1);
+            }
+        }
+
+        #[test]
         fn optional_semicolon_requires_structural_provenance() {
             let mut cursor = super::tokenize(Path::new("optional"), "\";\"")
                 .unwrap()
@@ -1676,6 +1755,22 @@ pub mod streaming {
             assert_eq!(current.tokens.as_slice().len(), 2);
             assert_eq!(current.tokens.as_slice()[0].value, "first");
             assert_eq!(current.tokens.as_slice()[1].value, "second");
+
+            let mut explicit = super::tokenize(Path::new("terminal-explicit"), "first\nsecond")
+                .unwrap()
+                .into_cursor();
+            let explicit_error = explicit
+                .reject_line_as::<()>(2, "planned exact-line rejection")
+                .unwrap_err();
+            assert_parse(
+                &explicit_error,
+                2,
+                "terminal-explicit: planned exact-line rejection",
+            );
+            assert_eq!(
+                explicit.next().unwrap_err().to_string(),
+                explicit_error.to_string()
+            );
 
             let mut eof_reserve = super::tokenize(Path::new("terminal-eof-reserve"), "\n\n\n")
                 .unwrap()
