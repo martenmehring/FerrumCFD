@@ -58,6 +58,7 @@ use ferrum_mesh::solver_state::SolverStatePlan;
 
 const FERRUM_DEFAULT_LDU_TOLERANCE: f64 = 1.0e-6;
 const FERRUM_DEFAULT_LDU_MAX_ITERATIONS: usize = 1_000;
+const FERRUM_MAX_CASE_LDU_MAX_ITERATIONS: usize = FERRUM_DEFAULT_LDU_MAX_ITERATIONS;
 
 pub fn run_ferrum() -> i32 {
     let args = env::args().skip(1).collect::<Vec<_>>();
@@ -1652,6 +1653,12 @@ fn resolve_laminar_simple_options(
     let pressure_case_tolerance = fv_solution_number(plan, "solvers.p", "tolerance")?;
     let momentum_case_max_iterations = fv_solution_usize(plan, "solvers.U", "maxIter")?;
     let pressure_case_max_iterations = fv_solution_usize(plan, "solvers.p", "maxIter")?;
+    if solve.momentum_max_linear_iterations.is_none() && solve.max_linear_iterations.is_none() {
+        validate_fv_solution_max_iterations("solvers.U", momentum_case_max_iterations)?;
+    }
+    if solve.pressure_max_linear_iterations.is_none() && solve.max_linear_iterations.is_none() {
+        validate_fv_solution_max_iterations("solvers.p", pressure_case_max_iterations)?;
+    }
 
     let linear_tolerance = solve
         .linear_tolerance
@@ -2380,6 +2387,20 @@ fn fv_solution_usize(
         .ok_or_else(|| {
             format!("fvSolution {section}.{key} must contain a non-negative integer, got '{value}'")
         })
+}
+
+fn validate_fv_solution_max_iterations(
+    section: &str,
+    max_iterations: Option<usize>,
+) -> Result<(), String> {
+    if let Some(max_iterations) = max_iterations
+        && max_iterations > FERRUM_MAX_CASE_LDU_MAX_ITERATIONS
+    {
+        return Err(format!(
+            "fvSolution {section}.maxIter={max_iterations} exceeds Ferrum's case-file safety cap of {FERRUM_MAX_CASE_LDU_MAX_ITERATIONS}; use --maxIterations or a field-specific CLI override for trusted cases that need a higher limit"
+        ));
+    }
+    Ok(())
 }
 
 fn numerics_dictionary_value<'a>(
@@ -8210,6 +8231,53 @@ mod tests {
         assert_eq!(options.pressure_linear_tolerance, 1.0e-6);
         assert_eq!(options.momentum_max_linear_iterations, 1_000);
         assert_eq!(options.pressure_max_linear_iterations, 1_000);
+    }
+
+    #[test]
+    fn laminar_simple_rejects_untrusted_case_max_iter_above_safety_cap() {
+        let mut plan = laminar_simple_test_plan(1000.0, 0.001002);
+        plan.numerics
+            .fv_solution
+            .entries
+            .push(SolverNumericsEntryPlan {
+                section: "solvers.U".to_string(),
+                key: "maxIter".to_string(),
+                value: "100000000".to_string(),
+            });
+        let parsed = parse_incompressible_fluid_args(&[]).expect("solver args should parse");
+        let solve = parsed
+            .laminar_simple_solve
+            .expect("laminar SIMPLE solve args");
+
+        let error = resolve_laminar_simple_options(&plan, &solve)
+            .expect_err("oversized case maxIter must fail closed");
+
+        assert!(error.contains("solvers.U.maxIter=100000000 exceeds"));
+        assert!(error.contains("safety cap of 1000"));
+    }
+
+    #[test]
+    fn laminar_simple_allows_cli_iteration_override_when_case_max_iter_exceeds_cap() {
+        let mut plan = laminar_simple_test_plan(1000.0, 0.001002);
+        plan.numerics
+            .fv_solution
+            .entries
+            .push(SolverNumericsEntryPlan {
+                section: "solvers.U".to_string(),
+                key: "maxIter".to_string(),
+                value: "100000000".to_string(),
+            });
+        let parsed =
+            parse_incompressible_fluid_args(&["--maxIterations".to_string(), "2500".to_string()])
+                .expect("solver args should parse");
+        let solve = parsed
+            .laminar_simple_solve
+            .expect("laminar SIMPLE solve args");
+        let options =
+            resolve_laminar_simple_options(&plan, &solve).expect("CLI cap should be trusted");
+
+        assert_eq!(options.momentum_max_linear_iterations, 2_500);
+        assert_eq!(options.pressure_max_linear_iterations, 2_500);
     }
 
     #[test]
