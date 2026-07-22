@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::case_input::CaseInput;
 use crate::dictionary::{MAX_DICTIONARY_NESTING, Token, TokenCursor, TokenProvenance, tokenize};
 use crate::{MeshError, Result};
 
@@ -37,8 +38,9 @@ pub fn read_case_properties(case_dir: &Path) -> Result<Vec<PropertyDictionary>> 
         return Ok(Vec::new());
     }
 
+    let input = CaseInput::new(case_dir);
     let mut dictionaries = Vec::new();
-    read_property_dictionaries_in_dir(&constant_dir, None, &mut dictionaries)?;
+    read_property_dictionaries_in_dir(&constant_dir, None, &input, &mut dictionaries)?;
 
     for entry in fs::read_dir(&constant_dir)? {
         let entry = entry?;
@@ -48,11 +50,16 @@ pub fn read_case_properties(case_dir: &Path) -> Result<Vec<PropertyDictionary>> 
             continue;
         }
 
-        let region = entry.file_name().to_string_lossy().to_string();
+        let region = entry.file_name().into_string().map_err(|_| {
+            MeshError::InvalidInput(format!(
+                "property dictionary region name is not valid UTF-8 under {}",
+                constant_dir.display()
+            ))
+        })?;
         if region == "polyMesh" || !try_path_is_real_directory(&path.join("polyMesh"))? {
             continue;
         }
-        read_property_dictionaries_in_dir(&path, Some(region), &mut dictionaries)?;
+        read_property_dictionaries_in_dir(&path, Some(region), &input, &mut dictionaries)?;
     }
 
     dictionaries.sort_by(|left, right| {
@@ -103,6 +110,7 @@ pub fn validate_properties(dictionaries: &[PropertyDictionary]) -> PropertyValid
 fn read_property_dictionaries_in_dir(
     dir: &Path,
     region: Option<String>,
+    input: &CaseInput,
     dictionaries: &mut Vec<PropertyDictionary>,
 ) -> Result<()> {
     for entry in fs::read_dir(dir)? {
@@ -119,7 +127,25 @@ fn read_property_dictionaries_in_dir(
             continue;
         }
 
-        dictionaries.push(read_property_dictionary(&path, region.clone())?);
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                MeshError::InvalidInput(format!(
+                    "property dictionary name is not valid UTF-8: {}",
+                    path.display()
+                ))
+            })?;
+        let logical = match &region {
+            Some(region) => format!("constant/{region}/{name}"),
+            None => format!("constant/{name}"),
+        };
+        dictionaries.push(read_property_dictionary(
+            input,
+            &logical,
+            &path,
+            region.clone(),
+        )?);
     }
     Ok(())
 }
@@ -150,10 +176,13 @@ fn try_path_is_real_directory(path: &Path) -> Result<bool> {
     }
 }
 
-fn read_property_dictionary(path: &Path, region: Option<String>) -> Result<PropertyDictionary> {
-    let content = fs::read_to_string(path).map_err(|error| {
-        MeshError::InvalidInput(format!("could not read {} ({error})", path.display()))
-    })?;
+fn read_property_dictionary(
+    input: &CaseInput,
+    logical: &str,
+    path: &Path,
+    region: Option<String>,
+) -> Result<PropertyDictionary> {
+    let content = input.required(logical)?;
     parse_property_dictionary_str(&content, path, region)
 }
 
@@ -394,6 +423,39 @@ mod tests {
                 .contains("property dictionary symlinks are not allowed"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn rejects_oversized_property_dictionary_before_parsing() {
+        let case = TestCaseDir::new("oversized");
+        let path = case.path.join("constant/transportProperties");
+        fs::File::create(&path)
+            .unwrap()
+            .set_len(16 * 1024 * 1024 + 1)
+            .unwrap();
+
+        let error = read_case_properties(&case.path).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("constant/transportProperties"));
+        assert_eq!(message.matches("constant/transportProperties").count(), 1);
+    }
+
+    #[test]
+    fn reads_region_property_through_capability_scope() {
+        let case = TestCaseDir::new("region");
+        fs::create_dir_all(case.path.join("constant/fluid/polyMesh")).unwrap();
+        fs::write(
+            case.path.join("constant/fluid/transportProperties"),
+            "nu [0 2 -1 0 0 0 0] 1e-05;",
+        )
+        .unwrap();
+
+        let dictionaries = read_case_properties(&case.path).unwrap();
+
+        assert_eq!(dictionaries.len(), 1);
+        assert_eq!(dictionaries[0].region.as_deref(), Some("fluid"));
+        assert_eq!(dictionaries[0].name, "transportProperties");
     }
 
     #[cfg(unix)]

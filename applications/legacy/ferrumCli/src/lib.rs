@@ -45,8 +45,8 @@ use ferrum_mesh::regions::{
     read_region_mesh_summaries, split_regions_by_cell_zones,
 };
 use ferrum_mesh::runner::{
-    SolverRunnerDryRun, SolverRunnerDryRunEvent, SolverRunnerDryRunOptions,
-    build_solver_runner_dry_run,
+    MAX_RUNNER_DRY_RUN_STEPS, SolverRunnerDryRun, SolverRunnerDryRunEvent,
+    SolverRunnerDryRunOptions, build_solver_runner_dry_run,
 };
 use ferrum_mesh::runtime::SolverRuntimeData;
 use ferrum_mesh::solver_plan::{
@@ -59,6 +59,7 @@ use ferrum_mesh::solver_state::SolverStatePlan;
 const FERRUM_DEFAULT_LDU_TOLERANCE: f64 = 1.0e-6;
 const FERRUM_DEFAULT_LDU_MAX_ITERATIONS: usize = 1_000;
 const FERRUM_MAX_CASE_LDU_MAX_ITERATIONS: usize = FERRUM_DEFAULT_LDU_MAX_ITERATIONS;
+const FERRUM_MAX_CASE_SIMPLE_ITERATIONS: usize = 1_000;
 
 pub fn run_ferrum() -> i32 {
     let args = env::args().skip(1).collect::<Vec<_>>();
@@ -561,7 +562,8 @@ fn solve_case_with_contract(
             SolverRunnerDryRunOptions {
                 max_steps: options.max_runner_steps,
             },
-        );
+        )
+        .map_err(|error| error.to_string())?;
         print_solver_runner_dry_run(&dry_run);
     }
     if let Some(solve) = &options.scalar_diffusion_solve {
@@ -1727,6 +1729,7 @@ fn resolve_laminar_simple_options(
         pressure_linear_solver,
         solve.pressure_preconditioner,
     )?;
+    let case_derived_simple_iterations = solve.max_simple_iterations.is_none();
     let max_simple_iterations = solve
         .max_simple_iterations
         .or(plan.run.estimated_steps)
@@ -1735,6 +1738,11 @@ fn resolve_laminar_simple_options(
             "Laminar SIMPLE requires --maxSimpleIterations or a positive controlDict endTime/deltaT iteration count"
                 .to_string()
         })?;
+    if case_derived_simple_iterations && max_simple_iterations > FERRUM_MAX_CASE_SIMPLE_ITERATIONS {
+        return Err(format!(
+            "controlDict-derived SIMPLE iteration count {max_simple_iterations} exceeds Ferrum's case-file safety cap of {FERRUM_MAX_CASE_SIMPLE_ITERATIONS}; use --maxSimpleIterations for trusted cases that need a higher limit"
+        ));
+    }
     let min_simple_iterations = solve
         .min_simple_iterations
         .or(fv_solution_usize(plan, "SIMPLE", "minSimpleIterations")?)
@@ -6822,6 +6830,11 @@ fn parse_solver_args_for_invocation(
                 if max_runner_steps == 0 {
                     return Err("--maxRunnerSteps must be greater than zero".to_string());
                 }
+                if max_runner_steps > MAX_RUNNER_DRY_RUN_STEPS {
+                    return Err(format!(
+                        "--maxRunnerSteps must not exceed {MAX_RUNNER_DRY_RUN_STEPS}"
+                    ));
+                }
                 index += 2;
             }
             "-solveScalarDiffusion"
@@ -7605,7 +7618,9 @@ fn print_solver_usage() {
     println!("  --planJson <file>    also write the solver-neutral plan as JSON");
     println!("  --runnerDryRun       preview the future solver runner without solving equations");
     println!("  inspection modes cannot be combined with --solveScalarDiffusion");
-    println!("  --maxRunnerSteps <n> limit runner dry-run preview steps (default: 3)");
+    println!(
+        "  --maxRunnerSteps <n> limit runner dry-run preview steps (default: 3, max: {MAX_RUNNER_DRY_RUN_STEPS})"
+    );
     println!("  --solveScalarDiffusion <field> assemble and solve one CPU scalar diffusion system");
 
     println!("  --solveTolerance <v> absolute residual tolerance (default: 1e-10)");
@@ -7636,9 +7651,10 @@ fn normalize_case_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContinuitySummary, LaminarSimpleIterationSummary, LaminarSimpleOptions,
-        LaminarSimpleResidualControlSummary, LaminarSimpleSchemes, ScalarDiffusionLinearSolver,
-        SolverNumericsDictionaryPlan, SolverSelectionSource, estimate_iterations_to_convergence,
+        ContinuitySummary, FERRUM_MAX_CASE_SIMPLE_ITERATIONS, LaminarSimpleIterationSummary,
+        LaminarSimpleOptions, LaminarSimpleResidualControlSummary, LaminarSimpleSchemes,
+        MAX_RUNNER_DRY_RUN_STEPS, ScalarDiffusionLinearSolver, SolverNumericsDictionaryPlan,
+        SolverSelectionSource, estimate_iterations_to_convergence,
         estimate_simple_iterations_to_convergence, numerics_dictionary_number,
         numerics_dictionary_usize, numerics_dictionary_value, openfoam_gamg_options,
         outer_convergence_status_for_reason, parse_ferrum_run_args,
@@ -7868,6 +7884,22 @@ mod tests {
         let error = parse_solver_args(&args).expect_err("zero preview steps should fail");
 
         assert!(error.contains("greater than zero"));
+    }
+
+    #[test]
+    fn max_runner_steps_cap_is_exact() {
+        let accepted = parse_solver_args(&[
+            "--maxRunnerSteps".to_string(),
+            MAX_RUNNER_DRY_RUN_STEPS.to_string(),
+        ])
+        .expect("exact runner preview cap should parse");
+        assert_eq!(accepted.max_runner_steps, MAX_RUNNER_DRY_RUN_STEPS);
+
+        for rejected in [MAX_RUNNER_DRY_RUN_STEPS + 1, usize::MAX] {
+            let error = parse_solver_args(&["--maxRunnerSteps".to_string(), rejected.to_string()])
+                .expect_err("runner preview above the cap must fail");
+            assert!(error.contains("must not exceed 1000"));
+        }
     }
 
     #[test]
@@ -8282,6 +8314,49 @@ mod tests {
 
         assert_eq!(options.momentum_max_linear_iterations, 2_500);
         assert_eq!(options.pressure_max_linear_iterations, 2_500);
+    }
+
+    #[test]
+    fn laminar_simple_control_dict_iteration_cap_is_exact() {
+        let parsed = parse_incompressible_fluid_args(&[]).expect("solver args should parse");
+        let solve = parsed
+            .laminar_simple_solve
+            .expect("laminar SIMPLE solve args");
+
+        let mut accepted = laminar_simple_test_plan(1000.0, 0.001002);
+        accepted.run.estimated_steps = Some(FERRUM_MAX_CASE_SIMPLE_ITERATIONS);
+        let options = resolve_laminar_simple_options(&accepted, &solve)
+            .expect("exact controlDict SIMPLE cap should resolve");
+        assert_eq!(
+            options.max_simple_iterations,
+            FERRUM_MAX_CASE_SIMPLE_ITERATIONS
+        );
+
+        let mut rejected = laminar_simple_test_plan(1000.0, 0.001002);
+        rejected.run.estimated_steps = Some(FERRUM_MAX_CASE_SIMPLE_ITERATIONS + 1);
+        let error = resolve_laminar_simple_options(&rejected, &solve)
+            .expect_err("controlDict SIMPLE iterations above the cap must fail");
+        assert!(error.contains("case-file safety cap of 1000"));
+    }
+
+    #[test]
+    fn laminar_simple_cli_override_bypasses_case_iteration_cap() {
+        let trusted_iterations = FERRUM_MAX_CASE_SIMPLE_ITERATIONS + 1;
+        let parsed = parse_incompressible_fluid_args(&[
+            "--maxSimpleIterations".to_string(),
+            trusted_iterations.to_string(),
+        ])
+        .expect("trusted SIMPLE override should parse");
+        let solve = parsed
+            .laminar_simple_solve
+            .expect("laminar SIMPLE solve args");
+        let mut plan = laminar_simple_test_plan(1000.0, 0.001002);
+        plan.run.estimated_steps = Some(trusted_iterations);
+
+        let options = resolve_laminar_simple_options(&plan, &solve)
+            .expect("trusted CLI SIMPLE override should bypass the case cap");
+
+        assert_eq!(options.max_simple_iterations, trusted_iterations);
     }
 
     #[test]

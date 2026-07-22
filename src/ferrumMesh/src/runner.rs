@@ -2,6 +2,10 @@ use crate::backends::BackendChoice;
 use crate::linear::linear_solver_capabilities;
 use crate::solver_plan::{SolverCasePlan, SolverRunPlan, SolverRunStageSource};
 use crate::solver_state::SolverStatePlan;
+use crate::{MeshError, Result};
+
+pub const MAX_RUNNER_DRY_RUN_STEPS: usize = 1_000;
+pub const MAX_RUNNER_DRY_RUN_EVENTS: usize = 100_000;
 
 #[derive(Clone, Copy, Debug)]
 pub struct SolverRunnerDryRunOptions {
@@ -125,8 +129,13 @@ impl std::fmt::Display for SolverRuntimeDispatchStatus {
 pub fn build_solver_runner_dry_run(
     plan: &SolverCasePlan,
     options: SolverRunnerDryRunOptions,
-) -> SolverRunnerDryRun {
-    let max_steps = options.max_steps.max(1);
+) -> Result<SolverRunnerDryRun> {
+    if options.max_steps == 0 || options.max_steps > MAX_RUNNER_DRY_RUN_STEPS {
+        return Err(MeshError::InvalidInput(format!(
+            "runner dry-run max steps must be between 1 and {MAX_RUNNER_DRY_RUN_STEPS}"
+        )));
+    }
+    let max_steps = options.max_steps;
     let planned_steps = plan.run.estimated_steps;
     let preview_steps = planned_steps
         .map(|steps| steps.min(max_steps))
@@ -141,10 +150,35 @@ pub fn build_solver_runner_dry_run(
                 .to_string(),
         );
     }
-    let runtime = build_solver_runtime_plan(plan);
+    let events_without_writes = preview_steps
+        .checked_mul(
+            plan.run
+                .stages
+                .len()
+                .checked_add(1)
+                .ok_or(MeshError::OutOfMemory)?,
+        )
+        .ok_or(MeshError::OutOfMemory)?;
+    let mut write_events = 0usize;
+    for step in 1..=preview_steps {
+        if is_write_due(&plan.run, step, step_time(&plan.run, step)) {
+            write_events = write_events.checked_add(1).ok_or(MeshError::OutOfMemory)?;
+        }
+    }
+    let event_count = events_without_writes
+        .checked_add(write_events)
+        .ok_or(MeshError::OutOfMemory)?;
+    if event_count > MAX_RUNNER_DRY_RUN_EVENTS {
+        return Err(MeshError::InvalidInput(format!(
+            "runner dry-run would create {event_count} events, exceeding the safety cap of {MAX_RUNNER_DRY_RUN_EVENTS}"
+        )));
+    }
 
+    let runtime = build_solver_runtime_plan(plan);
     let mut events = Vec::new();
-    let mut write_events = 0;
+    events
+        .try_reserve_exact(event_count)
+        .map_err(|_| MeshError::OutOfMemory)?;
     for step in 1..=preview_steps {
         let time = step_time(&plan.run, step);
         events.push(SolverRunnerDryRunEvent::StepStart { step, time });
@@ -161,12 +195,11 @@ pub fn build_solver_runner_dry_run(
         }
 
         if is_write_due(&plan.run, step, time) {
-            write_events += 1;
             events.push(SolverRunnerDryRunEvent::Write { step, time });
         }
     }
 
-    SolverRunnerDryRun {
+    Ok(SolverRunnerDryRun {
         planned_steps,
         preview_steps,
         max_steps,
@@ -177,7 +210,7 @@ pub fn build_solver_runner_dry_run(
         runtime,
         events,
         warnings,
-    }
+    })
 }
 
 fn build_solver_runtime_plan(plan: &SolverCasePlan) -> SolverRuntimePlan {
@@ -325,7 +358,10 @@ mod tests {
     };
     use crate::solver_state::SolverStatePlan;
 
-    use super::{SolverRunnerDryRunEvent, SolverRunnerDryRunOptions, build_solver_runner_dry_run};
+    use super::{
+        MAX_RUNNER_DRY_RUN_EVENTS, MAX_RUNNER_DRY_RUN_STEPS, SolverRunnerDryRunEvent,
+        SolverRunnerDryRunOptions, build_solver_runner_dry_run,
+    };
     use super::{SolverRuntimeDispatchStatus, SolverRuntimeTarget};
 
     #[test]
@@ -333,7 +369,7 @@ mod tests {
         let plan = case_plan(Some(5), 1.0, "timeStep", Some(2.0));
 
         let dry_run =
-            build_solver_runner_dry_run(&plan, SolverRunnerDryRunOptions { max_steps: 3 });
+            build_solver_runner_dry_run(&plan, SolverRunnerDryRunOptions { max_steps: 3 }).unwrap();
 
         assert_eq!(dry_run.planned_steps, Some(5));
         assert_eq!(dry_run.preview_steps, 3);
@@ -383,7 +419,7 @@ mod tests {
         let plan = case_plan(None, 1.0, "timeStep", Some(1.0));
 
         let dry_run =
-            build_solver_runner_dry_run(&plan, SolverRunnerDryRunOptions { max_steps: 3 });
+            build_solver_runner_dry_run(&plan, SolverRunnerDryRunOptions { max_steps: 3 }).unwrap();
 
         assert_eq!(dry_run.planned_steps, None);
         assert_eq!(dry_run.preview_steps, 0);
@@ -393,6 +429,73 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("cannot be expanded"))
+        );
+    }
+
+    #[test]
+    fn runner_preview_step_cap_is_exact() {
+        let accepted_plan = case_plan(Some(MAX_RUNNER_DRY_RUN_STEPS), 1.0, "timeStep", Some(1.0));
+        let accepted = build_solver_runner_dry_run(
+            &accepted_plan,
+            SolverRunnerDryRunOptions {
+                max_steps: MAX_RUNNER_DRY_RUN_STEPS,
+            },
+        )
+        .expect("exact preview step cap should succeed");
+        assert_eq!(accepted.preview_steps, MAX_RUNNER_DRY_RUN_STEPS);
+
+        let rejected_plan = case_plan(
+            Some(MAX_RUNNER_DRY_RUN_STEPS + 1),
+            1.0,
+            "timeStep",
+            Some(1.0),
+        );
+
+        let error = build_solver_runner_dry_run(
+            &rejected_plan,
+            SolverRunnerDryRunOptions {
+                max_steps: MAX_RUNNER_DRY_RUN_STEPS + 1,
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("max steps must be between"));
+    }
+
+    #[test]
+    fn runner_direct_zero_steps_fail_closed() {
+        let plan = case_plan(Some(1), 1.0, "timeStep", Some(1.0));
+
+        let error = build_solver_runner_dry_run(&plan, SolverRunnerDryRunOptions { max_steps: 0 })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("max steps must be between"));
+    }
+
+    #[test]
+    fn runner_event_cap_fails_before_growth() {
+        let mut plan = case_plan(Some(MAX_RUNNER_DRY_RUN_STEPS), 1.0, "timeStep", None);
+        plan.run.stages = (0..MAX_RUNNER_DRY_RUN_EVENTS / MAX_RUNNER_DRY_RUN_STEPS)
+            .map(|index| SolverRunStagePlan {
+                section: format!("flow{index}"),
+                step: "residual".to_string(),
+                choice: BackendChoice::Cpu,
+                source: SolverRunStageSource::Configured,
+            })
+            .collect();
+
+        let error = build_solver_runner_dry_run(
+            &plan,
+            SolverRunnerDryRunOptions {
+                max_steps: MAX_RUNNER_DRY_RUN_STEPS,
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("events, exceeding the safety cap")
         );
     }
 
