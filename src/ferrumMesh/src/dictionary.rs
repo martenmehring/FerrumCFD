@@ -1111,6 +1111,9 @@ pub mod streaming {
                         self.physical,
                     )));
                 }
+                if ch == '#' {
+                    return Err((start, "unsupported dictionary directive"));
+                }
                 if Self::structural(ch) {
                     let mut token_end = self.physical;
                     if matches!(ch, '}' | ')' | ']') {
@@ -1618,22 +1621,21 @@ pub mod streaming {
         #[test]
         fn unsupported_directives_are_line_aware_and_sticky() {
             let mut streaming = source(b"\n#include \"initialConditions\"\n");
-            let first = streaming.next_required().unwrap_err();
+            let first = streaming.next().unwrap_err();
             assert_parse(&first, 2, "fixture: unsupported dictionary directive");
-            assert_eq!(
-                streaming.next_required().unwrap_err().to_string(),
-                first.to_string()
-            );
+            assert_eq!(streaming.next().unwrap_err().to_string(), first.to_string());
 
-            let mut cursor = super::tokenize(Path::new("directive"), "\n#includeFunc residuals\n")
-                .unwrap()
-                .into_cursor();
-            let first = cursor.next_required().unwrap_err();
+            let mut peeked = source(b"#codeStream something\n");
+            let first = peeked.peek().unwrap_err();
+            assert_parse(&first, 1, "fixture: unsupported dictionary directive");
+            assert_eq!(peeked.peek().unwrap_err().to_string(), first.to_string());
+
+            let first = match super::tokenize(Path::new("directive"), "\n#includeFunc residuals\n")
+            {
+                Ok(_) => panic!("unsupported directive must fail during tokenization"),
+                Err(err) => err,
+            };
             assert_parse(&first, 2, "directive: unsupported dictionary directive");
-            assert_eq!(
-                cursor.next_required().unwrap_err().to_string(),
-                first.to_string()
-            );
         }
 
         #[test]
