@@ -1,5 +1,8 @@
 use std::time::Instant;
 
+// Reject finite pressure corrections that amplify continuity by more than two orders of magnitude.
+const LAMINAR_SIMPLE_MAX_CONTINUITY_GROWTH_PER_STEP: f64 = 100.0;
+
 use crate::fields::{FieldFile, FieldValueSummary, InitialFieldSet};
 use crate::linear::{
     BiCgStabOptions, CgPreconditioner, ConjugateGradientOptions, CsrMatrix, CsrSparsityPattern,
@@ -1207,7 +1210,10 @@ fn solve_laminar_simple_driven(
         let corrected_continuity =
             summarize_continuity(&net_cell_flux(&runtime.mesh, &corrected_phi)?);
         let pressure_correction_update_scale = 1.0;
-        if !is_finite_continuity(corrected_continuity)
+        let pressure_correction_diverged =
+            simple_step_continuity_growth_exceeded(continuity_before, corrected_continuity);
+        if pressure_correction_diverged
+            || !is_finite_continuity(corrected_continuity)
             || !points_are_finite(&corrected_velocity)
             || !scalars_are_finite(&corrected_pressure)
             || !corrected_phi.iter().all(|value| value.is_finite())
@@ -2429,6 +2435,22 @@ fn evaluate_laminar_simple_residual_control(
         momentum_satisfied,
         pressure_satisfied,
     }
+}
+
+fn simple_step_continuity_growth_exceeded(
+    before: ContinuitySummary,
+    after: ContinuitySummary,
+) -> bool {
+    fn component_growth_exceeded(before: f64, after: f64) -> bool {
+        after.is_finite()
+            && before.is_finite()
+            && after > before.max(f64::EPSILON) * LAMINAR_SIMPLE_MAX_CONTINUITY_GROWTH_PER_STEP
+    }
+
+    component_growth_exceeded(before.l2_norm, after.l2_norm)
+        || component_growth_exceeded(before.max_abs, after.max_abs)
+        || component_growth_exceeded(before.sum_abs, after.sum_abs)
+        || component_growth_exceeded(before.global_sum.abs(), after.global_sum.abs())
 }
 
 fn points_are_finite(values: &[Point3]) -> bool {
@@ -7186,6 +7208,35 @@ mod tests {
             report.timing.pressure_pcg_total_seconds
                 <= report.timing.pressure_linear_solve_seconds + 1.0e-9
         );
+    }
+
+    #[test]
+    fn laminar_simple_rejects_large_finite_continuity_growth() {
+        let before = super::ContinuitySummary {
+            l2_norm: 1.0,
+            max_abs: 0.5,
+            sum_abs: 1.25,
+            global_sum: 0.1,
+        };
+        let bounded = super::ContinuitySummary {
+            l2_norm: 100.0,
+            max_abs: 50.0,
+            sum_abs: 125.0,
+            global_sum: 10.0,
+        };
+        let divergent = super::ContinuitySummary {
+            l2_norm: 100.0_f64.next_up(),
+            max_abs: 50.0,
+            sum_abs: 125.0,
+            global_sum: 10.0,
+        };
+
+        assert!(!super::simple_step_continuity_growth_exceeded(
+            before, bounded
+        ));
+        assert!(super::simple_step_continuity_growth_exceeded(
+            before, divergent
+        ));
     }
 
     #[test]
