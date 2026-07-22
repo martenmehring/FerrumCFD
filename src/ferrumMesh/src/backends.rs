@@ -1,9 +1,12 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::dictionary::{TokenCursor, TokenProvenance, tokenize};
 use crate::{MeshError, Result};
+
+const MAX_BACKEND_CONFIG_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug)]
 pub struct BackendConfig {
@@ -100,11 +103,57 @@ impl std::fmt::Display for BackendChoice {
 
 pub fn read_backend_config(case_dir: &Path) -> Result<Option<BackendConfig>> {
     let path = case_dir.join("system").join("ferrumBackends");
-    if !path.exists() {
-        return Ok(None);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(MeshError::InvalidInput(format!(
+                "could not inspect {} ({error})",
+                path.display()
+            )));
+        }
+    };
+
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Err(MeshError::InvalidInput(format!(
+            "{} must be a regular file, not a symlink",
+            path.display()
+        )));
+    }
+    if !file_type.is_file() {
+        return Err(MeshError::InvalidInput(format!(
+            "{} must be a regular file",
+            path.display()
+        )));
+    }
+    if metadata.len() > MAX_BACKEND_CONFIG_BYTES {
+        return Err(MeshError::InvalidInput(format!(
+            "{} is too large (maximum {} bytes)",
+            path.display(),
+            MAX_BACKEND_CONFIG_BYTES
+        )));
     }
 
-    let content = fs::read_to_string(&path).map_err(|error| {
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    File::open(&path)
+        .and_then(|file| {
+            file.take(MAX_BACKEND_CONFIG_BYTES + 1)
+                .read_to_end(&mut bytes)
+        })
+        .map_err(|error| {
+            MeshError::InvalidInput(format!("could not read {} ({error})", path.display()))
+        })?;
+
+    if bytes.len() as u64 > MAX_BACKEND_CONFIG_BYTES {
+        return Err(MeshError::InvalidInput(format!(
+            "{} is too large (maximum {} bytes)",
+            path.display(),
+            MAX_BACKEND_CONFIG_BYTES
+        )));
+    }
+
+    let content = String::from_utf8(bytes).map_err(|error| {
         MeshError::InvalidInput(format!("could not read {} ({error})", path.display()))
     })?;
     let mut config = parse_backend_config_str(&content, &path)?;
@@ -775,9 +824,57 @@ impl BackendConfigBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{BackendChoice, parse_backend_config_str};
+    use super::{
+        BackendChoice, MAX_BACKEND_CONFIG_BYTES, parse_backend_config_str, read_backend_config,
+    };
+
+    fn unique_case_dir(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time must be after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("ferrum-backends-{name}-{nonce}"));
+        fs::create_dir_all(path.join("system")).expect("create temporary case directory");
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_backend_config_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let case_dir = unique_case_dir("symlink");
+        let secret_path = case_dir.join("host_secret.txt");
+        fs::write(&secret_path, "TOPSECRET1 TOPSECRET2").expect("write secret fixture");
+        symlink(&secret_path, case_dir.join("system").join("ferrumBackends"))
+            .expect("create ferrumBackends symlink");
+
+        let error = read_backend_config(&case_dir).expect_err("symlink must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("must be a regular file, not a symlink"));
+        assert!(!message.contains("TOPSECRET"));
+
+        fs::remove_dir_all(case_dir).expect("remove temporary case directory");
+    }
+
+    #[test]
+    fn read_backend_config_rejects_oversized_files_before_parsing() {
+        let case_dir = unique_case_dir("oversized");
+        fs::write(
+            case_dir.join("system").join("ferrumBackends"),
+            vec![b'a'; MAX_BACKEND_CONFIG_BYTES as usize + 1],
+        )
+        .expect("write oversized backend config");
+
+        let error = read_backend_config(&case_dir).expect_err("oversized file must be rejected");
+        assert!(error.to_string().contains("is too large"));
+
+        fs::remove_dir_all(case_dir).expect("remove temporary case directory");
+    }
 
     #[test]
     fn parses_template_backend_config() {
