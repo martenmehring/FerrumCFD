@@ -1,14 +1,12 @@
 use std::mem::size_of;
 use std::path::Path;
 
-use crate::fields::{
-    FieldLoadPolicy, FieldValueSummary, InitialFieldSet, nonuniform_value_type_components,
-};
+use crate::fields::{FieldLoadPolicy, FieldValueSummary, InitialFieldSet};
 use crate::geometry::compute_poly_mesh_geometry;
 use crate::poly_mesh::PolyMesh;
 use crate::solver_state::{
     SolverStateCpuBufferStatus, SolverStateFieldKind, SolverStateFieldPlan, SolverStatePlan,
-    SolverStateStorageStatus, SolverStateValueKind,
+    derive_field_descriptors,
 };
 use crate::{MeshError, Point3, Result};
 
@@ -252,55 +250,47 @@ fn preflight_runtime_descriptor(
     source: &crate::fields::FieldFile,
     label: &str,
 ) -> Result<()> {
-    let expected_kind = runtime_kind_from_class(source.class_name.as_deref());
-    if planned.kind != expected_kind {
-        return Err(runtime_descriptor_mismatch(label, "field kind"));
-    }
-    if planned.region.is_none()
-        && (planned.mesh_cells != Some(mesh.cell_count())
+    let (mesh_cells, mesh_faces) = if planned.region.is_none() {
+        if planned.mesh_cells != Some(mesh.cell_count())
             || planned.mesh_faces != Some(mesh.faces.len())
-            || planned.mesh_boundary_patches != Some(mesh.patches.len()))
+            || planned.mesh_boundary_patches != Some(mesh.patches.len())
+        {
+            return Err(runtime_descriptor_mismatch(label, "base mesh shape"));
+        }
+        (Some(mesh.cell_count()), Some(mesh.faces.len()))
+    } else {
+        // Region meshes were read while the plan was built and are not retained
+        // at runtime. Their sealed shape is therefore authoritative here; the
+        // runtime base mesh must never be substituted for a region shape.
+        (planned.mesh_cells, planned.mesh_faces)
+    };
+    let expected = derive_field_descriptors(source, mesh_cells, mesh_faces)?;
+    if expected.kind != SolverStateFieldKind::Other
+        && expected.internal_field.expected_count.is_some()
     {
-        return Err(runtime_descriptor_mismatch(label, "base mesh shape"));
+        if expected.storage.scalar_slots.is_none() {
+            return Err(MeshError::InvalidInput(format!(
+                "field '{label}' runtime scalar-slot count overflowed"
+            )));
+        }
+        if expected.storage.bytes_f64.is_none() {
+            return Err(MeshError::InvalidInput(format!(
+                "field '{label}' runtime byte size overflowed"
+            )));
+        }
     }
 
-    let expected_components = runtime_components(expected_kind);
-    let expected_count = match expected_kind {
-        SolverStateFieldKind::VolScalar | SolverStateFieldKind::VolVector => planned.mesh_cells,
-        SolverStateFieldKind::SurfaceScalar => planned.mesh_faces,
-        SolverStateFieldKind::Other => None,
-    };
-    let expected_slots = expected_components
-        .zip(expected_count)
-        .map(|(components, count)| {
-            count.checked_mul(components).ok_or_else(|| {
-                MeshError::InvalidInput(format!(
-                    "field '{label}' runtime scalar-slot count overflowed"
-                ))
-            })
-        })
-        .transpose()?;
-    let expected_bytes = expected_slots
-        .map(|slots| {
-            slots.checked_mul(size_of::<f64>()).ok_or_else(|| {
-                MeshError::InvalidInput(format!("field '{label}' runtime byte size overflowed"))
-            })
-        })
-        .transpose()?;
-    let expected_storage_status = if expected_kind == SolverStateFieldKind::Other {
-        SolverStateStorageStatus::UnsupportedClass
-    } else {
-        SolverStateStorageStatus::Loaded
-    };
-    let storage_capable = expected_storage_status == SolverStateStorageStatus::Loaded;
-    if planned.storage.components != expected_components
-        || planned.storage.scalar_slots != expected_slots
-        || planned.storage.bytes_f64 != expected_bytes
-        || planned.storage.status != expected_storage_status
-        || planned.storage.cpu_capable != storage_capable
-        || planned.storage.gpu_capable != storage_capable
-        || planned.cpu_buffer.scalar_slots != expected_slots
-        || planned.cpu_buffer.bytes_f64 != expected_bytes
+    if planned.kind != expected.kind {
+        return Err(runtime_descriptor_mismatch(label, "field kind"));
+    }
+    if planned.storage.components != expected.storage.components
+        || planned.storage.scalar_slots != expected.storage.scalar_slots
+        || planned.storage.bytes_f64 != expected.storage.bytes_f64
+        || planned.storage.status != expected.storage.status
+        || planned.storage.cpu_capable != expected.storage.cpu_capable
+        || planned.storage.gpu_capable != expected.storage.gpu_capable
+        || planned.cpu_buffer.scalar_slots != expected.cpu_buffer.scalar_slots
+        || planned.cpu_buffer.bytes_f64 != expected.cpu_buffer.bytes_f64
     {
         return Err(runtime_descriptor_mismatch(
             label,
@@ -308,16 +298,14 @@ fn preflight_runtime_descriptor(
         ));
     }
 
-    let (internal_kind, value_count, valid_count, uniform_components, loaded_scalars, status) =
-        expected_internal_descriptor(source, expected_kind, expected_count, expected_slots)?;
-    if planned.internal_field.kind != internal_kind
-        || planned.internal_field.value_count != value_count
-        || planned.internal_field.expected_count != expected_count
-        || planned.internal_field.valid_count != valid_count
-        || planned.internal_field.uniform_components != uniform_components
-        || planned.internal_field.loaded_scalars != loaded_scalars
-        || planned.cpu_buffer.status != status
-        || planned.cpu_buffer.materializable != (status == SolverStateCpuBufferStatus::UniformReady)
+    if planned.internal_field.kind != expected.internal_field.kind
+        || planned.internal_field.value_count != expected.internal_field.value_count
+        || planned.internal_field.expected_count != expected.internal_field.expected_count
+        || planned.internal_field.valid_count != expected.internal_field.valid_count
+        || planned.internal_field.uniform_components != expected.internal_field.uniform_components
+        || planned.internal_field.loaded_scalars != expected.internal_field.loaded_scalars
+        || planned.cpu_buffer.status != expected.cpu_buffer.status
+        || planned.cpu_buffer.materializable != expected.cpu_buffer.materializable
     {
         return Err(runtime_descriptor_mismatch(
             label,
@@ -325,185 +313,6 @@ fn preflight_runtime_descriptor(
         ));
     }
     Ok(())
-}
-
-type ExpectedInternalDescriptor = (
-    SolverStateValueKind,
-    Option<usize>,
-    Option<bool>,
-    Option<Vec<f64>>,
-    Option<usize>,
-    SolverStateCpuBufferStatus,
-);
-
-fn expected_internal_descriptor(
-    source: &crate::fields::FieldFile,
-    kind: SolverStateFieldKind,
-    expected_count: Option<usize>,
-    expected_slots: Option<usize>,
-) -> Result<ExpectedInternalDescriptor> {
-    if kind == SolverStateFieldKind::Other {
-        let internal_kind = source_internal_kind(source);
-        let value_count = source_nonuniform_count(source);
-        return Ok((
-            internal_kind,
-            value_count,
-            None,
-            source_uniform_components(source)?,
-            source_loaded_scalars(source),
-            SolverStateCpuBufferStatus::UnsupportedClass,
-        ));
-    }
-
-    match &source.internal_field {
-        Some(FieldValueSummary::Uniform(value)) => {
-            let uniform = parse_runtime_uniform_components(value)?;
-            let valid_count = expected_count.map(|_| true);
-            let ready = expected_count.is_some()
-                && expected_slots.is_some()
-                && runtime_components(kind)
-                    .zip(uniform.as_ref())
-                    .is_some_and(|(components, values)| values.len() == components);
-            Ok((
-                SolverStateValueKind::Uniform,
-                expected_count,
-                valid_count,
-                uniform,
-                None,
-                if ready {
-                    SolverStateCpuBufferStatus::UniformReady
-                } else {
-                    SolverStateCpuBufferStatus::InvalidShape
-                },
-            ))
-        }
-        Some(FieldValueSummary::NonUniform {
-            value_type,
-            count,
-            values,
-        }) => {
-            let supported = nonuniform_value_type_components(value_type.as_deref()).is_some();
-            let valid_count = count
-                .zip(expected_count)
-                .map(|(count, expected)| count == expected);
-            let loaded_scalars = supported.then(|| values.as_ref().map(Vec::len)).flatten();
-            let status = if !supported {
-                SolverStateCpuBufferStatus::UnsupportedInternalField
-            } else if valid_count == Some(true)
-                && loaded_scalars.is_some_and(|loaded| Some(loaded) == expected_slots)
-            {
-                SolverStateCpuBufferStatus::NonUniformReady
-            } else if valid_count == Some(false) || loaded_scalars.is_some() {
-                SolverStateCpuBufferStatus::InvalidShape
-            } else {
-                SolverStateCpuBufferStatus::NonUniformDataNotLoaded
-            };
-            Ok((
-                if supported {
-                    SolverStateValueKind::NonUniform
-                } else {
-                    SolverStateValueKind::UnsupportedNonUniform
-                },
-                *count,
-                valid_count,
-                None,
-                loaded_scalars,
-                status,
-            ))
-        }
-        Some(FieldValueSummary::Other(_)) => Ok((
-            SolverStateValueKind::Other,
-            None,
-            None,
-            None,
-            None,
-            SolverStateCpuBufferStatus::UnsupportedInternalField,
-        )),
-        None => Ok((
-            SolverStateValueKind::Missing,
-            None,
-            Some(false),
-            None,
-            None,
-            SolverStateCpuBufferStatus::MissingInternalField,
-        )),
-    }
-}
-
-fn source_internal_kind(source: &crate::fields::FieldFile) -> SolverStateValueKind {
-    match &source.internal_field {
-        Some(FieldValueSummary::Uniform(_)) => SolverStateValueKind::Uniform,
-        Some(FieldValueSummary::NonUniform { value_type, .. })
-            if nonuniform_value_type_components(value_type.as_deref()).is_some() =>
-        {
-            SolverStateValueKind::NonUniform
-        }
-        Some(FieldValueSummary::NonUniform { .. }) => SolverStateValueKind::UnsupportedNonUniform,
-        Some(FieldValueSummary::Other(_)) => SolverStateValueKind::Other,
-        None => SolverStateValueKind::Missing,
-    }
-}
-
-fn source_nonuniform_count(source: &crate::fields::FieldFile) -> Option<usize> {
-    match &source.internal_field {
-        Some(FieldValueSummary::NonUniform { count, .. }) => *count,
-        _ => None,
-    }
-}
-
-fn source_uniform_components(source: &crate::fields::FieldFile) -> Result<Option<Vec<f64>>> {
-    match &source.internal_field {
-        Some(FieldValueSummary::Uniform(value)) => parse_runtime_uniform_components(value),
-        _ => Ok(None),
-    }
-}
-
-fn source_loaded_scalars(source: &crate::fields::FieldFile) -> Option<usize> {
-    match &source.internal_field {
-        Some(FieldValueSummary::NonUniform {
-            value_type, values, ..
-        }) if nonuniform_value_type_components(value_type.as_deref()).is_some() => {
-            values.as_ref().map(Vec::len)
-        }
-        _ => None,
-    }
-}
-
-fn parse_runtime_uniform_components(value: &str) -> Result<Option<Vec<f64>>> {
-    let mut values = Vec::new();
-    for token in value
-        .split(|character: char| character.is_whitespace() || matches!(character, '(' | ')'))
-        .filter(|token| !token.is_empty())
-    {
-        let Ok(number) = token.parse::<f64>() else {
-            return Ok(None);
-        };
-        if !number.is_finite() {
-            return Ok(None);
-        }
-        values.try_reserve(1).map_err(|_| {
-            MeshError::InvalidInput("runtime uniform preflight allocation failed".to_string())
-        })?;
-        values.push(number);
-    }
-    Ok((!values.is_empty()).then_some(values))
-}
-
-fn runtime_kind_from_class(class_name: Option<&str>) -> SolverStateFieldKind {
-    match class_name {
-        Some("volScalarField") => SolverStateFieldKind::VolScalar,
-        Some("volVectorField") => SolverStateFieldKind::VolVector,
-        Some("surfaceScalarField") => SolverStateFieldKind::SurfaceScalar,
-        _ => SolverStateFieldKind::Other,
-    }
-}
-
-fn runtime_components(kind: SolverStateFieldKind) -> Option<usize> {
-    match kind {
-        SolverStateFieldKind::VolScalar | SolverStateFieldKind::SurfaceScalar => Some(1),
-        SolverStateFieldKind::VolVector => Some(3),
-        SolverStateFieldKind::Other => None,
-    }
 }
 
 fn runtime_descriptor_mismatch(label: &str, detail: &str) -> MeshError {
@@ -788,6 +597,300 @@ mod tests {
         };
         assert_eq!(preserved.as_ptr(), original_pointer);
         assert_eq!(preserved, &[300.0]);
+    }
+
+    #[test]
+    fn base_and_region_shapes_have_distinct_authority() {
+        let mesh = unit_cube_mesh();
+        let mut region_state = runtime_state();
+        region_state.fields.remove(0);
+        let planned = &mut region_state.fields[0];
+        planned.region = Some("fluid".to_string());
+        planned.mesh_cells = Some(2);
+        planned.mesh_faces = Some(12);
+        planned.mesh_boundary_patches = Some(2);
+        planned.internal_field.value_count = Some(2);
+        planned.internal_field.expected_count = Some(2);
+        planned.internal_field.loaded_scalars = Some(2);
+        planned.storage.scalar_slots = Some(2);
+        planned.storage.bytes_f64 = Some(16);
+        planned.cpu_buffer.scalar_slots = Some(2);
+        planned.cpu_buffer.bytes_f64 = Some(16);
+
+        let mut region_fields = initial_fields();
+        region_fields.fields.remove(0);
+        let source = &mut region_fields.fields[0];
+        source.region = Some("fluid".to_string());
+        let Some(FieldValueSummary::NonUniform { count, values, .. }) =
+            source.internal_field.as_mut()
+        else {
+            panic!("nonuniform region fixture missing");
+        };
+        *count = Some(2);
+        *values = Some(vec![300.0, 301.0]);
+        let source_pointer = values.as_ref().map(Vec::as_ptr);
+
+        let runtime = build_solver_runtime_data(
+            Path::new("case"),
+            &mesh,
+            &region_state,
+            &mut region_fields,
+            FieldLoadPolicy::Full,
+        )
+        .expect("region field must use its planned region shape, not the runtime base mesh");
+        assert_eq!(runtime.fields[0].region.as_deref(), Some("fluid"));
+        assert_eq!(runtime.fields[0].scalar_slots, 2);
+        assert_eq!(
+            runtime.fields[0].values.as_ref().map(Vec::as_ptr),
+            source_pointer
+        );
+
+        let mut base_state = region_state;
+        base_state.fields[0].region = None;
+        let mut base_fields = initial_fields();
+        base_fields.fields.remove(0);
+        let source = &mut base_fields.fields[0];
+        let Some(FieldValueSummary::NonUniform { count, values, .. }) =
+            source.internal_field.as_mut()
+        else {
+            panic!("nonuniform base fixture missing");
+        };
+        *count = Some(2);
+        *values = Some(vec![300.0, 301.0]);
+        let source_pointer = values.as_ref().map(Vec::as_ptr);
+
+        let error = build_solver_runtime_data(
+            Path::new("case"),
+            &mesh,
+            &base_state,
+            &mut base_fields,
+            FieldLoadPolicy::Full,
+        )
+        .expect_err("base field shape must be derived from the runtime base mesh");
+        assert_eq!(
+            error.to_string(),
+            "field 'T' runtime descriptor mismatch: base mesh shape"
+        );
+        let Some(FieldValueSummary::NonUniform {
+            values: Some(values),
+            ..
+        }) = &base_fields.fields[0].internal_field
+        else {
+            panic!("base shape rejection consumed the source payload");
+        };
+        assert_eq!(Some(values.as_ptr()), source_pointer);
+        assert_eq!(values, &[300.0, 301.0]);
+    }
+
+    #[test]
+    fn later_source_tampering_preserves_all_nonuniform_allocations() {
+        let mesh = unit_cube_mesh();
+        let mut state = runtime_state();
+        state.fields.remove(0);
+        let mut second_plan = state.fields[0].clone();
+        state.fields[0].name = "A".to_string();
+        second_plan.name = "B".to_string();
+        state.fields.push(second_plan);
+
+        let mut fields = initial_fields();
+        fields.fields.remove(0);
+        let mut second_fields = initial_fields();
+        second_fields.fields.remove(0);
+        let mut second_source = second_fields.fields.remove(0);
+        fields.fields[0].name = "A".to_string();
+        second_source.name = "B".to_string();
+        let Some(FieldValueSummary::NonUniform { count, .. }) =
+            second_source.internal_field.as_mut()
+        else {
+            panic!("second nonuniform fixture missing");
+        };
+        *count = Some(2);
+        fields.fields.push(second_source);
+
+        let source_pointers = fields
+            .fields
+            .iter()
+            .map(|field| match &field.internal_field {
+                Some(FieldValueSummary::NonUniform {
+                    values: Some(values),
+                    ..
+                }) => values.as_ptr(),
+                _ => panic!("nonuniform fixture missing"),
+            })
+            .collect::<Vec<_>>();
+
+        let error = build_solver_runtime_data(
+            Path::new("case"),
+            &mesh,
+            &state,
+            &mut fields,
+            FieldLoadPolicy::Full,
+        )
+        .expect_err("tampered later source descriptor must fail before any transfer");
+        assert_eq!(
+            error.to_string(),
+            "field 'B' runtime descriptor mismatch: internal-field status or source provenance"
+        );
+        for (field, expected_pointer) in fields.fields.iter().zip(source_pointers) {
+            let Some(FieldValueSummary::NonUniform {
+                values: Some(values),
+                ..
+            }) = &field.internal_field
+            else {
+                panic!("all-or-nothing preflight consumed a source payload");
+            };
+            assert_eq!(values.as_ptr(), expected_pointer);
+            assert_eq!(values, &[300.0]);
+        }
+    }
+
+    #[test]
+    fn region_storage_overflow_remains_a_hard_preflight_error() {
+        let mesh = unit_cube_mesh();
+
+        let mut vector_state = runtime_state();
+        vector_state.fields.remove(0);
+        let vector_plan = &mut vector_state.fields[0];
+        vector_plan.region = Some("fluid".to_string());
+        vector_plan.class_name = Some("volVectorField".to_string());
+        vector_plan.kind = SolverStateFieldKind::VolVector;
+        vector_plan.mesh_cells = Some(usize::MAX);
+        vector_plan.internal_field.value_count = Some(usize::MAX);
+        vector_plan.internal_field.expected_count = Some(usize::MAX);
+        vector_plan.internal_field.valid_count = Some(true);
+        vector_plan.internal_field.loaded_scalars = None;
+        vector_plan.storage.components = Some(3);
+        vector_plan.storage.scalar_slots = None;
+        vector_plan.storage.bytes_f64 = None;
+        vector_plan.cpu_buffer.scalar_slots = None;
+        vector_plan.cpu_buffer.bytes_f64 = None;
+        vector_plan.cpu_buffer.status = SolverStateCpuBufferStatus::NonUniformDataNotLoaded;
+
+        let mut vector_fields = initial_fields();
+        vector_fields.fields.remove(0);
+        let vector_source = &mut vector_fields.fields[0];
+        vector_source.region = Some("fluid".to_string());
+        vector_source.class_name = Some("volVectorField".to_string());
+        let Some(FieldValueSummary::NonUniform {
+            value_type,
+            count,
+            values,
+        }) = vector_source.internal_field.as_mut()
+        else {
+            panic!("nonuniform vector fixture missing");
+        };
+        *value_type = Some("List<vector>".to_string());
+        *count = Some(usize::MAX);
+        *values = None;
+
+        let vector_error = build_solver_runtime_data(
+            Path::new("case"),
+            &mesh,
+            &vector_state,
+            &mut vector_fields,
+            FieldLoadPolicy::Full,
+        )
+        .expect_err("vector scalar-slot overflow must fail before runtime construction");
+        assert_eq!(
+            vector_error.to_string(),
+            "field 'fluid/T' runtime scalar-slot count overflowed"
+        );
+
+        let mut scalar_state = runtime_state();
+        scalar_state.fields.remove(0);
+        let scalar_plan = &mut scalar_state.fields[0];
+        scalar_plan.region = Some("fluid".to_string());
+        scalar_plan.mesh_cells = Some(usize::MAX);
+        scalar_plan.internal_field.value_count = Some(usize::MAX);
+        scalar_plan.internal_field.expected_count = Some(usize::MAX);
+        scalar_plan.internal_field.valid_count = Some(true);
+        scalar_plan.internal_field.loaded_scalars = None;
+        scalar_plan.storage.scalar_slots = Some(usize::MAX);
+        scalar_plan.storage.bytes_f64 = None;
+        scalar_plan.cpu_buffer.scalar_slots = Some(usize::MAX);
+        scalar_plan.cpu_buffer.bytes_f64 = None;
+        scalar_plan.cpu_buffer.status = SolverStateCpuBufferStatus::NonUniformDataNotLoaded;
+
+        let mut scalar_fields = initial_fields();
+        scalar_fields.fields.remove(0);
+        let scalar_source = &mut scalar_fields.fields[0];
+        scalar_source.region = Some("fluid".to_string());
+        let Some(FieldValueSummary::NonUniform { count, values, .. }) =
+            scalar_source.internal_field.as_mut()
+        else {
+            panic!("nonuniform scalar fixture missing");
+        };
+        *count = Some(usize::MAX);
+        *values = None;
+
+        let scalar_error = build_solver_runtime_data(
+            Path::new("case"),
+            &mesh,
+            &scalar_state,
+            &mut scalar_fields,
+            FieldLoadPolicy::Full,
+        )
+        .expect_err("f64 byte-size overflow must fail before runtime construction");
+        assert_eq!(
+            scalar_error.to_string(),
+            "field 'fluid/T' runtime byte size overflowed"
+        );
+    }
+
+    #[test]
+    fn unsupported_class_with_missing_internal_field_is_consistently_omitted() {
+        let mesh = unit_cube_mesh();
+        let mut state = runtime_state();
+        let planned = &mut state.fields[0];
+        planned.class_name = Some("dictionary".to_string());
+        planned.kind = SolverStateFieldKind::Other;
+        planned.internal_field = SolverStateInternalFieldPlan {
+            kind: SolverStateValueKind::Missing,
+            value_count: None,
+            expected_count: None,
+            valid_count: Some(false),
+            uniform_components: None,
+            loaded_scalars: None,
+        };
+        planned.storage = SolverStateStoragePlan {
+            cpu_capable: false,
+            gpu_capable: false,
+            components: None,
+            scalar_slots: None,
+            bytes_f64: None,
+            status: SolverStateStorageStatus::UnsupportedClass,
+        };
+        planned.cpu_buffer = SolverStateCpuBufferPlan {
+            materializable: false,
+            scalar_slots: None,
+            bytes_f64: None,
+            status: SolverStateCpuBufferStatus::UnsupportedClass,
+        };
+
+        let mut fields = initial_fields();
+        fields.fields[0].class_name = Some("dictionary".to_string());
+        fields.fields[0].internal_field = None;
+
+        let runtime = build_solver_runtime_data(
+            Path::new("case"),
+            &mesh,
+            &state,
+            &mut fields,
+            FieldLoadPolicy::Full,
+        )
+        .expect("unsupported descriptors must be consistently omitted, not misclassified");
+        assert_eq!(
+            runtime
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["T"]
+        );
+        assert_eq!(
+            runtime.warnings,
+            vec!["field 'p' has no component count for runtime buffer"]
+        );
     }
 
     #[test]

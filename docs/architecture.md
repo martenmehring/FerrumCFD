@@ -367,7 +367,9 @@ The preflight reads:
 - region-local property dictionaries below `constant/<region>/`
 - generated region meshes below `constant/<region>/polyMesh`
 - initial fields below `0/`
-- `constant/interfaces` for model-facing interface sign conventions
+- optional `constant/interfaces` for model-facing interface sign conventions;
+  absence means an empty configuration, while a present file must contain
+  exactly one unquoted, ordinary `interfaces { ... }` block
 - `system/ferrumBackends` for CPU/GPU resource and stage policy
 
 The plan classifies the case as `3d`, `2d-empty`, `axisymmetric-wedge`, or

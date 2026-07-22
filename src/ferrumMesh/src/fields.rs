@@ -478,16 +478,47 @@ fn parse_dimensions<R: BufRead>(source: &mut TokenSource<R>) -> Result<Vec<Strin
     if values.try_reserve(7).is_err() {
         return reject(source, "dimensions allocation failed");
     }
-    for _ in 0..7 {
+    let closer_line = loop {
         let token = source.next_required()?;
+        if structural(&token, "]") {
+            break token.line;
+        }
         if token.provenance != TokenProvenance::Ordinary
             || !token.value.parse::<f64>().is_ok_and(f64::is_finite)
         {
             return source.reject_line_as(token.line, "expected finite dimensions exponent");
         }
+        if values.len() == 7 {
+            return source.reject_line_as(
+                token.line,
+                "dimensions must contain exactly 5 or 7 exponents",
+            );
+        }
         values.push(token.value);
+    };
+    match values.len() {
+        5 => {
+            let mut current = String::new();
+            if current.try_reserve(1).is_err() {
+                return source.reject_line_as(closer_line, "dimensions allocation failed");
+            }
+            current.push('0');
+            let mut luminous_intensity = String::new();
+            if luminous_intensity.try_reserve(1).is_err() {
+                return source.reject_line_as(closer_line, "dimensions allocation failed");
+            }
+            luminous_intensity.push('0');
+            values.push(current);
+            values.push(luminous_intensity);
+        }
+        7 => {}
+        _ => {
+            return source.reject_line_as(
+                closer_line,
+                "dimensions must contain exactly 5 or 7 exponents",
+            );
+        }
     }
-    expect_structural(source, "]", "expected dimensions closer")?;
     expect_current_structural(source, ";", "dimensions entry is missing a semicolon")?;
     Ok(values)
 }
@@ -1867,6 +1898,106 @@ boundaryField
     }
 
     #[test]
+    fn dimensions_accept_exactly_five_exponents_and_normalize_to_seven() {
+        let field = parse_field_file_str(
+            "FoamFile { class volScalarField; object p; }\n\
+             dimensions [0 1 -1 0 0];\n\
+             internalField uniform 0;\n\
+             boundaryField {}\n",
+            Path::new("0/p"),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            field.dimensions,
+            Some(vec![
+                "0".to_string(),
+                "1".to_string(),
+                "-1".to_string(),
+                "0".to_string(),
+                "0".to_string(),
+                "0".to_string(),
+                "0".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn dimensions_accept_exactly_seven_exponents() {
+        let field = parse_field_file_str(
+            "FoamFile { class volScalarField; object p; }\n\
+             dimensions [0 1 -1 0 0 2 -2];\n\
+             internalField uniform 0;\n\
+             boundaryField {}\n",
+            Path::new("0/p"),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            field.dimensions,
+            Some(vec![
+                "0".to_string(),
+                "1".to_string(),
+                "-1".to_string(),
+                "0".to_string(),
+                "0".to_string(),
+                "2".to_string(),
+                "-2".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn dimensions_reject_four_six_and_eight_exponents_without_accepting_a_prefix() {
+        assert_parse_error(
+            "FoamFile { class volScalarField; object p; }\n\
+             dimensions [0 1 -1 0];\n\
+             internalField uniform 8;\n\
+             boundaryField {}\n",
+            2,
+            "dimensions must contain exactly 5 or 7 exponents",
+        );
+        assert_parse_error(
+            "FoamFile { class volScalarField; object p; }\n\
+             dimensions [0 1 -1 0 0 0];\n\
+             internalField uniform 9;\n\
+             boundaryField {}\n",
+            2,
+            "dimensions must contain exactly 5 or 7 exponents",
+        );
+        assert_parse_error(
+            "FoamFile { class volScalarField; object p; }\n\
+             dimensions [0 1 -1 0 0 0 0 8];\n\
+             internalField uniform 10;\n\
+             boundaryField {}\n",
+            2,
+            "dimensions must contain exactly 5 or 7 exponents",
+        );
+    }
+
+    #[test]
+    fn dimensions_reject_quoted_exponents() {
+        assert_parse_error(
+            "FoamFile { class volScalarField; object p; }\n\
+             dimensions [0 1 \"-1\" 0 0];\n",
+            2,
+            "expected finite dimensions exponent",
+        );
+    }
+
+    #[test]
+    fn dimensions_reject_non_finite_exponents() {
+        assert_parse_error(
+            "FoamFile { class volScalarField; object p; }\n\
+             dimensions [0 1 NaN 0 0];\n",
+            2,
+            "expected finite dimensions exponent",
+        );
+    }
+
+    #[test]
     fn dimensions_patches_and_mesh_cache_fail_atomically() {
         let quoted = parse_field_file_str(
             "FoamFile { class volScalarField; object p; }\n\"dimensions\" ignored;\ninternalField uniform 0;\nboundaryField {}\n",
@@ -1884,7 +2015,7 @@ boundaryField
         assert_parse_error(
             "FoamFile { class volScalarField; object p; }\ndimensions [0 1 2\n3 4 5\n];\n",
             4,
-            "expected finite dimensions exponent",
+            "dimensions must contain exactly 5 or 7 exponents",
         );
         assert_parse_error(
             "FoamFile { class volScalarField; object p; }\ndimensions [0 1 2 3 4 5 6]\ninternalField uniform 0;\n",

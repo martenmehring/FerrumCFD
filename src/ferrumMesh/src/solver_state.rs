@@ -61,6 +61,14 @@ pub struct SolverStateCpuBufferPlan {
     pub status: SolverStateCpuBufferStatus,
 }
 
+#[derive(Debug)]
+pub(crate) struct SolverStateFieldDescriptors {
+    pub kind: SolverStateFieldKind,
+    pub internal_field: SolverStateInternalFieldPlan,
+    pub storage: SolverStateStoragePlan,
+    pub cpu_buffer: SolverStateCpuBufferPlan,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SolverStateFieldKind {
     VolScalar,
@@ -217,27 +225,43 @@ fn build_state_field(
     warnings: &mut Vec<String>,
 ) -> Result<SolverStateFieldPlan> {
     let label = field_label(field)?;
-    let kind = SolverStateFieldKind::from_class(field.class_name.as_deref());
     let mesh_cells = mesh.map(PolyMesh::cell_count);
     let mesh_faces = mesh.map(|mesh| mesh.faces.len());
-    let expected_count = expected_internal_count(kind, mesh);
 
     validate_dimensions(field, &label, warnings)?;
-    let internal_field = build_internal_field_plan(field, kind, expected_count, &label, warnings)?;
-    let storage = build_storage_plan(kind, expected_count, &label, warnings)?;
-    let cpu_buffer = build_cpu_buffer_plan(&internal_field, &storage);
+    let descriptors = derive_field_descriptors(field, mesh_cells, mesh_faces)?;
+    validate_internal_field_descriptor(field, &descriptors, &label, warnings)?;
+    validate_storage_descriptor(&descriptors, &label, warnings)?;
 
     Ok(SolverStateFieldPlan {
         region: try_clone_optional_string(field.region.as_deref())?,
         name: try_clone_string(&field.name, "solver-state field name allocation failed")?,
         class_name: try_clone_optional_string(field.class_name.as_deref())?,
-        kind,
+        kind: descriptors.kind,
         dimensions: try_clone_optional_string_vec(field.dimensions.as_deref())?,
         mesh_cells,
         mesh_faces,
-        internal_field,
+        internal_field: descriptors.internal_field,
         boundary_patches: field.boundary_patches.len(),
         mesh_boundary_patches: mesh.map(|mesh| mesh.patches.len()),
+        storage: descriptors.storage,
+        cpu_buffer: descriptors.cpu_buffer,
+    })
+}
+
+pub(crate) fn derive_field_descriptors(
+    field: &FieldFile,
+    mesh_cells: Option<usize>,
+    mesh_faces: Option<usize>,
+) -> Result<SolverStateFieldDescriptors> {
+    let kind = SolverStateFieldKind::from_class(field.class_name.as_deref());
+    let expected_count = expected_internal_count(kind, mesh_cells, mesh_faces);
+    let internal_field = derive_internal_field_plan(field, expected_count)?;
+    let storage = derive_storage_plan(kind, expected_count);
+    let cpu_buffer = build_cpu_buffer_plan(&internal_field, &storage);
+    Ok(SolverStateFieldDescriptors {
+        kind,
+        internal_field,
         storage,
         cpu_buffer,
     })
@@ -294,37 +318,13 @@ fn validate_dimensions(field: &FieldFile, label: &str, warnings: &mut Vec<String
     Ok(())
 }
 
-fn build_internal_field_plan(
+fn derive_internal_field_plan(
     field: &FieldFile,
-    kind: SolverStateFieldKind,
     expected_count: Option<usize>,
-    label: &str,
-    warnings: &mut Vec<String>,
 ) -> Result<SolverStateInternalFieldPlan> {
     match &field.internal_field {
         Some(FieldValueSummary::Uniform(value)) => {
             let uniform_components = parse_uniform_components(value)?;
-            match (&uniform_components, components_per_value(kind)) {
-                (Some(values), Some(expected_components))
-                    if values.len() != expected_components =>
-                {
-                    push_warning(
-                        warnings,
-                        format!(
-                            "field '{label}' uniform internalField has {} components, expected {expected_components} for {kind}",
-                            values.len()
-                        ),
-                    )?;
-                }
-                (None, Some(_)) => push_warning(
-                    warnings,
-                    format!(
-                        "field '{label}' uniform internalField value could not be parsed as numeric components"
-                    ),
-                )?,
-                _ => {}
-            }
-
             Ok(SolverStateInternalFieldPlan {
                 kind: SolverStateValueKind::Uniform,
                 value_count: expected_count,
@@ -344,32 +344,6 @@ fn build_internal_field_plan(
             let valid_count = count
                 .zip(expected_count)
                 .map(|(count, expected)| count == expected);
-            if let (Some(count), Some(expected)) = (count, expected_count)
-                && count != &expected
-            {
-                push_warning(
-                    warnings,
-                    format!(
-                        "field '{label}' internalField count {count} does not match expected {expected} for {kind}"
-                    ),
-                )?;
-            }
-            if count.is_none() {
-                push_warning(
-                    warnings,
-                    format!(
-                        "field '{label}' has nonuniform internalField without a readable value count"
-                    ),
-                )?;
-            }
-            validate_nonuniform_values(
-                kind,
-                value_type.as_deref(),
-                *count,
-                values.as_deref(),
-                label,
-                warnings,
-            )?;
             Ok(SolverStateInternalFieldPlan {
                 kind: if supported_value_type {
                     SolverStateValueKind::NonUniform
@@ -393,21 +367,91 @@ fn build_internal_field_plan(
             uniform_components: None,
             loaded_scalars: None,
         }),
-        None => {
-            push_warning(
-                warnings,
-                format!("field '{label}' has no internalField entry"),
-            )?;
-            Ok(SolverStateInternalFieldPlan {
-                kind: SolverStateValueKind::Missing,
-                value_count: None,
-                expected_count,
-                valid_count: Some(false),
-                uniform_components: None,
-                loaded_scalars: None,
-            })
-        }
+        None => Ok(SolverStateInternalFieldPlan {
+            kind: SolverStateValueKind::Missing,
+            value_count: None,
+            expected_count,
+            valid_count: Some(false),
+            uniform_components: None,
+            loaded_scalars: None,
+        }),
     }
+}
+
+fn validate_internal_field_descriptor(
+    field: &FieldFile,
+    descriptors: &SolverStateFieldDescriptors,
+    label: &str,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    match &field.internal_field {
+        Some(FieldValueSummary::Uniform(_)) => {
+            match (
+                &descriptors.internal_field.uniform_components,
+                components_per_value(descriptors.kind),
+            ) {
+                (Some(values), Some(expected_components))
+                    if values.len() != expected_components =>
+                {
+                    push_warning(
+                        warnings,
+                        format!(
+                            "field '{label}' uniform internalField has {} components, expected {expected_components} for {}",
+                            values.len(),
+                            descriptors.kind
+                        ),
+                    )?;
+                }
+                (None, Some(_)) => push_warning(
+                    warnings,
+                    format!(
+                        "field '{label}' uniform internalField value could not be parsed as numeric components"
+                    ),
+                )?,
+                _ => {}
+            }
+        }
+        Some(FieldValueSummary::NonUniform {
+            value_type,
+            count,
+            values,
+        }) => {
+            let expected_count = descriptors.internal_field.expected_count;
+            if let (Some(count), Some(expected)) = (count, expected_count)
+                && count != &expected
+            {
+                push_warning(
+                    warnings,
+                    format!(
+                        "field '{label}' internalField count {count} does not match expected {expected} for {}",
+                        descriptors.kind
+                    ),
+                )?;
+            }
+            if count.is_none() {
+                push_warning(
+                    warnings,
+                    format!(
+                        "field '{label}' has nonuniform internalField without a readable value count"
+                    ),
+                )?;
+            }
+            validate_nonuniform_values(
+                descriptors.kind,
+                value_type.as_deref(),
+                *count,
+                values.as_deref(),
+                label,
+                warnings,
+            )?;
+        }
+        Some(FieldValueSummary::Other(_)) => {}
+        None => push_warning(
+            warnings,
+            format!("field '{label}' has no internalField entry"),
+        )?,
+    }
+    Ok(())
 }
 
 fn validate_nonuniform_values(
@@ -455,23 +499,22 @@ fn validate_nonuniform_values(
     Ok(())
 }
 
-fn expected_internal_count(kind: SolverStateFieldKind, mesh: Option<&PolyMesh>) -> Option<usize> {
-    let mesh = mesh?;
+fn expected_internal_count(
+    kind: SolverStateFieldKind,
+    mesh_cells: Option<usize>,
+    mesh_faces: Option<usize>,
+) -> Option<usize> {
     match kind {
-        SolverStateFieldKind::VolScalar | SolverStateFieldKind::VolVector => {
-            Some(mesh.cell_count())
-        }
-        SolverStateFieldKind::SurfaceScalar => Some(mesh.faces.len()),
+        SolverStateFieldKind::VolScalar | SolverStateFieldKind::VolVector => mesh_cells,
+        SolverStateFieldKind::SurfaceScalar => mesh_faces,
         SolverStateFieldKind::Other => None,
     }
 }
 
-fn build_storage_plan(
+fn derive_storage_plan(
     kind: SolverStateFieldKind,
     expected_count: Option<usize>,
-    label: &str,
-    warnings: &mut Vec<String>,
-) -> Result<SolverStateStoragePlan> {
+) -> SolverStateStoragePlan {
     match kind {
         SolverStateFieldKind::VolScalar
         | SolverStateFieldKind::VolVector
@@ -481,39 +524,45 @@ fn build_storage_plan(
                 .zip(expected_count)
                 .and_then(|(components, count)| count.checked_mul(components));
             let bytes_f64 = scalar_slots.and_then(|slots| slots.checked_mul(size_of::<f64>()));
-            if expected_count.is_some() && scalar_slots.is_none() {
-                push_warning(
-                    warnings,
-                    format!(
-                        "field '{label}' storage size overflowed while estimating scalar slots"
-                    ),
-                )?;
-            }
-
-            Ok(SolverStateStoragePlan {
+            SolverStateStoragePlan {
                 cpu_capable: true,
                 gpu_capable: true,
                 components,
                 scalar_slots,
                 bytes_f64,
                 status: SolverStateStorageStatus::Loaded,
-            })
+            }
         }
-        SolverStateFieldKind::Other => {
-            push_warning(
-                warnings,
-                format!("field '{label}' has unsupported class for solver-state storage"),
-            )?;
-            Ok(SolverStateStoragePlan {
-                cpu_capable: false,
-                gpu_capable: false,
-                components: None,
-                scalar_slots: None,
-                bytes_f64: None,
-                status: SolverStateStorageStatus::UnsupportedClass,
-            })
-        }
+        SolverStateFieldKind::Other => SolverStateStoragePlan {
+            cpu_capable: false,
+            gpu_capable: false,
+            components: None,
+            scalar_slots: None,
+            bytes_f64: None,
+            status: SolverStateStorageStatus::UnsupportedClass,
+        },
     }
+}
+
+fn validate_storage_descriptor(
+    descriptors: &SolverStateFieldDescriptors,
+    label: &str,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    if descriptors.kind == SolverStateFieldKind::Other {
+        push_warning(
+            warnings,
+            format!("field '{label}' has unsupported class for solver-state storage"),
+        )?;
+    } else if descriptors.internal_field.expected_count.is_some()
+        && descriptors.storage.scalar_slots.is_none()
+    {
+        push_warning(
+            warnings,
+            format!("field '{label}' storage size overflowed while estimating scalar slots"),
+        )?;
+    }
+    Ok(())
 }
 
 fn build_cpu_buffer_plan(
