@@ -20,13 +20,12 @@ pub struct InitCaseSummary {
 }
 
 pub fn init_case(options: &InitCaseOptions) -> Result<InitCaseSummary, String> {
-    let (output, created_dirs) =
-        SafeOutputRoot::create_trusted(&options.case_dir).map_err(|error| {
-            format!(
-                "could not safely open or create case directory {} ({error})",
-                options.case_dir.display()
-            )
-        })?;
+    let (output, created_dirs) = SafeOutputRoot::create(&options.case_dir).map_err(|error| {
+        format!(
+            "could not safely open or create case directory {} ({error})",
+            options.case_dir.display()
+        )
+    })?;
     let mut summary = InitCaseSummary {
         case_dir: options.case_dir.clone(),
         created_dirs,
@@ -345,6 +344,34 @@ fn write_foam_header(
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn init_case_rejects_symlinked_case_root() {
+        let root = temp_dir("symlinked-case-root");
+        let case_dir = root.join("case");
+        let outside = root.join("outside-case");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        if create_directory_symlink(&outside, &case_dir).is_err() {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+
+        let error = match init_case(&InitCaseOptions {
+            case_dir: case_dir.clone(),
+            force: true,
+            regions: Vec::new(),
+        }) {
+            Ok(_) => panic!("init_case accepted a symlinked case root"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("could not safely open or create case directory"));
+        assert!(!outside.join("README.md").exists());
+        assert!(!outside.join("system").exists());
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn init_case_rejects_symlinked_case_subdirectories() {

@@ -66,7 +66,7 @@ pub struct BoundaryFaceZoneSummary {
 pub fn split_regions_by_cell_zones(case_dir: &Path) -> Result<RegionSplitSummary> {
     let poly_mesh_dir = case_dir.join("constant").join("polyMesh");
     let mesh = PolyMesh::read(&poly_mesh_dir)?;
-    let output = SafeOutputRoot::open_trusted(case_dir)?;
+    let output = SafeOutputRoot::open_existing(case_dir)?;
 
     if mesh.cell_zones.is_empty() {
         return Err(MeshError::InvalidInput(format!(
@@ -1440,6 +1440,42 @@ mod tests {
             .expect("system time before epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("ferrum_regions_{name}_{suffix}"))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn split_rejects_symlinked_case_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_path("symlink_root");
+        let target = temp_path("symlink_root_target");
+        fs::create_dir_all(&root).expect("create extraction root");
+        let poly_mesh = target.join("constant/polyMesh");
+        fs::create_dir_all(&poly_mesh).expect("create source polyMesh");
+        for name in [
+            "points",
+            "faces",
+            "owner",
+            "neighbour",
+            "boundary",
+            "faceZones",
+        ] {
+            fs::write(poly_mesh.join(name), "0\n(\n)\n").expect("write empty mesh list");
+        }
+        fs::write(
+            poly_mesh.join("cellZones"),
+            "1\n(\nzoneA\n{\ncellLabels List<label>\n0\n(\n)\n}\n)\n",
+        )
+        .expect("write cell zones");
+
+        let case_dir = root.join("case");
+        symlink(&target, &case_dir).expect("create symlinked case root");
+
+        split_regions_by_cell_zones(&case_dir).expect_err("symlinked case root must be rejected");
+        assert!(!target.join("constant/zoneA").exists());
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&target);
     }
 
     #[test]
