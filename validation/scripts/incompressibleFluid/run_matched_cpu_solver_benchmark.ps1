@@ -207,7 +207,7 @@ function Convert-PressureFieldToKinematic(
     [string]$DestinationPath,
     [double]$Rho
 ) {
-    $valuesPa = @(Read-InternalScalarField $FerrumPressurePath)
+    [double[]]$valuesPa = Read-InternalScalarField $FerrumPressurePath
     $valuesKinematic = [double[]]@($valuesPa | ForEach-Object { [double]$_ / $Rho })
     $internalField = if ($valuesKinematic.Count -eq 1) {
         "internalField uniform $(Format-F64 $valuesKinematic[0]);"

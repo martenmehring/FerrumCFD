@@ -1396,8 +1396,11 @@ fn solve_laminar_simple_driven(
         let corrected_continuity =
             summarize_continuity(&net_cell_flux(&runtime.mesh, &corrected_phi)?);
         let pressure_correction_update_scale = 1.0;
-        let pressure_correction_diverged =
-            simple_step_continuity_growth_exceeded(continuity_before, corrected_continuity);
+        let pressure_correction_diverged = simple_step_continuity_growth_exceeded(
+            continuity_before,
+            continuity_star,
+            corrected_continuity,
+        );
         let candidate_update_metrics = checked_candidate_update_metrics(
             &previous_velocity,
             &previous_pressure,
@@ -2631,18 +2634,25 @@ fn evaluate_laminar_simple_residual_control(
 }
 
 fn simple_step_continuity_growth_exceeded(
-    before: ContinuitySummary,
-    after: ContinuitySummary,
+    accepted: ContinuitySummary,
+    predictor: ContinuitySummary,
+    corrected: ContinuitySummary,
 ) -> bool {
-    fn component_growth_exceeded(before: f64, after: f64) -> bool {
-        after.is_finite()
-            && before.is_finite()
-            && growth_ratio_exceeds(before, after, LAMINAR_SIMPLE_MAX_CONTINUITY_GROWTH_PER_STEP)
+    fn component_growth_exceeded(accepted: f64, predictor: f64, corrected: f64) -> bool {
+        accepted.is_finite()
+            && predictor.is_finite()
+            && corrected.is_finite()
+            && corrected > predictor
+            && growth_ratio_exceeds(
+                accepted,
+                corrected,
+                LAMINAR_SIMPLE_MAX_CONTINUITY_GROWTH_PER_STEP,
+            )
     }
 
-    component_growth_exceeded(before.l2_norm, after.l2_norm)
-        || component_growth_exceeded(before.max_abs, after.max_abs)
-        || component_growth_exceeded(before.sum_abs, after.sum_abs)
+    component_growth_exceeded(accepted.l2_norm, predictor.l2_norm, corrected.l2_norm)
+        || component_growth_exceeded(accepted.max_abs, predictor.max_abs, corrected.max_abs)
+        || component_growth_exceeded(accepted.sum_abs, predictor.sum_abs, corrected.sum_abs)
 }
 
 fn checked_update_metrics(
@@ -7585,10 +7595,10 @@ mod tests {
         };
 
         assert!(!super::simple_step_continuity_growth_exceeded(
-            before, bounded
+            before, before, bounded
         ));
         assert!(super::simple_step_continuity_growth_exceeded(
-            before, divergent
+            before, before, divergent
         ));
     }
 
@@ -7608,8 +7618,33 @@ mod tests {
         };
 
         assert!(!super::simple_step_continuity_growth_exceeded(
-            before, after
+            before, before, after
         ));
+    }
+
+    #[test]
+    fn pressure_correction_continuity_gate_is_scale_invariant() {
+        for scale in [2.0_f64.powi(-300), 1.0, 2.0_f64.powi(300)] {
+            let summary = |component: f64| super::ContinuitySummary {
+                l2_norm: component * scale,
+                max_abs: component * scale,
+                sum_abs: component * scale,
+                global_sum: 0.0,
+            };
+            let accepted = summary(1.0);
+            let predictor = summary(200.0);
+
+            assert!(!super::simple_step_continuity_growth_exceeded(
+                accepted,
+                predictor,
+                summary(50.0),
+            ));
+            assert!(super::simple_step_continuity_growth_exceeded(
+                accepted,
+                predictor,
+                summary(201.0),
+            ));
+        }
     }
 
     #[test]
