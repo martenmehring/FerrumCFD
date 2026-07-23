@@ -246,6 +246,13 @@ does not yet configure `SIMPLE.residualControl`.
 The solver is therefore promising for the pipe case, but it is not yet a
 production `simpleFoam` replacement.
 
+The merged finite-SIMPLE semantic invariant is unconditional: finite iterates
+and corrections are never clipped, capped, replaced, or rolled back merely
+because their magnitude is large. NaN/Inf, arithmetic overflow, linear-solver
+breakdown or singularity, allocation or resource exhaustion, and
+user-configured explicit iteration bounds continue to fail closed. Those
+conditions are errors or explicit bounds, not finite-value magnitude caps.
+
 ## Definition Of Done For Driver 1
 
 The first laminar incompressible solver should be considered ready when it:
@@ -470,6 +477,9 @@ Acceptance criteria for every scalar-CPU optimization:
 
 - use the release executable directly; record build time separately;
 - run at least one warmup and five measured runs, reporting the median;
+- require both fixed-work evidence and time-to-accuracy evidence. Measure
+  convergence and external accuracy separately, and exclude build time from
+  both release-run medians;
 - preserve convergence state, SIMPLE and linear-iteration observables, final
   continuity, residuals, and field summaries within stated tolerances on both
   `laminarPipe` and `planeChannel`;
@@ -512,10 +522,20 @@ The first optimization sequence is tracked as follows:
 13. completed: profile GAMG hierarchy refresh and every V-cycle phase, identify
     smoothing as the dominant phase, and reuse cached diagonal slots in the
     Gauss-Seidel smoother while preserving floating-point operation order;
-14. validate DILU/ILU for nonsymmetric momentum systems;
-15. add further in-place history, residual, and reporting operations only where
-    measurement shows material cost;
-16. rerun the two-case gate after every step, then proceed to threaded CPU work.
+14. establish strict absolute and relative normalized-L1 stopping as the first
+    post-flow correctness gate, retaining L2 telemetry wherever it is exposed;
+15. freeze `laminarPipe` and `planeChannel` as the A/B corpus after an accepted
+    post-flow clean baseline;
+16. implement allocation-free CSR symmetric Gauss-Seidel with explicit
+    row/diagonal scaling and reusable solve workspaces;
+17. after CSR acceptance, implement symmetric LDU-addressed Gauss-Seidel only
+    for the symmetric pressure equation;
+18. condition any further hierarchy work on phase diagnostics and the frozen
+    A/B gate showing material hierarchy or transfer cost;
+19. persist SIMPLE and momentum state, then gate adaptive linear tolerances,
+    then SIMPLEC;
+20. accept portable and native scalar profiles, then proceed through SIMD,
+    shared-memory threading, and GPU as separate reviewed leaves.
 
 n8n may build, execute, collect artifacts, compare tolerances, and reject a
 regression. It must not combine several numerical or storage optimizations into
@@ -524,29 +544,50 @@ its own before/after evidence.
 
 Next performance targets:
 
-- retain the completed per-level GAMG profile and cached-diagonal smoother. A
-  further GAMG performance leaf must first isolate the remaining row-kernel
-  cost; it must not tune case tolerances or cycle counts as a shortcut;
-- retain the completed medium/fine/skewed IC(0) gate and add a true
-  nonsymmetric ILU/DILU path for momentum/BiCGStab;
-- reduce repeated allocations in SIMPLE history and operator assembly;
+- first make normalized L1 the post-flow correctness gate. Stopping requires
+  strict absolute and relative normalized-L1 criteria; preserve L2 telemetry
+  where already exposed. Do not tune tolerances or iteration budgets to
+  manufacture parity;
+- freeze `laminarPipe` and `planeChannel` as the mandatory A/B corpus using
+  identical inputs, schemes, controls, hardware lane, process/thread settings,
+  and an accepted post-flow clean baseline;
+- implement CSR symmetric Gauss-Seidel first, with explicit row/diagonal
+  scaling and reusable allocation-free solve workspaces. Require Pipe/Channel
+  numerical, convergence, and failure-behavior parity;
+- only after CSR acceptance, implement symmetric LDU-addressed Gauss-Seidel for
+  the symmetric pressure equation. Reject nonsymmetric momentum use and compare
+  it directly with accepted CSR behavior;
+- undertake further GAMG hierarchy work only if phase diagnostics show
+  material hierarchy or transfer cost and the frozen two-case A/B gate
+  justifies the added complexity;
+- next persist SIMPLE and momentum topology, coefficients where valid,
+  preconditioner state, histories, and workspaces. Define explicit invalidation
+  and preserve equations, boundaries, and convergence semantics;
+- only after persistence parity, add adaptive linear tolerances bounded by user
+  controls. Preserve final outer acceptance criteria and report each effective
+  tolerance and the resulting linear work;
+- only after the persistence and adaptive-tolerance gates pass, implement
+  SIMPLEC and accept it on the same frozen Pipe/Channel observables before
+  expanding case coverage;
+- define a portable release profile for reproducible comparison and correctness
+  and a native release profile that is explicitly hardware-specific. Never mix
+  timing claims between these lanes;
+- require every accepted performance leaf to provide fixed-work and
+  time-to-accuracy evidence: at least one warmup and five measured median
+  release runs, build time excluded, with convergence and external accuracy
+  measured separately;
+- only after all scalar gates pass, accept acceleration in the order SIMD,
+  shared-memory threading, then GPU. Each is a separate reviewed leaf under the
+  unchanged frozen A/B contract and the universal fixed-work plus
+  time-to-accuracy gate;
 - keep fields, operators, equation assembly, convergence criteria, reports, and
-  case semantics independent of execution backend now;
-- defer parallel optimization until the complete selected Driver 1 and Driver 2
-  SIMPLE/SIMPLEC/PISO/PIMPLE case inventory passes on the scalar CPU baseline;
-- then execute the following acceptance phases in order:
-  1. one process and one CPU worker as the correctness reference;
-  2. one process with multiple CPU worker threads and explicit affinity/NUMA
-     policy;
-  3. partitioned multi-process CPU execution on one host, followed by
-     multi-node execution when required;
-  4. one GPU with explicit capability and `f64` checks;
-  5. multiple GPUs on one host with deterministic placement, peer-transfer
-     policy, and conservative halo exchange;
-  6. multi-node CPU/GPU execution with an explicit communication transport;
-- require every phase to run the identical case inputs and numerical schemes,
-  with stated tolerance parity, conservation checks, deterministic regression
-  mode, scaling efficiency, and memory-transfer measurements;
+  case semantics independent of execution backend;
+- after those acceleration leaves and the selected Driver 1/2 inventory gate,
+  undertake explicitly named partitioned multi-process CPU, multi-node CPU,
+  multi-GPU, and multi-node CPU/GPU backend integration;
+- require every backend leaf to use identical case inputs and numerical
+  schemes, with stated tolerance parity, conservation checks, deterministic
+  regression mode, scaling efficiency, and memory-transfer measurements;
 - keep GPU optional and selectable per stage (`flow`, linear solves,
   nonlinear/interface/ODE stages), with CPU as a valid choice when GPU is busy,
   unsupported, or inefficient.
@@ -554,7 +595,7 @@ Next performance targets:
 Rust threads can use all cores of one shared-memory host without MPI. Rust does
 not remove the distributed-memory problem: multiple processes, multiple nodes,
 and some multi-GPU layouts still require MPI or an equivalent transport. Before
-Phase 3, record an architecture decision comparing a Rust MPI binding with
+partitioned multi-process CPU work, record an architecture decision comparing a Rust MPI binding with
 UCX/libfabric or a project-owned transport. One-process multi-GPU execution may
 use vendor peer/collective APIs, but cross-node execution still requires a
 network communication layer. No transport choice may leak into finite-volume
@@ -589,7 +630,7 @@ tutorial matrix:
 | ---: | --- | --- | --- |
 | 1 | `laminarPipe` | 3D internal flow and pressure loss | Hagen-Poiseuille analytical solution |
 | 2 | `planeChannel` | true 2D `empty` handling | Plane-Poiseuille analytical solution |
-| 3 | `cylinder` | official OpenFOAM 13 steady laminar external flow at `Re = 1`; limited-scheme compatibility is the next prerequisite | Official-case observables selected during the focused case task |
+| 3 | `cylinder` | official OpenFOAM 13 steady laminar external flow at `Re = 1`; deferred until the correctness and scalar-performance gates above are accepted | Official-case observables selected during the focused case task |
 | 4 | `lidDrivenCavity` | recirculation and closed-pressure reference | Published benchmark |
 | 5 | `backwardFacingStep` | separation, reattachment, and outlet robustness | Published benchmark |
 | 6 | `axisymmetricPipe` | `wedge` handling | Hagen-Poiseuille analytical solution |
@@ -621,14 +662,17 @@ Implementation order:
 
 1. extract a module registry and common solver lifecycle while completing
    `ferrumRun`;
-2. keep `ferrumRun` on the scalar CPU correctness backend until the selected
-   SIMPLE/SIMPLEC/PISO/PIMPLE inventory passes, while making operators and
-   storage backend-neutral;
+2. accept the scalar correctness and performance sequence, then the separate
+   SIMD, shared-memory threading, and single-GPU leaves on the frozen A/B
+   contract, while making operators and storage backend-neutral;
 3. define a backend-neutral execution context that distinguishes sockets,
    cores, worker threads, process ranks, domain partitions, GPU devices,
    memory, and queues while preventing oversubscription;
-4. implement and accept the `ferrumRun` threaded, distributed CPU, single-GPU,
-   and multi-GPU phases from Milestone 5;
+4. after the selected SIMPLE/SIMPLEC/PISO/PIMPLE inventory passes, implement
+   and accept the named `ferrumRun` partitioned multi-process CPU, multi-node
+   CPU, multi-GPU, and multi-node CPU/GPU backend integration leaves in that
+   order, reusing the already accepted SIMD, shared-memory, and single-GPU
+   leaves;
 5. implement a deterministic `ferrumMultiRun` CPU scheduler with a
    capability/dependency graph,
    rank/partition mapping, halo/ghost exchange, interface barriers, and failure
@@ -643,8 +687,10 @@ Implementation order:
    tolerances.
 
 The lifecycle and backend contracts are established during Drivers 1 and 2 so
-later acceleration does not require an architectural rewrite, but parallel
-kernel implementation starts only after the Driver 1/2 correctness gate.
+later acceleration does not require an architectural rewrite. The partitioned,
+distributed, multi-node, and multi-GPU integration kernels start only after the
+selected Driver 1/2 inventory gate; this does not repeat the earlier accepted
+SIMD, shared-memory, or single-GPU leaves.
 `ferrumMultiRun` does not create a second backend stack: it schedules the same
 module kernels over a coupled dependency graph. A working coupled CPU runner
 plus the accepted single-region backend contract is required before Driver 6;
@@ -739,9 +785,9 @@ epics unless explicitly marked as a leaf. They decompose as follows:
 - Driver 1/2 implementation: one ID per boundary condition, operator,
   SIMPLEC/PISO/PIMPLE behavior, or tutorial case, followed by a separate driver
   gate task;
-- backend work: `F-BE-THREADS`, `F-BE-PARTITION`, `F-BE-MULTIPROCESS`,
-  `F-BE-MULTINODE`, `F-BE-GPU1`, `F-BE-GPUN`, and
-  `F-BE-MULTINODE-GPU` in that order;
+- later backend expansion: `F-BE-PARTITION`, `F-BE-MULTIPROCESS`,
+  `F-BE-MULTINODE`, `F-BE-GPUN`, and `F-BE-MULTINODE-GPU` in that order,
+  reusing the earlier accepted `F-BE-THREADS` and `F-BE-GPU1` leaves;
 - Drivers 3-7: separate audit, module/lifecycle, model, individual case, and
   final readiness-gate tasks for each driver.
 
@@ -772,31 +818,51 @@ five-run median solver time by `4.44%` for the pipe and `9.43%` for the channel
 with identical numerical observables. PCG/IC(0) remains the default; GAMG
 remains explicitly selectable.
 
-1. **F-D1-CYLINDER-LIMITED-SCHEMES:** Implement and regression-test the two
-   finite-volume scheme capabilities required by the selected official
-   OpenFOAM Foundation 13 `incompressibleFluid/cylinder` reference:
-   `cellLimited Gauss linear 1` for `grad(U)` and
-   `bounded Gauss linearUpwind limited` for `div(phi,U)`. Keep this a numerical
-   implementation task; add no generator, comparison runner, or hardening
-   framework.
-2. **F-D1-CASE-CYLINDER:** After those schemes are supported, add the Ferrum
-   compatibility case and provide the independent OpenFOAM 13 sibling, select
-   sourced observables with tolerances, and explain why no suitable closed-form
-   reference is used for this finite-domain case.
-3. **F-AUTO-1 (accepted external dependency):** Keep the accepted isolated n8n
+The immediate sequence is:
+
+1. **F-CORRECT-NL1:** Establish strict absolute and relative normalized-L1
+   stopping, preserve exposed L2 telemetry, and freeze the accepted
+   `laminarPipe`/`planeChannel` A/B baseline without tolerance or
+   iteration-budget tuning.
+2. **F-PERF-CSR-SYMGS:** Add explicitly scaled, allocation-free CSR SymGS and
+   pass the frozen two-case numerical, convergence, and failure-behavior gate.
+3. **F-PERF-LDU-PRESSURE-SYMGS:** Add symmetric LDU-addressed SymGS for pressure
+   only, reject nonsymmetric momentum use, and compare directly with CSR.
+4. **F-PERF-HIERARCHY-CONDITIONAL:** Proceed only if phase diagnostics show
+   material hierarchy or transfer cost and the frozen A/B evidence justifies
+   the complexity.
+5. **F-PERF-SIMPLE-PERSISTENCE:** Persist valid SIMPLE/momentum topology,
+   coefficients, preconditioner state, histories, and workspaces with explicit
+   invalidation and unchanged equations, boundaries, and convergence semantics.
+6. **F-PERF-ADAPTIVE-LINEAR:** After persistence parity, add user-bounded
+   adaptive linear tolerances while preserving final outer acceptance and
+   reporting effective tolerances and linear work.
+7. **F-D1-SIMPLEC:** After both preceding gates, implement SIMPLEC on the frozen
+   Pipe/Channel observables before expanding coverage.
+8. **F-PERF-PORTABLE-NATIVE:** Accept separate portable and hardware-specific
+   native profiles, then accept SIMD, shared-memory threading, and GPU in that
+   order as separate leaves. Apply fixed-work plus time-to-accuracy evidence to
+   every leaf.
+9. **F-D1-CYLINDER-LIMITED-SCHEMES / F-D1-CASE-CYLINDER:** Only after all
+   correctness and scalar-performance gates above are accepted, implement the
+   required limited schemes and then the Cylinder case. Validation order
+   remains Pipe, Channel, then Cylinder.
+10. **F-AUTO-1 (accepted external dependency):** Keep the accepted isolated n8n
    coding workflow in the AI Dev Orchestrator repository and preserve the
    existing analysis workflow as a separate read-only path.
-4. **F-REF-1:** Keep a focused OpenFOAM 13 module/case reference and
+11. **F-REF-1:** Keep a focused OpenFOAM 13 module/case reference and
    license/provenance note for each newly selected physics area. Expand it only
    when a bounded implementation task needs more detail.
-5. **F-ARCH-1:** Extract the `incompressibleFluid` module registry and common solver
+12. **F-ARCH-1:** Extract the `incompressibleFluid` module registry and common solver
    lifecycle from the transitional combined crates with parity tests.
-6. **F-IO-1:** Specify and implement `FerrumFile v1`; isolate OpenFOAM support behind the
+13. **F-IO-1:** Specify and implement `FerrumFile v1`; isolate OpenFOAM support behind the
    `openfoamIO` interoperability layer.
-7. **F-D1D2-1:** Complete Driver 1 SIMPLE/SIMPLEC and Driver 2 PISO/PIMPLE on the scalar CPU
+14. **F-D1D2-1:** Complete Driver 1 SIMPLE/SIMPLEC and Driver 2 PISO/PIMPLE on the scalar CPU
    reference backend for the frozen selected-case inventory.
-8. **F-BACKEND-1:** Accept `ferrumRun` successively on threaded CPU, distributed CPU, one GPU,
-   and multiple GPUs without changing case numerics.
-9. **F-D3D7-1:** Implement Drivers 3 through 7 in the fixed order above, applying the common
+15. **F-BACKEND-1:** After the Driver 1/2 inventory gate, accept `ferrumRun`
+   successively on partitioned multi-process CPU, multi-node CPU, multi-GPU,
+   and multi-node CPU/GPU integration without changing case numerics, reusing
+   the earlier accepted shared-memory and single-GPU leaves.
+16. **F-D3D7-1:** Implement Drivers 3 through 7 in the fixed order above, applying the common
    readiness gate and completing coupled `ferrumMultiRun` before Driver 6.
-10. **F-POROUS-1:** Begin porous-media and packed-bed work only after Driver 7 is complete.
+17. **F-POROUS-1:** Begin porous-media and packed-bed work only after Driver 7 is complete.
