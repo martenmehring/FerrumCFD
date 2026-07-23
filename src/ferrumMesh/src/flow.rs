@@ -13,191 +13,10 @@ use crate::runtime::{SolverRuntimeData, SolverRuntimeMeshData};
 use crate::solver_state::SolverStateFieldKind;
 use crate::{MeshError, Point3, Result};
 
-const LAMINAR_SIMPLE_MAX_CONTINUITY_GROWTH_PER_STEP: f64 = 100.0;
-const LAMINAR_SIMPLE_SUSTAINED_GROWTH_FACTOR: f64 = 2.0;
-const LAMINAR_SIMPLE_MAX_SUSTAINED_GROWTH_STEPS: usize = 3;
-const LAMINAR_SIMPLE_MAX_FIELD_NORM_GROWTH_PER_STEP: f64 = 64.0;
-const LAMINAR_SIMPLE_MAX_FIELD_NORM_TOTAL_GROWTH: f64 = 1_048_576.0;
-const LAMINAR_SIMPLE_LARGE_RELATIVE_UPDATE: f64 = 1.5;
-const LAMINAR_SIMPLE_MAX_SUSTAINED_LARGE_UPDATE_STEPS: usize = 3;
-
 #[derive(Clone, Copy, Debug)]
 struct SimpleUpdateMetrics {
-    velocity_l2: f64,
-    pressure_l2: f64,
-    phi_l2: f64,
-    continuity_l2: f64,
     velocity_change_l2: f64,
     pressure_change_l2: f64,
-    phi_change_l2: f64,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct SimpleUpdateGuard {
-    baseline: SimpleUpdateMetrics,
-    previous: SimpleUpdateMetrics,
-    provisional_field_baselines: [Option<f64>; 3],
-    sustained_growth_steps: usize,
-    sustained_large_update_steps: usize,
-}
-
-impl SimpleUpdateGuard {
-    fn new(initial: SimpleUpdateMetrics) -> Self {
-        Self {
-            baseline: initial,
-            previous: initial,
-            provisional_field_baselines: [None; 3],
-            sustained_growth_steps: 0,
-            sustained_large_update_steps: 0,
-        }
-    }
-
-    fn rejects(&mut self, next: SimpleUpdateMetrics) -> bool {
-        let exceeds_total_growth = [
-            (self.baseline.velocity_l2, next.velocity_l2),
-            (self.baseline.pressure_l2, next.pressure_l2),
-            (self.baseline.phi_l2, next.phi_l2),
-        ]
-        .into_iter()
-        .any(|(before, after)| {
-            growth_ratio_exceeds(before, after, LAMINAR_SIMPLE_MAX_FIELD_NORM_TOTAL_GROWTH)
-        });
-
-        let continuity_reference =
-            anchored_growth_reference(self.previous.continuity_l2, self.baseline.continuity_l2);
-        let continuity_worsened =
-            continuity_reference.is_some_and(|before| next.continuity_l2 > before);
-        let exceeds_step_growth = continuity_worsened
-            && [
-                (
-                    anchored_growth_reference(self.previous.velocity_l2, self.baseline.velocity_l2),
-                    next.velocity_l2,
-                ),
-                (
-                    anchored_growth_reference(self.previous.pressure_l2, self.baseline.pressure_l2),
-                    next.pressure_l2,
-                ),
-                (
-                    anchored_growth_reference(self.previous.phi_l2, self.baseline.phi_l2),
-                    next.phi_l2,
-                ),
-            ]
-            .into_iter()
-            .any(|(before, after)| {
-                before.is_some_and(|before| {
-                    growth_ratio_exceeds(
-                        before,
-                        after,
-                        LAMINAR_SIMPLE_MAX_FIELD_NORM_GROWTH_PER_STEP,
-                    )
-                })
-            });
-
-        let coupled_growth = continuity_reference.is_some_and(|before| {
-            growth_ratio_at_least(
-                before,
-                next.continuity_l2,
-                LAMINAR_SIMPLE_SUSTAINED_GROWTH_FACTOR,
-            )
-        }) && [
-            (
-                anchored_growth_reference(self.previous.velocity_l2, self.baseline.velocity_l2),
-                next.velocity_l2,
-            ),
-            (
-                anchored_growth_reference(self.previous.pressure_l2, self.baseline.pressure_l2),
-                next.pressure_l2,
-            ),
-            (
-                anchored_growth_reference(self.previous.phi_l2, self.baseline.phi_l2),
-                next.phi_l2,
-            ),
-        ]
-        .into_iter()
-        .any(|(before, after)| {
-            before.is_some_and(|before| {
-                growth_ratio_at_least(before, after, LAMINAR_SIMPLE_SUSTAINED_GROWTH_FACTOR)
-            })
-        });
-        let next_sustained_growth_steps = if coupled_growth {
-            self.sustained_growth_steps.saturating_add(1)
-        } else {
-            0
-        };
-        let exceeds_sustained_growth =
-            next_sustained_growth_steps >= LAMINAR_SIMPLE_MAX_SUSTAINED_GROWTH_STEPS;
-        let large_relative_update = [
-            next.velocity_change_l2,
-            next.pressure_change_l2,
-            next.phi_change_l2,
-        ]
-        .into_iter()
-        .any(|change| change >= LAMINAR_SIMPLE_LARGE_RELATIVE_UPDATE);
-        let next_sustained_large_update_steps = if large_relative_update {
-            self.sustained_large_update_steps.saturating_add(1)
-        } else {
-            0
-        };
-        let exceeds_sustained_large_update =
-            next_sustained_large_update_steps >= LAMINAR_SIMPLE_MAX_SUSTAINED_LARGE_UPDATE_STEPS;
-        let rejected = exceeds_total_growth
-            || exceeds_step_growth
-            || exceeds_sustained_growth
-            || exceeds_sustained_large_update;
-
-        if !rejected {
-            anchor_zero_field_metric(
-                &mut self.baseline.velocity_l2,
-                &mut self.provisional_field_baselines[0],
-                next.velocity_l2,
-            );
-            anchor_zero_field_metric(
-                &mut self.baseline.pressure_l2,
-                &mut self.provisional_field_baselines[1],
-                next.pressure_l2,
-            );
-            anchor_zero_field_metric(
-                &mut self.baseline.phi_l2,
-                &mut self.provisional_field_baselines[2],
-                next.phi_l2,
-            );
-            anchor_zero_metric(&mut self.baseline.continuity_l2, next.continuity_l2);
-            self.previous = next;
-            self.sustained_growth_steps = next_sustained_growth_steps;
-            self.sustained_large_update_steps = next_sustained_large_update_steps;
-        }
-        rejected
-    }
-}
-
-fn anchor_zero_metric(baseline: &mut f64, accepted: f64) {
-    if *baseline == 0.0 && accepted > 0.0 {
-        *baseline = accepted;
-    }
-}
-
-fn anchor_zero_field_metric(baseline: &mut f64, provisional: &mut Option<f64>, accepted: f64) {
-    if *baseline != 0.0 || accepted <= 0.0 {
-        return;
-    }
-    match provisional.take() {
-        Some(first) => *baseline = first.max(accepted),
-        None => *provisional = Some(accepted),
-    }
-}
-
-fn anchored_growth_reference(previous: f64, baseline: f64) -> Option<f64> {
-    (previous > 0.0)
-        .then_some(previous)
-        .or_else(|| (baseline > 0.0).then_some(baseline))
-}
-
-fn growth_ratio_exceeds(before: f64, after: f64, limit: f64) -> bool {
-    before > 0.0 && after / before > limit
-}
-
-fn growth_ratio_at_least(before: f64, after: f64, limit: f64) -> bool {
-    before > 0.0 && after / before >= limit
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -871,16 +690,13 @@ fn solve_laminar_simple_driven(
     let (mut velocity, mut pressure) = take_runtime_initial_fields(runtime)?;
     let initial_phi = compute_face_flux(&runtime.mesh, &velocity, &velocity_boundary)?;
     let initial_continuity = summarize_continuity(&net_cell_flux(&runtime.mesh, &initial_phi)?);
-    let initial_update_metrics =
-        checked_update_metrics(&velocity, &pressure, &initial_phi, initial_continuity).ok_or_else(
-            || {
-                invalid_input(
-                    "laminar SIMPLE initial field metrics exceed the finite numeric range"
-                        .to_string(),
-                )
-            },
-        )?;
-    let mut update_guard = SimpleUpdateGuard::new(initial_update_metrics);
+    checked_update_metrics(&velocity, &pressure, &initial_phi, initial_continuity).ok_or_else(
+        || {
+            invalid_input(
+                "laminar SIMPLE initial field metrics exceed the finite numeric range".to_string(),
+            )
+        },
+    )?;
     let mut timing = LaminarSimpleTimingAccumulator {
         setup_seconds: setup_started.elapsed().as_secs_f64(),
         ..LaminarSimpleTimingAccumulator::default()
@@ -917,6 +733,14 @@ fn solve_laminar_simple_driven(
     };
 
     for iteration in 1..=options.max_simple_iterations {
+        let accepted_final_residuals = (
+            final_momentum_initial_normalized_residual_norm,
+            final_momentum_residual_norm,
+            final_momentum_normalized_residual_norm,
+            final_pressure_correction_initial_normalized_residual_norm,
+            final_pressure_correction_residual_norm,
+            final_pressure_correction_normalized_residual_norm,
+        );
         let iteration_setup_started = Instant::now();
         let previous_velocity = velocity.clone();
         let previous_pressure = pressure.clone();
@@ -1354,8 +1178,14 @@ fn solve_laminar_simple_driven(
                 .unwrap_or(pressure_report.initial_normalized_residual_norm);
         final_pressure_correction_initial_normalized_residual_norm =
             pressure_initial_normalized_residual_norm;
-        let pressure_delta = pressure_report
-            .solution
+        let pressure_solution_is_representable =
+            checked_l2_norm(pressure_report.solution.iter().copied()).is_some();
+        let pressure_solution = if pressure_solution_is_representable {
+            pressure_report.solution.as_slice()
+        } else {
+            pressure.as_slice()
+        };
+        let pressure_delta = pressure_solution
             .iter()
             .zip(&pressure)
             .map(|(after, before)| options.pressure_relaxation * (after - before))
@@ -1376,7 +1206,7 @@ fn solve_laminar_simple_driven(
 
         let pressure_flux = pressure_equation_flux(
             &runtime.mesh,
-            &pressure_report.solution,
+            pressure_solution,
             &r_at_u,
             &constrained_pressure_boundary,
         )?;
@@ -1396,24 +1226,20 @@ fn solve_laminar_simple_driven(
         let corrected_continuity =
             summarize_continuity(&net_cell_flux(&runtime.mesh, &corrected_phi)?);
         let pressure_correction_update_scale = 1.0;
-        let pressure_correction_diverged = simple_step_continuity_growth_exceeded(
-            continuity_before,
-            continuity_star,
-            corrected_continuity,
-        );
-        let candidate_update_metrics = checked_candidate_update_metrics(
-            &previous_velocity,
-            &previous_pressure,
-            &phi,
-            &corrected_velocity,
-            &corrected_pressure,
-            &corrected_phi,
-            corrected_continuity,
-        );
-        let update_growth_rejected =
-            candidate_update_metrics.is_none_or(|metrics| update_guard.rejects(metrics));
-        if pressure_correction_diverged
-            || update_growth_rejected
+        let candidate_update_metrics = pressure_solution_is_representable
+            .then(|| {
+                checked_candidate_update_metrics(
+                    &previous_velocity,
+                    &previous_pressure,
+                    &phi,
+                    &corrected_velocity,
+                    &corrected_pressure,
+                    &corrected_phi,
+                    corrected_continuity,
+                )
+            })
+            .flatten();
+        if candidate_update_metrics.is_none()
             || !is_finite_continuity(corrected_continuity)
             || !points_are_finite(&corrected_velocity)
             || !scalars_are_finite(&corrected_pressure)
@@ -1421,6 +1247,14 @@ fn solve_laminar_simple_driven(
         {
             velocity = previous_velocity;
             pressure = previous_pressure;
+            (
+                final_momentum_initial_normalized_residual_norm,
+                final_momentum_residual_norm,
+                final_momentum_normalized_residual_norm,
+                final_pressure_correction_initial_normalized_residual_norm,
+                final_pressure_correction_residual_norm,
+                final_pressure_correction_normalized_residual_norm,
+            ) = accepted_final_residuals;
             final_phi = phi;
             final_continuity = continuity_before;
             emit_iteration(LaminarSimpleIterationSummary {
@@ -1476,7 +1310,6 @@ fn solve_laminar_simple_driven(
                 "laminar SIMPLE accepted update metrics exceed the finite numeric range",
             ))
         })?;
-
         velocity = corrected_velocity;
         pressure = corrected_pressure;
         final_phi = corrected_phi;
@@ -2633,50 +2466,20 @@ fn evaluate_laminar_simple_residual_control(
     }
 }
 
-fn simple_step_continuity_growth_exceeded(
-    accepted: ContinuitySummary,
-    predictor: ContinuitySummary,
-    corrected: ContinuitySummary,
-) -> bool {
-    fn component_growth_exceeded(accepted: f64, predictor: f64, corrected: f64) -> bool {
-        accepted.is_finite()
-            && predictor.is_finite()
-            && corrected.is_finite()
-            && corrected > predictor
-            && growth_ratio_exceeds(
-                accepted,
-                corrected,
-                LAMINAR_SIMPLE_MAX_CONTINUITY_GROWTH_PER_STEP,
-            )
-    }
-
-    component_growth_exceeded(accepted.l2_norm, predictor.l2_norm, corrected.l2_norm)
-        || component_growth_exceeded(accepted.max_abs, predictor.max_abs, corrected.max_abs)
-        || component_growth_exceeded(accepted.sum_abs, predictor.sum_abs, corrected.sum_abs)
-}
-
 fn checked_update_metrics(
     velocity: &[Point3],
     pressure: &[f64],
     phi: &[f64],
     continuity: ContinuitySummary,
-) -> Option<SimpleUpdateMetrics> {
-    let velocity_l2 = checked_l2_norm(
+) -> Option<()> {
+    checked_l2_norm(
         velocity
             .iter()
             .flat_map(|value| [value.x, value.y, value.z]),
     )?;
-    let pressure_l2 = checked_gauge_invariant_scalar_l2(pressure)?;
-    let phi_l2 = checked_l2_norm(phi.iter().copied())?;
-    is_finite_continuity(continuity).then_some(SimpleUpdateMetrics {
-        velocity_l2,
-        pressure_l2,
-        phi_l2,
-        continuity_l2: continuity.l2_norm,
-        velocity_change_l2: 0.0,
-        pressure_change_l2: 0.0,
-        phi_change_l2: 0.0,
-    })
+    checked_gauge_invariant_scalar_l2(pressure)?;
+    checked_l2_norm(phi.iter().copied())?;
+    is_finite_continuity(continuity).then_some(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2689,13 +2492,15 @@ fn checked_candidate_update_metrics(
     phi: &[f64],
     continuity: ContinuitySummary,
 ) -> Option<SimpleUpdateMetrics> {
-    let mut metrics = checked_update_metrics(velocity, pressure, phi, continuity)?;
-    metrics.velocity_change_l2 =
-        checked_relative_vector_field_change_l2(previous_velocity, velocity)?;
-    metrics.pressure_change_l2 =
+    checked_update_metrics(velocity, pressure, phi, continuity)?;
+    let velocity_change_l2 = checked_relative_vector_field_change_l2(previous_velocity, velocity)?;
+    let pressure_change_l2 =
         checked_relative_gauge_scalar_field_change_l2(previous_pressure, pressure)?;
-    metrics.phi_change_l2 = checked_relative_scalar_field_change_l2(previous_phi, phi)?;
-    Some(metrics)
+    checked_relative_scalar_field_change_l2(previous_phi, phi)?;
+    Some(SimpleUpdateMetrics {
+        velocity_change_l2,
+        pressure_change_l2,
+    })
 }
 
 fn checked_gauge_invariant_scalar_l2(values: &[f64]) -> Option<f64> {
@@ -7574,80 +7379,6 @@ mod tests {
     }
 
     #[test]
-    fn laminar_simple_rejects_large_finite_continuity_growth() {
-        let before = super::ContinuitySummary {
-            l2_norm: 1.0,
-            max_abs: 0.5,
-            sum_abs: 1.25,
-            global_sum: 0.1,
-        };
-        let bounded = super::ContinuitySummary {
-            l2_norm: 100.0,
-            max_abs: 50.0,
-            sum_abs: 125.0,
-            global_sum: 10.0,
-        };
-        let divergent = super::ContinuitySummary {
-            l2_norm: 100.0_f64.next_up(),
-            max_abs: 50.0,
-            sum_abs: 125.0,
-            global_sum: 10.0,
-        };
-
-        assert!(!super::simple_step_continuity_growth_exceeded(
-            before, before, bounded
-        ));
-        assert!(super::simple_step_continuity_growth_exceeded(
-            before, before, divergent
-        ));
-    }
-
-    #[test]
-    fn laminar_simple_global_sum_noise_does_not_mask_bounded_continuity() {
-        let before = super::ContinuitySummary {
-            l2_norm: 8.276981e-10,
-            max_abs: 2.0e-10,
-            sum_abs: 1.0e-9,
-            global_sum: 0.0,
-        };
-        let after = super::ContinuitySummary {
-            l2_norm: 8.825281e-10,
-            max_abs: 2.1e-10,
-            sum_abs: 1.1e-9,
-            global_sum: 8.0e-10,
-        };
-
-        assert!(!super::simple_step_continuity_growth_exceeded(
-            before, before, after
-        ));
-    }
-
-    #[test]
-    fn pressure_correction_continuity_gate_is_scale_invariant() {
-        for scale in [2.0_f64.powi(-300), 1.0, 2.0_f64.powi(300)] {
-            let summary = |component: f64| super::ContinuitySummary {
-                l2_norm: component * scale,
-                max_abs: component * scale,
-                sum_abs: component * scale,
-                global_sum: 0.0,
-            };
-            let accepted = summary(1.0);
-            let predictor = summary(200.0);
-
-            assert!(!super::simple_step_continuity_growth_exceeded(
-                accepted,
-                predictor,
-                summary(50.0),
-            ));
-            assert!(super::simple_step_continuity_growth_exceeded(
-                accepted,
-                predictor,
-                summary(201.0),
-            ));
-        }
-    }
-
-    #[test]
     fn checked_update_metrics_reject_finite_arithmetic_overflow() {
         let velocity = [Point3 {
             x: f64::MAX,
@@ -7689,503 +7420,13 @@ mod tests {
     }
 
     #[test]
-    fn simple_update_guard_total_growth_cap_is_exact() {
-        let reference = 2.0_f64.powi(-40);
-        let baseline = super::SimpleUpdateMetrics {
-            velocity_l2: reference,
-            pressure_l2: reference,
-            phi_l2: reference,
-            continuity_l2: reference,
-            velocity_change_l2: 0.0,
-            pressure_change_l2: 0.0,
-            phi_change_l2: 0.0,
-        };
-        let cap = super::LAMINAR_SIMPLE_MAX_FIELD_NORM_TOTAL_GROWTH;
-        let at_limit = reference * cap;
-        let at_cap = [
-            super::SimpleUpdateMetrics {
-                velocity_l2: at_limit,
-                ..baseline
-            },
-            super::SimpleUpdateMetrics {
-                pressure_l2: at_limit,
-                ..baseline
-            },
-            super::SimpleUpdateMetrics {
-                phi_l2: at_limit,
-                ..baseline
-            },
-        ];
-        let over_cap = [
-            super::SimpleUpdateMetrics {
-                velocity_l2: at_limit.next_up(),
-                ..baseline
-            },
-            super::SimpleUpdateMetrics {
-                pressure_l2: at_limit.next_up(),
-                ..baseline
-            },
-            super::SimpleUpdateMetrics {
-                phi_l2: at_limit.next_up(),
-                ..baseline
-            },
-        ];
-
-        for metrics in at_cap {
-            assert!(!super::SimpleUpdateGuard::new(baseline).rejects(metrics));
-        }
-        for metrics in over_cap {
-            assert!(super::SimpleUpdateGuard::new(baseline).rejects(metrics));
-        }
-    }
-
-    #[test]
-    fn simple_update_guard_step_growth_cap_is_exact() {
-        let reference = 2.0_f64.powi(-40);
-        let baseline = super::SimpleUpdateMetrics {
-            velocity_l2: reference,
-            pressure_l2: reference,
-            phi_l2: reference,
-            continuity_l2: reference,
-            velocity_change_l2: 0.0,
-            pressure_change_l2: 0.0,
-            phi_change_l2: 0.0,
-        };
-        let cap = super::LAMINAR_SIMPLE_MAX_FIELD_NORM_GROWTH_PER_STEP;
-        let at_limit = reference * cap;
-        let continuity_l2 = reference.next_up();
-        let at_cap = [
-            super::SimpleUpdateMetrics {
-                velocity_l2: at_limit,
-                continuity_l2,
-                ..baseline
-            },
-            super::SimpleUpdateMetrics {
-                pressure_l2: at_limit,
-                continuity_l2,
-                ..baseline
-            },
-            super::SimpleUpdateMetrics {
-                phi_l2: at_limit,
-                continuity_l2,
-                ..baseline
-            },
-        ];
-        let over_cap = [
-            super::SimpleUpdateMetrics {
-                velocity_l2: at_limit.next_up(),
-                continuity_l2,
-                ..baseline
-            },
-            super::SimpleUpdateMetrics {
-                pressure_l2: at_limit.next_up(),
-                continuity_l2,
-                ..baseline
-            },
-            super::SimpleUpdateMetrics {
-                phi_l2: at_limit.next_up(),
-                continuity_l2,
-                ..baseline
-            },
-        ];
-
-        for metrics in at_cap {
-            assert!(!super::SimpleUpdateGuard::new(baseline).rejects(metrics));
-        }
-        for metrics in over_cap {
-            assert!(super::SimpleUpdateGuard::new(baseline).rejects(metrics));
-        }
-    }
-
-    #[test]
-    fn simple_update_guard_decisions_are_scale_invariant() {
-        let baseline = super::SimpleUpdateMetrics {
-            velocity_l2: 2.0,
-            pressure_l2: 3.0,
-            phi_l2: 4.0,
-            continuity_l2: 5.0,
-            velocity_change_l2: 0.0,
-            pressure_change_l2: 0.0,
-            phi_change_l2: 0.0,
-        };
-        let sequence = [2.0, 4.0, 8.0].map(|factor| super::SimpleUpdateMetrics {
-            velocity_l2: baseline.velocity_l2 * factor,
-            pressure_l2: baseline.pressure_l2,
-            phi_l2: baseline.phi_l2,
-            continuity_l2: baseline.continuity_l2 * factor,
-            velocity_change_l2: 0.25,
-            pressure_change_l2: 0.0,
-            phi_change_l2: 0.0,
-        });
-
-        for scale in [1.0e-12, 1.0, 1.0e12] {
-            let scale_metrics = |metrics: super::SimpleUpdateMetrics| super::SimpleUpdateMetrics {
-                velocity_l2: metrics.velocity_l2 * scale,
-                pressure_l2: metrics.pressure_l2 * scale,
-                phi_l2: metrics.phi_l2 * scale,
-                continuity_l2: metrics.continuity_l2 * scale,
-                ..metrics
-            };
-            let mut guard = super::SimpleUpdateGuard::new(scale_metrics(baseline));
-            let decisions = sequence.map(|metrics| guard.rejects(scale_metrics(metrics)));
-            assert_eq!(decisions, [false, false, true]);
-        }
-    }
-
-    #[test]
-    fn simple_update_guard_anchors_zero_once_then_enforces_exact_total_cap() {
-        let zero = super::SimpleUpdateMetrics {
-            velocity_l2: 0.0,
-            pressure_l2: 0.0,
-            phi_l2: 0.0,
-            continuity_l2: 0.0,
-            velocity_change_l2: 0.0,
-            pressure_change_l2: 0.0,
-            phi_change_l2: 0.0,
-        };
-        let first = super::SimpleUpdateMetrics {
-            phi_l2: 1.0e-12,
-            continuity_l2: 1.0e-14,
-            phi_change_l2: 1.0,
-            ..zero
-        };
-        let mut guard = super::SimpleUpdateGuard::new(zero);
-        assert!(!guard.rejects(first));
-        assert!(!guard.rejects(first));
-
-        let at_limit = first.phi_l2 * super::LAMINAR_SIMPLE_MAX_FIELD_NORM_TOTAL_GROWTH;
-        assert!(!guard.rejects(super::SimpleUpdateMetrics {
-            phi_l2: at_limit,
-            ..first
-        }));
-        assert!(guard.rejects(super::SimpleUpdateMetrics {
-            phi_l2: at_limit.next_up(),
-            ..first
-        }));
-    }
-
-    #[test]
-    fn simple_update_guard_two_positive_field_anchors_are_exact_and_transactional() {
-        fn with_field(
-            mut metrics: super::SimpleUpdateMetrics,
-            field: usize,
-            value: f64,
-            change: f64,
-        ) -> super::SimpleUpdateMetrics {
-            match field {
-                0 => {
-                    metrics.velocity_l2 = value;
-                    metrics.velocity_change_l2 = change;
-                }
-                1 => {
-                    metrics.pressure_l2 = value;
-                    metrics.pressure_change_l2 = change;
-                }
-                2 => {
-                    metrics.phi_l2 = value;
-                    metrics.phi_change_l2 = change;
-                }
-                _ => unreachable!(),
-            }
-            metrics
-        }
-
-        fn guard_bits(guard: &super::SimpleUpdateGuard) -> Vec<u64> {
-            let metrics_bits = |metrics: super::SimpleUpdateMetrics| {
-                [
-                    metrics.velocity_l2.to_bits(),
-                    metrics.pressure_l2.to_bits(),
-                    metrics.phi_l2.to_bits(),
-                    metrics.continuity_l2.to_bits(),
-                    metrics.velocity_change_l2.to_bits(),
-                    metrics.pressure_change_l2.to_bits(),
-                    metrics.phi_change_l2.to_bits(),
-                ]
-            };
-            let mut bits = Vec::from(metrics_bits(guard.baseline));
-            bits.extend(metrics_bits(guard.previous));
-            bits.extend(
-                guard
-                    .provisional_field_baselines
-                    .map(|value| value.map_or(0, |value| value.to_bits())),
-            );
-            bits.push(guard.sustained_growth_steps as u64);
-            bits.push(guard.sustained_large_update_steps as u64);
-            bits
-        }
-
-        let zero = super::SimpleUpdateMetrics {
-            velocity_l2: 0.0,
-            pressure_l2: 0.0,
-            phi_l2: 0.0,
-            continuity_l2: 0.0,
-            velocity_change_l2: 0.0,
-            pressure_change_l2: 0.0,
-            phi_change_l2: 0.0,
-        };
-        for field in 0..3 {
-            for (first, second) in [
-                (2f64.powi(-40), 2f64.powi(-20)),
-                (2f64.powi(-20), 2f64.powi(-40)),
-            ] {
-                let mut guard = super::SimpleUpdateGuard::new(zero);
-                assert!(!guard.rejects(with_field(zero, field, first, 0.125)));
-                assert_eq!(guard.provisional_field_baselines[field], Some(first));
-                assert!(!guard.rejects(with_field(zero, field, second, 0.25)));
-                assert_eq!(guard.provisional_field_baselines[field], None);
-                let baseline = [
-                    guard.baseline.velocity_l2,
-                    guard.baseline.pressure_l2,
-                    guard.baseline.phi_l2,
-                ][field];
-                assert_eq!(baseline.to_bits(), 2f64.powi(-20).to_bits());
-
-                assert!(!guard.rejects(with_field(zero, field, 2f64.powi(-19), 0.375)));
-                assert!(!guard.rejects(with_field(zero, field, 0.0, 0.5)));
-                assert_eq!(
-                    [
-                        guard.baseline.velocity_l2,
-                        guard.baseline.pressure_l2,
-                        guard.baseline.phi_l2
-                    ][field]
-                        .to_bits(),
-                    2f64.powi(-20).to_bits()
-                );
-
-                assert!(!guard.rejects(with_field(zero, field, 1.0, 0.625)));
-                let snapshot = guard_bits(&guard);
-                assert!(guard.rejects(with_field(zero, field, 1.0f64.next_up(), 0.75)));
-                assert_eq!(guard_bits(&guard), snapshot);
-                assert!(!guard.rejects(with_field(zero, field, 1.0, 0.875)));
-            }
-        }
-    }
-
-    #[test]
-    fn simple_update_guard_zero_revisit_cannot_reset_the_anchor() {
-        let zero = super::SimpleUpdateMetrics {
-            velocity_l2: 0.0,
-            pressure_l2: 0.0,
-            phi_l2: 0.0,
-            continuity_l2: 0.0,
-            velocity_change_l2: 0.0,
-            pressure_change_l2: 0.0,
-            phi_change_l2: 0.0,
-        };
-        let first = super::SimpleUpdateMetrics {
-            phi_l2: 1.0e-12,
-            continuity_l2: 1.0e-14,
-            ..zero
-        };
-        let mut guard = super::SimpleUpdateGuard::new(zero);
-        assert!(!guard.rejects(first));
-        assert!(!guard.rejects(zero));
-        assert!(!guard.rejects(first));
-        assert!(guard.rejects(super::SimpleUpdateMetrics {
-            phi_l2: (first.phi_l2 * super::LAMINAR_SIMPLE_MAX_FIELD_NORM_TOTAL_GROWTH).next_up(),
-            ..zero
-        }));
-    }
-
-    #[test]
-    fn simple_update_guard_rejects_small_scale_phi_growth() {
-        let baseline = super::SimpleUpdateMetrics {
-            velocity_l2: 1.0e-9,
-            pressure_l2: 1.0e-9,
-            phi_l2: 1.0e-12,
-            continuity_l2: 1.0e-14,
-            velocity_change_l2: 0.0,
-            pressure_change_l2: 0.0,
-            phi_change_l2: 0.0,
-        };
-        let mut guard = super::SimpleUpdateGuard::new(baseline);
-        for factor in [2.0, 4.0] {
-            assert!(!guard.rejects(super::SimpleUpdateMetrics {
-                phi_l2: baseline.phi_l2 * factor,
-                continuity_l2: baseline.continuity_l2 * factor,
-                ..baseline
-            }));
-        }
-        assert!(guard.rejects(super::SimpleUpdateMetrics {
-            phi_l2: baseline.phi_l2 * 8.0,
-            continuity_l2: baseline.continuity_l2 * 8.0,
-            ..baseline
-        }));
-    }
-
-    #[test]
-    fn simple_update_guard_rejects_third_sustained_finite_growth() {
-        let baseline = super::SimpleUpdateMetrics {
-            velocity_l2: 1.0,
-            pressure_l2: 1.0,
-            phi_l2: 1.0,
-            continuity_l2: 1.0,
-            velocity_change_l2: 0.0,
-            pressure_change_l2: 0.0,
-            phi_change_l2: 0.0,
-        };
-        let mut guard = super::SimpleUpdateGuard::new(baseline);
-
-        for multiplier in [2.0, 4.0] {
-            assert!(!guard.rejects(super::SimpleUpdateMetrics {
-                velocity_l2: multiplier,
-                continuity_l2: multiplier,
-                ..baseline
-            }));
-        }
-        assert!(guard.rejects(super::SimpleUpdateMetrics {
-            velocity_l2: 8.0,
-            continuity_l2: 8.0,
-            ..baseline
-        }));
-    }
-
-    #[test]
-    fn simple_update_guard_recovery_resets_growth_streak() {
-        let baseline = super::SimpleUpdateMetrics {
-            velocity_l2: 1.0,
-            pressure_l2: 1.0,
-            phi_l2: 1.0,
-            continuity_l2: 1.0,
-            velocity_change_l2: 0.0,
-            pressure_change_l2: 0.0,
-            phi_change_l2: 0.0,
-        };
-        let mut guard = super::SimpleUpdateGuard::new(baseline);
-
-        for multiplier in [2.0, 4.0] {
-            assert!(!guard.rejects(super::SimpleUpdateMetrics {
-                velocity_l2: multiplier,
-                continuity_l2: multiplier,
-                ..baseline
-            }));
-        }
-        assert!(!guard.rejects(super::SimpleUpdateMetrics {
-            velocity_l2: 4.0,
-            continuity_l2: 3.0,
-            ..baseline
-        }));
-        for (velocity_l2, continuity_l2) in [(8.0, 6.0), (16.0, 12.0)] {
-            assert!(!guard.rejects(super::SimpleUpdateMetrics {
-                velocity_l2,
-                continuity_l2,
-                ..baseline
-            }));
-        }
-        assert!(guard.rejects(super::SimpleUpdateMetrics {
-            velocity_l2: 32.0,
-            continuity_l2: 24.0,
-            ..baseline
-        }));
-    }
-
-    #[test]
-    fn simple_update_guard_accepts_synthetic_finite_norm_transitions() {
-        let transitions = [
-            (
-                super::SimpleUpdateMetrics {
-                    velocity_l2: 0.894_427_190_999_915_9,
-                    pressure_l2: 0.0,
-                    phi_l2: 6.283_185_307_179_586e-6,
-                    continuity_l2: 0.0,
-                    velocity_change_l2: 0.0,
-                    pressure_change_l2: 0.0,
-                    phi_change_l2: 0.0,
-                },
-                super::SimpleUpdateMetrics {
-                    velocity_l2: 1.025_919,
-                    pressure_l2: 6.035_06,
-                    phi_l2: 7.203_914e-6,
-                    continuity_l2: 50.0 * f64::EPSILON,
-                    velocity_change_l2: 0.128,
-                    pressure_change_l2: 1.0,
-                    phi_change_l2: 0.128,
-                },
-            ),
-            (
-                super::SimpleUpdateMetrics {
-                    velocity_l2: 0.894_427_190_999_915_9,
-                    pressure_l2: 0.0,
-                    phi_l2: 4.0e-7,
-                    continuity_l2: 0.0,
-                    velocity_change_l2: 0.0,
-                    pressure_change_l2: 0.0,
-                    phi_change_l2: 0.0,
-                },
-                super::SimpleUpdateMetrics {
-                    velocity_l2: 0.972_239,
-                    pressure_l2: 2.4,
-                    phi_l2: 4.348e-7,
-                    continuity_l2: 80.0 * f64::EPSILON,
-                    velocity_change_l2: 0.08,
-                    pressure_change_l2: 1.0,
-                    phi_change_l2: 0.08,
-                },
-            ),
-        ];
-
-        for (baseline, transition) in transitions {
-            assert!(!super::SimpleUpdateGuard::new(baseline).rejects(transition));
-        }
-    }
-
-    #[test]
-    fn simple_update_guard_rejects_third_same_norm_sign_reversal() {
-        let positive_velocity = [point(2.0, -3.0, 0.0)];
-        let negative_velocity = [point(-2.0, 3.0, 0.0)];
-        let positive_pressure = [0.0, 4.0];
-        let negative_pressure = [0.0, -4.0];
-        let positive_phi = [5.0, -5.0];
-        let negative_phi = [-5.0, 5.0];
-        let continuity = super::ContinuitySummary {
-            l2_norm: 1.0,
-            max_abs: 1.0,
-            sum_abs: 1.0,
-            global_sum: 0.0,
-        };
-        let initial = super::checked_update_metrics(
-            &positive_velocity,
-            &positive_pressure,
-            &positive_phi,
-            continuity,
-        )
-        .expect("initial metrics");
-        let mut guard = super::SimpleUpdateGuard::new(initial);
-
-        let first = super::checked_candidate_update_metrics(
-            &positive_velocity,
-            &positive_pressure,
-            &positive_phi,
-            &negative_velocity,
-            &negative_pressure,
-            &negative_phi,
-            continuity,
-        )
-        .expect("first reversal metrics");
-        let second = super::checked_candidate_update_metrics(
-            &negative_velocity,
-            &negative_pressure,
-            &negative_phi,
-            &positive_velocity,
-            &positive_pressure,
-            &positive_phi,
-            continuity,
-        )
-        .expect("second reversal metrics");
-
-        assert!(!guard.rejects(first));
-        assert!(!guard.rejects(second));
-        assert!(guard.rejects(first));
-    }
-
-    #[test]
     fn pressure_metrics_ignore_a_large_uniform_gauge_shift() {
         let velocity = [point(1.0, 0.0, 0.0), point(2.0, 0.0, 0.0)];
         let phi = [1.0, 2.0];
         let before_pressure = [0.0, 1.0];
         let after_pressure = [1.0e12, 1.0e12 + 1.0];
         let continuity = super::ContinuitySummary::default();
-        let initial = super::checked_update_metrics(&velocity, &before_pressure, &phi, continuity)
+        super::checked_update_metrics(&velocity, &before_pressure, &phi, continuity)
             .expect("initial metrics");
         let shifted = super::checked_candidate_update_metrics(
             &velocity,
@@ -8198,13 +7439,20 @@ mod tests {
         )
         .expect("shifted metrics");
 
-        assert_eq!(initial.pressure_l2.to_bits(), shifted.pressure_l2.to_bits());
+        assert_eq!(
+            super::checked_gauge_invariant_scalar_l2(&before_pressure)
+                .unwrap()
+                .to_bits(),
+            super::checked_gauge_invariant_scalar_l2(&after_pressure)
+                .unwrap()
+                .to_bits()
+        );
         assert_eq!(shifted.pressure_change_l2.to_bits(), 0.0_f64.to_bits());
-        assert!(!super::SimpleUpdateGuard::new(initial).rejects(shifted));
+        assert_eq!(shifted.velocity_change_l2.to_bits(), 0.0_f64.to_bits());
     }
 
     #[test]
-    fn divergent_simple_update_rolls_back_atomically() {
+    fn large_finite_simple_update_commits() {
         let mut runtime = two_cell_runtime();
         let mut fields = two_cell_fields();
         fields.fields[1].boundary_patches[1].patch_type = Some("zeroGradient".to_string());
@@ -8213,12 +7461,7 @@ mod tests {
         options.max_simple_iterations = 1;
         options.pressure_reference_cell = Some(0);
         let initial_velocity = [point(1.0, 0.0, 0.0), point(1.0, 0.0, 0.0)];
-        let initial_pressure: [f64; 2] = [1.0, 0.0];
-        let velocity_boundary = super::vector_face_treatments(&runtime.mesh, &fields.fields[0])
-            .expect("velocity boundary");
-        let initial_phi = compute_face_flux(&runtime.mesh, &initial_velocity, &velocity_boundary)
-            .expect("initial phi");
-        let mut force_divergent_correction =
+        let mut force_large_correction =
             |_solve: usize,
              report: &mut super::ScalarSolveReport,
              _predicted_velocity: &[Point3],
@@ -8232,130 +7475,448 @@ mod tests {
             &fields,
             &options,
             None,
-            Some(&mut force_divergent_correction),
+            Some(&mut force_large_correction),
         )
-        .expect("divergent update must stop safely");
+        .expect("large finite update");
 
         assert_eq!(
             report.stop_reason,
-            LaminarSimpleStopReason::SolverInvalidState
+            LaminarSimpleStopReason::ConvergenceCriteriaNotConfigured
         );
-        assert!(report.pressure_assembly.is_none());
+        assert!(report.pressure_assembly.is_some());
         assert_eq!(report.simple_iterations, 1);
-        assert!(!report.history[0].pressure_correction_accepted);
-        assert_eq!(report.history[0].pressure_correction_update_scale, 0.0);
-        for (actual, expected) in report.final_velocity.iter().zip(initial_velocity) {
-            assert_eq!(actual.x.to_bits(), expected.x.to_bits());
-            assert_eq!(actual.y.to_bits(), expected.y.to_bits());
-            assert_eq!(actual.z.to_bits(), expected.z.to_bits());
+        assert!(report.history[0].pressure_correction_accepted);
+        assert_eq!(report.history[0].pressure_correction_update_scale, 1.0);
+        assert!(
+            report
+                .final_velocity
+                .iter()
+                .all(|value| value.x.is_finite())
+        );
+        assert!(
+            report
+                .final_velocity
+                .iter()
+                .zip(initial_velocity)
+                .any(|(actual, initial)| actual.x.to_bits() != initial.x.to_bits())
+        );
+        let expected_pressure: [f64; 2] = [0.7 * 1.0 + 0.3 * 1.0e12, -0.3 * 1.0e12];
+        assert_eq!(report.final_pressure.len(), expected_pressure.len());
+        for (actual, expected) in report.final_pressure.iter().zip(expected_pressure) {
+            assert_eq!(actual.to_bits(), expected.to_bits());
         }
+        let committed_pressure_span = report.final_pressure[0] - report.final_pressure[1];
         assert_eq!(
-            report
-                .final_pressure
-                .iter()
-                .map(|value| value.to_bits())
-                .collect::<Vec<_>>(),
-            initial_pressure
-                .iter()
-                .map(|value| value.to_bits())
-                .collect::<Vec<_>>()
+            committed_pressure_span.to_bits(),
+            (expected_pressure[0] - expected_pressure[1]).to_bits()
         );
-        assert_eq!(
-            report
-                .final_phi
-                .iter()
-                .map(|value| value.to_bits())
-                .collect::<Vec<_>>(),
-            initial_phi
-                .iter()
-                .map(|value| value.to_bits())
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(report.final_continuity.l2_norm.to_bits(), 0.0_f64.to_bits());
+        assert!(committed_pressure_span > 1_048_576.0);
+        assert!(committed_pressure_span > 64.0);
+        assert!(report.final_phi.iter().all(|value| value.is_finite()));
+        assert!(report.final_continuity.l2_norm.is_finite());
+        assert!(report.final_continuity.l2_norm > 0.0);
     }
 
     #[test]
-    fn rejected_second_update_preserves_the_last_accepted_diagnostics() {
-        let fields = two_cell_fields();
-        let mut first_options = minimal_laminar_options();
-        first_options.max_simple_iterations = 1;
-        first_options.pressure_reference_cell = Some(0);
-        let mut first_runtime = two_cell_runtime();
-        first_runtime.fields[0].values = Some(vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
-        let mut accept_first =
+    fn repeated_growing_and_sign_reversing_finite_updates_commit() {
+        let mut runtime = two_cell_runtime();
+        let mut fields = two_cell_fields();
+        fields.fields[1].boundary_patches[1].patch_type = Some("zeroGradient".to_string());
+        fields.fields[1].boundary_patches[1].value = None;
+        let mut options = minimal_laminar_options();
+        options.max_simple_iterations = 4;
+        options.pressure_reference_cell = Some(0);
+        let seeded_pressure_difference = 0.7 * 1.0 + 0.3 * 200.0;
+        let first_reversal_difference = -(2.2 / 0.3) * seeded_pressure_difference;
+        let second_reversal_difference = -1.5 * first_reversal_difference;
+        let third_reversal_difference = -1.5 * second_reversal_difference;
+        let forced_solutions = [
+            [100.0, -100.0],
+            [
+                0.5 * first_reversal_difference,
+                -0.5 * first_reversal_difference,
+            ],
+            [
+                0.5 * second_reversal_difference,
+                -0.5 * second_reversal_difference,
+            ],
+            [
+                0.5 * third_reversal_difference,
+                -0.5 * third_reversal_difference,
+            ],
+        ];
+        let mut iteration = 0;
+        let mut drive_corrections =
             |_solve: usize,
              report: &mut super::ScalarSolveReport,
              _predicted_velocity: &[Point3],
              _phi_hby_a: &[f64],
              _continuity_star: super::ContinuitySummary| {
-                report.solution.copy_from_slice(&[1.0, 0.0]);
+                report
+                    .solution
+                    .copy_from_slice(&forced_solutions[iteration]);
+                iteration += 1;
             };
-        let first = super::solve_laminar_simple_driven(
-            &mut first_runtime,
-            &fields,
-            &first_options,
-            None,
-            Some(&mut accept_first),
-        )
-        .expect("first accepted iteration");
-        assert!(
-            first.history[0].pressure_correction_accepted,
-            "first iteration rejected: stop={:?} history={:?}",
-            first.stop_reason, first.history
-        );
-        assert!(first.pressure_assembly.is_some());
 
-        let mut second_options = first_options.clone();
-        second_options.max_simple_iterations = 2;
-        let mut second_runtime = two_cell_runtime();
-        second_runtime.fields[0].values = Some(vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
-        let mut pressure_calls = 0usize;
-        let mut reject_second =
-            |_solve: usize,
-             report: &mut super::ScalarSolveReport,
-             _predicted_velocity: &[Point3],
-             _phi_hby_a: &[f64],
-             _continuity_star: super::ContinuitySummary| {
-                pressure_calls += 1;
-                if pressure_calls == 1 {
-                    report.solution.copy_from_slice(&[1.0, 0.0]);
-                } else if pressure_calls == 2 {
-                    report.solution.copy_from_slice(&[1.0e12, -1.0e12]);
-                }
-            };
-        let second = super::solve_laminar_simple_driven(
-            &mut second_runtime,
+        let report = super::solve_laminar_simple_driven(
+            &mut runtime,
             &fields,
-            &second_options,
+            &options,
             None,
-            Some(&mut reject_second),
+            Some(&mut drive_corrections),
         )
-        .expect("second update must fail safely");
+        .expect("repeated finite updates");
 
-        assert_eq!(pressure_calls, 2);
+        assert_eq!(iteration, options.max_simple_iterations);
+        assert_eq!(report.simple_iterations, options.max_simple_iterations);
         assert_eq!(
-            second.stop_reason,
+            report.stop_reason,
+            LaminarSimpleStopReason::ConvergenceCriteriaNotConfigured
+        );
+        assert!(report.history.iter().all(|summary| {
+            summary.pressure_correction_accepted
+                && summary.pressure_correction_update_scale == 1.0
+                && summary.relative_velocity_change_l2.is_finite()
+                && summary.relative_pressure_change_l2.is_finite()
+        }));
+        assert!(
+            report
+                .history
+                .iter()
+                .skip(1)
+                .all(|summary| summary.relative_pressure_change_l2 >= 1.5),
+            "{:?}",
+            report
+                .history
+                .iter()
+                .map(|summary| summary.relative_pressure_change_l2)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            report
+                .history
+                .iter()
+                .skip(1)
+                .filter(|summary| summary.relative_pressure_change_l2 >= 1.5)
+                .count(),
+            3
+        );
+        assert_eq!(
+            report
+                .history
+                .iter()
+                .filter(
+                    |summary| summary.continuity_after.l2_norm > summary.continuity_before.l2_norm
+                )
+                .count(),
+            2
+        );
+        assert!(forced_solutions.windows(2).all(|updates| {
+            updates[0][0].is_sign_positive() != updates[1][0].is_sign_positive()
+                && updates[1][0].abs() > updates[0][0].abs()
+        }));
+        let mut expected_pressure = [1.0, 0.0];
+        for forced in forced_solutions {
+            for (value, target) in expected_pressure.iter_mut().zip(forced) {
+                *value += options.pressure_relaxation * (target - *value);
+            }
+        }
+        for (actual, expected) in report.final_pressure.iter().zip(expected_pressure) {
+            assert_eq!(actual.to_bits(), expected.to_bits());
+        }
+        assert!(
+            report
+                .final_velocity
+                .iter()
+                .all(|value| value.x.is_finite())
+        );
+        assert!(report.final_phi.iter().all(|value| value.is_finite()));
+        assert!(report.final_continuity.l2_norm.is_finite());
+    }
+
+    #[test]
+    fn non_finite_and_overflowing_simple_updates_roll_back_atomically() {
+        for invalid_solution in [
+            [f64::NAN, 0.0],
+            [f64::INFINITY, 0.0],
+            [f64::NEG_INFINITY, 0.0],
+            [f64::MAX, -f64::MAX],
+        ] {
+            let mut runtime = two_cell_runtime();
+            let fields = two_cell_fields();
+            let options = minimal_laminar_options();
+            let initial_velocity = [point(1.0, 0.0, 0.0), point(1.0, 0.0, 0.0)];
+            let initial_pressure = [1.0, 0.0];
+            let velocity_boundary =
+                super::vector_face_treatments(&runtime.mesh, &fields.fields[0]).unwrap();
+            let initial_phi =
+                compute_face_flux(&runtime.mesh, &initial_velocity, &velocity_boundary).unwrap();
+            let initial_continuity =
+                super::summarize_continuity(&net_cell_flux(&runtime.mesh, &initial_phi).unwrap());
+            let mut drive_invalid =
+                |_solve: usize,
+                 report: &mut super::ScalarSolveReport,
+                 _predicted_velocity: &[Point3],
+                 _phi_hby_a: &[f64],
+                 _continuity_star: super::ContinuitySummary| {
+                    report.solution.copy_from_slice(&invalid_solution);
+                };
+
+            let report = super::solve_laminar_simple_driven(
+                &mut runtime,
+                &fields,
+                &options,
+                None,
+                Some(&mut drive_invalid),
+            )
+            .expect("invalid candidate report");
+
+            assert_eq!(
+                report.stop_reason,
+                LaminarSimpleStopReason::SolverInvalidState
+            );
+            for (actual, expected) in report.final_velocity.iter().zip(initial_velocity) {
+                assert_eq!(actual.x.to_bits(), expected.x.to_bits());
+                assert_eq!(actual.y.to_bits(), expected.y.to_bits());
+                assert_eq!(actual.z.to_bits(), expected.z.to_bits());
+            }
+            assert_eq!(report.final_pressure, initial_pressure);
+            assert_eq!(report.final_phi, initial_phi);
+            assert_eq!(
+                format!("{:?}", report.final_continuity),
+                format!("{initial_continuity:?}")
+            );
+            let rejected = report.history.last().unwrap();
+            assert!(!rejected.pressure_correction_accepted);
+            assert_eq!(rejected.pressure_correction_update_scale, 0.0);
+            assert_eq!(
+                format!("{:?}", rejected.continuity_after),
+                format!("{initial_continuity:?}")
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_second_update_preserves_last_accepted_state_and_diagnostics() {
+        fn assert_f64_bits(actual: f64, expected: f64) {
+            assert_eq!(actual.to_bits(), expected.to_bits());
+        }
+
+        fn assert_continuity_bits(
+            actual: super::ContinuitySummary,
+            expected: super::ContinuitySummary,
+        ) {
+            assert_f64_bits(actual.l2_norm, expected.l2_norm);
+            assert_f64_bits(actual.max_abs, expected.max_abs);
+            assert_f64_bits(actual.sum_abs, expected.sum_abs);
+            assert_f64_bits(actual.global_sum, expected.global_sum);
+        }
+
+        fn assert_scalar_diagnostics_bits(
+            actual: super::ScalarDiagnosticSummary,
+            expected: super::ScalarDiagnosticSummary,
+        ) {
+            assert_f64_bits(actual.min, expected.min);
+            assert_f64_bits(actual.max, expected.max);
+            assert_f64_bits(actual.l2_norm, expected.l2_norm);
+            assert_f64_bits(actual.sum, expected.sum);
+            assert_f64_bits(actual.sum_abs, expected.sum_abs);
+        }
+
+        fn assert_vector_diagnostics_bits(
+            actual: super::VectorDiagnosticSummary,
+            expected: super::VectorDiagnosticSummary,
+        ) {
+            assert_f64_bits(actual.min_magnitude, expected.min_magnitude);
+            assert_f64_bits(actual.max_magnitude, expected.max_magnitude);
+            assert_f64_bits(actual.l2_norm, expected.l2_norm);
+            assert_f64_bits(actual.x_min, expected.x_min);
+            assert_f64_bits(actual.x_max, expected.x_max);
+            assert_f64_bits(actual.y_min, expected.y_min);
+            assert_f64_bits(actual.y_max, expected.y_max);
+            assert_f64_bits(actual.z_min, expected.z_min);
+            assert_f64_bits(actual.z_max, expected.z_max);
+        }
+
+        fn assert_face_flux_diagnostics_bits(
+            actual: super::FaceFluxDiagnosticSummary,
+            expected: super::FaceFluxDiagnosticSummary,
+        ) {
+            assert_f64_bits(actual.min, expected.min);
+            assert_f64_bits(actual.max, expected.max);
+            assert_f64_bits(actual.l2_norm, expected.l2_norm);
+            assert_f64_bits(actual.sum, expected.sum);
+            assert_f64_bits(actual.sum_abs, expected.sum_abs);
+            assert_f64_bits(actual.internal_sum_abs, expected.internal_sum_abs);
+            assert_f64_bits(actual.boundary_sum, expected.boundary_sum);
+            assert_f64_bits(actual.boundary_sum_abs, expected.boundary_sum_abs);
+        }
+
+        fn assert_matrix_diagnostics_bits(
+            actual: super::MatrixDiagnosticSummary,
+            expected: super::MatrixDiagnosticSummary,
+        ) {
+            assert_eq!(actual.rows, expected.rows);
+            assert_eq!(actual.cols, expected.cols);
+            assert_eq!(actual.nonzeros, expected.nonzeros);
+            assert_f64_bits(actual.diagonal_min, expected.diagonal_min);
+            assert_f64_bits(actual.diagonal_max, expected.diagonal_max);
+            assert_f64_bits(actual.diagonal_sum_abs, expected.diagonal_sum_abs);
+            assert_f64_bits(actual.off_diagonal_sum_abs, expected.off_diagonal_sum_abs);
+            assert_f64_bits(actual.max_row_sum_abs, expected.max_row_sum_abs);
+            assert_f64_bits(
+                actual.max_row_off_diagonal_sum_abs,
+                expected.max_row_off_diagonal_sum_abs,
+            );
+        }
+
+        fn run(max_iterations: usize, invalidate_second: bool) -> super::LaminarSimpleReport {
+            let mut runtime = two_cell_runtime();
+            let fields = two_cell_fields();
+            let mut options = minimal_laminar_options();
+            options.max_simple_iterations = max_iterations;
+            let mut iteration = 0;
+            let mut drive =
+                |_solve: usize,
+                 report: &mut super::ScalarSolveReport,
+                 _predicted_velocity: &[Point3],
+                 _phi_hby_a: &[f64],
+                 _continuity_star: super::ContinuitySummary| {
+                    iteration += 1;
+                    if iteration == 1 {
+                        report.solution.copy_from_slice(&[2.0, -2.0]);
+                    } else if invalidate_second {
+                        report.solution.copy_from_slice(&[f64::MAX, -f64::MAX]);
+                    }
+                };
+            super::solve_laminar_simple_driven(
+                &mut runtime,
+                &fields,
+                &options,
+                None,
+                Some(&mut drive),
+            )
+            .expect("driven SIMPLE report")
+        }
+
+        let accepted = run(1, false);
+        let rejected = run(2, true);
+
+        assert_eq!(
+            rejected.stop_reason,
             LaminarSimpleStopReason::SolverInvalidState
         );
-        assert_eq!(second.simple_iterations, 2);
-        assert!(second.history[0].pressure_correction_accepted);
-        assert!(!second.history[1].pressure_correction_accepted);
-        assert_eq!(second.final_velocity.len(), first.final_velocity.len());
-        for (actual, expected) in second.final_velocity.iter().zip(&first.final_velocity) {
+        for (actual, expected) in rejected.final_velocity.iter().zip(&accepted.final_velocity) {
             assert_eq!(actual.x.to_bits(), expected.x.to_bits());
             assert_eq!(actual.y.to_bits(), expected.y.to_bits());
             assert_eq!(actual.z.to_bits(), expected.z.to_bits());
         }
-        assert_eq!(second.final_pressure, first.final_pressure);
-        assert_eq!(second.final_phi, first.final_phi);
-        assert_eq!(
-            format!("{:?}", second.operator_summary),
-            format!("{:?}", first.operator_summary)
+        for (actual, expected) in rejected.final_pressure.iter().zip(&accepted.final_pressure) {
+            assert_f64_bits(*actual, *expected);
+        }
+        for (actual, expected) in rejected.final_phi.iter().zip(&accepted.final_phi) {
+            assert_f64_bits(*actual, *expected);
+        }
+        assert_continuity_bits(rejected.final_continuity, accepted.final_continuity);
+        assert_vector_diagnostics_bits(rejected.fields.velocity, accepted.fields.velocity);
+        assert_scalar_diagnostics_bits(rejected.fields.pressure, accepted.fields.pressure);
+        assert_f64_bits(
+            rejected.operator_summary.phi_min,
+            accepted.operator_summary.phi_min,
+        );
+        assert_f64_bits(
+            rejected.operator_summary.phi_max,
+            accepted.operator_summary.phi_max,
+        );
+        assert_f64_bits(
+            rejected.operator_summary.phi_sum_abs,
+            accepted.operator_summary.phi_sum_abs,
+        );
+        assert_f64_bits(
+            rejected.operator_summary.grad_p_l2_norm,
+            accepted.operator_summary.grad_p_l2_norm,
+        );
+        assert_f64_bits(
+            rejected.operator_summary.hby_a_l2_norm,
+            accepted.operator_summary.hby_a_l2_norm,
+        );
+        assert_f64_bits(
+            rejected.operator_summary.div_phi_u_l2_norm,
+            accepted.operator_summary.div_phi_u_l2_norm,
+        );
+        let rejected_assembly = rejected.pressure_assembly.unwrap();
+        let accepted_assembly = accepted.pressure_assembly.unwrap();
+        assert_scalar_diagnostics_bits(rejected_assembly.r_au, accepted_assembly.r_au);
+        assert_scalar_diagnostics_bits(rejected_assembly.r_at_u, accepted_assembly.r_at_u);
+        assert_vector_diagnostics_bits(rejected_assembly.hby_a, accepted_assembly.hby_a);
+        assert_face_flux_diagnostics_bits(
+            rejected_assembly.phi_hby_a_before_adjust,
+            accepted_assembly.phi_hby_a_before_adjust,
+        );
+        assert_face_flux_diagnostics_bits(
+            rejected_assembly.phi_hby_a_after_adjust,
+            accepted_assembly.phi_hby_a_after_adjust,
+        );
+        assert_scalar_diagnostics_bits(
+            rejected_assembly.pressure_source,
+            accepted_assembly.pressure_source,
+        );
+        assert_face_flux_diagnostics_bits(
+            rejected_assembly.pressure_equation_flux,
+            accepted_assembly.pressure_equation_flux,
+        );
+        assert_matrix_diagnostics_bits(
+            rejected_assembly.pressure_matrix,
+            accepted_assembly.pressure_matrix,
+        );
+        assert_face_flux_diagnostics_bits(
+            rejected_assembly.pressure_flux,
+            accepted_assembly.pressure_flux,
+        );
+        assert_face_flux_diagnostics_bits(
+            rejected_assembly.corrected_phi,
+            accepted_assembly.corrected_phi,
         );
         assert_eq!(
-            format!("{:?}", second.pressure_assembly),
-            format!("{:?}", first.pressure_assembly)
+            rejected
+                .final_momentum_initial_normalized_residual_norm
+                .to_bits(),
+            accepted
+                .final_momentum_initial_normalized_residual_norm
+                .to_bits()
         );
+        assert_eq!(
+            rejected.final_momentum_residual_norm.to_bits(),
+            accepted.final_momentum_residual_norm.to_bits()
+        );
+        assert_eq!(
+            rejected.final_momentum_normalized_residual_norm.to_bits(),
+            accepted.final_momentum_normalized_residual_norm.to_bits()
+        );
+        assert_eq!(
+            rejected
+                .final_pressure_correction_initial_normalized_residual_norm
+                .to_bits(),
+            accepted
+                .final_pressure_correction_initial_normalized_residual_norm
+                .to_bits()
+        );
+        assert_eq!(
+            rejected.final_pressure_correction_residual_norm.to_bits(),
+            accepted.final_pressure_correction_residual_norm.to_bits()
+        );
+        assert_eq!(
+            rejected
+                .final_pressure_correction_normalized_residual_norm
+                .to_bits(),
+            accepted
+                .final_pressure_correction_normalized_residual_norm
+                .to_bits()
+        );
+        let summary = rejected.history.last().unwrap();
+        assert!(!summary.pressure_correction_accepted);
+        assert_eq!(summary.pressure_correction_update_scale, 0.0);
+        assert_continuity_bits(summary.continuity_after, accepted.final_continuity);
     }
 
     #[test]
