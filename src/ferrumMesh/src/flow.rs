@@ -2635,14 +2635,12 @@ fn evaluate_laminar_simple_residual_control(
 
 fn simple_step_continuity_growth_exceeded(
     accepted: ContinuitySummary,
-    predictor: ContinuitySummary,
+    _predictor: ContinuitySummary,
     corrected: ContinuitySummary,
 ) -> bool {
-    fn component_growth_exceeded(accepted: f64, predictor: f64, corrected: f64) -> bool {
+    fn component_growth_exceeded(accepted: f64, corrected: f64) -> bool {
         accepted.is_finite()
-            && predictor.is_finite()
             && corrected.is_finite()
-            && corrected > predictor
             && growth_ratio_exceeds(
                 accepted,
                 corrected,
@@ -2650,9 +2648,9 @@ fn simple_step_continuity_growth_exceeded(
             )
     }
 
-    component_growth_exceeded(accepted.l2_norm, predictor.l2_norm, corrected.l2_norm)
-        || component_growth_exceeded(accepted.max_abs, predictor.max_abs, corrected.max_abs)
-        || component_growth_exceeded(accepted.sum_abs, predictor.sum_abs, corrected.sum_abs)
+    component_growth_exceeded(accepted.l2_norm, corrected.l2_norm)
+        || component_growth_exceeded(accepted.max_abs, corrected.max_abs)
+        || component_growth_exceeded(accepted.sum_abs, corrected.sum_abs)
 }
 
 fn checked_update_metrics(
@@ -7638,6 +7636,11 @@ mod tests {
                 accepted,
                 predictor,
                 summary(50.0),
+            ));
+            assert!(super::simple_step_continuity_growth_exceeded(
+                accepted,
+                predictor,
+                summary(150.0),
             ));
             assert!(super::simple_step_continuity_growth_exceeded(
                 accepted,
