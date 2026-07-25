@@ -1,6 +1,7 @@
 use std::time::Instant;
 
 use crate::fields::{FieldFile, FieldValueSummary, InitialFieldSet};
+use crate::linear::gamg::NormalizedL1GamgSolveControls;
 use crate::linear::{
     BiCgStabOptions, CgPreconditioner, ConjugateGradientOptions, CsrMatrix, CsrSparsityPattern,
     GamgAgglomerator, GamgFacePairWeight, GamgKernelTiming, GamgOptions, GamgSolveControls,
@@ -2012,7 +2013,12 @@ fn solve_scalar_system_with_workspaces(
         .gamg_options
         .map(|options| options.min_iterations)
         .unwrap_or(0);
-    if initial_normalized_residual_norm < controls.tolerance && gamg_min_iterations == 0 {
+    let initially_converged = if controls.solver == LaminarSimpleLinearSolver::Gamg {
+        initial_l1_residual_norm == 0.0
+    } else {
+        initial_normalized_residual_norm < controls.tolerance
+    };
+    if initially_converged && gamg_min_iterations == 0 {
         return Ok(ScalarSolveReport {
             solution: initial_values.to_vec(),
             iterations: 0,
@@ -2068,26 +2074,37 @@ fn solve_scalar_system_with_workspaces(
             let workspace = gamg_workspace.ok_or_else(|| {
                 invalid_input("GAMG solve requires a matching hierarchy workspace".to_string())
             })?;
-            // GAMG evaluates its native convergence controls with an L2 norm.
-            // Translate both OpenFOAM-style LDU L1 criteria into one conservative
-            // absolute L2 limit so relTol cannot terminate the solve prematurely.
             let relative_solver_tolerance = strict_l2_tolerance_for_l1_limit(
                 gamg_options.relative_tolerance * initial_l1_residual_norm,
                 component_count,
             );
-            let solve_controls = GamgSolveControls {
-                max_iterations: controls.max_iterations,
-                min_iterations: gamg_options.min_iterations,
-                tolerance: solver_tolerance.max(relative_solver_tolerance),
-                relative_tolerance: 0.0,
+            let solve_controls = NormalizedL1GamgSolveControls {
+                normalization_factor: normalisation_factor,
+                tolerance: controls.tolerance,
+                relative_tolerance: gamg_options.relative_tolerance,
+                l2_controls: GamgSolveControls {
+                    max_iterations: controls.max_iterations,
+                    min_iterations: gamg_options.min_iterations,
+                    tolerance: solver_tolerance.max(relative_solver_tolerance),
+                    relative_tolerance: 0.0,
+                },
             };
             if controls.profile_gamg {
-                let profiled =
-                    workspace.solve_with_controls_profiled(matrix, rhs, initial, solve_controls)?;
+                let profiled = workspace.solve_normalized_l1_with_controls_profiled(
+                    matrix,
+                    rhs,
+                    initial,
+                    solve_controls,
+                )?;
                 (profiled.report, None, Some(profiled.timing))
             } else {
                 (
-                    workspace.solve_with_controls(matrix, rhs, initial, solve_controls)?,
+                    workspace.solve_normalized_l1_with_controls(
+                        matrix,
+                        rhs,
+                        initial,
+                        solve_controls,
+                    )?,
                     None,
                     None,
                 )
@@ -2159,12 +2176,18 @@ fn solve_scalar_system_with_workspaces(
     {
         *residual_value = source - matrix_value;
     }
-    let final_normalized_residual_norm = l1_norm(residual) / normalisation_factor;
+    let final_l1_residual_norm = l1_norm(residual);
+    let final_normalized_residual_norm = final_l1_residual_norm / normalisation_factor;
     let relative_tolerance = controls
         .gamg_options
         .map(|options| options.relative_tolerance)
         .unwrap_or(0.0);
-    let converged = final_normalized_residual_norm < controls.tolerance
+    let gamg_exact_zero = controls.solver == LaminarSimpleLinearSolver::Gamg
+        && final_l1_residual_norm == 0.0
+        && report.termination == IterativeSolveTermination::Converged
+        && report.iterations == 0;
+    let converged = gamg_exact_zero
+        || final_normalized_residual_norm < controls.tolerance
         || (relative_tolerance > 0.0
             && final_normalized_residual_norm
                 < relative_tolerance * initial_normalized_residual_norm);
@@ -8001,30 +8024,54 @@ mod tests {
     }
 
     #[test]
-    fn gamg_relative_tolerance_uses_the_openfoam_normalized_residual() {
+    fn gamg_absolute_normalized_l1_stops_before_conservative_l2() {
         let cell_count = 8;
-        let rows = (0..cell_count)
-            .map(|row| {
-                let mut entries = vec![(row, 2.0)];
-                if row > 0 {
-                    entries.push((row - 1, -1.0));
-                }
-                if row + 1 < cell_count {
-                    entries.push((row + 1, -1.0));
-                }
-                entries.sort_by_key(|(column, _)| *column);
-                entries
-            })
-            .collect::<Vec<_>>();
-        let matrix = CsrMatrix::from_rows(rows, cell_count).expect("Poisson chain");
-        let expected = (0..cell_count)
-            .map(|cell| 0.25 + cell as f64 / cell_count as f64)
-            .collect::<Vec<_>>();
-        let rhs = matrix.matvec(&expected).expect("Poisson rhs");
+        let rows = vec![
+            vec![(0, 5.2), (1, -0.7), (3, -0.4)],
+            vec![(0, -0.7), (1, 4.7), (2, -0.6)],
+            vec![(1, -0.6), (2, 4.9), (3, -0.8), (5, -0.3)],
+            vec![(0, -0.4), (2, -0.8), (3, 5.4), (4, -0.5)],
+            vec![(3, -0.5), (4, 4.6), (5, -0.9), (7, -0.2)],
+            vec![(2, -0.3), (4, -0.9), (5, 5.1), (6, -0.6)],
+            vec![(5, -0.6), (6, 4.8), (7, -0.7)],
+            vec![(4, -0.2), (6, -0.7), (7, 4.3)],
+        ];
+        let expected = [0.3, -0.2, 0.8, 1.4, -0.7, 0.5, 1.1, -0.4];
+        let initial = [0.1, 0.4, -0.3, 0.9, -0.2, 0.7, 0.2, -0.1];
+        let mut rhs = vec![0.0; cell_count];
+        let mut initial_product = vec![0.0; cell_count];
+        let mut row_sums = vec![0.0; cell_count];
+        for (row, entries) in rows.iter().enumerate() {
+            for &(column, coefficient) in entries {
+                rhs[row] += coefficient * expected[column];
+                initial_product[row] += coefficient * initial[column];
+                row_sums[row] += coefficient;
+            }
+        }
+        let average = initial.iter().sum::<f64>() / cell_count as f64;
+        let mut source_term = 0.0;
+        let mut matrix_term = 0.0;
+        let mut factor = 0.0;
+        let mut initial_l1 = 0.0;
+        let mut initial_l2_squared = 0.0;
+        for row in 0..cell_count {
+            let source_contribution = (rhs[row] - row_sums[row] * average).abs();
+            let matrix_contribution = (initial_product[row] - row_sums[row] * average).abs();
+            source_term += source_contribution;
+            matrix_term += matrix_contribution;
+            factor += matrix_contribution + source_contribution;
+            let residual = rhs[row] - initial_product[row];
+            initial_l1 += residual.abs();
+            initial_l2_squared += residual * residual;
+        }
+        assert!(source_term > 0.0);
+        assert!(matrix_term > 0.0);
+        assert!(initial_l2_squared > 0.0);
+        let matrix = CsrMatrix::from_rows(rows, cell_count).expect("nontrivial SPD matrix");
         let gamg_options = GamgOptions {
-            max_iterations: 50,
-            tolerance: 1.0e-30,
-            relative_tolerance: 0.2,
+            max_iterations: 2,
+            tolerance: initial_l1 / factor,
+            relative_tolerance: 0.0,
             n_cells_in_coarsest_level: 1,
             direct_solve_coarsest: true,
             ..GamgOptions::default()
@@ -8035,7 +8082,7 @@ mod tests {
         let report = super::solve_scalar_system_with_workspaces(
             &matrix,
             &rhs,
-            None,
+            Some(&initial),
             super::ScalarSolveControls {
                 solver: LaminarSimpleLinearSolver::Gamg,
                 preconditioner: LaminarSimplePreconditioner::None,
@@ -8048,17 +8095,476 @@ mod tests {
             None,
             Some(&mut gamg_workspace),
         )
-        .expect("GAMG relative-tolerance solve");
+        .expect("GAMG absolute probe");
 
-        assert!(report.iterations > 0);
-        assert!(report.converged);
-        assert!(
-            report.normalized_residual_norm
-                < gamg_options.relative_tolerance * report.initial_normalized_residual_norm
+        assert_eq!(report.iterations, 1);
+        assert_eq!(report.termination, IterativeSolveTermination::Converged);
+        assert_eq!(
+            report.initial_normalized_residual_norm.to_bits(),
+            (initial_l1 / factor).to_bits()
+        );
+        let mut final_l1 = 0.0;
+        let mut final_l2_squared = 0.0;
+        for (row, rhs_value) in rhs.iter().enumerate() {
+            let mut product = 0.0;
+            for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                product += matrix.values()[entry] * report.solution[matrix.col_indices()[entry]];
+            }
+            let residual = rhs_value - product;
+            final_l1 += residual.abs();
+            final_l2_squared += residual * residual;
+        }
+        let boundary = final_l1 / factor;
+        assert_eq!(
+            report.normalized_residual_norm.to_bits(),
+            boundary.to_bits()
+        );
+        assert_eq!(
+            report.residual_norm.to_bits(),
+            final_l2_squared.sqrt().to_bits()
         );
         let profile = report.gamg_timing.as_ref().expect("GAMG profile");
         assert_eq!(profile.solves, 1);
         assert_eq!(profile.v_cycles, report.iterations);
+        assert_eq!(profile.finest_residual_evaluations, 2);
+        assert!(report.pcg_timing.is_none());
+
+        let accepted_options = GamgOptions {
+            tolerance: boundary.next_up(),
+            max_iterations: 2,
+            ..gamg_options
+        };
+        let mut accepted_scalar_workspace = super::ScalarSolveWorkspace::new(cell_count);
+        let mut accepted_gamg_workspace =
+            GamgWorkspace::new(&matrix, accepted_options).expect("accepted GAMG workspace");
+        let accepted = super::solve_scalar_system_with_workspaces(
+            &matrix,
+            &rhs,
+            Some(&initial),
+            super::ScalarSolveControls {
+                solver: LaminarSimpleLinearSolver::Gamg,
+                preconditioner: LaminarSimplePreconditioner::None,
+                tolerance: accepted_options.tolerance,
+                max_iterations: accepted_options.max_iterations,
+                gamg_options: Some(accepted_options),
+                profile_gamg: true,
+            },
+            &mut accepted_scalar_workspace,
+            None,
+            Some(&mut accepted_gamg_workspace),
+        )
+        .expect("accepted GAMG absolute solve");
+        assert_eq!(accepted.termination, IterativeSolveTermination::Converged);
+        assert_eq!(accepted.iterations, 1);
+        assert_eq!(accepted.solution.len(), report.solution.len());
+        for (accepted_value, probe_value) in accepted.solution.iter().zip(&report.solution) {
+            assert_eq!(accepted_value.to_bits(), probe_value.to_bits());
+        }
+        assert_eq!(
+            accepted.residual_norm.to_bits(),
+            report.residual_norm.to_bits()
+        );
+        let accepted_timing = accepted.gamg_timing.as_ref().expect("accepted timing");
+        assert_eq!(
+            (
+                accepted_timing.hierarchy_builds,
+                accepted_timing.hierarchy_rebuilds,
+                accepted_timing.matrix_refreshes,
+                accepted_timing.finest_residual_evaluations,
+                accepted_timing.solves,
+                accepted_timing.v_cycles,
+            ),
+            (0, 0, 1, 2, 1, 1)
+        );
+        assert_eq!(
+            accepted_timing
+                .levels
+                .iter()
+                .map(|level| (level.level, level.cells, level.nonzeros))
+                .collect::<Vec<_>>(),
+            [(0, 8, 28), (1, 4, 10), (2, 2, 4), (3, 1, 1)]
+        );
+        for level in &accepted_timing.levels {
+            let expected = match level.level {
+                0 => (1, 1, 1, 1, 2, 1, 0, 1, 0),
+                1 => (1, 1, 1, 1, 2, 1, 0, 1, 0),
+                2 => (1, 1, 1, 2, 4, 0, 1, 1, 0),
+                3 => (1, 0, 0, 0, 0, 0, 0, 0, 1),
+                _ => unreachable!("literal four-level hierarchy"),
+            };
+            assert_eq!(
+                (
+                    level.matrix_refreshes,
+                    level.restriction_calls,
+                    level.prolongation_calls,
+                    level.smoothing_calls,
+                    level.smoothing_sweeps,
+                    level.scaling_calls,
+                    level.residual_evaluations,
+                    level.correction_updates,
+                    level.coarsest_solves,
+                ),
+                expected
+            );
+            assert!(
+                level.matrix_refresh_seconds.is_finite() && level.matrix_refresh_seconds >= 0.0
+            );
+            for seconds in [
+                level.restriction_seconds,
+                level.prolongation_seconds,
+                level.smoothing_seconds,
+                level.scaling_seconds,
+                level.residual_seconds,
+                level.correction_seconds,
+                level.coarsest_solve_seconds,
+            ] {
+                assert!(seconds.is_finite() && seconds >= 0.0);
+            }
+        }
+        for seconds in [
+            accepted_timing.total_seconds,
+            accepted_timing.hierarchy_build_seconds,
+            accepted_timing.hierarchy_rebuild_seconds,
+            accepted_timing.matrix_refresh_seconds,
+            accepted_timing.finest_residual_seconds,
+            accepted_timing.v_cycle_seconds,
+            accepted_timing.other_seconds,
+        ] {
+            assert!(seconds.is_finite() && seconds >= 0.0);
+        }
+        assert!(accepted.pcg_timing.is_none());
+        let equality_options = GamgOptions {
+            tolerance: boundary,
+            ..accepted_options
+        };
+        let mut equality_scalar_workspace = super::ScalarSolveWorkspace::new(cell_count);
+        let mut equality_gamg_workspace =
+            GamgWorkspace::new(&matrix, equality_options).expect("equality GAMG workspace");
+        let equality = super::solve_scalar_system_with_workspaces(
+            &matrix,
+            &rhs,
+            Some(&initial),
+            super::ScalarSolveControls {
+                solver: LaminarSimpleLinearSolver::Gamg,
+                preconditioner: LaminarSimplePreconditioner::None,
+                tolerance: equality_options.tolerance,
+                max_iterations: equality_options.max_iterations,
+                gamg_options: Some(equality_options),
+                profile_gamg: true,
+            },
+            &mut equality_scalar_workspace,
+            None,
+            Some(&mut equality_gamg_workspace),
+        )
+        .expect("equality GAMG absolute solve");
+        assert_eq!(equality.iterations, 2);
+        assert_eq!(equality.termination, IterativeSolveTermination::Converged);
+        let equality_timing = equality.gamg_timing.expect("equality timing");
+        assert_eq!(equality_timing.finest_residual_evaluations, 3);
+
+        let legacy_limit =
+            (accepted_options.tolerance * factor / (cell_count as f64).sqrt()).next_down();
+        let mut legacy_workspace =
+            GamgWorkspace::new(&matrix, gamg_options).expect("legacy GAMG workspace");
+        let legacy = legacy_workspace
+            .solve_with_controls_profiled(
+                &matrix,
+                &rhs,
+                Some(&initial),
+                crate::linear::gamg::GamgSolveControls {
+                    max_iterations: 2,
+                    min_iterations: 0,
+                    tolerance: legacy_limit,
+                    relative_tolerance: 0.0,
+                },
+            )
+            .expect("legacy L2 solve");
+        assert_eq!(legacy.report.iterations, 2);
+        assert_eq!(
+            legacy.report.termination,
+            IterativeSolveTermination::Converged
+        );
+        assert_eq!(legacy.timing.finest_residual_evaluations, 3);
+        for (equality_value, legacy_value) in equality.solution.iter().zip(&legacy.report.solution)
+        {
+            assert_eq!(equality_value.to_bits(), legacy_value.to_bits());
+        }
+        assert_eq!(
+            equality.residual_norm.to_bits(),
+            legacy.report.residual_norm.to_bits()
+        );
+    }
+
+    #[test]
+    fn gamg_relative_normalized_l1_stops_before_conservative_l2() {
+        let rows = vec![
+            vec![(0, 4.0), (1, -1.0), (3, -0.5)],
+            vec![(0, -1.0), (1, 4.5), (2, -0.8)],
+            vec![(1, -0.8), (2, 3.8), (3, -0.7)],
+            vec![(0, -0.5), (2, -0.7), (3, 4.2), (4, -0.9)],
+            vec![(3, -0.9), (4, 4.1), (5, -0.6)],
+            vec![(4, -0.6), (5, 3.9), (6, -0.8)],
+            vec![(5, -0.8), (6, 4.4), (7, -0.7)],
+            vec![(6, -0.7), (7, 3.7)],
+        ];
+        let matrix = CsrMatrix::from_rows(rows, 8).expect("nontrivial SPD matrix");
+        let reference = [0.7, -0.4, 1.2, 0.3, -0.8, 1.5, 0.6, -0.2];
+        let initial = [-0.1, 0.5, 0.2, -0.6, 0.9, 0.1, -0.3, 0.4];
+        let mut rhs = [0.0; 8];
+        let mut initial_product = [0.0; 8];
+        let mut row_sums = [0.0; 8];
+        for (row, rhs_value) in rhs.iter_mut().enumerate() {
+            for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                let column = matrix.col_indices()[entry];
+                let coefficient = matrix.values()[entry];
+                *rhs_value += coefficient * reference[column];
+                initial_product[row] += coefficient * initial[column];
+                row_sums[row] += coefficient;
+            }
+        }
+        let average = initial.iter().sum::<f64>() / 8.0;
+        let mut source_term = 0.0;
+        let mut matrix_term = 0.0;
+        let mut factor = 0.0;
+        let mut initial_l1 = 0.0;
+        let mut initial_l2_squared = 0.0;
+        for row in 0..8 {
+            let source_contribution = (rhs[row] - row_sums[row] * average).abs();
+            let matrix_contribution = (initial_product[row] - row_sums[row] * average).abs();
+            source_term += source_contribution;
+            matrix_term += matrix_contribution;
+            factor += matrix_contribution + source_contribution;
+            let residual = rhs[row] - initial_product[row];
+            initial_l1 += residual.abs();
+            initial_l2_squared += residual * residual;
+        }
+        assert!(source_term > 0.0);
+        assert!(matrix_term > 0.0);
+        assert!(initial_l2_squared > 0.0);
+        let probe_options = GamgOptions {
+            max_iterations: 2,
+            tolerance: f64::MIN_POSITIVE,
+            relative_tolerance: 1.0,
+            n_cells_in_coarsest_level: 1,
+            direct_solve_coarsest: true,
+            ..GamgOptions::default()
+        };
+        let mut probe_scalar_workspace = super::ScalarSolveWorkspace::new(8);
+        let mut probe_gamg_workspace =
+            GamgWorkspace::new(&matrix, probe_options).expect("probe GAMG workspace");
+        let probe = super::solve_scalar_system_with_workspaces(
+            &matrix,
+            &rhs,
+            Some(&initial),
+            super::ScalarSolveControls {
+                solver: LaminarSimpleLinearSolver::Gamg,
+                preconditioner: LaminarSimplePreconditioner::None,
+                tolerance: probe_options.tolerance,
+                max_iterations: probe_options.max_iterations,
+                gamg_options: Some(probe_options),
+                profile_gamg: false,
+            },
+            &mut probe_scalar_workspace,
+            None,
+            Some(&mut probe_gamg_workspace),
+        )
+        .expect("relative probe");
+        assert_eq!(probe.iterations, 1);
+        assert_eq!(probe.termination, IterativeSolveTermination::Converged);
+        assert_eq!(
+            probe.initial_normalized_residual_norm.to_bits(),
+            (initial_l1 / factor).to_bits()
+        );
+        let mut final_l1 = 0.0;
+        let mut final_l2_squared = 0.0;
+        for (row, rhs_value) in rhs.iter().enumerate() {
+            let mut product = 0.0;
+            for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                product += matrix.values()[entry] * probe.solution[matrix.col_indices()[entry]];
+            }
+            let residual = rhs_value - product;
+            final_l1 += residual.abs();
+            final_l2_squared += residual * residual;
+        }
+        let relative_boundary = (final_l1 / factor) / (initial_l1 / factor);
+        assert_eq!(
+            probe.normalized_residual_norm.to_bits(),
+            (final_l1 / factor).to_bits()
+        );
+        assert_eq!(
+            probe.residual_norm.to_bits(),
+            final_l2_squared.sqrt().to_bits()
+        );
+
+        let accepted_options = GamgOptions {
+            max_iterations: 2,
+            relative_tolerance: relative_boundary.next_up(),
+            ..probe_options
+        };
+        let mut accepted_scalar_workspace = super::ScalarSolveWorkspace::new(8);
+        let mut accepted_gamg_workspace =
+            GamgWorkspace::new(&matrix, accepted_options).expect("accepted GAMG workspace");
+        let accepted = super::solve_scalar_system_with_workspaces(
+            &matrix,
+            &rhs,
+            Some(&initial),
+            super::ScalarSolveControls {
+                solver: LaminarSimpleLinearSolver::Gamg,
+                preconditioner: LaminarSimplePreconditioner::None,
+                tolerance: accepted_options.tolerance,
+                max_iterations: accepted_options.max_iterations,
+                gamg_options: Some(accepted_options),
+                profile_gamg: true,
+            },
+            &mut accepted_scalar_workspace,
+            None,
+            Some(&mut accepted_gamg_workspace),
+        )
+        .expect("accepted GAMG relative solve");
+        assert_eq!(accepted.termination, IterativeSolveTermination::Converged);
+        assert_eq!(accepted.iterations, 1);
+        for (accepted_value, probe_value) in accepted.solution.iter().zip(&probe.solution) {
+            assert_eq!(accepted_value.to_bits(), probe_value.to_bits());
+        }
+        assert_eq!(
+            accepted.residual_norm.to_bits(),
+            probe.residual_norm.to_bits()
+        );
+        let timing = accepted.gamg_timing.expect("profiled GAMG timing");
+        assert_eq!(timing.solves, 1);
+        assert_eq!(timing.v_cycles, 1);
+        assert_eq!(timing.finest_residual_evaluations, 2);
+        assert_eq!(
+            (
+                timing.hierarchy_builds,
+                timing.hierarchy_rebuilds,
+                timing.matrix_refreshes,
+            ),
+            (0, 0, 1)
+        );
+        assert_eq!(
+            timing
+                .levels
+                .iter()
+                .map(|level| (level.level, level.cells, level.nonzeros))
+                .collect::<Vec<_>>(),
+            [(0, 8, 24), (1, 4, 10), (2, 2, 4), (3, 1, 1)]
+        );
+        for level in &timing.levels {
+            let expected = match level.level {
+                0 => (1, 1, 1, 1, 2, 1, 0, 1, 0),
+                1 => (1, 1, 1, 1, 2, 1, 0, 1, 0),
+                2 => (1, 1, 1, 2, 4, 0, 1, 1, 0),
+                3 => (1, 0, 0, 0, 0, 0, 0, 0, 1),
+                _ => unreachable!("literal four-level hierarchy"),
+            };
+            assert_eq!(
+                (
+                    level.matrix_refreshes,
+                    level.restriction_calls,
+                    level.prolongation_calls,
+                    level.smoothing_calls,
+                    level.smoothing_sweeps,
+                    level.scaling_calls,
+                    level.residual_evaluations,
+                    level.correction_updates,
+                    level.coarsest_solves,
+                ),
+                expected
+            );
+            for seconds in [
+                level.matrix_refresh_seconds,
+                level.restriction_seconds,
+                level.prolongation_seconds,
+                level.smoothing_seconds,
+                level.scaling_seconds,
+                level.residual_seconds,
+                level.correction_seconds,
+                level.coarsest_solve_seconds,
+            ] {
+                assert!(seconds.is_finite() && seconds >= 0.0);
+            }
+        }
+        for seconds in [
+            timing.total_seconds,
+            timing.hierarchy_build_seconds,
+            timing.hierarchy_rebuild_seconds,
+            timing.matrix_refresh_seconds,
+            timing.finest_residual_seconds,
+            timing.v_cycle_seconds,
+            timing.other_seconds,
+        ] {
+            assert!(seconds.is_finite() && seconds >= 0.0);
+        }
+        assert!(accepted.pcg_timing.is_none());
+
+        let equality_options = GamgOptions {
+            relative_tolerance: relative_boundary,
+            ..accepted_options
+        };
+        let mut equality_scalar_workspace = super::ScalarSolveWorkspace::new(8);
+        let mut equality_gamg_workspace =
+            GamgWorkspace::new(&matrix, equality_options).expect("equality GAMG workspace");
+        let equality = super::solve_scalar_system_with_workspaces(
+            &matrix,
+            &rhs,
+            Some(&initial),
+            super::ScalarSolveControls {
+                solver: LaminarSimpleLinearSolver::Gamg,
+                preconditioner: LaminarSimplePreconditioner::None,
+                tolerance: equality_options.tolerance,
+                max_iterations: equality_options.max_iterations,
+                gamg_options: Some(equality_options),
+                profile_gamg: true,
+            },
+            &mut equality_scalar_workspace,
+            None,
+            Some(&mut equality_gamg_workspace),
+        )
+        .expect("equality GAMG relative solve");
+        assert_eq!(equality.iterations, 2);
+        assert_eq!(equality.termination, IterativeSolveTermination::Converged);
+        assert!(
+            equality.normalized_residual_norm
+                < relative_boundary * equality.initial_normalized_residual_norm
+        );
+        let equality_timing = equality.gamg_timing.expect("equality timing");
+        assert_eq!(equality_timing.finest_residual_evaluations, 3);
+
+        let legacy_absolute_limit =
+            (accepted_options.tolerance * factor / 8.0_f64.sqrt()).next_down();
+        let legacy_relative_limit =
+            (accepted_options.relative_tolerance * initial_l1 / 8.0_f64.sqrt()).next_down();
+        let legacy_limit = legacy_absolute_limit.max(legacy_relative_limit);
+        let mut legacy_workspace =
+            GamgWorkspace::new(&matrix, probe_options).expect("legacy GAMG workspace");
+        let legacy = legacy_workspace
+            .solve_with_controls_profiled(
+                &matrix,
+                &rhs,
+                Some(&initial),
+                crate::linear::gamg::GamgSolveControls {
+                    max_iterations: 2,
+                    min_iterations: 0,
+                    tolerance: legacy_limit,
+                    relative_tolerance: 0.0,
+                },
+            )
+            .expect("legacy L2 solve");
+        assert_eq!(legacy.report.iterations, 2);
+        assert_eq!(
+            legacy.report.termination,
+            IterativeSolveTermination::Converged
+        );
+        assert_eq!(legacy.timing.finest_residual_evaluations, 3);
+        for (equality_value, legacy_value) in equality.solution.iter().zip(&legacy.report.solution)
+        {
+            assert_eq!(equality_value.to_bits(), legacy_value.to_bits());
+        }
+        assert_eq!(
+            equality.residual_norm.to_bits(),
+            legacy.report.residual_norm.to_bits()
+        );
     }
 
     #[test]
