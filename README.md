@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="ferrumcfd-banner-dark.png" alt="FerrumCFD logo with cylinder-flow visualization" width="720">
+  <img src="ferrumcfd-logo.png" alt="FerrumCFD logo with a cylinder-flow visualization" width="720">
 </p>
 
 <h1 align="center">FerrumCFD</h1>
