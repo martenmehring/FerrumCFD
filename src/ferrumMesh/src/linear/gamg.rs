@@ -2239,6 +2239,3844 @@ mod tests {
     }
 
     #[test]
+    fn invalid_normalized_l1_controls_fail_before_solve_mutation() {
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct UsizeVecSnap {
+            len: usize,
+            capacity: usize,
+            values: Vec<usize>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct BitsVecSnap {
+            len: usize,
+            capacity: usize,
+            bits: Vec<u64>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct PairVecSnap {
+            len: usize,
+            capacity: usize,
+            values: Vec<(usize, usize)>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct NestedUsizeSnap {
+            len: usize,
+            capacity: usize,
+            vectors: Vec<(usize, UsizeVecSnap)>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct NestedBitsSnap {
+            len: usize,
+            capacity: usize,
+            vectors: Vec<(usize, BitsVecSnap)>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct NestedPairSnap {
+            len: usize,
+            capacity: usize,
+            vectors: Vec<(usize, PairVecSnap)>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct SparsityValueSnap {
+            rows: usize,
+            cols: usize,
+            row_offsets_len: usize,
+            row_offsets: Vec<usize>,
+            col_indices_len: usize,
+            col_indices: Vec<usize>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct MatrixValueSnap {
+            sparsity: SparsityValueSnap,
+            values: BitsVecSnap,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        enum AgglomerationValueSnap {
+            Algebraic,
+            FaceArea {
+                len: usize,
+                weights: Vec<(usize, usize, u64)>,
+            },
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct TransferValueSnap {
+            fine_to_coarse: UsizeVecSnap,
+            fine_entry_to_coarse_entry: UsizeVecSnap,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct IncompleteCholeskyValueSnap {
+            sparsity: SparsityValueSnap,
+            lower_row_offsets: UsizeVecSnap,
+            lower_columns: UsizeVecSnap,
+            matrix_slots: UsizeVecSnap,
+            diagonal_factor_slots: UsizeVecSnap,
+            update_pairs: NestedPairSnap,
+            dependent_row_offsets: UsizeVecSnap,
+            dependent_entries: PairVecSnap,
+            factors: BitsVecSnap,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        enum PreconditionerValueSnap {
+            None,
+            Diagonal {
+                matrix_slots: UsizeVecSnap,
+                inverse: BitsVecSnap,
+            },
+            IncompleteCholesky(Box<IncompleteCholeskyValueSnap>),
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct PcgValueSnap {
+            sparsity: SparsityValueSnap,
+            preconditioner_kind: CgPreconditioner,
+            preconditioner: PreconditionerValueSnap,
+            residual: BitsVecSnap,
+            preconditioned_residual: BitsVecSnap,
+            direction: BitsVecSnap,
+            matrix_direction: BitsVecSnap,
+            preconditioner_scratch: BitsVecSnap,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct WorkspaceValueSnap {
+            option_iterations: (usize, usize, u64, u64),
+            option_hierarchy: (bool, usize, usize, GamgAgglomerator),
+            option_smoothing: (GamgSmoother, usize, usize, usize, usize, usize, usize),
+            option_correction: (usize, bool, bool, bool),
+            agglomeration: AgglomerationValueSnap,
+            finest_sparsity: SparsityValueSnap,
+            matrices_len: usize,
+            matrices_capacity: usize,
+            matrices: Vec<(usize, MatrixValueSnap)>,
+            transfers_len: usize,
+            transfers_capacity: usize,
+            transfers: Vec<(usize, TransferValueSnap)>,
+            diagonal_slots: NestedUsizeSnap,
+            corrections: NestedBitsSnap,
+            sources: NestedBitsSnap,
+            residuals: NestedBitsSnap,
+            products: NestedBitsSnap,
+            pre_smoothed: NestedBitsSnap,
+            coarsest_pcg: Option<PcgValueSnap>,
+            has_solved: bool,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct LevelTimingValueSnap {
+            metadata: (usize, usize, usize),
+            seconds_bits: [u64; 8],
+            counters: [usize; 9],
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct TimingValueSnap {
+            seconds_bits: [u64; 7],
+            counters: [usize; 6],
+            levels_len: usize,
+            levels_capacity: usize,
+            levels: Vec<(usize, LevelTimingValueSnap)>,
+        }
+
+        #[derive(Clone, Debug)]
+        struct FullSnapshot {
+            workspace: WorkspaceValueSnap,
+            timing: TimingValueSnap,
+            initial: BitsVecSnap,
+            usize_arcs: Vec<(String, std::sync::Arc<[usize]>)>,
+            face_arcs: Vec<std::sync::Arc<[GamgFacePairWeight]>>,
+        }
+
+        let usize_vec_snap = |values: &Vec<usize>| UsizeVecSnap {
+            len: values.len(),
+            capacity: values.capacity(),
+            values: values.clone(),
+        };
+        let bits_vec_snap = |values: &Vec<f64>| BitsVecSnap {
+            len: values.len(),
+            capacity: values.capacity(),
+            bits: values.iter().map(|value| value.to_bits()).collect(),
+        };
+        let pair_vec_snap = |values: &Vec<(usize, usize)>| PairVecSnap {
+            len: values.len(),
+            capacity: values.capacity(),
+            values: values.clone(),
+        };
+        let nested_usize_snap = |vectors: &Vec<Vec<usize>>| NestedUsizeSnap {
+            len: vectors.len(),
+            capacity: vectors.capacity(),
+            vectors: vectors
+                .iter()
+                .enumerate()
+                .map(|(index, values)| (index, usize_vec_snap(values)))
+                .collect(),
+        };
+        let nested_bits_snap = |vectors: &Vec<Vec<f64>>| NestedBitsSnap {
+            len: vectors.len(),
+            capacity: vectors.capacity(),
+            vectors: vectors
+                .iter()
+                .enumerate()
+                .map(|(index, values)| (index, bits_vec_snap(values)))
+                .collect(),
+        };
+        let nested_pair_snap = |vectors: &Vec<Vec<(usize, usize)>>| NestedPairSnap {
+            len: vectors.len(),
+            capacity: vectors.capacity(),
+            vectors: vectors
+                .iter()
+                .enumerate()
+                .map(|(index, values)| (index, pair_vec_snap(values)))
+                .collect(),
+        };
+        let sparsity_snap =
+            |sparsity: &crate::linear::CsrSparsityPattern,
+             label: &str,
+             arcs: &mut Vec<(String, std::sync::Arc<[usize]>)>| {
+                arcs.push((format!("{label}.row_offsets"), sparsity.row_offsets.clone()));
+                arcs.push((format!("{label}.col_indices"), sparsity.col_indices.clone()));
+                SparsityValueSnap {
+                    rows: sparsity.rows,
+                    cols: sparsity.cols,
+                    row_offsets_len: sparsity.row_offsets.len(),
+                    row_offsets: sparsity.row_offsets.to_vec(),
+                    col_indices_len: sparsity.col_indices.len(),
+                    col_indices: sparsity.col_indices.to_vec(),
+                }
+            };
+        let timing_snap = |timing: &super::GamgKernelTiming| TimingValueSnap {
+            seconds_bits: [
+                timing.total_seconds.to_bits(),
+                timing.hierarchy_build_seconds.to_bits(),
+                timing.hierarchy_rebuild_seconds.to_bits(),
+                timing.matrix_refresh_seconds.to_bits(),
+                timing.finest_residual_seconds.to_bits(),
+                timing.v_cycle_seconds.to_bits(),
+                timing.other_seconds.to_bits(),
+            ],
+            counters: [
+                timing.hierarchy_builds,
+                timing.hierarchy_rebuilds,
+                timing.matrix_refreshes,
+                timing.finest_residual_evaluations,
+                timing.solves,
+                timing.v_cycles,
+            ],
+            levels_len: timing.levels.len(),
+            levels_capacity: timing.levels.capacity(),
+            levels: timing
+                .levels
+                .iter()
+                .enumerate()
+                .map(|(index, level)| {
+                    (
+                        index,
+                        LevelTimingValueSnap {
+                            metadata: (level.level, level.cells, level.nonzeros),
+                            seconds_bits: [
+                                level.matrix_refresh_seconds.to_bits(),
+                                level.restriction_seconds.to_bits(),
+                                level.prolongation_seconds.to_bits(),
+                                level.smoothing_seconds.to_bits(),
+                                level.scaling_seconds.to_bits(),
+                                level.residual_seconds.to_bits(),
+                                level.correction_seconds.to_bits(),
+                                level.coarsest_solve_seconds.to_bits(),
+                            ],
+                            counters: [
+                                level.matrix_refreshes,
+                                level.restriction_calls,
+                                level.prolongation_calls,
+                                level.smoothing_calls,
+                                level.smoothing_sweeps,
+                                level.scaling_calls,
+                                level.residual_evaluations,
+                                level.correction_updates,
+                                level.coarsest_solves,
+                            ],
+                        },
+                    )
+                })
+                .collect(),
+        };
+        let snapshot = |workspace: &GamgWorkspace,
+                        timing: &super::GamgKernelTiming,
+                        initial: &Vec<f64>| {
+            let mut usize_arcs = Vec::<(String, std::sync::Arc<[usize]>)>::new();
+            let mut face_arcs = Vec::<std::sync::Arc<[GamgFacePairWeight]>>::new();
+
+            let agglomeration = match &workspace.agglomeration_source {
+                super::GamgAgglomerationSource::Algebraic => AgglomerationValueSnap::Algebraic,
+                super::GamgAgglomerationSource::FaceArea(weights) => {
+                    face_arcs.push(weights.clone());
+                    AgglomerationValueSnap::FaceArea {
+                        len: weights.len(),
+                        weights: weights
+                            .iter()
+                            .map(|weight| {
+                                let (first, second) = weight.cells();
+                                (first, second, weight.weight().to_bits())
+                            })
+                            .collect(),
+                    }
+                }
+            };
+            let finest_sparsity = sparsity_snap(
+                &workspace.finest_sparsity,
+                "finest_sparsity",
+                &mut usize_arcs,
+            );
+            let matrices = workspace
+                .matrices
+                .iter()
+                .enumerate()
+                .map(|(index, matrix)| {
+                    let sparsity = sparsity_snap(
+                        &matrix.sparsity_pattern(),
+                        &format!("matrix[{index}]"),
+                        &mut usize_arcs,
+                    );
+                    (
+                        index,
+                        MatrixValueSnap {
+                            sparsity,
+                            values: bits_vec_snap(&matrix.values),
+                        },
+                    )
+                })
+                .collect();
+            let transfers = workspace
+                .transfers
+                .iter()
+                .enumerate()
+                .map(|(index, transfer)| {
+                    (
+                        index,
+                        TransferValueSnap {
+                            fine_to_coarse: usize_vec_snap(&transfer.fine_to_coarse),
+                            fine_entry_to_coarse_entry: usize_vec_snap(
+                                &transfer.fine_entry_to_coarse_entry,
+                            ),
+                        },
+                    )
+                })
+                .collect();
+            let coarsest_pcg = workspace.coarsest_pcg.as_ref().map(|pcg| {
+                let sparsity =
+                    sparsity_snap(&pcg.sparsity, "coarsest_pcg.sparsity", &mut usize_arcs);
+                let preconditioner = match &pcg.preconditioner {
+                    crate::linear::ReusablePreconditioner::None => PreconditionerValueSnap::None,
+                    crate::linear::ReusablePreconditioner::Diagonal {
+                        matrix_slots,
+                        inverse,
+                    } => PreconditionerValueSnap::Diagonal {
+                        matrix_slots: usize_vec_snap(matrix_slots),
+                        inverse: bits_vec_snap(inverse),
+                    },
+                    crate::linear::ReusablePreconditioner::IncompleteCholesky(ic) => {
+                        let ic_sparsity = sparsity_snap(
+                            &ic.sparsity,
+                            "coarsest_pcg.ic.sparsity",
+                            &mut usize_arcs,
+                        );
+                        PreconditionerValueSnap::IncompleteCholesky(Box::new(
+                            IncompleteCholeskyValueSnap {
+                                sparsity: ic_sparsity,
+                                lower_row_offsets: usize_vec_snap(&ic.lower_row_offsets),
+                                lower_columns: usize_vec_snap(&ic.lower_columns),
+                                matrix_slots: usize_vec_snap(&ic.matrix_slots),
+                                diagonal_factor_slots: usize_vec_snap(&ic.diagonal_factor_slots),
+                                update_pairs: nested_pair_snap(&ic.update_pairs),
+                                dependent_row_offsets: usize_vec_snap(&ic.dependent_row_offsets),
+                                dependent_entries: pair_vec_snap(&ic.dependent_entries),
+                                factors: bits_vec_snap(&ic.factors),
+                            },
+                        ))
+                    }
+                };
+                PcgValueSnap {
+                    sparsity,
+                    preconditioner_kind: pcg.preconditioner_kind,
+                    preconditioner,
+                    residual: bits_vec_snap(&pcg.residual),
+                    preconditioned_residual: bits_vec_snap(&pcg.preconditioned_residual),
+                    direction: bits_vec_snap(&pcg.direction),
+                    matrix_direction: bits_vec_snap(&pcg.matrix_direction),
+                    preconditioner_scratch: bits_vec_snap(&pcg.preconditioner_scratch),
+                }
+            });
+            FullSnapshot {
+                workspace: WorkspaceValueSnap {
+                    option_iterations: (
+                        workspace.options.max_iterations,
+                        workspace.options.min_iterations,
+                        workspace.options.tolerance.to_bits(),
+                        workspace.options.relative_tolerance.to_bits(),
+                    ),
+                    option_hierarchy: (
+                        workspace.options.cache_agglomeration,
+                        workspace.options.n_cells_in_coarsest_level,
+                        workspace.options.merge_levels,
+                        workspace.options.agglomerator,
+                    ),
+                    option_smoothing: (
+                        workspace.options.smoother,
+                        workspace.options.n_pre_sweeps,
+                        workspace.options.pre_sweeps_level_multiplier,
+                        workspace.options.max_pre_sweeps,
+                        workspace.options.n_post_sweeps,
+                        workspace.options.post_sweeps_level_multiplier,
+                        workspace.options.max_post_sweeps,
+                    ),
+                    option_correction: (
+                        workspace.options.n_finest_sweeps,
+                        workspace.options.interpolate_correction,
+                        workspace.options.scale_correction,
+                        workspace.options.direct_solve_coarsest,
+                    ),
+                    agglomeration,
+                    finest_sparsity,
+                    matrices_len: workspace.matrices.len(),
+                    matrices_capacity: workspace.matrices.capacity(),
+                    matrices,
+                    transfers_len: workspace.transfers.len(),
+                    transfers_capacity: workspace.transfers.capacity(),
+                    transfers,
+                    diagonal_slots: nested_usize_snap(&workspace.diagonal_slots),
+                    corrections: nested_bits_snap(&workspace.corrections),
+                    sources: nested_bits_snap(&workspace.sources),
+                    residuals: nested_bits_snap(&workspace.residuals),
+                    products: nested_bits_snap(&workspace.products),
+                    pre_smoothed: nested_bits_snap(&workspace.pre_smoothed),
+                    coarsest_pcg,
+                    has_solved: workspace.has_solved,
+                },
+                timing: timing_snap(timing),
+                initial: bits_vec_snap(initial),
+                usize_arcs,
+                face_arcs,
+            }
+        };
+
+        let assert_same_snapshot = |before: &FullSnapshot, after: &FullSnapshot| {
+            assert_eq!(after.workspace, before.workspace);
+            assert_eq!(after.timing, before.timing);
+            assert_eq!(after.initial, before.initial);
+            assert_eq!(after.usize_arcs.len(), before.usize_arcs.len());
+            for ((before_label, before_arc), (after_label, after_arc)) in
+                before.usize_arcs.iter().zip(&after.usize_arcs)
+            {
+                assert_eq!(after_label, before_label);
+                assert!(
+                    std::sync::Arc::ptr_eq(before_arc, after_arc),
+                    "Arc identity changed for {before_label}"
+                );
+            }
+            for first in 0..before.usize_arcs.len() {
+                for second in 0..before.usize_arcs.len() {
+                    assert_eq!(
+                        std::sync::Arc::ptr_eq(
+                            &before.usize_arcs[first].1,
+                            &before.usize_arcs[second].1,
+                        ),
+                        std::sync::Arc::ptr_eq(
+                            &after.usize_arcs[first].1,
+                            &after.usize_arcs[second].1,
+                        ),
+                        "Arc sharing relation changed for {} and {}",
+                        before.usize_arcs[first].0,
+                        before.usize_arcs[second].0,
+                    );
+                }
+            }
+            assert_eq!(after.face_arcs.len(), before.face_arcs.len());
+            for (before_arc, after_arc) in before.face_arcs.iter().zip(&after.face_arcs) {
+                assert!(std::sync::Arc::ptr_eq(before_arc, after_arc));
+            }
+        };
+
+        let matrix = CsrMatrix::from_rows(
+            vec![
+                vec![(0, 2.0), (1, -1.0)],
+                vec![(0, -1.0), (1, 2.0), (2, -1.0)],
+                vec![(1, -1.0), (2, 2.0), (3, -1.0)],
+                vec![(2, -1.0), (3, 2.0)],
+            ],
+            4,
+        )
+        .expect("invalid-controls matrix");
+        let rhs = [1.0, 0.0, 0.0, 0.0];
+        let face_weights = [
+            GamgFacePairWeight::new(0, 1, 4.0).expect("face 0-1"),
+            GamgFacePairWeight::new(1, 2, 3.0).expect("face 1-2"),
+            GamgFacePairWeight::new(2, 3, 2.0).expect("face 2-3"),
+        ];
+        let options = GamgOptions {
+            max_iterations: 1,
+            cache_agglomeration: false,
+            n_cells_in_coarsest_level: 2,
+            agglomerator: GamgAgglomerator::FaceAreaPair,
+            direct_solve_coarsest: false,
+            ..GamgOptions::default()
+        };
+        let mut workspace =
+            GamgWorkspace::new_with_face_area_weights(&matrix, options, &face_weights)
+                .expect("invalid workspace");
+        workspace
+            .solve(&matrix, &rhs, None)
+            .expect("prime uncached FaceArea/PCG workspace");
+        assert!(workspace.has_solved);
+
+        let mut initial = Vec::with_capacity(11);
+        initial.extend_from_slice(&[0.25, -0.5, 0.75, -1.0]);
+        let seeded_timing = || super::GamgKernelTiming {
+            total_seconds: 1.0,
+            hierarchy_build_seconds: 2.0,
+            hierarchy_rebuild_seconds: 3.0,
+            matrix_refresh_seconds: 4.0,
+            finest_residual_seconds: 5.0,
+            v_cycle_seconds: 6.0,
+            other_seconds: 7.0,
+            hierarchy_builds: 11,
+            hierarchy_rebuilds: 12,
+            matrix_refreshes: 13,
+            finest_residual_evaluations: 14,
+            solves: 15,
+            v_cycles: 16,
+            levels: vec![
+                super::GamgLevelTiming {
+                    level: 0,
+                    cells: 4,
+                    nonzeros: 10,
+                    matrix_refresh_seconds: 21.0,
+                    restriction_seconds: 22.0,
+                    prolongation_seconds: 23.0,
+                    smoothing_seconds: 24.0,
+                    scaling_seconds: 25.0,
+                    residual_seconds: 26.0,
+                    correction_seconds: 27.0,
+                    coarsest_solve_seconds: 28.0,
+                    matrix_refreshes: 31,
+                    restriction_calls: 32,
+                    prolongation_calls: 33,
+                    smoothing_calls: 34,
+                    smoothing_sweeps: 35,
+                    scaling_calls: 36,
+                    residual_evaluations: 37,
+                    correction_updates: 38,
+                    coarsest_solves: 39,
+                },
+                super::GamgLevelTiming {
+                    level: 1,
+                    cells: 2,
+                    nonzeros: 4,
+                    matrix_refresh_seconds: 41.0,
+                    restriction_seconds: 42.0,
+                    prolongation_seconds: 43.0,
+                    smoothing_seconds: 44.0,
+                    scaling_seconds: 45.0,
+                    residual_seconds: 46.0,
+                    correction_seconds: 47.0,
+                    coarsest_solve_seconds: 48.0,
+                    matrix_refreshes: 51,
+                    restriction_calls: 52,
+                    prolongation_calls: 53,
+                    smoothing_calls: 54,
+                    smoothing_sweeps: 55,
+                    scaling_calls: 56,
+                    residual_evaluations: 57,
+                    correction_updates: 58,
+                    coarsest_solves: 59,
+                },
+            ],
+        };
+
+        let ic_variant = snapshot(&workspace, &seeded_timing(), &initial);
+        assert!(matches!(
+            ic_variant.workspace.coarsest_pcg,
+            Some(PcgValueSnap {
+                preconditioner: PreconditionerValueSnap::IncompleteCholesky(_),
+                ..
+            })
+        ));
+
+        let none_options = GamgOptions {
+            direct_solve_coarsest: true,
+            ..options
+        };
+        let mut none_workspace =
+            GamgWorkspace::new_with_face_area_weights(&matrix, none_options, &face_weights)
+                .expect("None-PCG snapshot workspace");
+        none_workspace
+            .solve(&matrix, &rhs, None)
+            .expect("prime None-PCG workspace");
+        let none_variant = snapshot(&none_workspace, &seeded_timing(), &initial);
+        assert!(none_variant.workspace.coarsest_pcg.is_none());
+
+        let mut unpreconditioned_workspace =
+            GamgWorkspace::new_with_face_area_weights(&matrix, options, &face_weights)
+                .expect("unpreconditioned PCG snapshot workspace");
+        let unpreconditioned_coarsest = unpreconditioned_workspace
+            .matrices
+            .last()
+            .expect("unpreconditioned coarsest matrix")
+            .clone();
+        unpreconditioned_workspace.coarsest_pcg = Some(
+            crate::linear::PreconditionedConjugateGradientWorkspace::new(
+                &unpreconditioned_coarsest,
+                CgPreconditioner::None,
+            )
+            .expect("unpreconditioned PCG workspace"),
+        );
+        let unpreconditioned_variant =
+            snapshot(&unpreconditioned_workspace, &seeded_timing(), &initial);
+        assert!(matches!(
+            unpreconditioned_variant.workspace.coarsest_pcg,
+            Some(PcgValueSnap {
+                preconditioner_kind: CgPreconditioner::None,
+                preconditioner: PreconditionerValueSnap::None,
+                ..
+            })
+        ));
+
+        let mut diagonal_workspace =
+            GamgWorkspace::new_with_face_area_weights(&matrix, options, &face_weights)
+                .expect("Diagonal-PCG snapshot workspace");
+        let coarsest_matrix = diagonal_workspace
+            .matrices
+            .last()
+            .expect("coarsest matrix")
+            .clone();
+        diagonal_workspace.coarsest_pcg = Some(
+            crate::linear::PreconditionedConjugateGradientWorkspace::new(
+                &coarsest_matrix,
+                CgPreconditioner::Diagonal,
+            )
+            .expect("Diagonal PCG workspace"),
+        );
+        let diagonal_variant = snapshot(&diagonal_workspace, &seeded_timing(), &initial);
+        assert!(matches!(
+            diagonal_variant.workspace.coarsest_pcg,
+            Some(PcgValueSnap {
+                preconditioner: PreconditionerValueSnap::Diagonal { .. },
+                ..
+            })
+        ));
+
+        macro_rules! assert_normalized_invalid {
+            ($controls:expr, $expected:expr) => {
+                for route in 0..4 {
+                    let controls = $controls;
+                    let expected = ($expected).clone();
+                    let mut timing = seeded_timing();
+                    let before = snapshot(&workspace, &timing, &initial);
+                    let error = match route {
+                        0 => workspace
+                            .solve_normalized_l1_with_controls(
+                                &matrix,
+                                &rhs,
+                                Some(initial.as_slice()),
+                                controls,
+                            )
+                            .expect_err("normalized public plain route must reject"),
+                        1 => workspace
+                            .solve_normalized_l1_with_controls_profiled(
+                                &matrix,
+                                &rhs,
+                                Some(initial.as_slice()),
+                                controls,
+                            )
+                            .expect_err("normalized public profiled route must reject"),
+                        2 => workspace
+                            .solve_normalized_l1_with_controls_internal::<false>(
+                                &matrix,
+                                &rhs,
+                                Some(initial.as_slice()),
+                                controls,
+                                &mut timing,
+                            )
+                            .expect_err("normalized internal false route must reject"),
+                        3 => workspace
+                            .solve_normalized_l1_with_controls_internal::<true>(
+                                &matrix,
+                                &rhs,
+                                Some(initial.as_slice()),
+                                controls,
+                                &mut timing,
+                            )
+                            .expect_err("normalized internal true route must reject"),
+                        _ => unreachable!("exactly four normalized routes"),
+                    };
+                    assert_eq!(error.to_string(), expected, "normalized route={route}");
+                    let crate::MeshError::InvalidInput(payload) = error else {
+                        panic!("normalized route={route} returned the wrong error variant");
+                    };
+                    assert_eq!(payload, expected, "normalized route={route}");
+                    let after = snapshot(&workspace, &timing, &initial);
+                    assert_same_snapshot(&before, &after);
+                }
+            };
+        }
+
+        macro_rules! assert_legacy_invalid {
+            ($controls:expr, $expected:expr) => {
+                for route in 0..4 {
+                    let controls = $controls;
+                    let expected = ($expected).clone();
+                    let mut timing = seeded_timing();
+                    let before = snapshot(&workspace, &timing, &initial);
+                    let error = match route {
+                        0 => workspace
+                            .solve_with_controls(&matrix, &rhs, Some(initial.as_slice()), controls)
+                            .expect_err("legacy public plain route must reject"),
+                        1 => workspace
+                            .solve_with_controls_profiled(
+                                &matrix,
+                                &rhs,
+                                Some(initial.as_slice()),
+                                controls,
+                            )
+                            .expect_err("legacy public profiled route must reject"),
+                        2 => workspace
+                            .solve_with_controls_internal::<false>(
+                                &matrix,
+                                &rhs,
+                                Some(initial.as_slice()),
+                                controls,
+                                &mut timing,
+                            )
+                            .expect_err("legacy internal false route must reject"),
+                        3 => workspace
+                            .solve_with_controls_internal::<true>(
+                                &matrix,
+                                &rhs,
+                                Some(initial.as_slice()),
+                                controls,
+                                &mut timing,
+                            )
+                            .expect_err("legacy internal true route must reject"),
+                        _ => unreachable!("exactly four legacy routes"),
+                    };
+                    assert_eq!(error.to_string(), expected, "legacy route={route}");
+                    let crate::MeshError::InvalidInput(payload) = error else {
+                        panic!("legacy route={route} returned the wrong error variant");
+                    };
+                    assert_eq!(payload, expected, "legacy route={route}");
+                    let after = snapshot(&workspace, &timing, &initial);
+                    assert_same_snapshot(&before, &after);
+                }
+            };
+        }
+
+        for value in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_normalized_invalid!(
+                NormalizedL1GamgSolveControls {
+                    normalization_factor: value,
+                    tolerance: 0.0,
+                    relative_tolerance: 0.0,
+                    l2_controls: super::GamgSolveControls {
+                        max_iterations: 1,
+                        min_iterations: 0,
+                        tolerance: 0.0,
+                        relative_tolerance: 0.0,
+                    },
+                },
+                format!("GAMG normalized-L1 factor must be finite and positive, got {value}")
+            );
+        }
+        for value in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_normalized_invalid!(
+                NormalizedL1GamgSolveControls {
+                    normalization_factor: 1.0,
+                    tolerance: value,
+                    relative_tolerance: 0.0,
+                    l2_controls: super::GamgSolveControls {
+                        max_iterations: 1,
+                        min_iterations: 0,
+                        tolerance: 0.0,
+                        relative_tolerance: 0.0,
+                    },
+                },
+                format!(
+                    "GAMG normalized-L1 tolerance must be finite and non-negative, got {value}"
+                )
+            );
+            assert_normalized_invalid!(
+                NormalizedL1GamgSolveControls {
+                    normalization_factor: 1.0,
+                    tolerance: 0.0,
+                    relative_tolerance: value,
+                    l2_controls: super::GamgSolveControls {
+                        max_iterations: 1,
+                        min_iterations: 0,
+                        tolerance: 0.0,
+                        relative_tolerance: 0.0,
+                    },
+                },
+                format!("GAMG normalized-L1 relTol must be finite and non-negative, got {value}")
+            );
+        }
+        for value in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let nested_tolerance = super::GamgSolveControls {
+                max_iterations: 1,
+                min_iterations: 0,
+                tolerance: value,
+                relative_tolerance: 0.0,
+            };
+            let tolerance_error =
+                format!("GAMG tolerance must be finite and non-negative, got {value}");
+            assert_normalized_invalid!(
+                NormalizedL1GamgSolveControls {
+                    normalization_factor: 1.0,
+                    tolerance: 0.0,
+                    relative_tolerance: 0.0,
+                    l2_controls: nested_tolerance,
+                },
+                tolerance_error.clone()
+            );
+            assert_legacy_invalid!(nested_tolerance, tolerance_error);
+
+            let nested_relative = super::GamgSolveControls {
+                max_iterations: 1,
+                min_iterations: 0,
+                tolerance: 0.0,
+                relative_tolerance: value,
+            };
+            let relative_error =
+                format!("GAMG relTol must be finite and non-negative, got {value}");
+            assert_normalized_invalid!(
+                NormalizedL1GamgSolveControls {
+                    normalization_factor: 1.0,
+                    tolerance: 0.0,
+                    relative_tolerance: 0.0,
+                    l2_controls: nested_relative,
+                },
+                relative_error.clone()
+            );
+            assert_legacy_invalid!(nested_relative, relative_error);
+        }
+
+        #[derive(Clone, Copy, Debug)]
+        enum ValidRoute {
+            NormalizedPlain,
+            NormalizedProfiled,
+            LegacyPlain,
+            LegacyProfiled,
+        }
+        let valid_normalized = NormalizedL1GamgSolveControls {
+            normalization_factor: 1.0,
+            tolerance: 0.0,
+            relative_tolerance: 0.0,
+            l2_controls: super::GamgSolveControls {
+                max_iterations: 2,
+                min_iterations: 2,
+                tolerance: 0.0,
+                relative_tolerance: 0.0,
+            },
+        };
+        let valid_legacy = valid_normalized.l2_controls;
+        let build_primed = || {
+            let mut fresh =
+                GamgWorkspace::new_with_face_area_weights(&matrix, options, &face_weights)
+                    .expect("clean retry workspace");
+            fresh
+                .solve(&matrix, &rhs, None)
+                .expect("prime clean retry workspace");
+            fresh
+        };
+        let run_valid = |target: &mut GamgWorkspace,
+                         route: ValidRoute|
+         -> crate::Result<(
+            super::IterativeSolveReport,
+            Option<super::GamgKernelTiming>,
+        )> {
+            match route {
+                ValidRoute::NormalizedPlain => Ok((
+                    target.solve_normalized_l1_with_controls(
+                        &matrix,
+                        &rhs,
+                        Some(initial.as_slice()),
+                        valid_normalized,
+                    )?,
+                    None,
+                )),
+                ValidRoute::NormalizedProfiled => {
+                    let profiled = target.solve_normalized_l1_with_controls_profiled(
+                        &matrix,
+                        &rhs,
+                        Some(initial.as_slice()),
+                        valid_normalized,
+                    )?;
+                    Ok((profiled.report, Some(profiled.timing)))
+                }
+                ValidRoute::LegacyPlain => Ok((
+                    target.solve_with_controls(
+                        &matrix,
+                        &rhs,
+                        Some(initial.as_slice()),
+                        valid_legacy,
+                    )?,
+                    None,
+                )),
+                ValidRoute::LegacyProfiled => {
+                    let profiled = target.solve_with_controls_profiled(
+                        &matrix,
+                        &rhs,
+                        Some(initial.as_slice()),
+                        valid_legacy,
+                    )?;
+                    Ok((profiled.report, Some(profiled.timing)))
+                }
+            }
+        };
+        let report_bits = |report: &super::IterativeSolveReport| {
+            (
+                report
+                    .solution
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                report.iterations,
+                report.residual_norm.to_bits(),
+                report.converged,
+                report.termination,
+            )
+        };
+        let logical_timing = |timing: &super::GamgKernelTiming| {
+            (
+                [
+                    timing.hierarchy_builds,
+                    timing.hierarchy_rebuilds,
+                    timing.matrix_refreshes,
+                    timing.finest_residual_evaluations,
+                    timing.solves,
+                    timing.v_cycles,
+                ],
+                timing
+                    .levels
+                    .iter()
+                    .map(|level| {
+                        (
+                            level.level,
+                            level.cells,
+                            level.nonzeros,
+                            level.matrix_refreshes,
+                            level.restriction_calls,
+                            level.prolongation_calls,
+                            level.smoothing_calls,
+                            level.smoothing_sweeps,
+                            level.scaling_calls,
+                            level.residual_evaluations,
+                            level.correction_updates,
+                            level.coarsest_solves,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let assert_finite_timing = |timing: &super::GamgKernelTiming| {
+            for seconds in [
+                timing.total_seconds,
+                timing.hierarchy_build_seconds,
+                timing.hierarchy_rebuild_seconds,
+                timing.matrix_refresh_seconds,
+                timing.finest_residual_seconds,
+                timing.v_cycle_seconds,
+                timing.other_seconds,
+            ] {
+                assert!(seconds.is_finite() && seconds >= 0.0);
+            }
+            for level in &timing.levels {
+                for seconds in [
+                    level.matrix_refresh_seconds,
+                    level.restriction_seconds,
+                    level.prolongation_seconds,
+                    level.smoothing_seconds,
+                    level.scaling_seconds,
+                    level.residual_seconds,
+                    level.correction_seconds,
+                    level.coarsest_solve_seconds,
+                ] {
+                    assert!(seconds.is_finite() && seconds >= 0.0);
+                }
+            }
+        };
+
+        for route in [
+            ValidRoute::NormalizedPlain,
+            ValidRoute::NormalizedProfiled,
+            ValidRoute::LegacyPlain,
+            ValidRoute::LegacyProfiled,
+        ] {
+            let (live_report, live_timing) =
+                run_valid(&mut workspace, route).expect("live post-invalid retry");
+            let mut clean_workspace = build_primed();
+            let (clean_report, clean_timing) =
+                run_valid(&mut clean_workspace, route).expect("clean retry baseline");
+            let default_clean = super::GamgKernelTiming::default();
+            let clean_timing_ref = clean_timing.as_ref().unwrap_or(&default_clean);
+            let clean_state = snapshot(&clean_workspace, clean_timing_ref, &initial);
+            let (repeated_report, repeated_timing) =
+                run_valid(&mut clean_workspace, route).expect("repeated retry baseline");
+            let default_repeated = super::GamgKernelTiming::default();
+            let repeated_timing_ref = repeated_timing.as_ref().unwrap_or(&default_repeated);
+            let repeated_state = snapshot(&clean_workspace, repeated_timing_ref, &initial);
+
+            assert_eq!(report_bits(&live_report), report_bits(&clean_report));
+            assert_eq!(report_bits(&live_report), report_bits(&repeated_report));
+
+            let default_live = super::GamgKernelTiming::default();
+            let live_timing_ref = live_timing.as_ref().unwrap_or(&default_live);
+            let live_state = snapshot(&workspace, live_timing_ref, &initial);
+            assert_eq!(live_state.workspace, clean_state.workspace);
+            assert_eq!(live_state.initial, clean_state.initial);
+            assert_eq!(live_state.workspace, repeated_state.workspace);
+            assert_eq!(live_state.initial, repeated_state.initial);
+            assert_eq!(
+                logical_timing(live_timing_ref),
+                logical_timing(clean_timing_ref)
+            );
+            assert_eq!(
+                logical_timing(live_timing_ref),
+                logical_timing(repeated_timing_ref)
+            );
+
+            if live_timing.is_some() {
+                assert_eq!(
+                    logical_timing(live_timing_ref),
+                    (
+                        [0, 1, 1, 3, 1, 2],
+                        vec![
+                            (0, 4, 10, 1, 2, 2, 2, 4, 2, 0, 2, 0),
+                            (1, 2, 4, 1, 0, 0, 0, 0, 0, 0, 0, 2),
+                        ],
+                    )
+                );
+                assert_finite_timing(live_timing_ref);
+                assert_finite_timing(clean_timing_ref);
+                assert_finite_timing(repeated_timing_ref);
+            } else {
+                assert_eq!(logical_timing(live_timing_ref), ([0; 6], vec![]));
+            }
+        }
+    }
+
+    #[test]
+    fn normalized_l1_solve_preserves_gamg_lifecycle_and_l2_report() {
+        let matrix = CsrMatrix::from_rows(
+            vec![vec![(0, 2.0), (1, -1.0)], vec![(0, -1.0), (1, 2.0)]],
+            2,
+        )
+        .expect("lifecycle matrix");
+        let exact_rhs = [1.0, 1.0];
+        let rhs = [1.0, 0.0];
+        let exact_initial = [1.0, 1.0];
+        let options = GamgOptions {
+            max_iterations: 2,
+            min_iterations: 0,
+            tolerance: 0.0,
+            relative_tolerance: 0.0,
+            cache_agglomeration: true,
+            n_cells_in_coarsest_level: 1,
+            merge_levels: 1,
+            agglomerator: GamgAgglomerator::AlgebraicPair,
+            smoother: GamgSmoother::GaussSeidel,
+            n_pre_sweeps: 0,
+            pre_sweeps_level_multiplier: 1,
+            max_pre_sweeps: 0,
+            n_post_sweeps: 0,
+            post_sweeps_level_multiplier: 1,
+            max_post_sweeps: 0,
+            n_finest_sweeps: 0,
+            interpolate_correction: false,
+            scale_correction: true,
+            direct_solve_coarsest: true,
+        };
+        let exact_controls = NormalizedL1GamgSolveControls {
+            normalization_factor: 1.0,
+            tolerance: 0.0,
+            relative_tolerance: 0.0,
+            l2_controls: super::GamgSolveControls {
+                max_iterations: 4,
+                min_iterations: 0,
+                tolerance: 0.0,
+                relative_tolerance: 0.0,
+            },
+        };
+        let first_controls = NormalizedL1GamgSolveControls {
+            normalization_factor: 1.0,
+            tolerance: 1.0,
+            relative_tolerance: 0.0,
+            l2_controls: super::GamgSolveControls {
+                max_iterations: 4,
+                min_iterations: 1,
+                tolerance: 0.0,
+                relative_tolerance: 0.0,
+            },
+        };
+        let minimum_controls = NormalizedL1GamgSolveControls {
+            normalization_factor: 1.0,
+            tolerance: 1.0,
+            relative_tolerance: 0.0,
+            l2_controls: super::GamgSolveControls {
+                max_iterations: 1,
+                min_iterations: 2,
+                tolerance: 0.0,
+                relative_tolerance: 0.0,
+            },
+        };
+        let maximum_controls = NormalizedL1GamgSolveControls {
+            normalization_factor: 1.0,
+            tolerance: 0.0,
+            relative_tolerance: 0.0,
+            l2_controls: super::GamgSolveControls {
+                max_iterations: 2,
+                min_iterations: 0,
+                tolerance: 0.0,
+                relative_tolerance: 0.0,
+            },
+        };
+        macro_rules! assert_success_workspace {
+            ($workspace:expr) => {{
+                let workspace: &GamgWorkspace = $workspace;
+                assert_eq!(workspace.level_sizes(), vec![2, 1]);
+                assert!(workspace.has_solved);
+                assert_eq!(
+                    (
+                        (
+                            workspace.options.max_iterations,
+                            workspace.options.min_iterations,
+                            workspace.options.tolerance.to_bits(),
+                            workspace.options.relative_tolerance.to_bits(),
+                        ),
+                        (
+                            workspace.options.cache_agglomeration,
+                            workspace.options.n_cells_in_coarsest_level,
+                            workspace.options.merge_levels,
+                            workspace.options.agglomerator,
+                        ),
+                        (
+                            workspace.options.smoother,
+                            workspace.options.n_pre_sweeps,
+                            workspace.options.pre_sweeps_level_multiplier,
+                            workspace.options.max_pre_sweeps,
+                            workspace.options.n_post_sweeps,
+                            workspace.options.post_sweeps_level_multiplier,
+                            workspace.options.max_post_sweeps,
+                        ),
+                        (
+                            workspace.options.n_finest_sweeps,
+                            workspace.options.interpolate_correction,
+                            workspace.options.scale_correction,
+                            workspace.options.direct_solve_coarsest,
+                        ),
+                    ),
+                    (
+                        (2, 0, 0.0f64.to_bits(), 0.0f64.to_bits()),
+                        (true, 1, 1, GamgAgglomerator::AlgebraicPair),
+                        (GamgSmoother::GaussSeidel, 0, 1, 0, 0, 1, 0),
+                        (0, false, true, true),
+                    )
+                );
+            }};
+        }
+        macro_rules! assert_singular_workspace {
+            ($workspace:expr) => {{
+                let workspace: &GamgWorkspace = $workspace;
+                assert_eq!(workspace.level_sizes(), vec![4, 2]);
+                assert!(!workspace.has_solved);
+                assert_eq!(
+                    (
+                        (
+                            workspace.options.max_iterations,
+                            workspace.options.min_iterations,
+                            workspace.options.tolerance.to_bits(),
+                            workspace.options.relative_tolerance.to_bits(),
+                        ),
+                        (
+                            workspace.options.cache_agglomeration,
+                            workspace.options.n_cells_in_coarsest_level,
+                            workspace.options.merge_levels,
+                            workspace.options.agglomerator,
+                        ),
+                        (
+                            workspace.options.smoother,
+                            workspace.options.n_pre_sweeps,
+                            workspace.options.pre_sweeps_level_multiplier,
+                            workspace.options.max_pre_sweeps,
+                            workspace.options.n_post_sweeps,
+                            workspace.options.post_sweeps_level_multiplier,
+                            workspace.options.max_post_sweeps,
+                        ),
+                        (
+                            workspace.options.n_finest_sweeps,
+                            workspace.options.interpolate_correction,
+                            workspace.options.scale_correction,
+                            workspace.options.direct_solve_coarsest,
+                        ),
+                    ),
+                    (
+                        (2, 0, 0.0f64.to_bits(), 0.0f64.to_bits()),
+                        (true, 2, 1, GamgAgglomerator::AlgebraicPair),
+                        (GamgSmoother::GaussSeidel, 0, 1, 0, 0, 1, 0),
+                        (0, false, true, true),
+                    )
+                );
+            }};
+        }
+
+        // 1/10: exact-zero, plain internal engine.
+        {
+            let mut workspace =
+                GamgWorkspace::new(&matrix, options).expect("plain exact-zero workspace");
+            let mut timing = super::GamgKernelTiming::from_matrices(&workspace.matrices);
+            let report = workspace
+                .solve_normalized_l1_with_controls_internal::<false>(
+                    &matrix,
+                    &exact_rhs,
+                    Some(&exact_initial),
+                    exact_controls,
+                    &mut timing,
+                )
+                .expect("plain exact-zero solve");
+            let mut squared_l2 = 0.0;
+            for (row, source) in exact_rhs.iter().enumerate() {
+                let mut product = 0.0;
+                for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                    product +=
+                        matrix.values()[entry] * report.solution[matrix.col_indices()[entry]];
+                }
+                let residual = source - product;
+                assert_eq!(residual.to_bits(), 0.0f64.to_bits());
+                squared_l2 += residual * residual;
+            }
+            assert_eq!(
+                report
+                    .solution
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                exact_initial
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(report.residual_norm.to_bits(), squared_l2.sqrt().to_bits());
+            assert_eq!(report.iterations, 0);
+            assert!(report.converged);
+            assert_eq!(
+                report.termination,
+                super::IterativeSolveTermination::Converged
+            );
+            assert_eq!(workspace.level_sizes(), vec![2, 1]);
+            assert!(workspace.has_solved);
+            assert_success_workspace!(&workspace);
+            assert_eq!(
+                (
+                    (
+                        workspace.options.max_iterations,
+                        workspace.options.min_iterations,
+                        workspace.options.tolerance.to_bits(),
+                        workspace.options.relative_tolerance.to_bits(),
+                    ),
+                    (
+                        workspace.options.cache_agglomeration,
+                        workspace.options.n_cells_in_coarsest_level,
+                        workspace.options.merge_levels,
+                        workspace.options.agglomerator,
+                    ),
+                    (
+                        workspace.options.smoother,
+                        workspace.options.n_pre_sweeps,
+                        workspace.options.pre_sweeps_level_multiplier,
+                        workspace.options.max_pre_sweeps,
+                        workspace.options.n_post_sweeps,
+                        workspace.options.post_sweeps_level_multiplier,
+                        workspace.options.max_post_sweeps,
+                    ),
+                    (
+                        workspace.options.n_finest_sweeps,
+                        workspace.options.interpolate_correction,
+                        workspace.options.scale_correction,
+                        workspace.options.direct_solve_coarsest,
+                    ),
+                ),
+                (
+                    (2, 0, 0.0f64.to_bits(), 0.0f64.to_bits()),
+                    (true, 1, 1, GamgAgglomerator::AlgebraicPair),
+                    (GamgSmoother::GaussSeidel, 0, 1, 0, 0, 1, 0),
+                    (0, false, true, true),
+                )
+            );
+            assert_eq!(
+                (
+                    timing.hierarchy_builds,
+                    timing.hierarchy_rebuilds,
+                    timing.matrix_refreshes,
+                    timing.finest_residual_evaluations,
+                    timing.solves,
+                    timing.v_cycles,
+                ),
+                (0, 0, 0, 0, 0, 0)
+            );
+            assert_eq!(
+                timing
+                    .levels
+                    .iter()
+                    .map(|level| (
+                        level.level,
+                        level.cells,
+                        level.nonzeros,
+                        level.matrix_refreshes,
+                        level.restriction_calls,
+                        level.prolongation_calls,
+                        level.smoothing_calls,
+                        level.smoothing_sweeps,
+                        level.scaling_calls,
+                        level.residual_evaluations,
+                        level.correction_updates,
+                        level.coarsest_solves,
+                    ))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (0, 2, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+                    (1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+                ]
+            );
+            for seconds in [
+                timing.total_seconds,
+                timing.hierarchy_build_seconds,
+                timing.hierarchy_rebuild_seconds,
+                timing.matrix_refresh_seconds,
+                timing.finest_residual_seconds,
+                timing.v_cycle_seconds,
+                timing.other_seconds,
+            ] {
+                assert!(seconds.is_finite() && seconds >= 0.0);
+            }
+            for level in &timing.levels {
+                for seconds in [
+                    level.matrix_refresh_seconds,
+                    level.restriction_seconds,
+                    level.prolongation_seconds,
+                    level.smoothing_seconds,
+                    level.scaling_seconds,
+                    level.residual_seconds,
+                    level.correction_seconds,
+                    level.coarsest_solve_seconds,
+                ] {
+                    assert!(seconds.is_finite() && seconds >= 0.0);
+                }
+            }
+        }
+
+        // 2/10: exact-zero, profiled public entrypoint.
+        {
+            let mut workspace =
+                GamgWorkspace::new(&matrix, options).expect("profiled exact-zero workspace");
+            let profiled = workspace
+                .solve_normalized_l1_with_controls_profiled(
+                    &matrix,
+                    &exact_rhs,
+                    Some(&exact_initial),
+                    exact_controls,
+                )
+                .expect("profiled exact-zero solve");
+            let report = &profiled.report;
+            let mut squared_l2 = 0.0;
+            for (row, source) in exact_rhs.iter().enumerate() {
+                let mut product = 0.0;
+                for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                    product +=
+                        matrix.values()[entry] * report.solution[matrix.col_indices()[entry]];
+                }
+                let residual = source - product;
+                assert_eq!(residual.to_bits(), 0.0f64.to_bits());
+                squared_l2 += residual * residual;
+            }
+            assert_eq!(
+                report
+                    .solution
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                exact_initial
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(report.residual_norm.to_bits(), squared_l2.sqrt().to_bits());
+            assert_eq!(report.iterations, 0);
+            assert!(report.converged);
+            assert_eq!(
+                report.termination,
+                super::IterativeSolveTermination::Converged
+            );
+            assert_eq!(workspace.level_sizes(), vec![2, 1]);
+            assert!(workspace.has_solved);
+            assert_success_workspace!(&workspace);
+            assert_eq!(
+                (
+                    profiled.timing.hierarchy_builds,
+                    profiled.timing.hierarchy_rebuilds,
+                    profiled.timing.matrix_refreshes,
+                    profiled.timing.finest_residual_evaluations,
+                    profiled.timing.solves,
+                    profiled.timing.v_cycles,
+                ),
+                (0, 0, 1, 1, 1, 0)
+            );
+            assert_eq!(
+                profiled
+                    .timing
+                    .levels
+                    .iter()
+                    .map(|level| (
+                        level.level,
+                        level.cells,
+                        level.nonzeros,
+                        level.matrix_refreshes,
+                        level.restriction_calls,
+                        level.prolongation_calls,
+                        level.smoothing_calls,
+                        level.smoothing_sweeps,
+                        level.scaling_calls,
+                        level.residual_evaluations,
+                        level.correction_updates,
+                        level.coarsest_solves,
+                    ))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (0, 2, 4, 1, 0, 0, 0, 0, 0, 0, 0, 0),
+                    (1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0),
+                ]
+            );
+            for seconds in [
+                profiled.timing.total_seconds,
+                profiled.timing.hierarchy_build_seconds,
+                profiled.timing.hierarchy_rebuild_seconds,
+                profiled.timing.matrix_refresh_seconds,
+                profiled.timing.finest_residual_seconds,
+                profiled.timing.v_cycle_seconds,
+                profiled.timing.other_seconds,
+            ] {
+                assert!(seconds.is_finite() && seconds >= 0.0);
+            }
+            for level in &profiled.timing.levels {
+                for seconds in [
+                    level.matrix_refresh_seconds,
+                    level.restriction_seconds,
+                    level.prolongation_seconds,
+                    level.smoothing_seconds,
+                    level.scaling_seconds,
+                    level.residual_seconds,
+                    level.correction_seconds,
+                    level.coarsest_solve_seconds,
+                ] {
+                    assert!(seconds.is_finite() && seconds >= 0.0);
+                }
+            }
+        }
+
+        // 3/10: first eligible iteration, plain internal engine.
+        {
+            let mut workspace =
+                GamgWorkspace::new(&matrix, options).expect("plain first-eligible workspace");
+            let mut timing = super::GamgKernelTiming::from_matrices(&workspace.matrices);
+            let report = workspace
+                .solve_normalized_l1_with_controls_internal::<false>(
+                    &matrix,
+                    &rhs,
+                    None,
+                    first_controls,
+                    &mut timing,
+                )
+                .expect("plain first-eligible solve");
+            let mut expected = vec![0.0; rhs.len()];
+            let mut expected_residual = vec![0.0; rhs.len()];
+            for (row, source) in rhs.iter().enumerate() {
+                let mut product = 0.0;
+                for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                    product += matrix.values()[entry] * expected[matrix.col_indices()[entry]];
+                }
+                expected_residual[row] = source - product;
+            }
+            for _ in 0..1 {
+                let mut coarse_diagonal = 0.0;
+                for row in 0..matrix.rows() {
+                    for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                        coarse_diagonal += matrix.values()[entry];
+                    }
+                }
+                let coarse_source = expected_residual.iter().copied().sum::<f64>();
+                let coarse_value = coarse_source / coarse_diagonal;
+                let mut correction = vec![coarse_value; rhs.len()];
+                let mut product = vec![0.0; rhs.len()];
+                for (row, product_value) in product.iter_mut().enumerate().take(matrix.rows()) {
+                    for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                        *product_value +=
+                            matrix.values()[entry] * correction[matrix.col_indices()[entry]];
+                    }
+                }
+                let mut numerator = 0.0;
+                let mut denominator = 0.0;
+                for index in 0..rhs.len() {
+                    numerator += expected_residual[index] * correction[index];
+                    denominator += product[index] * correction[index];
+                }
+                let denominator = if denominator.abs() < 1.0e-300_f64 {
+                    if denominator.is_sign_negative() {
+                        -1.0e-300_f64
+                    } else {
+                        1.0e-300_f64
+                    }
+                } else {
+                    denominator
+                };
+                let factor = numerator / denominator;
+                for row in 0..matrix.rows() {
+                    let mut diagonal = None;
+                    for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                        if matrix.col_indices()[entry] == row {
+                            diagonal = Some(matrix.values()[entry]);
+                        }
+                    }
+                    correction[row] = factor * correction[row]
+                        + (expected_residual[row] - factor * product[row])
+                            / diagonal.expect("oracle diagonal");
+                    expected[row] += correction[row];
+                }
+                for (row, source) in rhs.iter().enumerate() {
+                    let mut matrix_value = 0.0;
+                    for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                        matrix_value +=
+                            matrix.values()[entry] * expected[matrix.col_indices()[entry]];
+                    }
+                    expected_residual[row] = source - matrix_value;
+                }
+            }
+            let squared_l2 = expected_residual
+                .iter()
+                .map(|residual| residual * residual)
+                .sum::<f64>();
+            assert_eq!(
+                report
+                    .solution
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(report.residual_norm.to_bits(), squared_l2.sqrt().to_bits());
+            assert_eq!(report.iterations, 1);
+            assert!(report.converged);
+            assert_eq!(
+                report.termination,
+                super::IterativeSolveTermination::Converged
+            );
+            assert_eq!(workspace.level_sizes(), vec![2, 1]);
+            assert!(workspace.has_solved);
+            assert_success_workspace!(&workspace);
+            assert_eq!(
+                (
+                    timing.hierarchy_builds,
+                    timing.hierarchy_rebuilds,
+                    timing.matrix_refreshes,
+                    timing.finest_residual_evaluations,
+                    timing.solves,
+                    timing.v_cycles,
+                ),
+                (0, 0, 0, 0, 0, 0)
+            );
+            assert_eq!(
+                timing
+                    .levels
+                    .iter()
+                    .map(|level| (
+                        level.level,
+                        level.cells,
+                        level.nonzeros,
+                        level.matrix_refreshes,
+                        level.restriction_calls,
+                        level.prolongation_calls,
+                        level.smoothing_calls,
+                        level.smoothing_sweeps,
+                        level.scaling_calls,
+                        level.residual_evaluations,
+                        level.correction_updates,
+                        level.coarsest_solves,
+                    ))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (0, 2, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+                    (1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+                ]
+            );
+            for seconds in [
+                timing.total_seconds,
+                timing.hierarchy_build_seconds,
+                timing.hierarchy_rebuild_seconds,
+                timing.matrix_refresh_seconds,
+                timing.finest_residual_seconds,
+                timing.v_cycle_seconds,
+                timing.other_seconds,
+            ] {
+                assert!(seconds.is_finite() && seconds >= 0.0);
+            }
+            for level in &timing.levels {
+                for seconds in [
+                    level.matrix_refresh_seconds,
+                    level.restriction_seconds,
+                    level.prolongation_seconds,
+                    level.smoothing_seconds,
+                    level.scaling_seconds,
+                    level.residual_seconds,
+                    level.correction_seconds,
+                    level.coarsest_solve_seconds,
+                ] {
+                    assert!(seconds.is_finite() && seconds >= 0.0);
+                }
+            }
+        }
+
+        // 4/10: first eligible iteration, profiled public entrypoint.
+        {
+            let mut workspace =
+                GamgWorkspace::new(&matrix, options).expect("profiled first-eligible workspace");
+            let profiled = workspace
+                .solve_normalized_l1_with_controls_profiled(&matrix, &rhs, None, first_controls)
+                .expect("profiled first-eligible solve");
+            let report = &profiled.report;
+            let mut expected = vec![0.0; rhs.len()];
+            let mut expected_residual = vec![0.0; rhs.len()];
+            for (row, source) in rhs.iter().enumerate() {
+                let mut product = 0.0;
+                for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                    product += matrix.values()[entry] * expected[matrix.col_indices()[entry]];
+                }
+                expected_residual[row] = source - product;
+            }
+            for _ in 0..1 {
+                let mut coarse_diagonal = 0.0;
+                for row in 0..matrix.rows() {
+                    for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                        coarse_diagonal += matrix.values()[entry];
+                    }
+                }
+                let coarse_source = expected_residual.iter().copied().sum::<f64>();
+                let coarse_value = coarse_source / coarse_diagonal;
+                let mut correction = vec![coarse_value; rhs.len()];
+                let mut product = vec![0.0; rhs.len()];
+                for (row, product_value) in product.iter_mut().enumerate().take(matrix.rows()) {
+                    for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                        *product_value +=
+                            matrix.values()[entry] * correction[matrix.col_indices()[entry]];
+                    }
+                }
+                let mut numerator = 0.0;
+                let mut denominator = 0.0;
+                for index in 0..rhs.len() {
+                    numerator += expected_residual[index] * correction[index];
+                    denominator += product[index] * correction[index];
+                }
+                let denominator = if denominator.abs() < 1.0e-300_f64 {
+                    if denominator.is_sign_negative() {
+                        -1.0e-300_f64
+                    } else {
+                        1.0e-300_f64
+                    }
+                } else {
+                    denominator
+                };
+                let factor = numerator / denominator;
+                for row in 0..matrix.rows() {
+                    let mut diagonal = None;
+                    for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                        if matrix.col_indices()[entry] == row {
+                            diagonal = Some(matrix.values()[entry]);
+                        }
+                    }
+                    correction[row] = factor * correction[row]
+                        + (expected_residual[row] - factor * product[row])
+                            / diagonal.expect("oracle diagonal");
+                    expected[row] += correction[row];
+                }
+                for (row, source) in rhs.iter().enumerate() {
+                    let mut matrix_value = 0.0;
+                    for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                        matrix_value +=
+                            matrix.values()[entry] * expected[matrix.col_indices()[entry]];
+                    }
+                    expected_residual[row] = source - matrix_value;
+                }
+            }
+            let squared_l2 = expected_residual
+                .iter()
+                .map(|residual| residual * residual)
+                .sum::<f64>();
+            assert_eq!(
+                report
+                    .solution
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(report.residual_norm.to_bits(), squared_l2.sqrt().to_bits());
+            assert_eq!(report.iterations, 1);
+            assert!(report.converged);
+            assert_eq!(
+                report.termination,
+                super::IterativeSolveTermination::Converged
+            );
+            assert_eq!(workspace.level_sizes(), vec![2, 1]);
+            assert!(workspace.has_solved);
+            assert_success_workspace!(&workspace);
+            assert_eq!(
+                (
+                    profiled.timing.hierarchy_builds,
+                    profiled.timing.hierarchy_rebuilds,
+                    profiled.timing.matrix_refreshes,
+                    profiled.timing.finest_residual_evaluations,
+                    profiled.timing.solves,
+                    profiled.timing.v_cycles,
+                ),
+                (0, 0, 1, 2, 1, 1)
+            );
+            assert_eq!(
+                profiled
+                    .timing
+                    .levels
+                    .iter()
+                    .map(|level| (
+                        level.level,
+                        level.cells,
+                        level.nonzeros,
+                        level.matrix_refreshes,
+                        level.restriction_calls,
+                        level.prolongation_calls,
+                        level.smoothing_calls,
+                        level.smoothing_sweeps,
+                        level.scaling_calls,
+                        level.residual_evaluations,
+                        level.correction_updates,
+                        level.coarsest_solves,
+                    ))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (0, 2, 4, 1, 1, 1, 1, 0, 1, 0, 1, 0),
+                    (1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1),
+                ]
+            );
+            for seconds in [
+                profiled.timing.total_seconds,
+                profiled.timing.hierarchy_build_seconds,
+                profiled.timing.hierarchy_rebuild_seconds,
+                profiled.timing.matrix_refresh_seconds,
+                profiled.timing.finest_residual_seconds,
+                profiled.timing.v_cycle_seconds,
+                profiled.timing.other_seconds,
+            ] {
+                assert!(seconds.is_finite() && seconds >= 0.0);
+            }
+            for level in &profiled.timing.levels {
+                for seconds in [
+                    level.matrix_refresh_seconds,
+                    level.restriction_seconds,
+                    level.prolongation_seconds,
+                    level.smoothing_seconds,
+                    level.scaling_seconds,
+                    level.residual_seconds,
+                    level.correction_seconds,
+                    level.coarsest_solve_seconds,
+                ] {
+                    assert!(seconds.is_finite() && seconds >= 0.0);
+                }
+            }
+        }
+
+        // 5/10: min_iterations > 1, plain internal engine.
+        {
+            let mut workspace =
+                GamgWorkspace::new(&matrix, options).expect("plain minimum workspace");
+            let mut timing = super::GamgKernelTiming::from_matrices(&workspace.matrices);
+            let report = workspace
+                .solve_normalized_l1_with_controls_internal::<false>(
+                    &matrix,
+                    &rhs,
+                    None,
+                    minimum_controls,
+                    &mut timing,
+                )
+                .expect("plain minimum solve");
+            let mut expected = vec![0.0; rhs.len()];
+            let mut expected_residual = vec![0.0; rhs.len()];
+            for (row, source) in rhs.iter().enumerate() {
+                let mut product = 0.0;
+                for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                    product += matrix.values()[entry] * expected[matrix.col_indices()[entry]];
+                }
+                expected_residual[row] = source - product;
+            }
+            for _ in 0..2 {
+                let mut coarse_diagonal = 0.0;
+                for row in 0..matrix.rows() {
+                    for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                        coarse_diagonal += matrix.values()[entry];
+                    }
+                }
+                let coarse_source = expected_residual.iter().copied().sum::<f64>();
+                let coarse_value = coarse_source / coarse_diagonal;
+                let mut correction = vec![coarse_value; rhs.len()];
+                let mut product = vec![0.0; rhs.len()];
+                for (row, product_value) in product.iter_mut().enumerate().take(matrix.rows()) {
+                    for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                        *product_value +=
+                            matrix.values()[entry] * correction[matrix.col_indices()[entry]];
+                    }
+                }
+                let mut numerator = 0.0;
+                let mut denominator = 0.0;
+                for index in 0..rhs.len() {
+                    numerator += expected_residual[index] * correction[index];
+                    denominator += product[index] * correction[index];
+                }
+                let denominator = if denominator.abs() < 1.0e-300_f64 {
+                    if denominator.is_sign_negative() {
+                        -1.0e-300_f64
+                    } else {
+                        1.0e-300_f64
+                    }
+                } else {
+                    denominator
+                };
+                let factor = numerator / denominator;
+                for row in 0..matrix.rows() {
+                    let mut diagonal = None;
+                    for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                        if matrix.col_indices()[entry] == row {
+                            diagonal = Some(matrix.values()[entry]);
+                        }
+                    }
+                    correction[row] = factor * correction[row]
+                        + (expected_residual[row] - factor * product[row])
+                            / diagonal.expect("oracle diagonal");
+                    expected[row] += correction[row];
+                }
+                for (row, source) in rhs.iter().enumerate() {
+                    let mut matrix_value = 0.0;
+                    for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                        matrix_value +=
+                            matrix.values()[entry] * expected[matrix.col_indices()[entry]];
+                    }
+                    expected_residual[row] = source - matrix_value;
+                }
+            }
+            let squared_l2 = expected_residual
+                .iter()
+                .map(|residual| residual * residual)
+                .sum::<f64>();
+            assert_eq!(
+                report
+                    .solution
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(report.residual_norm.to_bits(), squared_l2.sqrt().to_bits());
+            assert_eq!(report.iterations, 2);
+            assert!(report.converged);
+            assert_eq!(
+                report.termination,
+                super::IterativeSolveTermination::Converged
+            );
+            assert_eq!(workspace.level_sizes(), vec![2, 1]);
+            assert!(workspace.has_solved);
+            assert_success_workspace!(&workspace);
+            assert_eq!(
+                (
+                    timing.hierarchy_builds,
+                    timing.hierarchy_rebuilds,
+                    timing.matrix_refreshes,
+                    timing.finest_residual_evaluations,
+                    timing.solves,
+                    timing.v_cycles,
+                ),
+                (0, 0, 0, 0, 0, 0)
+            );
+            assert_eq!(
+                timing
+                    .levels
+                    .iter()
+                    .map(|level| (
+                        level.level,
+                        level.cells,
+                        level.nonzeros,
+                        level.matrix_refreshes,
+                        level.restriction_calls,
+                        level.prolongation_calls,
+                        level.smoothing_calls,
+                        level.smoothing_sweeps,
+                        level.scaling_calls,
+                        level.residual_evaluations,
+                        level.correction_updates,
+                        level.coarsest_solves,
+                    ))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (0, 2, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+                    (1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+                ]
+            );
+            for seconds in [
+                timing.total_seconds,
+                timing.hierarchy_build_seconds,
+                timing.hierarchy_rebuild_seconds,
+                timing.matrix_refresh_seconds,
+                timing.finest_residual_seconds,
+                timing.v_cycle_seconds,
+                timing.other_seconds,
+            ] {
+                assert!(seconds.is_finite() && seconds >= 0.0);
+            }
+            for level in &timing.levels {
+                for seconds in [
+                    level.matrix_refresh_seconds,
+                    level.restriction_seconds,
+                    level.prolongation_seconds,
+                    level.smoothing_seconds,
+                    level.scaling_seconds,
+                    level.residual_seconds,
+                    level.correction_seconds,
+                    level.coarsest_solve_seconds,
+                ] {
+                    assert!(seconds.is_finite() && seconds >= 0.0);
+                }
+            }
+        }
+
+        // 6/10: min_iterations > 1, profiled public entrypoint.
+        {
+            let mut workspace =
+                GamgWorkspace::new(&matrix, options).expect("profiled minimum workspace");
+            let profiled = workspace
+                .solve_normalized_l1_with_controls_profiled(&matrix, &rhs, None, minimum_controls)
+                .expect("profiled minimum solve");
+            let report = &profiled.report;
+            let mut expected = vec![0.0; rhs.len()];
+            let mut expected_residual = vec![0.0; rhs.len()];
+            for (row, source) in rhs.iter().enumerate() {
+                let mut product = 0.0;
+                for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                    product += matrix.values()[entry] * expected[matrix.col_indices()[entry]];
+                }
+                expected_residual[row] = source - product;
+            }
+            for _ in 0..2 {
+                let mut coarse_diagonal = 0.0;
+                for row in 0..matrix.rows() {
+                    for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                        coarse_diagonal += matrix.values()[entry];
+                    }
+                }
+                let coarse_source = expected_residual.iter().copied().sum::<f64>();
+                let coarse_value = coarse_source / coarse_diagonal;
+                let mut correction = vec![coarse_value; rhs.len()];
+                let mut product = vec![0.0; rhs.len()];
+                for (row, product_value) in product.iter_mut().enumerate().take(matrix.rows()) {
+                    for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                        *product_value +=
+                            matrix.values()[entry] * correction[matrix.col_indices()[entry]];
+                    }
+                }
+                let mut numerator = 0.0;
+                let mut denominator = 0.0;
+                for index in 0..rhs.len() {
+                    numerator += expected_residual[index] * correction[index];
+                    denominator += product[index] * correction[index];
+                }
+                let denominator = if denominator.abs() < 1.0e-300_f64 {
+                    if denominator.is_sign_negative() {
+                        -1.0e-300_f64
+                    } else {
+                        1.0e-300_f64
+                    }
+                } else {
+                    denominator
+                };
+                let factor = numerator / denominator;
+                for row in 0..matrix.rows() {
+                    let mut diagonal = None;
+                    for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                        if matrix.col_indices()[entry] == row {
+                            diagonal = Some(matrix.values()[entry]);
+                        }
+                    }
+                    correction[row] = factor * correction[row]
+                        + (expected_residual[row] - factor * product[row])
+                            / diagonal.expect("oracle diagonal");
+                    expected[row] += correction[row];
+                }
+                for (row, source) in rhs.iter().enumerate() {
+                    let mut matrix_value = 0.0;
+                    for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                        matrix_value +=
+                            matrix.values()[entry] * expected[matrix.col_indices()[entry]];
+                    }
+                    expected_residual[row] = source - matrix_value;
+                }
+            }
+            let squared_l2 = expected_residual
+                .iter()
+                .map(|residual| residual * residual)
+                .sum::<f64>();
+            assert_eq!(
+                report
+                    .solution
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(report.residual_norm.to_bits(), squared_l2.sqrt().to_bits());
+            assert_eq!(report.iterations, 2);
+            assert!(report.converged);
+            assert_eq!(
+                report.termination,
+                super::IterativeSolveTermination::Converged
+            );
+            assert_eq!(workspace.level_sizes(), vec![2, 1]);
+            assert!(workspace.has_solved);
+            assert_success_workspace!(&workspace);
+            assert_eq!(
+                (
+                    profiled.timing.hierarchy_builds,
+                    profiled.timing.hierarchy_rebuilds,
+                    profiled.timing.matrix_refreshes,
+                    profiled.timing.finest_residual_evaluations,
+                    profiled.timing.solves,
+                    profiled.timing.v_cycles,
+                ),
+                (0, 0, 1, 3, 1, 2)
+            );
+            assert_eq!(
+                profiled
+                    .timing
+                    .levels
+                    .iter()
+                    .map(|level| (
+                        level.level,
+                        level.cells,
+                        level.nonzeros,
+                        level.matrix_refreshes,
+                        level.restriction_calls,
+                        level.prolongation_calls,
+                        level.smoothing_calls,
+                        level.smoothing_sweeps,
+                        level.scaling_calls,
+                        level.residual_evaluations,
+                        level.correction_updates,
+                        level.coarsest_solves,
+                    ))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (0, 2, 4, 1, 2, 2, 2, 0, 2, 0, 2, 0),
+                    (1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 2),
+                ]
+            );
+            for seconds in [
+                profiled.timing.total_seconds,
+                profiled.timing.hierarchy_build_seconds,
+                profiled.timing.hierarchy_rebuild_seconds,
+                profiled.timing.matrix_refresh_seconds,
+                profiled.timing.finest_residual_seconds,
+                profiled.timing.v_cycle_seconds,
+                profiled.timing.other_seconds,
+            ] {
+                assert!(seconds.is_finite() && seconds >= 0.0);
+            }
+            for level in &profiled.timing.levels {
+                for seconds in [
+                    level.matrix_refresh_seconds,
+                    level.restriction_seconds,
+                    level.prolongation_seconds,
+                    level.smoothing_seconds,
+                    level.scaling_seconds,
+                    level.residual_seconds,
+                    level.correction_seconds,
+                    level.coarsest_solve_seconds,
+                ] {
+                    assert!(seconds.is_finite() && seconds >= 0.0);
+                }
+            }
+        }
+
+        // 7/10: exhausted iteration budget, plain internal engine.
+        {
+            let mut workspace =
+                GamgWorkspace::new(&matrix, options).expect("plain maximum workspace");
+            let mut timing = super::GamgKernelTiming::from_matrices(&workspace.matrices);
+            let report = workspace
+                .solve_normalized_l1_with_controls_internal::<false>(
+                    &matrix,
+                    &rhs,
+                    None,
+                    maximum_controls,
+                    &mut timing,
+                )
+                .expect("plain maximum solve");
+            let mut expected = vec![0.0; rhs.len()];
+            let mut expected_residual = vec![0.0; rhs.len()];
+            for (row, source) in rhs.iter().enumerate() {
+                let mut product = 0.0;
+                for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                    product += matrix.values()[entry] * expected[matrix.col_indices()[entry]];
+                }
+                expected_residual[row] = source - product;
+            }
+            for _ in 0..2 {
+                let mut coarse_diagonal = 0.0;
+                for row in 0..matrix.rows() {
+                    for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                        coarse_diagonal += matrix.values()[entry];
+                    }
+                }
+                let coarse_source = expected_residual.iter().copied().sum::<f64>();
+                let coarse_value = coarse_source / coarse_diagonal;
+                let mut correction = vec![coarse_value; rhs.len()];
+                let mut product = vec![0.0; rhs.len()];
+                for (row, product_value) in product.iter_mut().enumerate().take(matrix.rows()) {
+                    for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                        *product_value +=
+                            matrix.values()[entry] * correction[matrix.col_indices()[entry]];
+                    }
+                }
+                let mut numerator = 0.0;
+                let mut denominator = 0.0;
+                for index in 0..rhs.len() {
+                    numerator += expected_residual[index] * correction[index];
+                    denominator += product[index] * correction[index];
+                }
+                let denominator = if denominator.abs() < 1.0e-300_f64 {
+                    if denominator.is_sign_negative() {
+                        -1.0e-300_f64
+                    } else {
+                        1.0e-300_f64
+                    }
+                } else {
+                    denominator
+                };
+                let factor = numerator / denominator;
+                for row in 0..matrix.rows() {
+                    let mut diagonal = None;
+                    for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                        if matrix.col_indices()[entry] == row {
+                            diagonal = Some(matrix.values()[entry]);
+                        }
+                    }
+                    correction[row] = factor * correction[row]
+                        + (expected_residual[row] - factor * product[row])
+                            / diagonal.expect("oracle diagonal");
+                    expected[row] += correction[row];
+                }
+                for (row, source) in rhs.iter().enumerate() {
+                    let mut matrix_value = 0.0;
+                    for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                        matrix_value +=
+                            matrix.values()[entry] * expected[matrix.col_indices()[entry]];
+                    }
+                    expected_residual[row] = source - matrix_value;
+                }
+            }
+            let squared_l2 = expected_residual
+                .iter()
+                .map(|residual| residual * residual)
+                .sum::<f64>();
+            assert_eq!(
+                report
+                    .solution
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(report.residual_norm.to_bits(), squared_l2.sqrt().to_bits());
+            assert_eq!(report.iterations, 2);
+            assert!(!report.converged);
+            assert_eq!(
+                report.termination,
+                super::IterativeSolveTermination::MaxIterations
+            );
+            assert_eq!(workspace.level_sizes(), vec![2, 1]);
+            assert!(workspace.has_solved);
+            assert_success_workspace!(&workspace);
+            assert_eq!(
+                (
+                    timing.hierarchy_builds,
+                    timing.hierarchy_rebuilds,
+                    timing.matrix_refreshes,
+                    timing.finest_residual_evaluations,
+                    timing.solves,
+                    timing.v_cycles,
+                ),
+                (0, 0, 0, 0, 0, 0)
+            );
+            assert_eq!(
+                timing
+                    .levels
+                    .iter()
+                    .map(|level| (
+                        level.level,
+                        level.cells,
+                        level.nonzeros,
+                        level.matrix_refreshes,
+                        level.restriction_calls,
+                        level.prolongation_calls,
+                        level.smoothing_calls,
+                        level.smoothing_sweeps,
+                        level.scaling_calls,
+                        level.residual_evaluations,
+                        level.correction_updates,
+                        level.coarsest_solves,
+                    ))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (0, 2, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+                    (1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+                ]
+            );
+            for seconds in [
+                timing.total_seconds,
+                timing.hierarchy_build_seconds,
+                timing.hierarchy_rebuild_seconds,
+                timing.matrix_refresh_seconds,
+                timing.finest_residual_seconds,
+                timing.v_cycle_seconds,
+                timing.other_seconds,
+            ] {
+                assert!(seconds.is_finite() && seconds >= 0.0);
+            }
+            for level in &timing.levels {
+                for seconds in [
+                    level.matrix_refresh_seconds,
+                    level.restriction_seconds,
+                    level.prolongation_seconds,
+                    level.smoothing_seconds,
+                    level.scaling_seconds,
+                    level.residual_seconds,
+                    level.correction_seconds,
+                    level.coarsest_solve_seconds,
+                ] {
+                    assert!(seconds.is_finite() && seconds >= 0.0);
+                }
+            }
+        }
+
+        // 8/10: exhausted iteration budget, profiled public entrypoint.
+        {
+            let mut workspace =
+                GamgWorkspace::new(&matrix, options).expect("profiled maximum workspace");
+            let profiled = workspace
+                .solve_normalized_l1_with_controls_profiled(&matrix, &rhs, None, maximum_controls)
+                .expect("profiled maximum solve");
+            let report = &profiled.report;
+            let mut expected = vec![0.0; rhs.len()];
+            let mut expected_residual = vec![0.0; rhs.len()];
+            for (row, source) in rhs.iter().enumerate() {
+                let mut product = 0.0;
+                for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                    product += matrix.values()[entry] * expected[matrix.col_indices()[entry]];
+                }
+                expected_residual[row] = source - product;
+            }
+            for _ in 0..2 {
+                let mut coarse_diagonal = 0.0;
+                for row in 0..matrix.rows() {
+                    for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                        coarse_diagonal += matrix.values()[entry];
+                    }
+                }
+                let coarse_source = expected_residual.iter().copied().sum::<f64>();
+                let coarse_value = coarse_source / coarse_diagonal;
+                let mut correction = vec![coarse_value; rhs.len()];
+                let mut product = vec![0.0; rhs.len()];
+                for (row, product_value) in product.iter_mut().enumerate().take(matrix.rows()) {
+                    for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                        *product_value +=
+                            matrix.values()[entry] * correction[matrix.col_indices()[entry]];
+                    }
+                }
+                let mut numerator = 0.0;
+                let mut denominator = 0.0;
+                for index in 0..rhs.len() {
+                    numerator += expected_residual[index] * correction[index];
+                    denominator += product[index] * correction[index];
+                }
+                let denominator = if denominator.abs() < 1.0e-300_f64 {
+                    if denominator.is_sign_negative() {
+                        -1.0e-300_f64
+                    } else {
+                        1.0e-300_f64
+                    }
+                } else {
+                    denominator
+                };
+                let factor = numerator / denominator;
+                for row in 0..matrix.rows() {
+                    let mut diagonal = None;
+                    for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                        if matrix.col_indices()[entry] == row {
+                            diagonal = Some(matrix.values()[entry]);
+                        }
+                    }
+                    correction[row] = factor * correction[row]
+                        + (expected_residual[row] - factor * product[row])
+                            / diagonal.expect("oracle diagonal");
+                    expected[row] += correction[row];
+                }
+                for (row, source) in rhs.iter().enumerate() {
+                    let mut matrix_value = 0.0;
+                    for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                        matrix_value +=
+                            matrix.values()[entry] * expected[matrix.col_indices()[entry]];
+                    }
+                    expected_residual[row] = source - matrix_value;
+                }
+            }
+            let squared_l2 = expected_residual
+                .iter()
+                .map(|residual| residual * residual)
+                .sum::<f64>();
+            assert_eq!(
+                report
+                    .solution
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(report.residual_norm.to_bits(), squared_l2.sqrt().to_bits());
+            assert_eq!(report.iterations, 2);
+            assert!(!report.converged);
+            assert_eq!(
+                report.termination,
+                super::IterativeSolveTermination::MaxIterations
+            );
+            assert_eq!(workspace.level_sizes(), vec![2, 1]);
+            assert!(workspace.has_solved);
+            assert_success_workspace!(&workspace);
+            assert_eq!(
+                (
+                    profiled.timing.hierarchy_builds,
+                    profiled.timing.hierarchy_rebuilds,
+                    profiled.timing.matrix_refreshes,
+                    profiled.timing.finest_residual_evaluations,
+                    profiled.timing.solves,
+                    profiled.timing.v_cycles,
+                ),
+                (0, 0, 1, 3, 1, 2)
+            );
+            assert_eq!(
+                profiled
+                    .timing
+                    .levels
+                    .iter()
+                    .map(|level| (
+                        level.level,
+                        level.cells,
+                        level.nonzeros,
+                        level.matrix_refreshes,
+                        level.restriction_calls,
+                        level.prolongation_calls,
+                        level.smoothing_calls,
+                        level.smoothing_sweeps,
+                        level.scaling_calls,
+                        level.residual_evaluations,
+                        level.correction_updates,
+                        level.coarsest_solves,
+                    ))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (0, 2, 4, 1, 2, 2, 2, 0, 2, 0, 2, 0),
+                    (1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 2),
+                ]
+            );
+            for seconds in [
+                profiled.timing.total_seconds,
+                profiled.timing.hierarchy_build_seconds,
+                profiled.timing.hierarchy_rebuild_seconds,
+                profiled.timing.matrix_refresh_seconds,
+                profiled.timing.finest_residual_seconds,
+                profiled.timing.v_cycle_seconds,
+                profiled.timing.other_seconds,
+            ] {
+                assert!(seconds.is_finite() && seconds >= 0.0);
+            }
+            for level in &profiled.timing.levels {
+                for seconds in [
+                    level.matrix_refresh_seconds,
+                    level.restriction_seconds,
+                    level.prolongation_seconds,
+                    level.smoothing_seconds,
+                    level.scaling_seconds,
+                    level.residual_seconds,
+                    level.correction_seconds,
+                    level.coarsest_solve_seconds,
+                ] {
+                    assert!(seconds.is_finite() && seconds >= 0.0);
+                }
+            }
+        }
+
+        let singular_matrix = CsrMatrix::from_rows(
+            vec![
+                vec![(0, 1.0), (1, -1.0)],
+                vec![(0, -1.0), (1, 2.0), (2, -1.0)],
+                vec![(1, -1.0), (2, 2.0), (3, -1.0)],
+                vec![(2, -1.0), (3, 1.0)],
+            ],
+            4,
+        )
+        .expect("singular lifecycle matrix");
+        let singular_rhs = [0.0; 4];
+        let singular_options = GamgOptions {
+            n_cells_in_coarsest_level: 2,
+            ..options
+        };
+        let singular_controls = NormalizedL1GamgSolveControls {
+            normalization_factor: 1.0,
+            tolerance: 0.0,
+            relative_tolerance: 0.0,
+            l2_controls: super::GamgSolveControls {
+                max_iterations: 1,
+                min_iterations: 1,
+                tolerance: 0.0,
+                relative_tolerance: 0.0,
+            },
+        };
+
+        // 9/10: singular direct coarsest solve, plain internal engine.
+        {
+            let mut workspace = GamgWorkspace::new(&singular_matrix, singular_options)
+                .expect("plain singular workspace");
+            assert_singular_workspace!(&workspace);
+            let mut initial = Vec::<f64>::with_capacity(9);
+            initial.extend_from_slice(&[0.0; 4]);
+            let before_finest_row_arc = workspace.finest_sparsity.row_offsets.clone();
+            let before_finest_column_arc = workspace.finest_sparsity.col_indices.clone();
+            let before_matrix_row_arcs = workspace
+                .matrices
+                .iter()
+                .map(|matrix| matrix.row_offsets.clone())
+                .collect::<Vec<_>>();
+            let before_matrix_column_arcs = workspace
+                .matrices
+                .iter()
+                .map(|matrix| matrix.col_indices.clone())
+                .collect::<Vec<_>>();
+            let before_state = (
+                (
+                    (
+                        workspace.options.max_iterations,
+                        workspace.options.min_iterations,
+                        workspace.options.tolerance.to_bits(),
+                        workspace.options.relative_tolerance.to_bits(),
+                    ),
+                    (
+                        workspace.options.cache_agglomeration,
+                        workspace.options.n_cells_in_coarsest_level,
+                        workspace.options.merge_levels,
+                        workspace.options.agglomerator,
+                    ),
+                    (
+                        workspace.options.smoother,
+                        workspace.options.n_pre_sweeps,
+                        workspace.options.pre_sweeps_level_multiplier,
+                        workspace.options.max_pre_sweeps,
+                        workspace.options.n_post_sweeps,
+                        workspace.options.post_sweeps_level_multiplier,
+                        workspace.options.max_post_sweeps,
+                    ),
+                    (
+                        workspace.options.n_finest_sweeps,
+                        workspace.options.interpolate_correction,
+                        workspace.options.scale_correction,
+                        workspace.options.direct_solve_coarsest,
+                    ),
+                ),
+                matches!(
+                    workspace.agglomeration_source,
+                    super::GamgAgglomerationSource::Algebraic
+                ),
+                (
+                    workspace.finest_sparsity.rows,
+                    workspace.finest_sparsity.cols,
+                    workspace.finest_sparsity.row_offsets.len(),
+                    workspace.finest_sparsity.row_offsets.to_vec(),
+                    workspace.finest_sparsity.col_indices.len(),
+                    workspace.finest_sparsity.col_indices.to_vec(),
+                ),
+                (
+                    workspace.matrices.len(),
+                    workspace.matrices.capacity(),
+                    workspace
+                        .matrices
+                        .iter()
+                        .enumerate()
+                        .map(|(index, matrix)| {
+                            (
+                                index,
+                                matrix.rows,
+                                matrix.cols,
+                                matrix.row_offsets.len(),
+                                matrix.row_offsets.to_vec(),
+                                matrix.col_indices.len(),
+                                matrix.col_indices.to_vec(),
+                                matrix.values.len(),
+                                matrix.values.capacity(),
+                                matrix
+                                    .values
+                                    .iter()
+                                    .map(|value| value.to_bits())
+                                    .collect::<Vec<_>>(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                (
+                    workspace.transfers.len(),
+                    workspace.transfers.capacity(),
+                    workspace
+                        .transfers
+                        .iter()
+                        .enumerate()
+                        .map(|(index, transfer)| {
+                            (
+                                index,
+                                (
+                                    transfer.fine_to_coarse.len(),
+                                    transfer.fine_to_coarse.capacity(),
+                                    transfer.fine_to_coarse.clone(),
+                                ),
+                                (
+                                    transfer.fine_entry_to_coarse_entry.len(),
+                                    transfer.fine_entry_to_coarse_entry.capacity(),
+                                    transfer.fine_entry_to_coarse_entry.clone(),
+                                ),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                (
+                    (
+                        workspace.diagonal_slots.len(),
+                        workspace.diagonal_slots.capacity(),
+                        workspace
+                            .diagonal_slots
+                            .iter()
+                            .enumerate()
+                            .map(|(index, values)| {
+                                (index, values.len(), values.capacity(), values.clone())
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    (
+                        workspace.corrections.len(),
+                        workspace.corrections.capacity(),
+                        workspace
+                            .corrections
+                            .iter()
+                            .enumerate()
+                            .map(|(index, values)| {
+                                (
+                                    index,
+                                    values.len(),
+                                    values.capacity(),
+                                    values
+                                        .iter()
+                                        .map(|value| value.to_bits())
+                                        .collect::<Vec<_>>(),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    (
+                        workspace.sources.len(),
+                        workspace.sources.capacity(),
+                        workspace
+                            .sources
+                            .iter()
+                            .enumerate()
+                            .map(|(index, values)| {
+                                (
+                                    index,
+                                    values.len(),
+                                    values.capacity(),
+                                    values
+                                        .iter()
+                                        .map(|value| value.to_bits())
+                                        .collect::<Vec<_>>(),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    (
+                        workspace.residuals.len(),
+                        workspace.residuals.capacity(),
+                        workspace
+                            .residuals
+                            .iter()
+                            .enumerate()
+                            .map(|(index, values)| {
+                                (
+                                    index,
+                                    values.len(),
+                                    values.capacity(),
+                                    values
+                                        .iter()
+                                        .map(|value| value.to_bits())
+                                        .collect::<Vec<_>>(),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    (
+                        workspace.products.len(),
+                        workspace.products.capacity(),
+                        workspace
+                            .products
+                            .iter()
+                            .enumerate()
+                            .map(|(index, values)| {
+                                (
+                                    index,
+                                    values.len(),
+                                    values.capacity(),
+                                    values
+                                        .iter()
+                                        .map(|value| value.to_bits())
+                                        .collect::<Vec<_>>(),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    (
+                        workspace.pre_smoothed.len(),
+                        workspace.pre_smoothed.capacity(),
+                        workspace
+                            .pre_smoothed
+                            .iter()
+                            .enumerate()
+                            .map(|(index, values)| {
+                                (
+                                    index,
+                                    values.len(),
+                                    values.capacity(),
+                                    values
+                                        .iter()
+                                        .map(|value| value.to_bits())
+                                        .collect::<Vec<_>>(),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                ),
+                workspace.coarsest_pcg.is_none(),
+                workspace.has_solved,
+                workspace.level_sizes(),
+                (
+                    initial.len(),
+                    initial.capacity(),
+                    initial
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                ),
+            );
+            assert!(std::sync::Arc::ptr_eq(
+                &before_finest_row_arc,
+                &before_matrix_row_arcs[0]
+            ));
+            assert!(std::sync::Arc::ptr_eq(
+                &before_finest_column_arc,
+                &before_matrix_column_arcs[0]
+            ));
+
+            let mut timing = super::GamgKernelTiming::from_matrices(&workspace.matrices);
+            let error = workspace
+                .solve_normalized_l1_with_controls_internal::<false>(
+                    &singular_matrix,
+                    &singular_rhs,
+                    Some(initial.as_slice()),
+                    singular_controls,
+                    &mut timing,
+                )
+                .expect_err("plain singular solve must fail");
+            let expected_error =
+                "GAMG direct coarsest solve has a singular pivot in column 1".to_string();
+            assert_eq!(error.to_string(), expected_error);
+            let crate::MeshError::InvalidInput(payload) = error else {
+                panic!("plain singular solve returned the wrong error variant");
+            };
+            assert_eq!(payload, expected_error);
+
+            let after_finest_row_arc = workspace.finest_sparsity.row_offsets.clone();
+            let after_finest_column_arc = workspace.finest_sparsity.col_indices.clone();
+            let after_matrix_row_arcs = workspace
+                .matrices
+                .iter()
+                .map(|matrix| matrix.row_offsets.clone())
+                .collect::<Vec<_>>();
+            let after_matrix_column_arcs = workspace
+                .matrices
+                .iter()
+                .map(|matrix| matrix.col_indices.clone())
+                .collect::<Vec<_>>();
+            let after_state = (
+                (
+                    (
+                        workspace.options.max_iterations,
+                        workspace.options.min_iterations,
+                        workspace.options.tolerance.to_bits(),
+                        workspace.options.relative_tolerance.to_bits(),
+                    ),
+                    (
+                        workspace.options.cache_agglomeration,
+                        workspace.options.n_cells_in_coarsest_level,
+                        workspace.options.merge_levels,
+                        workspace.options.agglomerator,
+                    ),
+                    (
+                        workspace.options.smoother,
+                        workspace.options.n_pre_sweeps,
+                        workspace.options.pre_sweeps_level_multiplier,
+                        workspace.options.max_pre_sweeps,
+                        workspace.options.n_post_sweeps,
+                        workspace.options.post_sweeps_level_multiplier,
+                        workspace.options.max_post_sweeps,
+                    ),
+                    (
+                        workspace.options.n_finest_sweeps,
+                        workspace.options.interpolate_correction,
+                        workspace.options.scale_correction,
+                        workspace.options.direct_solve_coarsest,
+                    ),
+                ),
+                matches!(
+                    workspace.agglomeration_source,
+                    super::GamgAgglomerationSource::Algebraic
+                ),
+                (
+                    workspace.finest_sparsity.rows,
+                    workspace.finest_sparsity.cols,
+                    workspace.finest_sparsity.row_offsets.len(),
+                    workspace.finest_sparsity.row_offsets.to_vec(),
+                    workspace.finest_sparsity.col_indices.len(),
+                    workspace.finest_sparsity.col_indices.to_vec(),
+                ),
+                (
+                    workspace.matrices.len(),
+                    workspace.matrices.capacity(),
+                    workspace
+                        .matrices
+                        .iter()
+                        .enumerate()
+                        .map(|(index, matrix)| {
+                            (
+                                index,
+                                matrix.rows,
+                                matrix.cols,
+                                matrix.row_offsets.len(),
+                                matrix.row_offsets.to_vec(),
+                                matrix.col_indices.len(),
+                                matrix.col_indices.to_vec(),
+                                matrix.values.len(),
+                                matrix.values.capacity(),
+                                matrix
+                                    .values
+                                    .iter()
+                                    .map(|value| value.to_bits())
+                                    .collect::<Vec<_>>(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                (
+                    workspace.transfers.len(),
+                    workspace.transfers.capacity(),
+                    workspace
+                        .transfers
+                        .iter()
+                        .enumerate()
+                        .map(|(index, transfer)| {
+                            (
+                                index,
+                                (
+                                    transfer.fine_to_coarse.len(),
+                                    transfer.fine_to_coarse.capacity(),
+                                    transfer.fine_to_coarse.clone(),
+                                ),
+                                (
+                                    transfer.fine_entry_to_coarse_entry.len(),
+                                    transfer.fine_entry_to_coarse_entry.capacity(),
+                                    transfer.fine_entry_to_coarse_entry.clone(),
+                                ),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                (
+                    (
+                        workspace.diagonal_slots.len(),
+                        workspace.diagonal_slots.capacity(),
+                        workspace
+                            .diagonal_slots
+                            .iter()
+                            .enumerate()
+                            .map(|(index, values)| {
+                                (index, values.len(), values.capacity(), values.clone())
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    (
+                        workspace.corrections.len(),
+                        workspace.corrections.capacity(),
+                        workspace
+                            .corrections
+                            .iter()
+                            .enumerate()
+                            .map(|(index, values)| {
+                                (
+                                    index,
+                                    values.len(),
+                                    values.capacity(),
+                                    values
+                                        .iter()
+                                        .map(|value| value.to_bits())
+                                        .collect::<Vec<_>>(),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    (
+                        workspace.sources.len(),
+                        workspace.sources.capacity(),
+                        workspace
+                            .sources
+                            .iter()
+                            .enumerate()
+                            .map(|(index, values)| {
+                                (
+                                    index,
+                                    values.len(),
+                                    values.capacity(),
+                                    values
+                                        .iter()
+                                        .map(|value| value.to_bits())
+                                        .collect::<Vec<_>>(),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    (
+                        workspace.residuals.len(),
+                        workspace.residuals.capacity(),
+                        workspace
+                            .residuals
+                            .iter()
+                            .enumerate()
+                            .map(|(index, values)| {
+                                (
+                                    index,
+                                    values.len(),
+                                    values.capacity(),
+                                    values
+                                        .iter()
+                                        .map(|value| value.to_bits())
+                                        .collect::<Vec<_>>(),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    (
+                        workspace.products.len(),
+                        workspace.products.capacity(),
+                        workspace
+                            .products
+                            .iter()
+                            .enumerate()
+                            .map(|(index, values)| {
+                                (
+                                    index,
+                                    values.len(),
+                                    values.capacity(),
+                                    values
+                                        .iter()
+                                        .map(|value| value.to_bits())
+                                        .collect::<Vec<_>>(),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    (
+                        workspace.pre_smoothed.len(),
+                        workspace.pre_smoothed.capacity(),
+                        workspace
+                            .pre_smoothed
+                            .iter()
+                            .enumerate()
+                            .map(|(index, values)| {
+                                (
+                                    index,
+                                    values.len(),
+                                    values.capacity(),
+                                    values
+                                        .iter()
+                                        .map(|value| value.to_bits())
+                                        .collect::<Vec<_>>(),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                ),
+                workspace.coarsest_pcg.is_none(),
+                workspace.has_solved,
+                workspace.level_sizes(),
+                (
+                    initial.len(),
+                    initial.capacity(),
+                    initial
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                ),
+            );
+            assert_eq!(after_state, before_state);
+            assert_singular_workspace!(&workspace);
+            assert!(std::sync::Arc::ptr_eq(
+                &before_finest_row_arc,
+                &after_finest_row_arc
+            ));
+            assert!(std::sync::Arc::ptr_eq(
+                &before_finest_column_arc,
+                &after_finest_column_arc
+            ));
+            for (before, after) in before_matrix_row_arcs.iter().zip(&after_matrix_row_arcs) {
+                assert!(std::sync::Arc::ptr_eq(before, after));
+            }
+            for (before, after) in before_matrix_column_arcs
+                .iter()
+                .zip(&after_matrix_column_arcs)
+            {
+                assert!(std::sync::Arc::ptr_eq(before, after));
+            }
+            assert_eq!(
+                (
+                    timing.hierarchy_builds,
+                    timing.hierarchy_rebuilds,
+                    timing.matrix_refreshes,
+                    timing.finest_residual_evaluations,
+                    timing.solves,
+                    timing.v_cycles,
+                ),
+                (0, 0, 0, 0, 0, 0)
+            );
+            assert_eq!(
+                timing
+                    .levels
+                    .iter()
+                    .map(|level| (
+                        level.level,
+                        level.cells,
+                        level.nonzeros,
+                        level.matrix_refreshes,
+                        level.restriction_calls,
+                        level.prolongation_calls,
+                        level.smoothing_calls,
+                        level.smoothing_sweeps,
+                        level.scaling_calls,
+                        level.residual_evaluations,
+                        level.correction_updates,
+                        level.coarsest_solves,
+                    ))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (0, 4, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+                    (1, 2, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+                ]
+            );
+            for seconds in [
+                timing.total_seconds,
+                timing.hierarchy_build_seconds,
+                timing.hierarchy_rebuild_seconds,
+                timing.matrix_refresh_seconds,
+                timing.finest_residual_seconds,
+                timing.v_cycle_seconds,
+                timing.other_seconds,
+            ] {
+                assert!(seconds.is_finite() && seconds >= 0.0);
+            }
+            for level in &timing.levels {
+                for seconds in [
+                    level.matrix_refresh_seconds,
+                    level.restriction_seconds,
+                    level.prolongation_seconds,
+                    level.smoothing_seconds,
+                    level.scaling_seconds,
+                    level.residual_seconds,
+                    level.correction_seconds,
+                    level.coarsest_solve_seconds,
+                ] {
+                    assert!(seconds.is_finite() && seconds >= 0.0);
+                }
+            }
+        }
+
+        // 10/10: singular direct coarsest solve, profiled internal engine.
+        {
+            let mut workspace = GamgWorkspace::new(&singular_matrix, singular_options)
+                .expect("profiled singular workspace");
+            assert_singular_workspace!(&workspace);
+            let mut initial = Vec::<f64>::with_capacity(9);
+            initial.extend_from_slice(&[0.0; 4]);
+            let before_options = (
+                (
+                    workspace.options.max_iterations,
+                    workspace.options.min_iterations,
+                    workspace.options.tolerance.to_bits(),
+                    workspace.options.relative_tolerance.to_bits(),
+                ),
+                (
+                    workspace.options.cache_agglomeration,
+                    workspace.options.n_cells_in_coarsest_level,
+                    workspace.options.merge_levels,
+                    workspace.options.agglomerator,
+                ),
+                (
+                    workspace.options.smoother,
+                    workspace.options.n_pre_sweeps,
+                    workspace.options.pre_sweeps_level_multiplier,
+                    workspace.options.max_pre_sweeps,
+                    workspace.options.n_post_sweeps,
+                    workspace.options.post_sweeps_level_multiplier,
+                    workspace.options.max_post_sweeps,
+                ),
+                (
+                    workspace.options.n_finest_sweeps,
+                    workspace.options.interpolate_correction,
+                    workspace.options.scale_correction,
+                    workspace.options.direct_solve_coarsest,
+                ),
+            );
+            let before_agglomeration = matches!(
+                workspace.agglomeration_source,
+                super::GamgAgglomerationSource::Algebraic
+            );
+            let before_finest = (
+                workspace.finest_sparsity.rows,
+                workspace.finest_sparsity.cols,
+                workspace.finest_sparsity.row_offsets.len(),
+                workspace.finest_sparsity.row_offsets.to_vec(),
+                workspace.finest_sparsity.col_indices.len(),
+                workspace.finest_sparsity.col_indices.to_vec(),
+            );
+            let before_finest_row_arc = workspace.finest_sparsity.row_offsets.clone();
+            let before_finest_column_arc = workspace.finest_sparsity.col_indices.clone();
+            let before_matrices = (
+                workspace.matrices.len(),
+                workspace.matrices.capacity(),
+                workspace
+                    .matrices
+                    .iter()
+                    .enumerate()
+                    .map(|(index, matrix)| {
+                        (
+                            index,
+                            matrix.rows,
+                            matrix.cols,
+                            matrix.row_offsets.len(),
+                            matrix.row_offsets.to_vec(),
+                            matrix.col_indices.len(),
+                            matrix.col_indices.to_vec(),
+                            matrix.values.len(),
+                            matrix.values.capacity(),
+                            matrix
+                                .values
+                                .iter()
+                                .map(|value| value.to_bits())
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let before_matrix_row_arcs = workspace
+                .matrices
+                .iter()
+                .map(|matrix| matrix.row_offsets.clone())
+                .collect::<Vec<_>>();
+            let before_matrix_column_arcs = workspace
+                .matrices
+                .iter()
+                .map(|matrix| matrix.col_indices.clone())
+                .collect::<Vec<_>>();
+            let before_transfers = (
+                workspace.transfers.len(),
+                workspace.transfers.capacity(),
+                workspace
+                    .transfers
+                    .iter()
+                    .enumerate()
+                    .map(|(index, transfer)| {
+                        (
+                            index,
+                            (
+                                transfer.fine_to_coarse.len(),
+                                transfer.fine_to_coarse.capacity(),
+                                transfer.fine_to_coarse.clone(),
+                            ),
+                            (
+                                transfer.fine_entry_to_coarse_entry.len(),
+                                transfer.fine_entry_to_coarse_entry.capacity(),
+                                transfer.fine_entry_to_coarse_entry.clone(),
+                            ),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let before_diagonal = (
+                workspace.diagonal_slots.len(),
+                workspace.diagonal_slots.capacity(),
+                workspace
+                    .diagonal_slots
+                    .iter()
+                    .enumerate()
+                    .map(|(index, values)| (index, values.len(), values.capacity(), values.clone()))
+                    .collect::<Vec<_>>(),
+            );
+            let before_corrections = (
+                workspace.corrections.len(),
+                workspace.corrections.capacity(),
+                workspace
+                    .corrections
+                    .iter()
+                    .enumerate()
+                    .map(|(index, values)| {
+                        (
+                            index,
+                            values.len(),
+                            values.capacity(),
+                            values
+                                .iter()
+                                .map(|value| value.to_bits())
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let before_sources = (
+                workspace.sources.len(),
+                workspace.sources.capacity(),
+                workspace
+                    .sources
+                    .iter()
+                    .enumerate()
+                    .map(|(index, values)| {
+                        (
+                            index,
+                            values.len(),
+                            values.capacity(),
+                            values
+                                .iter()
+                                .map(|value| value.to_bits())
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let before_residuals = (
+                workspace.residuals.len(),
+                workspace.residuals.capacity(),
+                workspace
+                    .residuals
+                    .iter()
+                    .enumerate()
+                    .map(|(index, values)| {
+                        (
+                            index,
+                            values.len(),
+                            values.capacity(),
+                            values
+                                .iter()
+                                .map(|value| value.to_bits())
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let before_products = (
+                workspace.products.len(),
+                workspace.products.capacity(),
+                workspace
+                    .products
+                    .iter()
+                    .enumerate()
+                    .map(|(index, values)| {
+                        (
+                            index,
+                            values.len(),
+                            values.capacity(),
+                            values
+                                .iter()
+                                .map(|value| value.to_bits())
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let before_pre_smoothed = (
+                workspace.pre_smoothed.len(),
+                workspace.pre_smoothed.capacity(),
+                workspace
+                    .pre_smoothed
+                    .iter()
+                    .enumerate()
+                    .map(|(index, values)| {
+                        (
+                            index,
+                            values.len(),
+                            values.capacity(),
+                            values
+                                .iter()
+                                .map(|value| value.to_bits())
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let before_pcg_none = workspace.coarsest_pcg.is_none();
+            let before_has_solved = workspace.has_solved;
+            let before_levels = workspace.level_sizes();
+            let before_initial = (
+                initial.len(),
+                initial.capacity(),
+                initial
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+            );
+            assert!(std::sync::Arc::ptr_eq(
+                &before_finest_row_arc,
+                &before_matrix_row_arcs[0]
+            ));
+            assert!(std::sync::Arc::ptr_eq(
+                &before_finest_column_arc,
+                &before_matrix_column_arcs[0]
+            ));
+
+            let mut timing = super::GamgKernelTiming::from_matrices(&workspace.matrices);
+            let error = workspace
+                .solve_normalized_l1_with_controls_internal::<true>(
+                    &singular_matrix,
+                    &singular_rhs,
+                    Some(initial.as_slice()),
+                    singular_controls,
+                    &mut timing,
+                )
+                .expect_err("profiled singular solve must fail");
+            let expected_error =
+                "GAMG direct coarsest solve has a singular pivot in column 1".to_string();
+            assert_eq!(error.to_string(), expected_error);
+            let crate::MeshError::InvalidInput(payload) = error else {
+                panic!("profiled singular solve returned the wrong error variant");
+            };
+            assert_eq!(payload, expected_error);
+
+            assert_eq!(
+                (
+                    (
+                        workspace.options.max_iterations,
+                        workspace.options.min_iterations,
+                        workspace.options.tolerance.to_bits(),
+                        workspace.options.relative_tolerance.to_bits(),
+                    ),
+                    (
+                        workspace.options.cache_agglomeration,
+                        workspace.options.n_cells_in_coarsest_level,
+                        workspace.options.merge_levels,
+                        workspace.options.agglomerator,
+                    ),
+                    (
+                        workspace.options.smoother,
+                        workspace.options.n_pre_sweeps,
+                        workspace.options.pre_sweeps_level_multiplier,
+                        workspace.options.max_pre_sweeps,
+                        workspace.options.n_post_sweeps,
+                        workspace.options.post_sweeps_level_multiplier,
+                        workspace.options.max_post_sweeps,
+                    ),
+                    (
+                        workspace.options.n_finest_sweeps,
+                        workspace.options.interpolate_correction,
+                        workspace.options.scale_correction,
+                        workspace.options.direct_solve_coarsest,
+                    ),
+                ),
+                before_options
+            );
+            assert_eq!(
+                matches!(
+                    workspace.agglomeration_source,
+                    super::GamgAgglomerationSource::Algebraic
+                ),
+                before_agglomeration
+            );
+            assert_eq!(
+                (
+                    workspace.finest_sparsity.rows,
+                    workspace.finest_sparsity.cols,
+                    workspace.finest_sparsity.row_offsets.len(),
+                    workspace.finest_sparsity.row_offsets.to_vec(),
+                    workspace.finest_sparsity.col_indices.len(),
+                    workspace.finest_sparsity.col_indices.to_vec(),
+                ),
+                before_finest
+            );
+            assert_eq!(
+                (
+                    workspace.matrices.len(),
+                    workspace.matrices.capacity(),
+                    workspace
+                        .matrices
+                        .iter()
+                        .enumerate()
+                        .map(|(index, matrix)| (
+                            index,
+                            matrix.rows,
+                            matrix.cols,
+                            matrix.row_offsets.len(),
+                            matrix.row_offsets.to_vec(),
+                            matrix.col_indices.len(),
+                            matrix.col_indices.to_vec(),
+                            matrix.values.len(),
+                            matrix.values.capacity(),
+                            matrix
+                                .values
+                                .iter()
+                                .map(|value| value.to_bits())
+                                .collect::<Vec<_>>(),
+                        ))
+                        .collect::<Vec<_>>(),
+                ),
+                before_matrices
+            );
+            assert_eq!(
+                (
+                    workspace.transfers.len(),
+                    workspace.transfers.capacity(),
+                    workspace
+                        .transfers
+                        .iter()
+                        .enumerate()
+                        .map(|(index, transfer)| (
+                            index,
+                            (
+                                transfer.fine_to_coarse.len(),
+                                transfer.fine_to_coarse.capacity(),
+                                transfer.fine_to_coarse.clone(),
+                            ),
+                            (
+                                transfer.fine_entry_to_coarse_entry.len(),
+                                transfer.fine_entry_to_coarse_entry.capacity(),
+                                transfer.fine_entry_to_coarse_entry.clone(),
+                            ),
+                        ))
+                        .collect::<Vec<_>>(),
+                ),
+                before_transfers
+            );
+            assert_eq!(
+                (
+                    workspace.diagonal_slots.len(),
+                    workspace.diagonal_slots.capacity(),
+                    workspace
+                        .diagonal_slots
+                        .iter()
+                        .enumerate()
+                        .map(|(index, values)| (
+                            index,
+                            values.len(),
+                            values.capacity(),
+                            values.clone(),
+                        ))
+                        .collect::<Vec<_>>(),
+                ),
+                before_diagonal
+            );
+            assert_eq!(
+                (
+                    workspace.corrections.len(),
+                    workspace.corrections.capacity(),
+                    workspace
+                        .corrections
+                        .iter()
+                        .enumerate()
+                        .map(|(index, values)| (
+                            index,
+                            values.len(),
+                            values.capacity(),
+                            values
+                                .iter()
+                                .map(|value| value.to_bits())
+                                .collect::<Vec<_>>(),
+                        ))
+                        .collect::<Vec<_>>(),
+                ),
+                before_corrections
+            );
+            assert_eq!(
+                (
+                    workspace.sources.len(),
+                    workspace.sources.capacity(),
+                    workspace
+                        .sources
+                        .iter()
+                        .enumerate()
+                        .map(|(index, values)| (
+                            index,
+                            values.len(),
+                            values.capacity(),
+                            values
+                                .iter()
+                                .map(|value| value.to_bits())
+                                .collect::<Vec<_>>(),
+                        ))
+                        .collect::<Vec<_>>(),
+                ),
+                before_sources
+            );
+            assert_eq!(
+                (
+                    workspace.residuals.len(),
+                    workspace.residuals.capacity(),
+                    workspace
+                        .residuals
+                        .iter()
+                        .enumerate()
+                        .map(|(index, values)| (
+                            index,
+                            values.len(),
+                            values.capacity(),
+                            values
+                                .iter()
+                                .map(|value| value.to_bits())
+                                .collect::<Vec<_>>(),
+                        ))
+                        .collect::<Vec<_>>(),
+                ),
+                before_residuals
+            );
+            assert_eq!(
+                (
+                    workspace.products.len(),
+                    workspace.products.capacity(),
+                    workspace
+                        .products
+                        .iter()
+                        .enumerate()
+                        .map(|(index, values)| (
+                            index,
+                            values.len(),
+                            values.capacity(),
+                            values
+                                .iter()
+                                .map(|value| value.to_bits())
+                                .collect::<Vec<_>>(),
+                        ))
+                        .collect::<Vec<_>>(),
+                ),
+                before_products
+            );
+            assert_eq!(
+                (
+                    workspace.pre_smoothed.len(),
+                    workspace.pre_smoothed.capacity(),
+                    workspace
+                        .pre_smoothed
+                        .iter()
+                        .enumerate()
+                        .map(|(index, values)| (
+                            index,
+                            values.len(),
+                            values.capacity(),
+                            values
+                                .iter()
+                                .map(|value| value.to_bits())
+                                .collect::<Vec<_>>(),
+                        ))
+                        .collect::<Vec<_>>(),
+                ),
+                before_pre_smoothed
+            );
+            assert_eq!(workspace.coarsest_pcg.is_none(), before_pcg_none);
+            assert_eq!(workspace.has_solved, before_has_solved);
+            assert_eq!(workspace.level_sizes(), before_levels);
+            assert_singular_workspace!(&workspace);
+            assert_eq!(
+                (
+                    initial.len(),
+                    initial.capacity(),
+                    initial
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                ),
+                before_initial
+            );
+            assert!(std::sync::Arc::ptr_eq(
+                &before_finest_row_arc,
+                &workspace.finest_sparsity.row_offsets
+            ));
+            assert!(std::sync::Arc::ptr_eq(
+                &before_finest_column_arc,
+                &workspace.finest_sparsity.col_indices
+            ));
+            for (before, after) in before_matrix_row_arcs
+                .iter()
+                .zip(workspace.matrices.iter().map(|matrix| &matrix.row_offsets))
+            {
+                assert!(std::sync::Arc::ptr_eq(before, after));
+            }
+            for (before, after) in before_matrix_column_arcs
+                .iter()
+                .zip(workspace.matrices.iter().map(|matrix| &matrix.col_indices))
+            {
+                assert!(std::sync::Arc::ptr_eq(before, after));
+            }
+            assert_eq!(
+                (
+                    timing.hierarchy_builds,
+                    timing.hierarchy_rebuilds,
+                    timing.matrix_refreshes,
+                    timing.finest_residual_evaluations,
+                    timing.solves,
+                    timing.v_cycles,
+                ),
+                (0, 0, 1, 1, 1, 0)
+            );
+            assert_eq!(
+                timing
+                    .levels
+                    .iter()
+                    .map(|level| (
+                        level.level,
+                        level.cells,
+                        level.nonzeros,
+                        level.matrix_refreshes,
+                        level.restriction_calls,
+                        level.prolongation_calls,
+                        level.smoothing_calls,
+                        level.smoothing_sweeps,
+                        level.scaling_calls,
+                        level.residual_evaluations,
+                        level.correction_updates,
+                        level.coarsest_solves,
+                    ))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (0, 4, 10, 1, 1, 0, 0, 0, 0, 0, 0, 0),
+                    (1, 2, 4, 1, 0, 0, 0, 0, 0, 0, 0, 0),
+                ]
+            );
+            for seconds in [
+                timing.total_seconds,
+                timing.hierarchy_build_seconds,
+                timing.hierarchy_rebuild_seconds,
+                timing.matrix_refresh_seconds,
+                timing.finest_residual_seconds,
+                timing.v_cycle_seconds,
+                timing.other_seconds,
+            ] {
+                assert!(seconds.is_finite() && seconds >= 0.0);
+            }
+            for level in &timing.levels {
+                for seconds in [
+                    level.matrix_refresh_seconds,
+                    level.restriction_seconds,
+                    level.prolongation_seconds,
+                    level.smoothing_seconds,
+                    level.scaling_seconds,
+                    level.residual_seconds,
+                    level.correction_seconds,
+                    level.coarsest_solve_seconds,
+                ] {
+                    assert!(seconds.is_finite() && seconds >= 0.0);
+                }
+            }
+        }
+    }
+    #[test]
+    fn profiled_normalized_l1_solve_is_bit_identical() {
+        let matrix = CsrMatrix::from_rows(
+            vec![
+                vec![(0, 4.0), (1, -1.0), (2, -0.5)],
+                vec![(0, -1.0), (1, 3.5), (3, -1.0)],
+                vec![(0, -0.5), (2, 3.0), (3, -1.0), (4, -0.25)],
+                vec![(1, -1.0), (2, -1.0), (3, 4.0), (5, -0.5)],
+                vec![(2, -0.25), (4, 2.5), (5, -1.0), (6, -0.5)],
+                vec![(3, -0.5), (4, -1.0), (5, 3.5), (7, -0.75)],
+                vec![(4, -0.5), (6, 2.75), (7, -1.0)],
+                vec![(5, -0.75), (6, -1.0), (7, 3.0)],
+            ],
+            8,
+        )
+        .expect("parity matrix");
+        let reference = [0.5, 1.0, -0.25, 2.0, 1.5, -1.0, 0.75, 1.25];
+        let mut rhs = vec![0.0; 8];
+        for (row, source) in rhs.iter_mut().enumerate() {
+            for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                *source += matrix.values()[entry] * reference[matrix.col_indices()[entry]];
+            }
+        }
+        let options = GamgOptions {
+            max_iterations: 2,
+            n_cells_in_coarsest_level: 2,
+            direct_solve_coarsest: true,
+            ..GamgOptions::default()
+        };
+        let controls = NormalizedL1GamgSolveControls {
+            normalization_factor: rhs.iter().map(|value| value.abs()).sum(),
+            tolerance: 0.0,
+            relative_tolerance: 0.0,
+            l2_controls: super::GamgSolveControls {
+                max_iterations: 2,
+                min_iterations: 0,
+                tolerance: 0.0,
+                relative_tolerance: 0.0,
+            },
+        };
+        let mut plain_workspace = GamgWorkspace::new(&matrix, options).expect("plain workspace");
+        let plain = plain_workspace
+            .solve_normalized_l1_with_controls(&matrix, &rhs, None, controls)
+            .expect("plain parity solve");
+        let mut profiled_workspace =
+            GamgWorkspace::new(&matrix, options).expect("profiled workspace");
+        let profiled = profiled_workspace
+            .solve_normalized_l1_with_controls_profiled(&matrix, &rhs, None, controls)
+            .expect("profiled parity solve");
+
+        assert_eq!(plain.iterations, 2);
+        assert_eq!(profiled.report.iterations, 2);
+        assert!(!plain.converged);
+        assert!(!profiled.report.converged);
+        assert_eq!(
+            plain.termination,
+            super::IterativeSolveTermination::MaxIterations
+        );
+        assert_eq!(
+            profiled.report.termination,
+            super::IterativeSolveTermination::MaxIterations
+        );
+        assert_eq!(plain_workspace.level_sizes(), vec![8, 4, 2]);
+        assert_eq!(profiled_workspace.level_sizes(), vec![8, 4, 2]);
+        assert!(plain_workspace.has_solved);
+        assert!(profiled_workspace.has_solved);
+        assert_eq!(
+            (
+                (
+                    plain_workspace.options.max_iterations,
+                    plain_workspace.options.min_iterations,
+                    plain_workspace.options.tolerance.to_bits(),
+                    plain_workspace.options.relative_tolerance.to_bits(),
+                ),
+                (
+                    plain_workspace.options.cache_agglomeration,
+                    plain_workspace.options.n_cells_in_coarsest_level,
+                    plain_workspace.options.merge_levels,
+                    plain_workspace.options.agglomerator,
+                ),
+                (
+                    plain_workspace.options.smoother,
+                    plain_workspace.options.n_pre_sweeps,
+                    plain_workspace.options.pre_sweeps_level_multiplier,
+                    plain_workspace.options.max_pre_sweeps,
+                    plain_workspace.options.n_post_sweeps,
+                    plain_workspace.options.post_sweeps_level_multiplier,
+                    plain_workspace.options.max_post_sweeps,
+                ),
+                (
+                    plain_workspace.options.n_finest_sweeps,
+                    plain_workspace.options.interpolate_correction,
+                    plain_workspace.options.scale_correction,
+                    plain_workspace.options.direct_solve_coarsest,
+                ),
+            ),
+            (
+                (2, 0, 1.0e-10f64.to_bits(), 0.0f64.to_bits()),
+                (true, 2, 1, GamgAgglomerator::AlgebraicPair),
+                (GamgSmoother::GaussSeidel, 0, 1, 4, 2, 1, 4),
+                (2, false, true, true),
+            )
+        );
+        assert_eq!(
+            (
+                (
+                    profiled_workspace.options.max_iterations,
+                    profiled_workspace.options.min_iterations,
+                    profiled_workspace.options.tolerance.to_bits(),
+                    profiled_workspace.options.relative_tolerance.to_bits(),
+                ),
+                (
+                    profiled_workspace.options.cache_agglomeration,
+                    profiled_workspace.options.n_cells_in_coarsest_level,
+                    profiled_workspace.options.merge_levels,
+                    profiled_workspace.options.agglomerator,
+                ),
+                (
+                    profiled_workspace.options.smoother,
+                    profiled_workspace.options.n_pre_sweeps,
+                    profiled_workspace.options.pre_sweeps_level_multiplier,
+                    profiled_workspace.options.max_pre_sweeps,
+                    profiled_workspace.options.n_post_sweeps,
+                    profiled_workspace.options.post_sweeps_level_multiplier,
+                    profiled_workspace.options.max_post_sweeps,
+                ),
+                (
+                    profiled_workspace.options.n_finest_sweeps,
+                    profiled_workspace.options.interpolate_correction,
+                    profiled_workspace.options.scale_correction,
+                    profiled_workspace.options.direct_solve_coarsest,
+                ),
+            ),
+            (
+                (2, 0, 1.0e-10f64.to_bits(), 0.0f64.to_bits()),
+                (true, 2, 1, GamgAgglomerator::AlgebraicPair),
+                (GamgSmoother::GaussSeidel, 0, 1, 4, 2, 1, 4),
+                (2, false, true, true),
+            )
+        );
+        assert_eq!(
+            plain.residual_norm.to_bits(),
+            profiled.report.residual_norm.to_bits()
+        );
+        assert_eq!(plain.solution.len(), 8);
+        assert_eq!(profiled.report.solution.len(), 8);
+        assert_eq!(
+            plain
+                .solution
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            profiled
+                .report
+                .solution
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        let mut squared_l2 = 0.0;
+        for (row, source) in rhs.iter().enumerate() {
+            let mut product = 0.0;
+            for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                product += matrix.values()[entry] * plain.solution[matrix.col_indices()[entry]];
+            }
+            let residual = source - product;
+            squared_l2 += residual * residual;
+        }
+        assert_eq!(plain.residual_norm.to_bits(), squared_l2.sqrt().to_bits());
+        assert_eq!(
+            (
+                profiled.timing.hierarchy_builds,
+                profiled.timing.hierarchy_rebuilds,
+                profiled.timing.matrix_refreshes,
+                profiled.timing.finest_residual_evaluations,
+                profiled.timing.solves,
+                profiled.timing.v_cycles,
+            ),
+            (0, 0, 1, 3, 1, 2)
+        );
+        assert_eq!(
+            profiled
+                .timing
+                .levels
+                .iter()
+                .map(|level| (
+                    level.level,
+                    level.cells,
+                    level.nonzeros,
+                    level.matrix_refreshes,
+                    level.restriction_calls,
+                    level.prolongation_calls,
+                    level.smoothing_calls,
+                    level.smoothing_sweeps,
+                    level.scaling_calls,
+                    level.residual_evaluations,
+                    level.correction_updates,
+                    level.coarsest_solves,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, 8, 28, 1, 2, 2, 2, 4, 2, 0, 2, 0),
+                (1, 4, 10, 1, 2, 2, 2, 4, 0, 0, 2, 0),
+                (2, 2, 4, 1, 0, 0, 0, 0, 0, 0, 0, 2),
+            ]
+        );
+        for seconds in [
+            profiled.timing.total_seconds,
+            profiled.timing.hierarchy_build_seconds,
+            profiled.timing.hierarchy_rebuild_seconds,
+            profiled.timing.matrix_refresh_seconds,
+            profiled.timing.finest_residual_seconds,
+            profiled.timing.v_cycle_seconds,
+            profiled.timing.other_seconds,
+        ] {
+            assert!(seconds.is_finite() && seconds >= 0.0);
+        }
+        for level in &profiled.timing.levels {
+            for seconds in [
+                level.matrix_refresh_seconds,
+                level.restriction_seconds,
+                level.prolongation_seconds,
+                level.smoothing_seconds,
+                level.scaling_seconds,
+                level.residual_seconds,
+                level.correction_seconds,
+                level.coarsest_solve_seconds,
+            ] {
+                assert!(seconds.is_finite() && seconds >= 0.0);
+            }
+        }
+    }
+
+    #[test]
     fn algebraic_pair_agglomeration_is_deterministic_and_alternates_order() {
         let matrix = poisson_grid(8, 8, 1.0);
         let forward = algebraic_pair_map(&matrix, true).expect("forward map");
