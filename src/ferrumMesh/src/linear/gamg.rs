@@ -78,6 +78,15 @@ pub struct GamgSolveControls {
     pub relative_tolerance: f64,
 }
 
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct NormalizedL1GamgSolveControls {
+    pub(crate) normalization_factor: f64,
+    pub(crate) tolerance: f64,
+    pub(crate) relative_tolerance: f64,
+    pub(crate) l2_controls: GamgSolveControls,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GamgLevelTiming {
     pub level: usize,
@@ -490,7 +499,23 @@ impl GamgWorkspace {
                     .to_string(),
             ));
         }
+        Self::build_validated(matrix, options, agglomeration_source)
+    }
 
+    fn build_validated(
+        matrix: &CsrMatrix,
+        options: GamgOptions,
+        agglomeration_source: GamgAgglomerationSource,
+    ) -> Result<Self> {
+        Self::build_validated_with_finest_diagonal(matrix, options, agglomeration_source, None)
+    }
+
+    fn build_validated_with_finest_diagonal(
+        matrix: &CsrMatrix,
+        options: GamgOptions,
+        agglomeration_source: GamgAgglomerationSource,
+        finest_diagonal_slots: Option<Vec<usize>>,
+    ) -> Result<Self> {
         let finest_sparsity = matrix.sparsity_pattern();
         let mut matrices = vec![matrix.clone()];
         let mut transfers = Vec::new();
@@ -528,10 +553,15 @@ impl GamgWorkspace {
             )));
         }
 
-        let diagonal_slots = matrices
-            .iter()
-            .map(super::csr_diagonal_slots)
-            .collect::<Result<Vec<_>>>()?;
+        let mut diagonal_slots = Vec::with_capacity(matrices.len());
+        if let Some(slots) = finest_diagonal_slots {
+            diagonal_slots.push(slots);
+        } else {
+            diagonal_slots.push(super::csr_diagonal_slots(&matrices[0])?);
+        }
+        for matrix in &matrices[1..] {
+            diagonal_slots.push(super::csr_diagonal_slots(matrix)?);
+        }
         let level_sizes = matrices.iter().map(CsrMatrix::rows).collect::<Vec<_>>();
         let corrections = level_vectors(&level_sizes);
         let sources = level_vectors(&level_sizes);
@@ -610,6 +640,156 @@ impl GamgWorkspace {
             + timing.v_cycle_seconds;
         timing.other_seconds = (timing.total_seconds - accounted_seconds).max(0.0);
         Ok(ProfiledGamgSolveReport { report, timing })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn solve_normalized_l1_with_controls(
+        &mut self,
+        matrix: &CsrMatrix,
+        rhs: &[f64],
+        initial: Option<&[f64]>,
+        controls: NormalizedL1GamgSolveControls,
+    ) -> Result<IterativeSolveReport> {
+        let mut timing = GamgKernelTiming::default();
+        self.solve_normalized_l1_with_controls_internal::<false>(
+            matrix,
+            rhs,
+            initial,
+            controls,
+            &mut timing,
+        )
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn solve_normalized_l1_with_controls_profiled(
+        &mut self,
+        matrix: &CsrMatrix,
+        rhs: &[f64],
+        initial: Option<&[f64]>,
+        controls: NormalizedL1GamgSolveControls,
+    ) -> Result<ProfiledGamgSolveReport> {
+        let started = Instant::now();
+        let mut timing = GamgKernelTiming::default();
+        let report = self.solve_normalized_l1_with_controls_internal::<true>(
+            matrix,
+            rhs,
+            initial,
+            controls,
+            &mut timing,
+        )?;
+        timing.total_seconds = started.elapsed().as_secs_f64();
+        let accounted_seconds = timing.hierarchy_rebuild_seconds
+            + timing.matrix_refresh_seconds
+            + timing.finest_residual_seconds
+            + timing.v_cycle_seconds;
+        timing.other_seconds = (timing.total_seconds - accounted_seconds).max(0.0);
+        Ok(ProfiledGamgSolveReport { report, timing })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn solve_normalized_l1_with_controls_internal<const PROFILE: bool>(
+        &mut self,
+        matrix: &CsrMatrix,
+        rhs: &[f64],
+        initial: Option<&[f64]>,
+        controls: NormalizedL1GamgSolveControls,
+        timing: &mut GamgKernelTiming,
+    ) -> Result<IterativeSolveReport> {
+        let finest_diagonal_slots = validate_normalized_l1_call(matrix, rhs, initial, controls)?;
+
+        if !self.options.cache_agglomeration && self.has_solved {
+            let rebuild_started = profile_started::<PROFILE>();
+            *self = Self::build_validated_with_finest_diagonal(
+                matrix,
+                self.options,
+                self.agglomeration_source.clone(),
+                Some(finest_diagonal_slots),
+            )?;
+            add_profile_elapsed::<PROFILE>(&mut timing.hierarchy_rebuild_seconds, rebuild_started);
+            if PROFILE {
+                timing.hierarchy_rebuilds += 1;
+            }
+        }
+        if PROFILE {
+            let hierarchy_rebuild_seconds = timing.hierarchy_rebuild_seconds;
+            let hierarchy_rebuilds = timing.hierarchy_rebuilds;
+            *timing = GamgKernelTiming::from_matrices(&self.matrices);
+            timing.hierarchy_rebuild_seconds = hierarchy_rebuild_seconds;
+            timing.hierarchy_rebuilds = hierarchy_rebuilds;
+            timing.solves = 1;
+        }
+
+        let refresh_started = profile_started::<PROFILE>();
+        self.refresh_matrix_values::<PROFILE>(matrix, timing)?;
+        add_profile_elapsed::<PROFILE>(&mut timing.matrix_refresh_seconds, refresh_started);
+        if PROFILE {
+            timing.matrix_refreshes += 1;
+        }
+
+        let mut solution = initial
+            .map(<[f64]>::to_vec)
+            .unwrap_or_else(|| vec![0.0; rhs.len()]);
+        let residual_started = profile_started::<PROFILE>();
+        let (initial_l1, initial_l2_squared) =
+            self.update_finest_residual_with_norms(&solution, rhs)?;
+        add_profile_elapsed::<PROFILE>(&mut timing.finest_residual_seconds, residual_started);
+        if PROFILE {
+            timing.finest_residual_evaluations += 1;
+        }
+        let mut residual_norm = initial_l2_squared.sqrt();
+        if controls.l2_controls.min_iterations == 0 && initial_l1 == 0.0 {
+            self.has_solved = true;
+            return Ok(IterativeSolveReport {
+                solution,
+                iterations: 0,
+                residual_norm,
+                converged: true,
+                termination: IterativeSolveTermination::Converged,
+            });
+        }
+
+        let iteration_limit = controls
+            .l2_controls
+            .max_iterations
+            .max(controls.l2_controls.min_iterations)
+            .max(1);
+        for iteration in 1..=iteration_limit {
+            let cycle_started = profile_started::<PROFILE>();
+            self.v_cycle::<PROFILE>(&mut solution, rhs, controls.l2_controls, timing)?;
+            add_profile_elapsed::<PROFILE>(&mut timing.v_cycle_seconds, cycle_started);
+            if PROFILE {
+                timing.v_cycles += 1;
+            }
+            let residual_started = profile_started::<PROFILE>();
+            let (current_l1, current_l2_squared) =
+                self.update_finest_residual_with_norms(&solution, rhs)?;
+            add_profile_elapsed::<PROFILE>(&mut timing.finest_residual_seconds, residual_started);
+            if PROFILE {
+                timing.finest_residual_evaluations += 1;
+            }
+            residual_norm = current_l2_squared.sqrt();
+            if iteration >= controls.l2_controls.min_iterations
+                && normalized_l1_has_converged(current_l1, initial_l1, controls)
+            {
+                self.has_solved = true;
+                return Ok(IterativeSolveReport {
+                    solution,
+                    iterations: iteration,
+                    residual_norm,
+                    converged: true,
+                    termination: IterativeSolveTermination::Converged,
+                });
+            }
+        }
+
+        self.has_solved = true;
+        Ok(IterativeSolveReport {
+            solution,
+            iterations: iteration_limit,
+            residual_norm,
+            converged: false,
+            termination: IterativeSolveTermination::MaxIterations,
+        })
     }
 
     fn solve_with_controls_internal<const PROFILE: bool>(
@@ -754,6 +934,25 @@ impl GamgWorkspace {
             *residual = source - product;
         }
         Ok(())
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn update_finest_residual_with_norms(
+        &mut self,
+        solution: &[f64],
+        rhs: &[f64],
+    ) -> Result<(f64, f64)> {
+        self.matrices[0].matvec_into(solution, &mut self.products[0])?;
+        let mut raw_l1 = 0.0;
+        let mut squared_l2 = 0.0;
+        for ((residual, source), product) in
+            self.residuals[0].iter_mut().zip(rhs).zip(&self.products[0])
+        {
+            *residual = source - product;
+            raw_l1 += residual.abs();
+            squared_l2 += *residual * *residual;
+        }
+        Ok((raw_l1, squared_l2))
     }
 
     fn v_cycle<const PROFILE: bool>(
@@ -1041,6 +1240,72 @@ fn validate_solve_controls(controls: GamgSolveControls) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+fn validate_normalized_l1_call(
+    matrix: &CsrMatrix,
+    rhs: &[f64],
+    initial: Option<&[f64]>,
+    controls: NormalizedL1GamgSolveControls,
+) -> Result<Vec<usize>> {
+    if !controls.normalization_factor.is_finite() || controls.normalization_factor <= 0.0 {
+        return Err(invalid_input(format!(
+            "GAMG normalized-L1 factor must be finite and positive, got {}",
+            controls.normalization_factor
+        )));
+    }
+    if !controls.tolerance.is_finite() || controls.tolerance < 0.0 {
+        return Err(invalid_input(format!(
+            "GAMG normalized-L1 tolerance must be finite and non-negative, got {}",
+            controls.tolerance
+        )));
+    }
+    if !controls.relative_tolerance.is_finite() || controls.relative_tolerance < 0.0 {
+        return Err(invalid_input(format!(
+            "GAMG normalized-L1 relTol must be finite and non-negative, got {}",
+            controls.relative_tolerance
+        )));
+    }
+    validate_solve_controls(controls.l2_controls)?;
+    if rhs.len() != matrix.rows() {
+        return Err(invalid_input(format!(
+            "iterative solve expected rhs with {} entries, got {}",
+            matrix.rows(),
+            rhs.len()
+        )));
+    }
+    if let Some(initial) = initial
+        && initial.len() != matrix.cols()
+    {
+        return Err(invalid_input(format!(
+            "iterative solve expected initial guess with {} entries, got {}",
+            matrix.cols(),
+            initial.len()
+        )));
+    }
+    if let Some((index, value)) = rhs
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(invalid_input(format!(
+            "iterative solve rhs entry {index} must be finite, got {value}"
+        )));
+    }
+    if let Some((index, value)) = initial.and_then(|values| {
+        values
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+    }) {
+        return Err(invalid_input(format!(
+            "iterative solve initial entry {index} must be finite, got {value}"
+        )));
+    }
+    validate_gamg_matrix_with_diagonal_slots(matrix)
+}
+
 fn validate_gamg_matrix(matrix: &CsrMatrix) -> Result<()> {
     if matrix.rows() != matrix.cols() {
         return Err(invalid_input(format!(
@@ -1095,6 +1360,62 @@ fn validate_gamg_matrix(matrix: &CsrMatrix) -> Result<()> {
     Ok(())
 }
 
+fn validate_gamg_matrix_with_diagonal_slots(matrix: &CsrMatrix) -> Result<Vec<usize>> {
+    if matrix.rows() != matrix.cols() {
+        return Err(invalid_input(format!(
+            "GAMG pressure foundation requires a square matrix, got {}x{}",
+            matrix.rows(),
+            matrix.cols()
+        )));
+    }
+    if matrix.rows() == 0 {
+        return Err(invalid_input(
+            "GAMG pressure foundation requires at least one matrix row".to_string(),
+        ));
+    }
+    let mut entries = BTreeMap::<(usize, usize), f64>::new();
+    let mut diagonal_counts = vec![0usize; matrix.rows()];
+    let mut diagonal_slots = vec![0usize; matrix.rows()];
+    for (row, diagonal_count) in diagonal_counts.iter_mut().enumerate() {
+        for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+            if matrix.col_indices()[entry] == row {
+                *diagonal_count += 1;
+                diagonal_slots[row] = entry;
+            }
+            *entries
+                .entry((row, matrix.col_indices()[entry]))
+                .or_default() += matrix.values()[entry];
+        }
+    }
+    for (row, &diagonal_count) in diagonal_counts.iter().enumerate() {
+        if diagonal_count != 1 {
+            return Err(invalid_input(format!(
+                "GAMG row {row} must have exactly one diagonal entry, got {}",
+                diagonal_count
+            )));
+        }
+        let diagonal = entries.get(&(row, row)).copied().unwrap_or_default();
+        if !diagonal.is_finite() || diagonal == 0.0 {
+            return Err(invalid_input(format!(
+                "GAMG row {row} has invalid diagonal value {diagonal}"
+            )));
+        }
+    }
+    for (&(row, column), &value) in &entries {
+        if row == column {
+            continue;
+        }
+        let transpose = entries.get(&(column, row)).copied().unwrap_or_default();
+        let scale = value.abs().max(transpose.abs()).max(1.0);
+        if (value - transpose).abs() > 64.0 * f64::EPSILON * scale {
+            return Err(invalid_input(format!(
+                "GAMG pressure foundation requires a symmetric matrix; A[{row},{column}]={value} differs from A[{column},{row}]={transpose}"
+            )));
+        }
+    }
+    Ok(diagonal_slots)
+}
+
 fn level_vectors(level_sizes: &[usize]) -> Vec<Vec<f64>> {
     level_sizes.iter().map(|&size| vec![0.0; size]).collect()
 }
@@ -1102,6 +1423,18 @@ fn level_vectors(level_sizes: &[usize]) -> Vec<Vec<f64>> {
 fn has_converged(residual: f64, initial: f64, controls: GamgSolveControls) -> bool {
     residual <= controls.tolerance
         || (controls.relative_tolerance > 0.0 && residual <= controls.relative_tolerance * initial)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn normalized_l1_has_converged(
+    current_l1: f64,
+    initial_l1: f64,
+    controls: NormalizedL1GamgSolveControls,
+) -> bool {
+    current_l1 / controls.normalization_factor < controls.tolerance
+        || (controls.relative_tolerance > 0.0
+            && current_l1 / controls.normalization_factor
+                < controls.relative_tolerance * (initial_l1 / controls.normalization_factor))
 }
 
 #[inline]
@@ -1563,8 +1896,8 @@ fn checked_dense_storage_len(n: usize) -> Result<usize> {
 mod tests {
     use super::{
         GamgAgglomerator, GamgFacePairWeight, GamgOptions, GamgSmoother, GamgWorkspace,
-        MAX_DENSE_COARSEST_CELLS, PairEdge, algebraic_pair_map, checked_dense_storage_len,
-        dense_lu_solve, gamg_solve, pair_map_from_edges,
+        MAX_DENSE_COARSEST_CELLS, NormalizedL1GamgSolveControls, PairEdge, algebraic_pair_map,
+        checked_dense_storage_len, dense_lu_solve, gamg_solve, pair_map_from_edges,
     };
     use crate::linear::{
         CgPreconditioner, CsrMatrix, PreconditionedConjugateGradientOptions,
@@ -1590,6 +1923,319 @@ mod tests {
         assert!(!options.direct_solve_coarsest);
         assert_eq!(options.agglomerator, GamgAgglomerator::AlgebraicPair);
         assert_eq!(options.smoother, GamgSmoother::GaussSeidel);
+    }
+
+    #[test]
+    fn normalized_l1_uses_strict_absolute_and_relative_boundaries() {
+        let matrix = CsrMatrix::from_rows(
+            vec![
+                vec![(0, 2.0), (1, -1.0)],
+                vec![(0, -1.0), (1, 2.0), (2, -1.0)],
+                vec![(1, -1.0), (2, 2.0), (3, -1.0)],
+                vec![(2, -1.0), (3, 2.0), (4, -1.0)],
+                vec![(3, -1.0), (4, 2.0), (5, -1.0)],
+                vec![(4, -1.0), (5, 2.0), (6, -1.0)],
+                vec![(5, -1.0), (6, 2.0), (7, -1.0)],
+                vec![(6, -1.0), (7, 2.0)],
+            ],
+            8,
+        )
+        .expect("explicit boundary matrix");
+        let rhs = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let options = GamgOptions {
+            max_iterations: 1,
+            n_cells_in_coarsest_level: 2,
+            direct_solve_coarsest: true,
+            ..GamgOptions::default()
+        };
+        let mut prepass_workspace =
+            GamgWorkspace::new(&matrix, options).expect("prepass workspace");
+        let prepass = prepass_workspace
+            .solve(&matrix, &rhs, None)
+            .expect("one-cycle prepass");
+        let initial_raw_l1 = rhs.iter().map(|value| value.abs()).sum::<f64>();
+        assert_eq!(initial_raw_l1.to_bits(), 1.0f64.to_bits());
+        assert_eq!((initial_raw_l1 / 1.0).to_bits(), 1.0f64.to_bits());
+        let mut raw_l1 = 0.0;
+        let mut squared_l2 = 0.0;
+        for (row, source) in rhs.iter().enumerate() {
+            let mut product = 0.0;
+            for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                product += matrix.values()[entry] * prepass.solution[matrix.col_indices()[entry]];
+            }
+            let residual = source - product;
+            raw_l1 += residual.abs();
+            squared_l2 += residual * residual;
+        }
+        assert_eq!(squared_l2.sqrt().to_bits(), prepass.residual_norm.to_bits());
+        assert!(raw_l1.is_finite() && raw_l1 > 0.0);
+        let next = raw_l1.next_up();
+        assert!(next.is_finite() && next > 0.0 && next > raw_l1);
+        assert_eq!(next.to_bits(), raw_l1.to_bits() + 1);
+        let mut two_cycle_solution_bits: Option<[u64; 8]> = None;
+        let mut equality_legs = 0;
+        let mut equality_comparisons = 0;
+
+        for relative in [false, true] {
+            for profiled in [false, true] {
+                for (boundary, expected_iterations) in [(raw_l1, 2), (next, 1)] {
+                    let controls = NormalizedL1GamgSolveControls {
+                        normalization_factor: 1.0,
+                        tolerance: if relative { 0.0 } else { boundary },
+                        relative_tolerance: if relative { boundary } else { 0.0 },
+                        l2_controls: super::GamgSolveControls {
+                            max_iterations: 2,
+                            min_iterations: 0,
+                            tolerance: 0.0,
+                            relative_tolerance: 0.0,
+                        },
+                    };
+                    let mut workspace =
+                        GamgWorkspace::new(&matrix, options).expect("boundary workspace");
+                    let (report, timing) = if profiled {
+                        let profiled = workspace
+                            .solve_normalized_l1_with_controls_profiled(
+                                &matrix, &rhs, None, controls,
+                            )
+                            .expect("profiled normalized solve");
+                        (profiled.report, Some(profiled.timing))
+                    } else {
+                        (
+                            workspace
+                                .solve_normalized_l1_with_controls(&matrix, &rhs, None, controls)
+                                .expect("plain normalized solve"),
+                            None,
+                        )
+                    };
+                    assert_eq!(report.iterations, expected_iterations);
+                    assert!(report.converged);
+                    assert_eq!(
+                        report.termination,
+                        super::IterativeSolveTermination::Converged
+                    );
+                    if expected_iterations == 1 {
+                        for (actual, expected) in
+                            report.solution.iter().zip(prepass.solution.iter())
+                        {
+                            assert_eq!(actual.to_bits(), expected.to_bits());
+                        }
+                    } else {
+                        equality_legs += 1;
+                        let actual_bits =
+                            std::array::from_fn(|index| report.solution[index].to_bits());
+                        if let Some(expected_bits) = two_cycle_solution_bits {
+                            assert_eq!(actual_bits, expected_bits);
+                            equality_comparisons += 1;
+                        } else {
+                            two_cycle_solution_bits = Some(actual_bits);
+                        }
+                    }
+                    let mut report_squared_l2 = 0.0;
+                    for (row, source) in rhs.iter().enumerate() {
+                        let mut product = 0.0;
+                        for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                            product += matrix.values()[entry]
+                                * report.solution[matrix.col_indices()[entry]];
+                        }
+                        let residual = source - product;
+                        report_squared_l2 += residual * residual;
+                    }
+                    assert_eq!(
+                        report.residual_norm.to_bits(),
+                        report_squared_l2.sqrt().to_bits()
+                    );
+                    if let Some(timing) = timing {
+                        assert_eq!(timing.hierarchy_builds, 0);
+                        assert_eq!(timing.hierarchy_rebuilds, 0);
+                        assert_eq!(timing.matrix_refreshes, 1);
+                        assert_eq!(timing.finest_residual_evaluations, expected_iterations + 1);
+                        assert_eq!(timing.solves, 1);
+                        assert_eq!(timing.v_cycles, expected_iterations);
+                        let level_tuples = timing
+                            .levels
+                            .iter()
+                            .map(|level| {
+                                (
+                                    level.level,
+                                    level.cells,
+                                    level.nonzeros,
+                                    level.matrix_refreshes,
+                                    level.restriction_calls,
+                                    level.prolongation_calls,
+                                    level.smoothing_calls,
+                                    level.smoothing_sweeps,
+                                    level.scaling_calls,
+                                    level.residual_evaluations,
+                                    level.correction_updates,
+                                    level.coarsest_solves,
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(
+                            level_tuples,
+                            vec![
+                                (
+                                    0,
+                                    8,
+                                    22,
+                                    1,
+                                    expected_iterations,
+                                    expected_iterations,
+                                    expected_iterations,
+                                    2 * expected_iterations,
+                                    expected_iterations,
+                                    0,
+                                    expected_iterations,
+                                    0,
+                                ),
+                                (
+                                    1,
+                                    4,
+                                    10,
+                                    1,
+                                    expected_iterations,
+                                    expected_iterations,
+                                    expected_iterations,
+                                    2 * expected_iterations,
+                                    0,
+                                    0,
+                                    expected_iterations,
+                                    0,
+                                ),
+                                (2, 2, 4, 1, 0, 0, 0, 0, 0, 0, 0, expected_iterations),
+                            ]
+                        );
+                    }
+                    assert_eq!(workspace.level_sizes(), vec![8, 4, 2]);
+                }
+            }
+        }
+        assert!(two_cycle_solution_bits.is_some());
+        assert_eq!(equality_legs, 4);
+        assert_eq!(equality_comparisons, 3);
+    }
+
+    #[test]
+    fn public_l2_convergence_keeps_inclusive_boundaries() {
+        let matrix = CsrMatrix::from_rows(
+            vec![
+                vec![(0, 2.0), (1, -1.0)],
+                vec![(0, -1.0), (1, 2.0), (2, -1.0)],
+                vec![(1, -1.0), (2, 2.0), (3, -1.0)],
+                vec![(2, -1.0), (3, 2.0), (4, -1.0)],
+                vec![(3, -1.0), (4, 2.0), (5, -1.0)],
+                vec![(4, -1.0), (5, 2.0), (6, -1.0)],
+                vec![(5, -1.0), (6, 2.0), (7, -1.0)],
+                vec![(6, -1.0), (7, 2.0)],
+            ],
+            8,
+        )
+        .expect("explicit boundary matrix");
+        let rhs = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let options = GamgOptions {
+            max_iterations: 1,
+            n_cells_in_coarsest_level: 2,
+            direct_solve_coarsest: true,
+            ..GamgOptions::default()
+        };
+        let mut prepass_workspace =
+            GamgWorkspace::new(&matrix, options).expect("prepass workspace");
+        let prepass = prepass_workspace
+            .solve(&matrix, &rhs, None)
+            .expect("one-cycle prepass");
+        let mut squared_l2 = 0.0;
+        for (row, source) in rhs.iter().enumerate() {
+            let mut product = 0.0;
+            for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                product += matrix.values()[entry] * prepass.solution[matrix.col_indices()[entry]];
+            }
+            let residual = source - product;
+            squared_l2 += residual * residual;
+        }
+        let boundary = squared_l2.sqrt();
+        assert_eq!(boundary.to_bits(), prepass.residual_norm.to_bits());
+        let initial_l2 = 1.0;
+
+        for relative in [false, true] {
+            for profiled in [false, true] {
+                let controls = super::GamgSolveControls {
+                    max_iterations: 2,
+                    min_iterations: 0,
+                    tolerance: if relative { 0.0 } else { boundary },
+                    relative_tolerance: if relative { boundary / initial_l2 } else { 0.0 },
+                };
+                assert_eq!(
+                    (controls.relative_tolerance * initial_l2).to_bits(),
+                    if relative {
+                        boundary.to_bits()
+                    } else {
+                        0.0f64.to_bits()
+                    }
+                );
+                let mut workspace =
+                    GamgWorkspace::new(&matrix, options).expect("boundary workspace");
+                let (report, timing) = if profiled {
+                    let profiled = workspace
+                        .solve_with_controls_profiled(&matrix, &rhs, None, controls)
+                        .expect("profiled L2 solve");
+                    (profiled.report, Some(profiled.timing))
+                } else {
+                    (
+                        workspace
+                            .solve_with_controls(&matrix, &rhs, None, controls)
+                            .expect("plain L2 solve"),
+                        None,
+                    )
+                };
+                assert_eq!(report.iterations, 1);
+                assert!(report.converged);
+                assert_eq!(
+                    report.termination,
+                    super::IterativeSolveTermination::Converged
+                );
+                assert_eq!(report.residual_norm.to_bits(), boundary.to_bits());
+                for (actual, expected) in report.solution.iter().zip(&prepass.solution) {
+                    assert_eq!(actual.to_bits(), expected.to_bits());
+                }
+                if let Some(timing) = timing {
+                    assert_eq!(timing.hierarchy_builds, 0);
+                    assert_eq!(timing.hierarchy_rebuilds, 0);
+                    assert_eq!(timing.matrix_refreshes, 1);
+                    assert_eq!(timing.finest_residual_evaluations, 2);
+                    assert_eq!(timing.solves, 1);
+                    assert_eq!(timing.v_cycles, 1);
+                    let level_tuples = timing
+                        .levels
+                        .iter()
+                        .map(|level| {
+                            (
+                                level.level,
+                                level.cells,
+                                level.nonzeros,
+                                level.matrix_refreshes,
+                                level.restriction_calls,
+                                level.prolongation_calls,
+                                level.smoothing_calls,
+                                level.smoothing_sweeps,
+                                level.scaling_calls,
+                                level.residual_evaluations,
+                                level.correction_updates,
+                                level.coarsest_solves,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        level_tuples,
+                        vec![
+                            (0, 8, 22, 1, 1, 1, 1, 2, 1, 0, 1, 0),
+                            (1, 4, 10, 1, 1, 1, 1, 2, 0, 0, 1, 0),
+                            (2, 2, 4, 1, 0, 0, 0, 0, 0, 0, 0, 1),
+                        ]
+                    );
+                }
+                assert_eq!(workspace.level_sizes(), vec![8, 4, 2]);
+            }
+        }
     }
 
     #[test]
