@@ -6688,6 +6688,785 @@ mod tests {
         assert!(error.contains("exactly one diagonal entry"));
     }
 
+    mod ldu_b1_spec {
+        use std::collections::BTreeMap;
+
+        use super::super::gauss_seidel_sweep_with_cached_diagonal;
+        use crate::linear::CsrMatrix;
+
+        #[derive(Debug)]
+        struct SpecLduLevel {
+            lower_addr: Vec<usize>,
+            upper_addr: Vec<usize>,
+            lower_csr: Vec<Option<usize>>,
+            upper_csr: Vec<Option<usize>>,
+            lower: Vec<f64>,
+            upper: Vec<f64>,
+            owner_start: Vec<usize>,
+            b_prime: Vec<f64>,
+        }
+
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+        struct Counters {
+            rhs_copies: usize,
+            rows: usize,
+        }
+
+        type Allocation = (*const (), usize, usize);
+
+        #[derive(Debug, PartialEq)]
+        struct LevelState {
+            lower_addr: Vec<usize>,
+            upper_addr: Vec<usize>,
+            lower_csr: Vec<Option<usize>>,
+            upper_csr: Vec<Option<usize>>,
+            lower: Vec<f64>,
+            upper: Vec<f64>,
+            owner_start: Vec<usize>,
+            b_prime: Vec<f64>,
+            allocations: [Allocation; 8],
+        }
+
+        impl SpecLduLevel {
+            fn new(matrix: &CsrMatrix) -> Self {
+                let mut pairs = BTreeMap::<(usize, usize), (Vec<usize>, Vec<usize>)>::new();
+                for row in 0..matrix.rows() {
+                    for slot in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                        let column = matrix.col_indices()[slot];
+                        if row == column {
+                            continue;
+                        }
+                        let (owner, neighbour) = if row < column {
+                            (row, column)
+                        } else {
+                            (column, row)
+                        };
+                        let occurrences = pairs.entry((owner, neighbour)).or_default();
+                        if row == owner {
+                            occurrences.1.push(slot);
+                        } else {
+                            occurrences.0.push(slot);
+                        }
+                    }
+                }
+                let face_count = pairs
+                    .values()
+                    .map(|(lower, upper)| lower.len().max(upper.len()))
+                    .sum();
+                let mut level = Self {
+                    lower_addr: Vec::with_capacity(face_count),
+                    upper_addr: Vec::with_capacity(face_count),
+                    lower_csr: Vec::with_capacity(face_count),
+                    upper_csr: Vec::with_capacity(face_count),
+                    lower: vec![0.0; face_count],
+                    upper: vec![0.0; face_count],
+                    owner_start: vec![0; matrix.rows() + 1],
+                    b_prime: vec![0.0; matrix.rows()],
+                };
+                for ((owner, neighbour), (lower, upper)) in pairs {
+                    for occurrence in 0..lower.len().max(upper.len()) {
+                        level.lower_addr.push(owner);
+                        level.upper_addr.push(neighbour);
+                        level.lower_csr.push(lower.get(occurrence).copied());
+                        level.upper_csr.push(upper.get(occurrence).copied());
+                    }
+                }
+                for &owner in &level.lower_addr {
+                    level.owner_start[owner + 1] += 1;
+                }
+                for cell in 0..matrix.rows() {
+                    level.owner_start[cell + 1] += level.owner_start[cell];
+                }
+                level.refresh(matrix);
+                level
+            }
+
+            fn refresh(&mut self, matrix: &CsrMatrix) {
+                for face in 0..self.lower.len() {
+                    self.lower[face] =
+                        self.lower_csr[face].map_or(0.0, |slot| matrix.values()[slot]);
+                    self.upper[face] =
+                        self.upper_csr[face].map_or(0.0, |slot| matrix.values()[slot]);
+                }
+            }
+
+            fn allocations(&self) -> [Allocation; 8] {
+                [
+                    vec_allocation(&self.lower_addr),
+                    vec_allocation(&self.upper_addr),
+                    vec_allocation(&self.lower_csr),
+                    vec_allocation(&self.upper_csr),
+                    vec_allocation(&self.lower),
+                    vec_allocation(&self.upper),
+                    vec_allocation(&self.owner_start),
+                    vec_allocation(&self.b_prime),
+                ]
+            }
+
+            fn state(&self) -> LevelState {
+                LevelState {
+                    lower_addr: self.lower_addr.clone(),
+                    upper_addr: self.upper_addr.clone(),
+                    lower_csr: self.lower_csr.clone(),
+                    upper_csr: self.upper_csr.clone(),
+                    lower: self.lower.clone(),
+                    upper: self.upper.clone(),
+                    owner_start: self.owner_start.clone(),
+                    b_prime: self.b_prime.clone(),
+                    allocations: self.allocations(),
+                }
+            }
+        }
+
+        fn vec_allocation<T>(values: &Vec<T>) -> Allocation {
+            (values.as_ptr().cast(), values.len(), values.capacity())
+        }
+
+        fn diagonal(matrix: &CsrMatrix) -> Result<Vec<f64>, String> {
+            let mut result = Vec::with_capacity(matrix.rows());
+            for row in 0..matrix.rows() {
+                let values = (matrix.row_offsets()[row]..matrix.row_offsets()[row + 1])
+                    .filter(|&slot| matrix.col_indices()[slot] == row)
+                    .map(|slot| matrix.values()[slot])
+                    .collect::<Vec<_>>();
+                if values.len() != 1 {
+                    return Err(format!(
+                        "LDU B1 diagonal row {row} must contain exactly one entry, got {}",
+                        values.len()
+                    ));
+                }
+                if !values[0].is_finite() || values[0] == 0.0 {
+                    return Err(format!(
+                        "LDU B1 diagonal row {row} must be finite and non-zero"
+                    ));
+                }
+                result.push(values[0]);
+            }
+            Ok(result)
+        }
+
+        fn sweep(
+            level: &mut SpecLduLevel,
+            diagonal: &[f64],
+            rhs: &[f64],
+            psi: &mut [f64],
+            counters: &mut Counters,
+        ) -> Result<(), String> {
+            if diagonal.len() != psi.len() {
+                return Err(format!(
+                    "LDU B1 diagonal length mismatch: expected {}, got {}",
+                    psi.len(),
+                    diagonal.len()
+                ));
+            }
+            if rhs.len() != psi.len() {
+                return Err(format!(
+                    "LDU B1 rhs length mismatch: expected {}, got {}",
+                    psi.len(),
+                    rhs.len()
+                ));
+            }
+            if level.b_prime.len() != psi.len() {
+                return Err(format!(
+                    "LDU B1 bPrime length mismatch: expected {}, got {}",
+                    psi.len(),
+                    level.b_prime.len()
+                ));
+            }
+            for (row, value) in diagonal.iter().enumerate() {
+                if !value.is_finite() || *value == 0.0 {
+                    return Err(format!(
+                        "LDU B1 diagonal row {row} must be finite and non-zero"
+                    ));
+                }
+            }
+            level.b_prime.copy_from_slice(rhs);
+            counters.rhs_copies += 1;
+            half_sweep(level, diagonal, psi, 0..psi.len(), counters)?;
+            half_sweep(level, diagonal, psi, (0..psi.len()).rev(), counters)
+        }
+
+        fn half_sweep<I: Iterator<Item = usize>>(
+            level: &mut SpecLduLevel,
+            diagonal: &[f64],
+            psi: &mut [f64],
+            cells: I,
+            counters: &mut Counters,
+        ) -> Result<(), String> {
+            for cell in cells {
+                let mut psii = level.b_prime[cell];
+                for face in level.owner_start[cell]..level.owner_start[cell + 1] {
+                    psii -= level.upper[face] * psi[level.upper_addr[face]];
+                }
+                psii /= diagonal[cell];
+                if !psii.is_finite() {
+                    return Err(format!("LDU B1 update row {cell} is not finite"));
+                }
+                for face in level.owner_start[cell]..level.owner_start[cell + 1] {
+                    level.b_prime[level.upper_addr[face]] -= level.lower[face] * psii;
+                }
+                psi[cell] = psii;
+                counters.rows += 1;
+            }
+            Ok(())
+        }
+
+        fn matrix(rows: Vec<Vec<(usize, f64)>>) -> CsrMatrix {
+            let count = rows.len();
+            CsrMatrix::from_rows(rows, count).expect("B1 fixture")
+        }
+
+        fn main_fixture() -> CsrMatrix {
+            matrix(vec![
+                vec![
+                    (0, 4.0),
+                    (1, -1.0000000000000002),
+                    (1, -0.25),
+                    (2, -0.12500000000000003),
+                ],
+                vec![
+                    (0, -0.9999999999999999),
+                    (0, -0.125),
+                    (1, 3.0),
+                    (2, -0.5000000000000001),
+                ],
+                vec![
+                    (0, -0.12499999999999999),
+                    (1, -0.49999999999999994),
+                    (2, 2.5),
+                ],
+            ])
+        }
+
+        #[test]
+        fn ldu_b1_topology_is_deterministic_for_noncanonical_directed_duplicates() {
+            let canonical = main_fixture();
+            let reordered = matrix(vec![
+                vec![
+                    (2, -0.12500000000000003),
+                    (1, -0.25),
+                    (0, 4.0),
+                    (1, -1.0000000000000002),
+                ],
+                vec![
+                    (2, -0.5000000000000001),
+                    (1, 3.0),
+                    (0, -0.125),
+                    (0, -0.9999999999999999),
+                ],
+                vec![
+                    (2, 2.5),
+                    (1, -0.49999999999999994),
+                    (0, -0.12499999999999999),
+                ],
+            ]);
+            let left = SpecLduLevel::new(&canonical);
+            let right = SpecLduLevel::new(&reordered);
+            assert_eq!(left.lower_addr, right.lower_addr);
+            assert_eq!(left.upper_addr, right.upper_addr);
+            assert_eq!(left.owner_start, right.owner_start);
+            assert_ne!(left.upper_csr, right.upper_csr);
+            assert_eq!(right.upper[0].to_bits(), (-0.25f64).to_bits());
+        }
+
+        #[test]
+        fn ldu_b1_preserves_missing_reciprocal_terms_without_merging() {
+            let mut csr = matrix(vec![
+                vec![(0, 2.0), (1, -1.0), (1, -2.0)],
+                vec![(0, -3.0), (1, 2.0)],
+            ]);
+            let mut level = SpecLduLevel::new(&csr);
+            assert_eq!(level.lower.len(), 2);
+            assert_eq!(
+                level.lower_csr.iter().filter(|slot| slot.is_none()).count(),
+                1
+            );
+            assert_eq!(level.lower[1].to_bits(), 0.0f64.to_bits());
+            assert_eq!(level.upper, [-1.0, -2.0]);
+            for lifecycle in 0..10 {
+                for (slot, value) in csr.values_mut().iter_mut().enumerate() {
+                    *value = (lifecycle * 10 + slot + 1) as f64;
+                }
+                level.refresh(&csr);
+                assert_eq!(level.lower[1].to_bits(), 0.0f64.to_bits());
+            }
+        }
+
+        #[test]
+        fn ldu_b1_refresh_is_in_place_across_three_levels_and_ten_lifecycles() {
+            for size in [2, 3, 7] {
+                let rows = (0..size)
+                    .map(|row| {
+                        let mut values = vec![(row, 4.0)];
+                        if row + 1 < size {
+                            values.push((row + 1, -1.0));
+                        }
+                        if row > 0 {
+                            values.push((row - 1, -1.0));
+                        }
+                        values
+                    })
+                    .collect();
+                let mut csr = matrix(rows);
+                let mut level = SpecLduLevel::new(&csr);
+                let allocations = level.allocations();
+                let topology = (
+                    level.lower_addr.clone(),
+                    level.upper_addr.clone(),
+                    level.lower_csr.clone(),
+                    level.upper_csr.clone(),
+                    level.owner_start.clone(),
+                );
+                for lifecycle in 0..10 {
+                    for (slot, value) in csr.values_mut().iter_mut().enumerate() {
+                        *value = (lifecycle * 100 + slot + 1) as f64;
+                    }
+                    let before_refresh = level.allocations();
+                    level.refresh(&csr);
+                    assert_eq!(level.allocations(), before_refresh);
+                    assert_eq!(level.allocations(), allocations);
+                    assert_eq!(
+                        (
+                            level.lower_addr.clone(),
+                            level.upper_addr.clone(),
+                            level.lower_csr.clone(),
+                            level.upper_csr.clone(),
+                            level.owner_start.clone(),
+                        ),
+                        topology
+                    );
+                    for face in 0..level.lower.len() {
+                        assert_eq!(
+                            level.lower[face].to_bits(),
+                            level.lower_csr[face]
+                                .map_or(0.0, |slot| csr.values()[slot])
+                                .to_bits()
+                        );
+                        assert_eq!(
+                            level.upper[face].to_bits(),
+                            level.upper_csr[face]
+                                .map_or(0.0, |slot| csr.values()[slot])
+                                .to_bits()
+                        );
+                    }
+                    let diagonal = diagonal(&csr).unwrap();
+                    let rhs = vec![1.0; size];
+                    let mut psi = vec![0.25; size];
+                    let mut counters = Counters::default();
+                    let before_sweep = level.allocations();
+                    sweep(&mut level, &diagonal, &rhs, &mut psi, &mut counters).unwrap();
+                    assert_eq!(level.allocations(), before_sweep);
+                    assert_eq!(level.allocations(), allocations);
+                    assert_eq!(
+                        (
+                            level.lower_addr.clone(),
+                            level.upper_addr.clone(),
+                            level.lower_csr.clone(),
+                            level.upper_csr.clone(),
+                            level.owner_start.clone(),
+                        ),
+                        topology
+                    );
+                    for face in 0..level.lower.len() {
+                        assert_eq!(
+                            level.lower[face].to_bits(),
+                            level.lower_csr[face]
+                                .map_or(0.0, |slot| csr.values()[slot])
+                                .to_bits()
+                        );
+                        assert_eq!(
+                            level.upper[face].to_bits(),
+                            level.upper_csr[face]
+                                .map_or(0.0, |slot| csr.values()[slot])
+                                .to_bits()
+                        );
+                    }
+                    assert_eq!(
+                        counters,
+                        Counters {
+                            rhs_copies: 1,
+                            rows: 2 * size
+                        }
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn ldu_b1_symgs_matches_openfoam_v13_forward_backward_bit_oracle() {
+            let csr = main_fixture();
+            let mut level = SpecLduLevel::new(&csr);
+            let diagonal = diagonal(&csr).unwrap();
+            let mut psi = vec![0.25, -0.5, 0.75];
+            level.b_prime.copy_from_slice(&[1.0, -2.0, 0.5]);
+            let mut counters = Counters::default();
+            half_sweep(&mut level, &diagonal, &mut psi, 0..3, &mut counters).unwrap();
+            assert_eq!(
+                psi.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                [
+                    4593108669964484606,
+                    13826009807593319083,
+                    4592325231279306616
+                ]
+            );
+            assert_eq!(
+                level
+                    .b_prime
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                [
+                    4607182418800017408,
+                    13834464319003164672,
+                    4598459626552994475
+                ]
+            );
+            half_sweep(&mut level, &diagonal, &mut psi, (0..3).rev(), &mut counters).unwrap();
+            assert_eq!(
+                psi.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                [
+                    4589294781764422130,
+                    13826996631496043907,
+                    4592325231279306616
+                ]
+            );
+            assert_eq!(
+                level
+                    .b_prime
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                [
+                    4607182418800017408,
+                    13834138746738232525,
+                    13807295973087021176
+                ]
+            );
+        }
+
+        #[test]
+        fn ldu_b1_symgs_distinguishes_face_order_and_bprime_reset_sentinels() {
+            let csr = main_fixture();
+            let diagonal = diagonal(&csr).unwrap();
+            let mut level = SpecLduLevel::new(&csr);
+            let mut psi = vec![0.25, -0.5, 0.75];
+            let mut counters = Counters::default();
+            half_sweep_with_rhs(
+                &mut level,
+                &diagonal,
+                &[1.0, -2.0, 0.5],
+                &mut psi,
+                0..3,
+                &mut counters,
+            );
+            level.b_prime.copy_from_slice(&[1.0, -2.0, 0.5]);
+            half_sweep(&mut level, &diagonal, &mut psi, (0..3).rev(), &mut counters).unwrap();
+            assert_eq!(
+                psi.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                [
+                    4588567540340219356,
+                    13827251815928054852,
+                    4596373779694328218
+                ]
+            );
+            assert_eq!(
+                level
+                    .b_prime
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                [
+                    4607182418800017408,
+                    13834762506556617523,
+                    4596036009722275433
+                ]
+            );
+            let wrong = (
+                psi.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                level
+                    .b_prime
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+            );
+            let mut correct_level = SpecLduLevel::new(&csr);
+            let mut correct_psi = vec![0.25, -0.5, 0.75];
+            sweep(
+                &mut correct_level,
+                &diagonal,
+                &[1.0, -2.0, 0.5],
+                &mut correct_psi,
+                &mut Counters::default(),
+            )
+            .unwrap();
+            assert_ne!(
+                wrong,
+                (
+                    correct_psi
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    correct_level
+                        .b_prime
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>()
+                )
+            );
+
+            let (canonical_psi, canonical_bprime) = run_order_fixture(false);
+            let (reversed_psi, reversed_bprime) = run_order_fixture(true);
+            assert_eq!(
+                canonical_psi,
+                [
+                    13907265759572411461,
+                    13826200974869677124,
+                    4594572341561366938
+                ]
+            );
+            assert_eq!(
+                canonical_bprime,
+                [
+                    4607182418800017408,
+                    13834241774413728973,
+                    4590744298198977742
+                ]
+            );
+            assert_eq!(
+                reversed_psi,
+                [
+                    13907265759572411460,
+                    13826200974869677124,
+                    4594572341561366938
+                ]
+            );
+            assert_eq!(
+                reversed_bprime,
+                [
+                    4607182418800017408,
+                    13834241774413728972,
+                    4590744298198977742
+                ]
+            );
+        }
+
+        fn half_sweep_with_rhs(
+            level: &mut SpecLduLevel,
+            diagonal: &[f64],
+            rhs: &[f64],
+            psi: &mut [f64],
+            cells: impl Iterator<Item = usize>,
+            counters: &mut Counters,
+        ) {
+            level.b_prime.copy_from_slice(rhs);
+            half_sweep(level, diagonal, psi, cells, counters).unwrap();
+        }
+
+        fn order_fixture() -> CsrMatrix {
+            matrix(vec![
+                vec![
+                    (0, 4.0),
+                    (1, -1048576.0),
+                    (1, -2f64.powi(-33)),
+                    (2, -2f64.powi(-33)),
+                ],
+                vec![
+                    (0, -2f64.powi(-20)),
+                    (0, -2f64.powi(-21)),
+                    (1, 3.0),
+                    (2, -0.5),
+                ],
+                vec![(0, -2f64.powi(-22)), (1, -0.5), (2, 2.5)],
+            ])
+        }
+
+        fn run_order_fixture(reverse: bool) -> ([u64; 3], [u64; 3]) {
+            let csr = order_fixture();
+            let mut level = SpecLduLevel::new(&csr);
+            if reverse {
+                level.lower_addr[0..3].reverse();
+                level.upper_addr[0..3].reverse();
+                level.lower_csr[0..3].reverse();
+                level.upper_csr[0..3].reverse();
+                level.lower[0..3].reverse();
+                level.upper[0..3].reverse();
+            }
+            let mut psi = [0.25, 1.0, 1.0];
+            sweep(
+                &mut level,
+                &diagonal(&csr).unwrap(),
+                &[1.0, -2.0, 0.5],
+                &mut psi,
+                &mut Counters::default(),
+            )
+            .unwrap();
+            (
+                psi.map(f64::to_bits),
+                std::array::from_fn(|i| level.b_prime[i].to_bits()),
+            )
+        }
+
+        #[test]
+        fn ldu_b1_symgs_matches_cached_csr_kernel_with_nonzero_initial() {
+            for csr in [
+                main_fixture(),
+                matrix(vec![
+                    vec![(0, 2.0), (1, -1.0)],
+                    vec![(1, 3.0), (2, -0.5)],
+                    vec![(1, -0.25), (2, 2.5)],
+                ]),
+            ] {
+                let diagonal = diagonal(&csr).unwrap();
+                let diagonal_slots = (0..csr.rows())
+                    .map(|row| {
+                        (csr.row_offsets()[row]..csr.row_offsets()[row + 1])
+                            .find(|&slot| csr.col_indices()[slot] == row)
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                let rhs = vec![1.0, -2.0, 0.5];
+                let initial = vec![0.25, -0.5, 0.75];
+                let mut ldu = initial.clone();
+                let mut level = SpecLduLevel::new(&csr);
+                sweep(
+                    &mut level,
+                    &diagonal,
+                    &rhs,
+                    &mut ldu,
+                    &mut Counters::default(),
+                )
+                .unwrap();
+                let mut cached = initial;
+                gauss_seidel_sweep_with_cached_diagonal(
+                    &csr,
+                    &diagonal_slots,
+                    &diagonal,
+                    &rhs,
+                    &mut cached,
+                    0..csr.rows(),
+                )
+                .unwrap();
+                gauss_seidel_sweep_with_cached_diagonal(
+                    &csr,
+                    &diagonal_slots,
+                    &diagonal,
+                    &rhs,
+                    &mut cached,
+                    (0..csr.rows()).rev(),
+                )
+                .unwrap();
+                for (actual, expected) in ldu.iter().zip(cached) {
+                    assert!((actual - expected).abs() <= 64.0 * f64::EPSILON);
+                }
+            }
+        }
+
+        #[test]
+        fn ldu_b1_dimension_and_diagonal_failures_are_exact_and_non_mutating() {
+            let csr = main_fixture();
+            for (diagonal, rhs, expected) in [
+                (
+                    vec![4.0, 3.0],
+                    vec![1.0, -2.0, 0.5],
+                    "LDU B1 diagonal length mismatch: expected 3, got 2",
+                ),
+                (
+                    vec![4.0, 3.0, 2.5],
+                    vec![1.0],
+                    "LDU B1 rhs length mismatch: expected 3, got 1",
+                ),
+            ] {
+                let mut level = SpecLduLevel::new(&csr);
+                let mut psi = vec![0.25, -0.5, 0.75];
+                let before_psi = psi.clone();
+                let before_level = level.state();
+                let mut counters = Counters::default();
+                assert_eq!(
+                    sweep(&mut level, &diagonal, &rhs, &mut psi, &mut counters).unwrap_err(),
+                    expected
+                );
+                assert_eq!(psi, before_psi);
+                assert_eq!(level.state(), before_level);
+                assert_eq!(counters, Counters::default());
+            }
+            let mut level = SpecLduLevel::new(&csr);
+            level.b_prime.pop();
+            let mut psi = vec![0.25, -0.5, 0.75];
+            let before_psi = psi.clone();
+            let before_level = level.state();
+            let mut counters = Counters::default();
+            assert_eq!(
+                sweep(
+                    &mut level,
+                    &[4.0, 3.0, 2.5],
+                    &[1.0, -2.0, 0.5],
+                    &mut psi,
+                    &mut counters
+                )
+                .unwrap_err(),
+                "LDU B1 bPrime length mismatch: expected 3, got 2"
+            );
+            assert_eq!(psi, before_psi);
+            assert_eq!(level.state(), before_level);
+            assert_eq!(counters, Counters::default());
+            for bad in [0.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                let mut level = SpecLduLevel::new(&csr);
+                let mut psi = vec![0.25, -0.5, 0.75];
+                let before_psi = psi.clone();
+                let before_level = level.state();
+                let mut counters = Counters::default();
+                assert_eq!(
+                    sweep(
+                        &mut level,
+                        &[bad, 3.0, 2.5],
+                        &[1.0, -2.0, 0.5],
+                        &mut psi,
+                        &mut counters
+                    )
+                    .unwrap_err(),
+                    "LDU B1 diagonal row 0 must be finite and non-zero"
+                );
+                assert_eq!(psi, before_psi);
+                assert_eq!(level.state(), before_level);
+                assert_eq!(counters, Counters::default());
+            }
+        }
+
+        #[test]
+        fn ldu_b1_nonfinite_update_fails_before_psi_write() {
+            let csr = matrix(vec![
+                vec![(0, f64::MIN_POSITIVE), (1, -1.0)],
+                vec![(0, -1.0), (1, 2.0)],
+            ]);
+            let mut level = SpecLduLevel::new(&csr);
+            let mut psi = vec![1.0, 1.0];
+            let before_psi = psi.clone();
+            let mut expected_level = level.state();
+            expected_level.b_prime = vec![f64::MAX, 0.0];
+            let mut counters = Counters::default();
+            assert_eq!(
+                sweep(
+                    &mut level,
+                    &[f64::MIN_POSITIVE, 2.0],
+                    &[f64::MAX, 0.0],
+                    &mut psi,
+                    &mut counters
+                )
+                .unwrap_err(),
+                "LDU B1 update row 0 is not finite"
+            );
+            assert_eq!(psi, before_psi);
+            assert_eq!(level.state(), expected_level);
+            assert_eq!(
+                counters,
+                Counters {
+                    rhs_copies: 1,
+                    rows: 0
+                }
+            );
+        }
+    }
+
     fn poisson_grid(nx: usize, ny: usize, scale: f64) -> CsrMatrix {
         let mut rows = Vec::with_capacity(nx * ny);
         for y in 0..ny {
