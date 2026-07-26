@@ -620,11 +620,13 @@ fn gauss_seidel_sweep(
 fn gauss_seidel_sweep_with_cached_diagonal(
     matrix: &CsrMatrix,
     diagonal_slots: &[usize],
+    diagonal_values: &[f64],
     rhs: &[f64],
     x: &mut [f64],
     rows: impl IntoIterator<Item = usize>,
 ) -> Result<()> {
     debug_assert_eq!(diagonal_slots.len(), matrix.rows);
+    debug_assert_eq!(diagonal_values.len(), matrix.rows);
     for row in rows {
         let start = matrix.row_offsets[row];
         let end = matrix.row_offsets[row + 1];
@@ -640,12 +642,7 @@ fn gauss_seidel_sweep_with_cached_diagonal(
             off_diagonal_sum += matrix.values[entry] * x[matrix.col_indices[entry]];
         }
 
-        let diagonal = matrix.values[diagonal_slot];
-        if !diagonal.is_finite() || diagonal == 0.0 {
-            return Err(invalid_input(format!(
-                "row {row} has invalid Gauss-Seidel diagonal value {diagonal}"
-            )));
-        }
+        let diagonal = diagonal_values[row];
         let raw = (rhs[row] - off_diagonal_sum) / diagonal;
         if !raw.is_finite() {
             return Err(invalid_input(format!(
@@ -1846,6 +1843,10 @@ mod tests {
         )
         .expect("matrix with first, middle, and last diagonal slots");
         let diagonal_slots = csr_diagonal_slots(&matrix).expect("diagonal slots");
+        let diagonal_values = diagonal_slots
+            .iter()
+            .map(|&slot| matrix.values()[slot])
+            .collect::<Vec<_>>();
         let rhs = [1.25, -0.5, 2.75];
         let mut scanned = [0.125, -0.25, 0.75];
         let mut cached = scanned;
@@ -1856,6 +1857,7 @@ mod tests {
             gauss_seidel_sweep_with_cached_diagonal(
                 &matrix,
                 &diagonal_slots,
+                &diagonal_values,
                 &rhs,
                 &mut cached,
                 0..matrix.rows(),
@@ -1872,6 +1874,7 @@ mod tests {
             gauss_seidel_sweep_with_cached_diagonal(
                 &matrix,
                 &diagonal_slots,
+                &diagonal_values,
                 &rhs,
                 &mut cached,
                 (0..matrix.rows()).rev(),
