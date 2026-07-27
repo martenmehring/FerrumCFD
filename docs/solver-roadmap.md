@@ -941,7 +941,7 @@ The immediate sequence is:
    `61925/30336` and `19007/9760` for Pipe/Channel respectively. The
    diagnostics remain local and unmerged while the first hierarchy leaves are
    falsified.
-8. **F-PERF-GAMG-HIERARCHY-LEAVES:** Test one predeclared variable per A/B:
+8. **F-PERF-GAMG-HIERARCHY-LEAVES (equal-weight pairing accepted locally):** Test one predeclared variable per A/B:
    coarsest-level target; cached direct versus iterative coarse solve;
    deterministic pairing/coarsening; pre/post/finest sweep placement; weighted
    prolongation; and, later, GAMG as a PCG/FCG preconditioner. Invalidate and
@@ -957,10 +957,25 @@ The immediate sequence is:
    iterations versus baseline `6995`), while Channel rose to `33950` versus
    `10654`. Candidate process times were also slower in every Channel run and
    in both Pipe runs. The leaf remains unmerged and did not proceed to `4+20`.
-   The next isolated hierarchy leaf is therefore deterministic pairing and
-   coarsening quality, focused on the weak Pipe NNZ contraction at levels
-   2->3 and 3->4; it must retain the same convergence and Linux order-cohort
-   gates.
+   The next isolated leaf, commit `9b6befb`, keeps connection weight as the
+   unrestricted primary criterion and changes only exact-weight ties: it
+   prefers the pair with the smaller external neighbour stencil, with
+   direction-symmetric canonical endpoint ordering. The one-file candidate
+   passed the complete Rust 1.94 workspace and Clippy gates plus an independent
+   determinism audit. On the profiled Pipe, pressure V-cycles fell from `6995`
+   to `1687`, weighted smoothing visits from `2520214560` to `603028272`, and
+   level-3 nonzeros from `4352` to `4064`; Channel hierarchy, work, and final
+   fields remained exact. The Native Linux `2+10` same-session A/B measured a
+   Pipe internal-time median of `7.3913 -> 2.2088 s` with paired ratio
+   `0.2895`; both order cohorts agreed. Channel retained identical work and
+   fields, while timing remained order-sensitive and is classified neutral.
+   Pipe pointwise relative L2 field differences were `3.17e-11` for `U` and
+   `4.90e-10` for `p`; all pressure solves converged and boundary values were
+   exact. A separate matched Native Linux `2+9` run against OpenFOAM Foundation
+   13 measured process medians of `2.24 vs 6.65 s` for Pipe and
+   `6.47 vs 10.97 s` for Channel, ratios `0.3368` and `0.5898`. These are
+   fixed-work results on the two frozen cases, not a general all-case speed
+   claim. Publication and CI remain pending.
 9. **F-PERF-ADAPTIVE-LINEAR:** After persistence parity, add user-bounded
    adaptive linear tolerances while preserving final outer acceptance and
    reporting effective tolerances and linear work.
