@@ -465,7 +465,28 @@ Current status:
 - pressure solves still dominate both convergence-profile runs: the pipe
   converges in `15.95 s` at iteration `207`, and the channel in `8.16 s` at
   iteration `545`. Both preserve the previous iteration counts and final
-  numerical observables exactly.
+  numerical observables exactly;
+- the canonical Linux-parity lane now builds exact source commit
+  `5ee13a3cde87620460f3b36d8e496a561d3a7601` with Rust `1.94.0` on WSL ext4
+  and runs Ferrum and OpenFOAM Foundation 13 on pinned CPU `2` with the same
+  external GNU-time metric. The portable `1+5` fixed-work run measured Pipe
+  medians of `7.82 s` versus `7.40 s` and Channel medians of `7.21 s` versus
+  `11.61 s`. The separate `target-cpu=native` `1+5` lane measured `7.36 s`
+  versus `6.58 s` for Pipe and `6.27 s` versus `12.04 s` for Channel. A
+  stronger Native Pipe `2+9` run measured a median paired Ferrum/OpenFOAM
+  ratio of `1.2792` with MAD `0.1326`, confirming that Pipe remains slower;
+  the Native Channel `1+5` median paired ratio was `0.5289` with MAD `0.0128`,
+  so Channel is clearly faster in this fixed-work lane. Build time is excluded,
+  engine-native timers remain diagnostic only, and no general all-case speedup
+  is claimed;
+- isolated native build screening did not establish a general compiler-profile
+  gain. Native `codegen-units=1` and Fat-LTO did not improve the Pipe screen.
+  Thin-LTO improved the stronger Pipe `2+9` median paired ratio from `1.2792`
+  to `1.1933`, but paired MAD remained essentially unchanged (`0.1310`) and
+  the ratio of separate medians remained `1.3109`. On Channel, Thin-LTO's
+  `1+5` median paired ratio was `0.5493`, slightly worse than Native's `0.5289`.
+  All profiles remain reproducible lanes, but none supports a general speedup
+  claim; PGO remains a later isolated leaf.
 
 ### Performance Foundation - Scalar CPU
 
@@ -561,8 +582,8 @@ The first optimization sequence is tracked as follows:
     production path and no speedup is claimed;
 18. persist SIMPLE and momentum state with explicit invalidation and unchanged
     equations, boundaries, and convergence semantics;
-19. establish the canonical Linux-parity benchmark lane before making further
-    Ferrum-versus-OpenFOAM solver-performance claims;
+19. completed: establish the canonical Linux-parity benchmark lane before
+    making further Ferrum-versus-OpenFOAM solver-performance claims;
 20. continue isolated CSR residual, scaling, and row-traversal leaves because
     smoothing plus scaling dominate the measured GAMG pressure time;
 21. add a GAMG hierarchy diagnostic gate. The accepted `5ee13a3c` fixed-GAMG
@@ -883,11 +904,17 @@ The immediate sequence is:
 4. **F-PERF-SIMPLE-PERSISTENCE:** Persist valid SIMPLE/momentum topology,
    coefficients, preconditioner state, histories, and workspaces with explicit
    invalidation and unchanged equations, boundaries, and convergence semantics.
-5. **F-PERF-LINUX-PARITY:** Add the canonical same-WSL Ferrum/OpenFOAM 13 lane,
+   The first unmerged P1 candidate preserved fixed linear work but did not show
+   a clean Linux gain in separate-session `1+5` measurements; an interleaved
+   main/P1 Ferrum-only A/B is required before acceptance.
+5. **F-PERF-LINUX-PARITY (completed):** Add the canonical same-WSL
+   Ferrum/OpenFOAM 13 lane,
    the secondary Windows/WSL product lane, and a Ferrum Windows/WSL self-lane.
    Stage source, cases, binaries, and logs on WSL ext4, pin Rust `1.94.0` for
    the reproducible lane, apply identical CPU affinity and serial environment,
-   and record common process plus separate native timers.
+   and record common process plus separate native timers. The same-WSL lane is
+   implemented and has accepted portable, Native `1+5`, and Native Pipe `2+9`
+   baseline evidence; the two secondary diagnostic lanes remain optional.
 6. **F-PERF-GAMG-SCALING-ROW-KERNELS:** Continue with isolated CSR residual,
    scaling, and row-traversal leaves before structural hierarchy changes.
    Smoothing plus scaling currently account for about `86.7%` of Pipe and

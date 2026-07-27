@@ -37,9 +37,13 @@ the selected WSL distribution before running it. A read-only preflight is:
   -PreflightOnly
 ```
 
-The portable reference and host-specific `target-cpu=native` builds are
-deliberately separate. LTO, reduced codegen units, and PGO remain later,
-separately measured optimization lanes:
+The portable reference and all host-specific builds are deliberately separate.
+`native` sets only `-C target-cpu=native`; `native-codegen1`,
+`native-thin-lto`, and `native-fat-lto` add exactly one Cargo release-profile
+setting to that native base. The controller clears inherited Rust/Cargo
+optimization variables, records the effective settings, and rejects a result
+whose returned build metadata differs. PGO remains a later, separately
+measured optimization lane:
 
 ```powershell
 # Portable, reproducible reference.
@@ -51,6 +55,11 @@ separately measured optimization lanes:
 .\validation\scripts\incompressibleFluid\run_matched_linux_cpu_solver_benchmark.ps1 `
   -Distro Ubuntu-22.04 -CpuSet 2 -PressureSolver gamg -CaseName all `
   -WarmupRuns 2 -MeasuredRuns 9 -BuildVariant native
+
+# Isolated native build leaves: native-codegen1, native-thin-lto, native-fat-lto.
+.\validation\scripts\incompressibleFluid\run_matched_linux_cpu_solver_benchmark.ps1 `
+  -Distro Ubuntu-22.04 -CpuSet 2 -PressureSolver gamg -CaseName laminarPipe `
+  -WarmupRuns 1 -MeasuredRuns 5 -BuildVariant native-thin-lto
 ```
 
 The controller rejects DrvFS/`/mnt/c` benchmark roots, verifies the exact source
@@ -60,7 +69,9 @@ timing, and writes schema-v2 JSON/Markdown below
 preserved; successful runs remove temporary staging unless
 `-KeepWslWorkspace` is supplied.
 
-For `-PressureSolver gamg`, the driver also enables the diagnostic
+For `-PressureSolver gamg`, `run_cpu_performance_baseline.ps1` also enables the diagnostic
 `--profileGamg` flag, requires a GAMG timing object in every solve report, and
 records aggregate and per-level phase medians. Profiling remains external
 validation behavior; it is not copied into `fvSolution` or a tutorial default.
+The matched Linux timing lane instead requires GAMG profiling to remain
+disabled.

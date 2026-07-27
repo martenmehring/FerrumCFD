@@ -70,7 +70,34 @@ command -v foamRun >/dev/null 2>&1 || fail "foamRun was not found after sourcing
 taskset -c "$cpu_set" true >/dev/null 2>&1 || fail "CPU set is not available: $cpu_set"
 [[ "$warmup_runs" =~ ^[0-9]+$ ]] || fail "warmup runs must be a non-negative integer"
 [[ "$measured_runs" =~ ^[1-9][0-9]*$ ]] || fail "measured runs must be a positive integer"
-[[ "$build_variant" == "portable" || "$build_variant" == "native" ]] || fail "unsupported build variant: $build_variant"
+case "$build_variant" in
+    portable)
+        build_rustflags=""
+        build_codegen_units=""
+        build_lto=""
+        ;;
+    native)
+        build_rustflags="-C target-cpu=native"
+        build_codegen_units=""
+        build_lto=""
+        ;;
+    native-codegen1)
+        build_rustflags="-C target-cpu=native"
+        build_codegen_units="1"
+        build_lto=""
+        ;;
+    native-thin-lto)
+        build_rustflags="-C target-cpu=native"
+        build_codegen_units=""
+        build_lto="thin"
+        ;;
+    native-fat-lto)
+        build_rustflags="-C target-cpu=native"
+        build_codegen_units=""
+        build_lto="fat"
+        ;;
+    *) fail "unsupported build variant: $build_variant" ;;
+esac
 [[ "$pressure_solver" == "pcg" || "$pressure_solver" == "gamg" ]] || fail "unsupported pressure solver: $pressure_solver"
 
 rustc_version="$(rustc "+$rust_toolchain" --version 2>/dev/null || true)"
@@ -89,6 +116,10 @@ if [[ "$mode" == "preflight" ]]; then
     printf 'wm_options=%s\n' "${WM_OPTIONS:-unknown}"
     printf 'filesystem=%s\n' "$home_fstype"
     printf 'cpu_set=%s\n' "$cpu_set"
+    printf 'build_variant=%s\n' "$build_variant"
+    printf 'rustflags=%s\n' "${build_rustflags:-<unset>}"
+    printf 'cargo_profile_release_codegen_units=%s\n' "${build_codegen_units:-<unset>}"
+    printf 'cargo_profile_release_lto=%s\n' "${build_lto:-<unset>}"
     exit 0
 fi
 
@@ -198,24 +229,26 @@ target_root="$source_root/target/linux-parity-$build_variant"
 build_timing="$metadata_root/build-timing.env"
 build_log="$metadata_root/cargo-build-release.log"
 build_format=$'elapsed_s=%e\nuser_s=%U\nsystem_s=%S\nmax_rss_kb=%M\nexit=%x'
-set +e
-if [[ "$build_variant" == "native" ]]; then
-    (
-        cd "$source_root"
-        CARGO_TARGET_DIR="$target_root" RUSTFLAGS="-C target-cpu=native" \
-            /usr/bin/time -q -f "$build_format" -o "$build_timing" \
-            cargo "+$rust_toolchain" build --locked --release -p ferrum-run --bin ferrumRun \
-            >"$build_log" 2>&1
-    )
-else
-    (
-        cd "$source_root"
-        CARGO_TARGET_DIR="$target_root" \
-            /usr/bin/time -q -f "$build_format" -o "$build_timing" \
-            cargo "+$rust_toolchain" build --locked --release -p ferrum-run --bin ferrumRun \
-            >"$build_log" 2>&1
-    )
+build_environment=("CARGO_TARGET_DIR=$target_root")
+if [[ -n "$build_rustflags" ]]; then
+    build_environment+=("RUSTFLAGS=$build_rustflags")
 fi
+if [[ -n "$build_codegen_units" ]]; then
+    build_environment+=("CARGO_PROFILE_RELEASE_CODEGEN_UNITS=$build_codegen_units")
+fi
+if [[ -n "$build_lto" ]]; then
+    build_environment+=("CARGO_PROFILE_RELEASE_LTO=$build_lto")
+fi
+set +e
+(
+    cd "$source_root"
+    /usr/bin/time -q -f "$build_format" -o "$build_timing" \
+        env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS \
+        -u CARGO_PROFILE_RELEASE_CODEGEN_UNITS -u CARGO_PROFILE_RELEASE_LTO \
+        "${build_environment[@]}" \
+        cargo "+$rust_toolchain" build --locked --release -p ferrum-run --bin ferrumRun \
+        >"$build_log" 2>&1
+)
 build_status=$?
 set -e
 [[ "$build_status" -eq 0 ]] || fail "Ferrum Linux release build failed; see $build_log"
@@ -242,6 +275,28 @@ printf '%s\n' "${WM_PROJECT_VERSION}" >"$metadata_root/openfoam-version.txt"
 printf '%s\n' "${WM_OPTIONS:-unknown}" >"$metadata_root/openfoam-build-options.txt"
 sha256sum "$(command -v foamRun)" | awk '{print $1}' >"$metadata_root/openfoam-binary-sha256.txt"
 printf '%s\n' "$build_variant" >"$metadata_root/build-variant.txt"
+printf '%s\n' "$build_rustflags" >"$metadata_root/build-rustflags.txt"
+printf '%s\n' "$build_codegen_units" >"$metadata_root/build-cargo-profile-release-codegen-units.txt"
+printf '%s\n' "$build_lto" >"$metadata_root/build-cargo-profile-release-lto.txt"
+{
+    printf 'name\tis_set\tvalue\n'
+    if [[ -n "$build_rustflags" ]]; then
+        printf 'RUSTFLAGS\ttrue\t%s\n' "$build_rustflags"
+    else
+        printf 'RUSTFLAGS\tfalse\t\n'
+    fi
+    printf 'CARGO_ENCODED_RUSTFLAGS\tfalse\t\n'
+    if [[ -n "$build_codegen_units" ]]; then
+        printf 'CARGO_PROFILE_RELEASE_CODEGEN_UNITS\ttrue\t%s\n' "$build_codegen_units"
+    else
+        printf 'CARGO_PROFILE_RELEASE_CODEGEN_UNITS\tfalse\t\n'
+    fi
+    if [[ -n "$build_lto" ]]; then
+        printf 'CARGO_PROFILE_RELEASE_LTO\ttrue\t%s\n' "$build_lto"
+    else
+        printf 'CARGO_PROFILE_RELEASE_LTO\tfalse\t\n'
+    fi
+} >"$metadata_root/build-environment.tsv"
 printf '%s\n' "$workspace" >"$metadata_root/workspace-path.txt"
 
 time_format=$'elapsed_s=%e\nuser_s=%U\nsystem_s=%S\nmax_rss_kb=%M\nexit=%x'
