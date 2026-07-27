@@ -988,6 +988,14 @@ The immediate sequence is:
    Every pressure solve still converged and boundary fields remained exact,
    so this is an algorithmic efficiency rejection rather than a breakdown.
    The global-matching leaf remains local and unmerged.
+   A subsequent control-only `nFinestSweeps 2 -> 1` probe also remains
+   unmerged. Pipe's Native Linux `0+2` gate initially suggested a `0.9679`
+   paired ratio, but the required `2+10` run reversed that result: process
+   medians were `2.29 vs 2.30 s`, the paired median ratio was `1.1141` with
+   `0.1669` MAD, and both order cohorts classified the candidate as slower.
+   Reports and final fields stayed bit-exact. Channel's `0+2` probe was
+   inconclusive because its two order cohorts disagreed, so the predeclared
+   both-case gate stopped before a stronger Channel run.
 9. **F-PERF-ADAPTIVE-LINEAR:** After persistence parity, add user-bounded
    adaptive linear tolerances while preserving final outer acceptance and
    reporting effective tolerances and linear work.
