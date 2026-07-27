@@ -28,9 +28,10 @@ use ferrum_mesh::flow::{
     LaminarSimpleInterpolationScheme, LaminarSimpleIterationSummary, LaminarSimpleLaplacianScheme,
     LaminarSimpleLinearSolver, LaminarSimpleOptions, LaminarSimplePreconditioner,
     LaminarSimpleReport, LaminarSimpleResidualControlSummary, LaminarSimpleSchemes,
-    LaminarSimpleSnGradScheme, LaminarSimpleStopReason, LinearSolveSummary,
-    MatrixDiagnosticSummary, PressureAssemblyDiagnostics, ScalarDiagnosticSummary,
-    VectorDiagnosticSummary, solve_laminar_simple, solve_laminar_simple_with_observer,
+    LaminarSimpleSnGradScheme, LaminarSimpleStopReason, LinearSolveConvergenceSummary,
+    LinearSolveSummary, MatrixDiagnosticSummary, PressureAssemblyDiagnostics,
+    ScalarDiagnosticSummary, VectorDiagnosticSummary, solve_laminar_simple,
+    solve_laminar_simple_with_observer,
 };
 use ferrum_mesh::foam::{FoamWriteOptions, write_openfoam_case_with_options};
 use ferrum_mesh::geometry::{GeometrySummary, summarize_case_geometry};
@@ -752,12 +753,14 @@ fn run_laminar_simple_solve(
     let wall_clock_seconds = started.elapsed().as_secs_f64();
 
     println!(
-        "incompressibleFluid solve: backend=cpu linearSolver={} momentumLinearSolver={} momentumPreconditioner={} pressureLinearSolver={} pressurePreconditioner={} divPhiU=\"{}\" gradP=\"{}\" gradU=\"{}\" laplacian=\"{}\" snGrad=\"{}\" interpolation=\"{}\" pRefCell={} pRefValue={} nonOrthogonalCorrectors={} consistent={} stopReason={} cells={} faces={} simpleIterations={} minSimpleIterations={} converged={} residualControl={} initialContinuityL2={} finalContinuityL2={} momentumInitialResidual={} momentumFinalResidual={} momentumResidualNorm={} pressureInitialResidual={} pressureFinalResidual={} pressureResidualNorm={} momentumLinearIterations={} pressureLinearIterations={} wallClockSeconds={:.6}",
+        "incompressibleFluid solve: backend=cpu linearSolver={} momentumLinearSolver={} momentumPreconditioner={} momentumRelTol={} pressureLinearSolver={} pressurePreconditioner={} pressureRelTol={} divPhiU=\"{}\" gradP=\"{}\" gradU=\"{}\" laplacian=\"{}\" snGrad=\"{}\" interpolation=\"{}\" pRefCell={} pRefValue={} nonOrthogonalCorrectors={} consistent={} stopReason={} cells={} faces={} simpleIterations={} minSimpleIterations={} converged={} residualControl={} initialContinuityL2={} finalContinuityL2={} momentumInitialResidual={} momentumFinalResidual={} momentumResidualNorm={} pressureInitialResidual={} pressureFinalResidual={} pressureResidualNorm={} momentumLinearIterations={} pressureLinearIterations={} wallClockSeconds={:.6}",
         options.linear_solver,
         options.momentum_linear_solver,
         options.momentum_preconditioner,
+        format_scientific(options.momentum_linear_relative_tolerance),
         options.pressure_linear_solver,
         options.pressure_preconditioner,
+        format_scientific(options.pressure_linear_relative_tolerance),
         options.schemes.div_phi_u,
         options.schemes.grad_p,
         options.schemes.grad_u,
@@ -1113,12 +1116,13 @@ fn write_laminar_simple_residual_csv(
 
     writeln!(
         writer,
-        "iteration,continuityBeforeL2,continuityAfterL2,momentumInitialResidualNormalized,momentumFinalResidualNormalized,momentumResidualNorm,pressureInitialResidualNormalized,pressureFinalResidualNormalized,pressureResidualNorm,residualControlConfigured,residualControlChecked,residualControlSatisfied,pressureCorrectionAccepted,momentumLinearIterations,momentumLinearConverged,pressureLinearIterations,pressureLinearConverged,relativeVelocityChangeL2,relativePressureChangeL2"
+        "iteration,continuityBeforeL2,continuityAfterL2,momentumInitialResidualNormalized,momentumFinalResidualNormalized,momentumResidualNorm,pressureInitialResidualNormalized,pressureFinalResidualNormalized,pressureResidualNorm,residualControlConfigured,residualControlChecked,residualControlSatisfied,pressureCorrectionAccepted,momentumLinearIterations,momentumLinearConverged,pressureLinearIterations,pressureLinearConverged,relativeVelocityChangeL2,relativePressureChangeL2,momentumComponentLinearSolveDiagnostics,pressureCorrectionLinearSolveDiagnostics"
     )?;
     for item in &report.history {
+        let pressure_linear_solves = pressure_linear_solve_summaries(item)?;
         writeln!(
             writer,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             item.iteration,
             item.continuity_before.l2_norm,
             item.continuity_after.l2_norm,
@@ -1137,11 +1141,31 @@ fn write_laminar_simple_residual_csv(
             item.pressure_linear_iterations,
             item.pressure_linear_converged,
             item.relative_velocity_change_l2,
-            item.relative_pressure_change_l2
+            item.relative_pressure_change_l2,
+            format_momentum_linear_solve_diagnostics(&item.momentum_component_linear_solves, ";"),
+            format_pressure_linear_solve_diagnostics(pressure_linear_solves, ";")
         )?;
     }
 
     writer.flush()
+}
+
+fn pressure_linear_solve_summaries(
+    item: &LaminarSimpleIterationSummary,
+) -> std::io::Result<&[LinearSolveConvergenceSummary]> {
+    item.pressure_correction_linear_solves
+        .get(..item.pressure_linear_solves)
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "SIMPLE iteration {} reports {} pressure solves, exceeding telemetry capacity {}",
+                    item.iteration,
+                    item.pressure_linear_solves,
+                    item.pressure_correction_linear_solves.len()
+                ),
+            )
+        })
 }
 
 struct SimpleIterationEstimate {
@@ -1706,6 +1730,10 @@ fn resolve_laminar_simple_options(
         })?;
     let momentum_case_tolerance = fv_solution_number(plan, "solvers.U", "tolerance")?;
     let pressure_case_tolerance = fv_solution_number(plan, "solvers.p", "tolerance")?;
+    let momentum_linear_relative_tolerance =
+        fv_solution_number(plan, "solvers.U", "relTol")?.unwrap_or(0.0);
+    let pressure_linear_relative_tolerance =
+        fv_solution_number(plan, "solvers.p", "relTol")?.unwrap_or(0.0);
     let momentum_case_max_iterations = fv_solution_usize(plan, "solvers.U", "maxIter")?;
     let pressure_case_max_iterations = fv_solution_usize(plan, "solvers.p", "maxIter")?;
     if solve.momentum_max_linear_iterations.is_none() && solve.max_linear_iterations.is_none() {
@@ -1838,6 +1866,8 @@ fn resolve_laminar_simple_options(
         max_linear_iterations,
         momentum_linear_tolerance,
         pressure_linear_tolerance,
+        momentum_linear_relative_tolerance,
+        pressure_linear_relative_tolerance,
         momentum_max_linear_iterations,
         pressure_max_linear_iterations,
         max_simple_iterations,
@@ -2405,10 +2435,10 @@ fn validate_openfoam_linear_controls(
         return Ok(());
     }
     if let Some(relative_tolerance) = fv_solution_number(plan, section, "relTol")?
-        && relative_tolerance != 0.0
+        && (!relative_tolerance.is_finite() || relative_tolerance < 0.0)
     {
         return Err(format!(
-            "fvSolution {section}.relTol={relative_tolerance} is not implemented yet; Ferrum refuses to ignore a non-zero OpenFOAM relative tolerance"
+            "fvSolution {section}.relTol must be finite and non-negative, got {relative_tolerance}"
         ));
     }
     if let Some(min_iterations) = fv_solution_usize(plan, section, "minIter")?
@@ -3820,8 +3850,14 @@ fn write_json_laminar_simple_options(
     write_json_key(writer, 4, "momentumLinearTolerance")?;
     write_json_optional_number(writer, Some(options.momentum_linear_tolerance))?;
     writeln!(writer, ",")?;
+    write_json_key(writer, 4, "momentumLinearRelativeTolerance")?;
+    write_json_optional_number(writer, Some(options.momentum_linear_relative_tolerance))?;
+    writeln!(writer, ",")?;
     write_json_key(writer, 4, "pressureLinearTolerance")?;
     write_json_optional_number(writer, Some(options.pressure_linear_tolerance))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "pressureLinearRelativeTolerance")?;
+    write_json_optional_number(writer, Some(options.pressure_linear_relative_tolerance))?;
     writeln!(writer, ",")?;
     write_json_key(writer, 4, "velocityRelaxation")?;
     write_json_optional_number(writer, Some(options.velocity_relaxation))?;
@@ -4377,6 +4413,7 @@ fn write_json_laminar_simple_history(
     write_json_key(writer, 2, "history")?;
     writeln!(writer, "[")?;
     for (index, item) in history.iter().enumerate() {
+        let pressure_linear_solves = pressure_linear_solve_summaries(item)?;
         write_indent(writer, 4)?;
         writeln!(writer, "{{")?;
         write_json_number_field(writer, 6, "iteration", item.iteration)?;
@@ -4535,6 +4572,16 @@ fn write_json_laminar_simple_history(
             "adjustPhiAdjustedFaces",
             item.adjust_phi_adjusted_faces,
         )?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 6, "momentumComponentLinearSolves")?;
+        write_json_momentum_linear_solve_diagnostics(
+            writer,
+            6,
+            &item.momentum_component_linear_solves,
+        )?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, 6, "pressureCorrectionLinearSolves")?;
+        write_json_pressure_linear_solve_diagnostics(writer, 6, pressure_linear_solves)?;
         writeln!(writer)?;
         write_indent(writer, 4)?;
         if index + 1 == history.len() {
@@ -4544,6 +4591,86 @@ fn write_json_laminar_simple_history(
         }
     }
     write_indent(writer, 2)?;
+    write!(writer, "]")
+}
+
+fn write_json_linear_solve_diagnostic(
+    writer: &mut impl Write,
+    indent: usize,
+    summary: &LinearSolveConvergenceSummary,
+) -> std::io::Result<()> {
+    writeln!(writer, "{{")?;
+    write_json_number_field(writer, indent + 2, "iterations", summary.iterations)?;
+    writeln!(writer, ",")?;
+    write_json_bool_field(writer, indent + 2, "converged", summary.converged)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "initialNormalizedResidual")?;
+    write_json_optional_number(writer, Some(summary.initial_normalized_residual_norm))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "residualNorm")?;
+    write_json_optional_number(writer, Some(summary.residual_norm))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "normalizedResidual")?;
+    write_json_optional_number(writer, Some(summary.normalized_residual_norm))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "effectiveNormalizedTolerance")?;
+    write_json_optional_number(writer, Some(summary.effective_normalized_tolerance))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "stopReason")?;
+    write_json_string(writer, &summary.stop_reason.to_string())?;
+    writeln!(writer)?;
+    write_indent(writer, indent)?;
+    write!(writer, "}}")
+}
+
+fn write_json_momentum_linear_solve_diagnostics(
+    writer: &mut impl Write,
+    indent: usize,
+    summaries: &[LinearSolveConvergenceSummary; 3],
+) -> std::io::Result<()> {
+    writeln!(writer, "[")?;
+    for (index, (component, summary)) in ["x", "y", "z"].iter().zip(summaries).enumerate() {
+        write_indent(writer, indent + 2)?;
+        writeln!(writer, "{{")?;
+        write_json_key(writer, indent + 4, "component")?;
+        write_json_string(writer, component)?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, indent + 4, "solve")?;
+        write_json_linear_solve_diagnostic(writer, indent + 4, summary)?;
+        writeln!(writer)?;
+        write_indent(writer, indent + 2)?;
+        if index + 1 == summaries.len() {
+            writeln!(writer, "}}")?;
+        } else {
+            writeln!(writer, "}},")?;
+        }
+    }
+    write_indent(writer, indent)?;
+    write!(writer, "]")
+}
+
+fn write_json_pressure_linear_solve_diagnostics(
+    writer: &mut impl Write,
+    indent: usize,
+    summaries: &[LinearSolveConvergenceSummary],
+) -> std::io::Result<()> {
+    writeln!(writer, "[")?;
+    for (index, summary) in summaries.iter().enumerate() {
+        write_indent(writer, indent + 2)?;
+        writeln!(writer, "{{")?;
+        write_json_number_field(writer, indent + 4, "correction", index + 1)?;
+        writeln!(writer, ",")?;
+        write_json_key(writer, indent + 4, "solve")?;
+        write_json_linear_solve_diagnostic(writer, indent + 4, summary)?;
+        writeln!(writer)?;
+        write_indent(writer, indent + 2)?;
+        if index + 1 == summaries.len() {
+            writeln!(writer, "}}")?;
+        } else {
+            writeln!(writer, "}},")?;
+        }
+    }
+    write_indent(writer, indent)?;
     write!(writer, "]")
 }
 
@@ -4661,6 +4788,11 @@ fn write_laminar_simple_report_markdown(
     )?;
     writeln!(
         writer,
+        "| Momentum linear relative tolerance | {} |",
+        format_scientific(options.momentum_linear_relative_tolerance)
+    )?;
+    writeln!(
+        writer,
         "| Momentum max linear iterations | {} |",
         options.momentum_max_linear_iterations
     )?;
@@ -4678,6 +4810,11 @@ fn write_laminar_simple_report_markdown(
         writer,
         "| Pressure linear tolerance | {} |",
         format_scientific(options.pressure_linear_tolerance)
+    )?;
+    writeln!(
+        writer,
+        "| Pressure linear relative tolerance | {} |",
+        format_scientific(options.pressure_linear_relative_tolerance)
     )?;
     writeln!(
         writer,
@@ -5167,16 +5304,17 @@ fn write_laminar_simple_report_markdown(
     writeln!(writer)?;
     writeln!(
         writer,
-        "| Iteration | Continuity before | Continuity after | Pressure correction | U initial | U final | U linear iter/ok | U components initial | U components final | p initial | p final | p linear iter/ok | p-solves/nonconv | residualControl | A diag min/max | H1 min/max | adjustPhi before/after/faces | U change | p change |"
+        "| Iteration | Continuity before | Continuity after | Pressure correction | U initial | U final | U linear iter/ok | U components initial | U components final | p initial | p final | p linear iter/ok | p-solves/nonconv | residualControl | A diag min/max | H1 min/max | adjustPhi before/after/faces | U change | p change | U solve diagnostics | p solve diagnostics |"
     )?;
     writeln!(
         writer,
-        "| ---: | ---: | ---: | --- | ---: | ---: | --- | --- | --- | ---: | ---: | --- | --- | --- | --- | --- | --- | ---: | ---: |"
+        "| ---: | ---: | ---: | --- | ---: | ---: | --- | --- | --- | ---: | ---: | --- | --- | --- | --- | --- | --- | ---: | ---: | --- | --- |"
     )?;
     for item in &report.history {
+        let pressure_linear_solves = pressure_linear_solve_summaries(item)?;
         writeln!(
             writer,
-            "| {} | {} | {} | {} | {} | {} | {} / {} | {} | {} | {} | {} | {} / {} | {} / {} | {} | {} / {} | {} / {} | {} / {} / {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} / {} | {} | {} | {} | {} | {} / {} | {} / {} | {} | {} / {} | {} / {} | {} / {} / {} | {} | {} | {} | {} |",
             item.iteration,
             format_scientific(item.continuity_before.l2_norm),
             format_scientific(item.continuity_after.l2_norm),
@@ -5206,7 +5344,12 @@ fn write_laminar_simple_report_markdown(
             format_scientific(item.adjust_phi_global_flux_after),
             item.adjust_phi_adjusted_faces,
             format_percent(item.relative_velocity_change_l2),
-            format_percent(item.relative_pressure_change_l2)
+            format_percent(item.relative_pressure_change_l2),
+            format_momentum_linear_solve_diagnostics(
+                &item.momentum_component_linear_solves,
+                "<br>"
+            ),
+            format_pressure_linear_solve_diagnostics(pressure_linear_solves, "<br>")
         )?;
     }
 
@@ -6787,6 +6930,43 @@ fn format_triplet(values: [f64; 3]) -> String {
     )
 }
 
+fn format_linear_solve_diagnostic(label: &str, summary: &LinearSolveConvergenceSummary) -> String {
+    format!(
+        "{label}:iter={}/ok={}/initial={}/residual={}/final={}/effectiveTol={}/reason={}",
+        summary.iterations,
+        summary.converged,
+        format_scientific(summary.initial_normalized_residual_norm),
+        format_scientific(summary.residual_norm),
+        format_scientific(summary.normalized_residual_norm),
+        format_scientific(summary.effective_normalized_tolerance),
+        summary.stop_reason
+    )
+}
+
+fn format_momentum_linear_solve_diagnostics(
+    summaries: &[LinearSolveConvergenceSummary; 3],
+    separator: &str,
+) -> String {
+    ["x", "y", "z"]
+        .iter()
+        .zip(summaries)
+        .map(|(label, summary)| format_linear_solve_diagnostic(label, summary))
+        .collect::<Vec<_>>()
+        .join(separator)
+}
+
+fn format_pressure_linear_solve_diagnostics(
+    summaries: &[LinearSolveConvergenceSummary],
+    separator: &str,
+) -> String {
+    summaries
+        .iter()
+        .enumerate()
+        .map(|(index, summary)| format_linear_solve_diagnostic(&(index + 1).to_string(), summary))
+        .collect::<Vec<_>>()
+        .join(separator)
+}
+
 fn print_region_patch(patch: &ferrum_mesh::regions::RegionPatchSummary) {
     if patch.source_flipped_faces > 0 {
         println!(
@@ -7822,6 +8002,7 @@ mod tests {
         resolve_solver_dispatch, resolved_gradient_scheme_value, run_ferrum_subcommand,
         validate_laminar_residual_control_dictionary, validate_module_execution_contract,
         write_json_solver_state, write_json_string, write_laminar_simple_fields,
+        write_laminar_simple_report_json, write_laminar_simple_report_markdown,
         write_laminar_simple_residual_csv, write_laminar_simple_residual_plot,
         write_solver_plan_json_in_root,
     };
@@ -7830,7 +8011,7 @@ mod tests {
     use ferrum_mesh::flow::{
         LaminarSimpleConvectionScheme, LaminarSimpleGradientScheme, LaminarSimpleLaplacianScheme,
         LaminarSimpleLinearSolver, LaminarSimplePreconditioner, LaminarSimpleSnGradScheme,
-        LaminarSimpleStopReason,
+        LaminarSimpleStopReason, LinearSolveConvergenceSummary, LinearSolveStopReason,
     };
     use ferrum_mesh::linear::{GamgAgglomerator, GamgSmoother};
     use ferrum_mesh::runtime::{SolverRuntimeData, SolverRuntimeMeshData};
@@ -8327,6 +8508,152 @@ mod tests {
                 .expect("p should be readable")
                 .contains("internalField nonuniform List<scalar>")
         );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn simple_reports_include_relative_tolerances_and_every_linear_solve_diagnostic() {
+        let base = output_test_dir("linear-reltol-reporting");
+        std::fs::create_dir_all(&base).expect("output root should be created");
+        let output_root = SafeOutputRoot::open_existing(&base).expect("output root should open");
+        let plan = laminar_simple_test_plan(1000.0, 0.001);
+        let mut options = minimal_laminar_simple_options_for_estimate();
+        options.momentum_linear_relative_tolerance = 0.125;
+        options.pressure_linear_relative_tolerance = 1.25;
+        let mut report = output_test_report();
+        let relative_solve = LinearSolveConvergenceSummary {
+            iterations: 3,
+            converged: true,
+            initial_normalized_residual_norm: 0.5,
+            residual_norm: 0.01,
+            normalized_residual_norm: 0.05,
+            effective_normalized_tolerance: 0.125,
+            stop_reason: LinearSolveStopReason::RelativeTolerance,
+        };
+        let absolute_solve = LinearSolveConvergenceSummary {
+            iterations: 2,
+            converged: true,
+            initial_normalized_residual_norm: 0.25,
+            residual_norm: 0.001,
+            normalized_residual_norm: 0.01,
+            effective_normalized_tolerance: 0.02,
+            stop_reason: LinearSolveStopReason::AbsoluteTolerance,
+        };
+        let mut iteration = build_laminar_simple_iteration_summary(1, 0.1, 0.5, 0.25);
+        iteration.momentum_component_linear_solves = [
+            relative_solve,
+            absolute_solve,
+            LinearSolveConvergenceSummary {
+                stop_reason: LinearSolveStopReason::ExactZero,
+                converged: true,
+                ..LinearSolveConvergenceSummary::default()
+            },
+        ];
+        iteration.pressure_linear_solves = 2;
+        iteration.pressure_correction_linear_solves[0] = relative_solve;
+        iteration.pressure_correction_linear_solves[1] = absolute_solve;
+        report.simple_iterations = 1;
+        report.history.push(iteration);
+
+        write_laminar_simple_report_json(
+            &plan,
+            &options,
+            &report,
+            0.0,
+            &output_root,
+            Path::new("report.json"),
+        )
+        .expect("JSON report should be written");
+        write_laminar_simple_report_markdown(
+            &plan,
+            &options,
+            &report,
+            0.0,
+            &output_root,
+            Path::new("report.md"),
+        )
+        .expect("Markdown report should be written");
+        write_laminar_simple_residual_csv(&report, &output_root, Path::new("residual.csv"))
+            .expect("CSV report should be written");
+
+        let json = std::fs::read_to_string(base.join("report.json"))
+            .expect("JSON report should be readable");
+        let markdown = std::fs::read_to_string(base.join("report.md"))
+            .expect("Markdown report should be readable");
+        let csv = std::fs::read_to_string(base.join("residual.csv"))
+            .expect("CSV report should be readable");
+        assert!(json.contains("\"momentumLinearRelativeTolerance\": 0.125"));
+        assert!(json.contains("\"pressureLinearRelativeTolerance\": 1.25"));
+        assert!(json.contains("\"momentumComponentLinearSolves\""));
+        assert!(json.contains("\"pressureCorrectionLinearSolves\""));
+        assert!(json.contains("\"correction\": 1"));
+        assert!(json.contains("\"correction\": 2"));
+        assert!(json.contains("\"effectiveNormalizedTolerance\": 0.125"));
+        assert!(json.contains("\"stopReason\": \"RelativeTolerance\""));
+        assert!(markdown.contains("| Momentum linear relative tolerance | 1.250000e-1 |"));
+        assert!(markdown.contains("| Pressure linear relative tolerance | 1.250000e0 |"));
+        assert!(markdown.contains("| U solve diagnostics | p solve diagnostics |"));
+        assert!(markdown.contains(
+            "x:iter=3/ok=true/initial=5.000000e-1/residual=1.000000e-2/final=5.000000e-2/effectiveTol=1.250000e-1/reason=RelativeTolerance"
+        ));
+        assert!(markdown.contains(
+            "1:iter=3/ok=true/initial=5.000000e-1/residual=1.000000e-2/final=5.000000e-2/effectiveTol=1.250000e-1/reason=RelativeTolerance"
+        ));
+        let mut csv_lines = csv.lines();
+        let csv_header = csv_lines.next().expect("CSV header");
+        let csv_row = csv_lines.next().expect("CSV history row");
+        assert!(csv_header.ends_with(
+            "momentumComponentLinearSolveDiagnostics,pressureCorrectionLinearSolveDiagnostics"
+        ));
+        assert_eq!(csv_header.split(',').count(), csv_row.split(',').count());
+        assert!(csv_row.contains(
+            "x:iter=3/ok=true/initial=5.000000e-1/residual=1.000000e-2/final=5.000000e-2/effectiveTol=1.250000e-1/reason=RelativeTolerance"
+        ));
+        assert!(csv_row.contains(
+            "2:iter=2/ok=true/initial=2.500000e-1/residual=1.000000e-3/final=1.000000e-2/effectiveTol=2.000000e-2/reason=AbsoluteTolerance"
+        ));
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn simple_report_writers_reject_pressure_telemetry_count_overflow_without_panicking() {
+        let base = output_test_dir("linear-telemetry-count");
+        std::fs::create_dir_all(&base).expect("output root should be created");
+        let output_root = SafeOutputRoot::open_existing(&base).expect("output root should open");
+        let plan = laminar_simple_test_plan(1000.0, 0.001);
+        let options = minimal_laminar_simple_options_for_estimate();
+        let mut report = output_test_report();
+        let mut iteration = build_laminar_simple_iteration_summary(1, 0.1, 0.2, 0.3);
+        iteration.pressure_linear_solves = iteration.pressure_correction_linear_solves.len() + 1;
+        report.history.push(iteration);
+
+        for error in [
+            write_laminar_simple_residual_csv(&report, &output_root, Path::new("overflow.csv"))
+                .expect_err("CSV must reject invalid pressure telemetry count"),
+            write_laminar_simple_report_json(
+                &plan,
+                &options,
+                &report,
+                0.0,
+                &output_root,
+                Path::new("overflow.json"),
+            )
+            .expect_err("JSON must reject invalid pressure telemetry count"),
+            write_laminar_simple_report_markdown(
+                &plan,
+                &options,
+                &report,
+                0.0,
+                &output_root,
+                Path::new("overflow.md"),
+            )
+            .expect_err("Markdown must reject invalid pressure telemetry count"),
+        ] {
+            assert_eq!(error.kind(), ErrorKind::InvalidData);
+            assert!(error.to_string().contains("exceeding telemetry capacity"));
+        }
+
         let _ = std::fs::remove_dir_all(base);
     }
 
@@ -8935,24 +9262,67 @@ mod tests {
     }
 
     #[test]
-    fn laminar_simple_rejects_unimplemented_nonzero_relative_tolerance() {
+    fn laminar_simple_resolves_relative_tolerances_independently_of_absolute_cli_overrides() {
         let mut plan = laminar_simple_test_plan(1000.0, 0.001002);
-        plan.numerics
-            .fv_solution
-            .entries
-            .push(ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
+        plan.numerics.fv_solution.entries.extend([
+            ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
                 section: "solvers.U".to_string(),
                 key: "relTol".to_string(),
                 value: "0.1".to_string(),
-            });
+            },
+            ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
+                section: "solvers.p".to_string(),
+                key: "relTol".to_string(),
+                value: "1.25".to_string(),
+            },
+        ]);
+        let parsed = parse_incompressible_fluid_args(&[
+            "--momentumSolveTolerance".to_string(),
+            "1e-7".to_string(),
+            "--pressureSolveTolerance".to_string(),
+            "1e-9".to_string(),
+        ])
+        .expect("solver args should parse");
+        let solve = parsed
+            .laminar_simple_solve
+            .expect("laminar SIMPLE solve args");
+        let options = resolve_laminar_simple_options(&plan, &solve)
+            .expect("finite non-negative relTol must resolve");
+
+        assert_eq!(options.momentum_linear_tolerance, 1.0e-7);
+        assert_eq!(options.pressure_linear_tolerance, 1.0e-9);
+        assert_eq!(options.momentum_linear_relative_tolerance, 0.1);
+        assert_eq!(options.pressure_linear_relative_tolerance, 1.25);
+    }
+
+    #[test]
+    fn laminar_simple_relative_tolerance_defaults_to_zero_and_rejects_invalid_values() {
         let parsed = parse_incompressible_fluid_args(&[]).expect("solver args should parse");
         let solve = parsed
             .laminar_simple_solve
             .expect("laminar SIMPLE solve args");
-        let error = resolve_laminar_simple_options(&plan, &solve)
-            .expect_err("non-zero relTol must not be ignored");
+        let defaults =
+            resolve_laminar_simple_options(&laminar_simple_test_plan(1000.0, 0.001002), &solve)
+                .expect("missing relTol must preserve the zero default");
+        assert_eq!(defaults.momentum_linear_relative_tolerance, 0.0);
+        assert_eq!(defaults.pressure_linear_relative_tolerance, 0.0);
 
-        assert!(error.contains("relTol=0.1 is not implemented"));
+        for value in ["-1", "NaN", "inf", "-inf"] {
+            let mut plan = laminar_simple_test_plan(1000.0, 0.001002);
+            plan.numerics.fv_solution.entries.push(
+                ferrum_mesh::solver_plan::SolverNumericsEntryPlan {
+                    section: "solvers.U".to_string(),
+                    key: "relTol".to_string(),
+                    value: value.to_string(),
+                },
+            );
+            let error = resolve_laminar_simple_options(&plan, &solve)
+                .expect_err("invalid relTol must fail closed");
+            assert!(
+                error.contains("fvSolution solvers.U.relTol must be finite and non-negative"),
+                "unexpected error for {value}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -9008,6 +9378,8 @@ mod tests {
             max_linear_iterations: 10_000,
             momentum_linear_tolerance: 1.0e-10,
             pressure_linear_tolerance: 1.0e-10,
+            momentum_linear_relative_tolerance: 0.0,
+            pressure_linear_relative_tolerance: 0.0,
             momentum_max_linear_iterations: 10_000,
             pressure_max_linear_iterations: 10_000,
             max_simple_iterations: 100,
@@ -9069,6 +9441,8 @@ mod tests {
             adjust_phi_global_flux_before: 0.0,
             adjust_phi_global_flux_after: 0.0,
             adjust_phi_adjusted_faces: 0,
+            momentum_component_linear_solves: Default::default(),
+            pressure_correction_linear_solves: Default::default(),
         }
     }
 
@@ -9305,6 +9679,7 @@ mod tests {
             LaminarSimplePreconditioner::None
         );
         assert_eq!(options.pressure_linear_tolerance, 5.0e-9);
+        assert_eq!(options.pressure_linear_relative_tolerance, 0.075);
         assert_eq!(options.pressure_max_linear_iterations, 41);
         assert!(options.profile_gamg);
         assert_eq!(gamg.agglomerator, GamgAgglomerator::FaceAreaPair);
