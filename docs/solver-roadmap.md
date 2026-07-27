@@ -975,7 +975,8 @@ The immediate sequence is:
    13 measured process medians of `2.24 vs 6.65 s` for Pipe and
    `6.47 vs 10.97 s` for Channel, ratios `0.3368` and `0.5898`. These are
    fixed-work results on the two frozen cases, not a general all-case speed
-   claim. Publication and CI remain pending.
+   claim. The isolated one-file implementation is published as Draft PR `#79`;
+   CI and trusted merge remain pending.
 9. **F-PERF-ADAPTIVE-LINEAR:** After persistence parity, add user-bounded
    adaptive linear tolerances while preserving final outer acceptance and
    reporting effective tolerances and linear work.
