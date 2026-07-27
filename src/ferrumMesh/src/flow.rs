@@ -95,6 +95,7 @@ pub struct LaminarSimpleSchemes {
 }
 
 pub const MAX_NON_ORTHOGONAL_CORRECTORS: usize = 20;
+pub const MAX_PRESSURE_CORRECTION_LINEAR_SOLVES: usize = MAX_NON_ORTHOGONAL_CORRECTORS + 1;
 
 #[derive(Clone, Debug)]
 pub struct LaminarSimpleOptions {
@@ -111,6 +112,8 @@ pub struct LaminarSimpleOptions {
     pub max_linear_iterations: usize,
     pub momentum_linear_tolerance: f64,
     pub pressure_linear_tolerance: f64,
+    pub momentum_linear_relative_tolerance: f64,
+    pub pressure_linear_relative_tolerance: f64,
     pub momentum_max_linear_iterations: usize,
     pub pressure_max_linear_iterations: usize,
     pub max_simple_iterations: usize,
@@ -290,6 +293,28 @@ pub enum LaminarSimpleStopReason {
     SolverInvalidState,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LinearSolveStopReason {
+    #[default]
+    NotRun,
+    ExactZero,
+    AbsoluteTolerance,
+    RelativeTolerance,
+    MaxIterations,
+    Breakdown,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LinearSolveConvergenceSummary {
+    pub iterations: usize,
+    pub converged: bool,
+    pub initial_normalized_residual_norm: f64,
+    pub residual_norm: f64,
+    pub normalized_residual_norm: f64,
+    pub effective_normalized_tolerance: f64,
+    pub stop_reason: LinearSolveStopReason,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ContinuitySummary {
     pub l2_norm: f64,
@@ -445,6 +470,9 @@ pub struct LaminarSimpleIterationSummary {
     pub adjust_phi_global_flux_before: f64,
     pub adjust_phi_global_flux_after: f64,
     pub adjust_phi_adjusted_faces: usize,
+    pub momentum_component_linear_solves: [LinearSolveConvergenceSummary; 3],
+    pub pressure_correction_linear_solves:
+        [LinearSolveConvergenceSummary; MAX_PRESSURE_CORRECTION_LINEAR_SOLVES],
 }
 
 #[derive(Clone, Debug)]
@@ -602,6 +630,19 @@ impl std::fmt::Display for LaminarSimpleStopReason {
             Self::MomentumSolverInvalidState => formatter.write_str("MomentumSolverInvalidState"),
             Self::PressureSolverInvalidState => formatter.write_str("PressureSolverInvalidState"),
             Self::SolverInvalidState => formatter.write_str("SolverInvalidState"),
+        }
+    }
+}
+
+impl std::fmt::Display for LinearSolveStopReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotRun => formatter.write_str("NotRun"),
+            Self::ExactZero => formatter.write_str("ExactZero"),
+            Self::AbsoluteTolerance => formatter.write_str("AbsoluteTolerance"),
+            Self::RelativeTolerance => formatter.write_str("RelativeTolerance"),
+            Self::MaxIterations => formatter.write_str("MaxIterations"),
+            Self::Breakdown => formatter.write_str("Breakdown"),
         }
     }
 }
@@ -816,6 +857,9 @@ fn solve_laminar_simple_driven(
                 adjust_phi_global_flux_before: 0.0,
                 adjust_phi_global_flux_after: 0.0,
                 adjust_phi_adjusted_faces: 0,
+                momentum_component_linear_solves: momentum.component_linear_solves,
+                pressure_correction_linear_solves: [LinearSolveConvergenceSummary::default();
+                    MAX_PRESSURE_CORRECTION_LINEAR_SOLVES],
             });
             stop_reason = Some(LaminarSimpleStopReason::MomentumSolverInvalidState);
             break;
@@ -870,6 +914,9 @@ fn solve_laminar_simple_driven(
                 adjust_phi_global_flux_before: 0.0,
                 adjust_phi_global_flux_after: 0.0,
                 adjust_phi_adjusted_faces: 0,
+                momentum_component_linear_solves: momentum.component_linear_solves,
+                pressure_correction_linear_solves: [LinearSolveConvergenceSummary::default();
+                    MAX_PRESSURE_CORRECTION_LINEAR_SOLVES],
             });
             stop_reason = Some(LaminarSimpleStopReason::MomentumSolverInvalidState);
             break;
@@ -952,6 +999,9 @@ fn solve_laminar_simple_driven(
                 adjust_phi_global_flux_before: adjust_phi_summary.global_flux_before,
                 adjust_phi_global_flux_after: adjust_phi_summary.global_flux_after,
                 adjust_phi_adjusted_faces: adjust_phi_summary.adjusted_faces,
+                momentum_component_linear_solves: momentum.component_linear_solves,
+                pressure_correction_linear_solves: [LinearSolveConvergenceSummary::default();
+                    MAX_PRESSURE_CORRECTION_LINEAR_SOLVES],
             });
             stop_reason = Some(LaminarSimpleStopReason::SolverInvalidState);
             break;
@@ -970,6 +1020,8 @@ fn solve_laminar_simple_driven(
         let mut pressure_linear_converged_this_simple = true;
         let mut pressure_linear_solves_this_simple = 0;
         let mut pressure_linear_non_converged_solves_this_simple = 0;
+        let mut pressure_correction_linear_solves =
+            [LinearSolveConvergenceSummary::default(); MAX_PRESSURE_CORRECTION_LINEAR_SOLVES];
         let mut pressure_source_summary = ScalarDiagnosticSummary::default();
         let mut pressure_equation_flux_summary = FaceFluxDiagnosticSummary::default();
         let mut pressure_matrix_summary = MatrixDiagnosticSummary::default();
@@ -990,7 +1042,7 @@ fn solve_laminar_simple_driven(
         };
         timing.pressure_coupling_setup_seconds +=
             pressure_coupling_setup_started.elapsed().as_secs_f64();
-        for _ in 0..pressure_solve_count {
+        for pressure_solve_index in 0..pressure_solve_count {
             let pressure_assembly_started = Instant::now();
             let initial_pressure = pressure_report
                 .as_ref()
@@ -1066,6 +1118,7 @@ fn solve_laminar_simple_driven(
                     solver: options.pressure_linear_solver,
                     preconditioner: options.pressure_preconditioner,
                     tolerance: options.pressure_linear_tolerance,
+                    relative_tolerance: options.pressure_linear_relative_tolerance,
                     max_iterations: options.pressure_max_linear_iterations,
                     gamg_options: options.pressure_gamg_options,
                     profile_gamg: options.profile_gamg,
@@ -1099,6 +1152,8 @@ fn solve_laminar_simple_driven(
             if let Some(gamg_timing) = report.gamg_timing.take() {
                 timing.add_pressure_gamg_timing(gamg_timing)?;
             }
+            pressure_correction_linear_solves[pressure_solve_index] =
+                LinearSolveConvergenceSummary::from(&report);
             if let Some(pressure_stop_reason) = pressure_solver_stop_reason(report.termination) {
                 pressure_linear_converged_this_simple = false;
                 pressure_linear_non_converged_solves_this_simple += 1;
@@ -1153,6 +1208,8 @@ fn solve_laminar_simple_driven(
                     adjust_phi_global_flux_before: adjust_phi_summary.global_flux_before,
                     adjust_phi_global_flux_after: adjust_phi_summary.global_flux_after,
                     adjust_phi_adjusted_faces: adjust_phi_summary.adjusted_faces,
+                    momentum_component_linear_solves: momentum.component_linear_solves,
+                    pressure_correction_linear_solves,
                 });
                 stop_reason = Some(pressure_stop_reason);
                 pressure_report = None;
@@ -1301,6 +1358,8 @@ fn solve_laminar_simple_driven(
                 adjust_phi_global_flux_before: adjust_phi_summary.global_flux_before,
                 adjust_phi_global_flux_after: adjust_phi_summary.global_flux_after,
                 adjust_phi_adjusted_faces: adjust_phi_summary.adjusted_faces,
+                momentum_component_linear_solves: momentum.component_linear_solves,
+                pressure_correction_linear_solves,
             });
             stop_reason = Some(LaminarSimpleStopReason::SolverInvalidState);
             break;
@@ -1366,6 +1425,8 @@ fn solve_laminar_simple_driven(
             adjust_phi_global_flux_before: adjust_phi_summary.global_flux_before,
             adjust_phi_global_flux_after: adjust_phi_summary.global_flux_after,
             adjust_phi_adjusted_faces: adjust_phi_summary.adjusted_faces,
+            momentum_component_linear_solves: momentum.component_linear_solves,
+            pressure_correction_linear_solves,
         });
 
         if laminar_simple_converged(iteration, residual_control, options) {
@@ -1461,6 +1522,7 @@ struct MomentumPredictorReport {
     component_residual_norms: [f64; 3],
     component_normalized_residual_norms: [f64; 3],
     component_converged: [bool; 3],
+    component_linear_solves: [LinearSolveConvergenceSummary; 3],
     diagonal_min: f64,
     diagonal_max: f64,
     h1_min: f64,
@@ -1486,8 +1548,31 @@ struct ScalarSolveReport {
     initial_normalized_residual_norm: f64,
     residual_norm: f64,
     normalized_residual_norm: f64,
+    effective_normalized_tolerance: f64,
+    stop_reason: LinearSolveStopReason,
     pcg_timing: Option<PcgKernelTiming>,
     gamg_timing: Option<GamgKernelTiming>,
+}
+
+impl From<&ScalarSolveReport> for LinearSolveConvergenceSummary {
+    fn from(report: &ScalarSolveReport) -> Self {
+        let stop_reason = match report.termination {
+            IterativeSolveTermination::Breakdown => LinearSolveStopReason::Breakdown,
+            IterativeSolveTermination::MaxIterations if !report.converged => {
+                LinearSolveStopReason::MaxIterations
+            }
+            _ => report.stop_reason,
+        };
+        Self {
+            iterations: report.iterations,
+            converged: report.converged,
+            initial_normalized_residual_norm: report.initial_normalized_residual_norm,
+            residual_norm: report.residual_norm,
+            normalized_residual_norm: report.normalized_residual_norm,
+            effective_normalized_tolerance: report.effective_normalized_tolerance,
+            stop_reason,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1495,9 +1580,58 @@ struct ScalarSolveControls {
     solver: LaminarSimpleLinearSolver,
     preconditioner: LaminarSimplePreconditioner,
     tolerance: f64,
+    relative_tolerance: f64,
     max_iterations: usize,
     gamg_options: Option<GamgOptions>,
     profile_gamg: bool,
+}
+
+// OpenFOAM Foundation's solver-performance convergence check treats relTol as
+// enabled only above `small` for double precision. The established Ferrum GAMG
+// normalized-L1 contract intentionally remains active for every positive
+// relTol to preserve its bit-for-bit solve lifecycle. Unifying that legacy
+// exception requires a separately measured GAMG contract change.
+const OPENFOAM_RELATIVE_TOLERANCE_SMALL: f64 = 1.0e-15;
+
+fn linear_relative_tolerance_is_active(
+    solver: LaminarSimpleLinearSolver,
+    relative_tolerance: f64,
+) -> bool {
+    if solver == LaminarSimpleLinearSolver::Gamg {
+        relative_tolerance > 0.0
+    } else {
+        relative_tolerance > OPENFOAM_RELATIVE_TOLERANCE_SMALL
+    }
+}
+
+fn effective_normalized_tolerance_and_reason(
+    solver: LaminarSimpleLinearSolver,
+    absolute_tolerance: f64,
+    relative_tolerance: f64,
+    initial_normalized_residual: f64,
+) -> (f64, LinearSolveStopReason) {
+    if linear_relative_tolerance_is_active(solver, relative_tolerance) {
+        let relative_limit = relative_tolerance * initial_normalized_residual;
+        if relative_limit > absolute_tolerance {
+            return (relative_limit, LinearSolveStopReason::RelativeTolerance);
+        }
+    }
+    (absolute_tolerance, LinearSolveStopReason::AbsoluteTolerance)
+}
+
+#[cfg(test)]
+fn effective_non_gamg_normalized_tolerance(
+    absolute_tolerance: f64,
+    relative_tolerance: f64,
+    initial_normalized_residual: f64,
+) -> f64 {
+    effective_normalized_tolerance_and_reason(
+        LaminarSimpleLinearSolver::Cg,
+        absolute_tolerance,
+        relative_tolerance,
+        initial_normalized_residual,
+    )
+    .0
 }
 
 struct ScalarSolveWorkspace {
@@ -1763,6 +1897,7 @@ fn solve_momentum_predictor(
     let mut component_residual_norms = [0.0; 3];
     let mut component_normalized_residual_norms = [0.0; 3];
     let mut component_converged = [false; 3];
+    let mut component_linear_solves = [LinearSolveConvergenceSummary::default(); 3];
     let linear_solve_started = Instant::now();
 
     for (component, system) in equation.components.iter().enumerate() {
@@ -1779,6 +1914,7 @@ fn solve_momentum_predictor(
                 solver: options.momentum_linear_solver,
                 preconditioner: options.momentum_preconditioner,
                 tolerance: options.momentum_linear_tolerance,
+                relative_tolerance: options.momentum_linear_relative_tolerance,
                 max_iterations: options.momentum_max_linear_iterations,
                 gamg_options: None,
                 profile_gamg: false,
@@ -1800,6 +1936,7 @@ fn solve_momentum_predictor(
         component_residual_norms[component] = report.residual_norm;
         component_normalized_residual_norms[component] = report.normalized_residual_norm;
         component_converged[component] = report.converged;
+        component_linear_solves[component] = LinearSolveConvergenceSummary::from(&report);
         solved_components[component] = report.solution;
     }
     let linear_solve_seconds = linear_solve_started.elapsed().as_secs_f64();
@@ -1829,6 +1966,7 @@ fn solve_momentum_predictor(
         component_residual_norms,
         component_normalized_residual_norms,
         component_converged,
+        component_linear_solves,
         diagonal_min: equation.diagonal_min,
         diagonal_max: equation.diagonal_max,
         h1_min: equation.h1_min,
@@ -1990,6 +2128,23 @@ fn solve_scalar_system_with_workspaces(
     pcg_workspace: Option<&mut PreconditionedConjugateGradientWorkspace>,
     gamg_workspace: Option<&mut GamgWorkspace>,
 ) -> Result<ScalarSolveReport> {
+    if !controls.relative_tolerance.is_finite() || controls.relative_tolerance < 0.0 {
+        return Err(invalid_input(format!(
+            "scalar solve relTol must be finite and non-negative, got {}",
+            controls.relative_tolerance
+        )));
+    }
+    if controls.solver == LaminarSimpleLinearSolver::Gamg {
+        let gamg_options = controls.gamg_options.ok_or_else(|| {
+            invalid_input("GAMG solve requires resolved GAMG options".to_string())
+        })?;
+        if controls.relative_tolerance.to_bits() != gamg_options.relative_tolerance.to_bits() {
+            return Err(invalid_input(format!(
+                "GAMG scalar solve relTol sources must match exactly, got controls={} and options={}",
+                controls.relative_tolerance, gamg_options.relative_tolerance
+            )));
+        }
+    }
     scalar_workspace.validate(matrix, rhs)?;
     let ScalarSolveWorkspace {
         zero_initial,
@@ -2008,6 +2163,13 @@ fn solve_scalar_system_with_workspaces(
     let initial_residual_norm = l2_norm(residual);
     let initial_l1_residual_norm = l1_norm(residual);
     let initial_normalized_residual_norm = initial_l1_residual_norm / normalisation_factor;
+    let (effective_normalized_tolerance, dominant_tolerance_reason) =
+        effective_normalized_tolerance_and_reason(
+            controls.solver,
+            controls.tolerance,
+            controls.relative_tolerance,
+            initial_normalized_residual_norm,
+        );
 
     let gamg_min_iterations = controls
         .gamg_options
@@ -2016,7 +2178,7 @@ fn solve_scalar_system_with_workspaces(
     let initially_converged = if controls.solver == LaminarSimpleLinearSolver::Gamg {
         initial_l1_residual_norm == 0.0
     } else {
-        initial_normalized_residual_norm < controls.tolerance
+        initial_normalized_residual_norm < effective_normalized_tolerance
     };
     if initially_converged && gamg_min_iterations == 0 {
         return Ok(ScalarSolveReport {
@@ -2027,6 +2189,14 @@ fn solve_scalar_system_with_workspaces(
             initial_normalized_residual_norm,
             residual_norm: initial_residual_norm,
             normalized_residual_norm: initial_normalized_residual_norm,
+            effective_normalized_tolerance,
+            stop_reason: if controls.solver == LaminarSimpleLinearSolver::Gamg
+                && initial_l1_residual_norm == 0.0
+            {
+                LinearSolveStopReason::ExactZero
+            } else {
+                dominant_tolerance_reason
+            },
             pcg_timing: None,
             gamg_timing: None,
         });
@@ -2035,8 +2205,13 @@ fn solve_scalar_system_with_workspaces(
     // Ferrum's current CSR kernels stop on L2. This conservative conversion
     // guarantees the LDU L1-normalised residual tolerance before reporting success.
     let component_count = rhs.len().max(1) as f64;
+    let l2_absolute_or_effective_tolerance = if controls.solver == LaminarSimpleLinearSolver::Gamg {
+        controls.tolerance
+    } else {
+        effective_normalized_tolerance
+    };
     let solver_tolerance = strict_l2_tolerance_for_l1_limit(
-        controls.tolerance * normalisation_factor,
+        l2_absolute_or_effective_tolerance * normalisation_factor,
         component_count,
     );
     let (report, pcg_timing, gamg_timing) = match controls.solver {
@@ -2068,9 +2243,9 @@ fn solve_scalar_system_with_workspaces(
             None,
         ),
         LaminarSimpleLinearSolver::Gamg => {
-            let gamg_options = controls.gamg_options.ok_or_else(|| {
-                invalid_input("GAMG solve requires resolved GAMG options".to_string())
-            })?;
+            let gamg_options = controls
+                .gamg_options
+                .expect("GAMG options were validated before workspace mutation");
             let workspace = gamg_workspace.ok_or_else(|| {
                 invalid_input("GAMG solve requires a matching hierarchy workspace".to_string())
             })?;
@@ -2181,14 +2356,16 @@ fn solve_scalar_system_with_workspaces(
     let relative_tolerance = controls
         .gamg_options
         .map(|options| options.relative_tolerance)
-        .unwrap_or(0.0);
+        .unwrap_or(controls.relative_tolerance);
+    let relative_tolerance_active =
+        linear_relative_tolerance_is_active(controls.solver, relative_tolerance);
     let gamg_exact_zero = controls.solver == LaminarSimpleLinearSolver::Gamg
         && final_l1_residual_norm == 0.0
         && report.termination == IterativeSolveTermination::Converged
         && report.iterations == 0;
     let converged = gamg_exact_zero
         || final_normalized_residual_norm < controls.tolerance
-        || (relative_tolerance > 0.0
+        || (relative_tolerance_active
             && final_normalized_residual_norm
                 < relative_tolerance * initial_normalized_residual_norm);
     let termination = if converged {
@@ -2198,6 +2375,15 @@ fn solve_scalar_system_with_workspaces(
     } else {
         IterativeSolveTermination::MaxIterations
     };
+    let stop_reason = if gamg_exact_zero {
+        LinearSolveStopReason::ExactZero
+    } else if converged {
+        dominant_tolerance_reason
+    } else if termination == IterativeSolveTermination::Breakdown {
+        LinearSolveStopReason::Breakdown
+    } else {
+        LinearSolveStopReason::MaxIterations
+    };
     Ok(ScalarSolveReport {
         solution: report.solution,
         iterations: report.iterations,
@@ -2206,6 +2392,8 @@ fn solve_scalar_system_with_workspaces(
         initial_normalized_residual_norm,
         residual_norm: report.residual_norm,
         normalized_residual_norm: final_normalized_residual_norm,
+        effective_normalized_tolerance,
+        stop_reason,
         pcg_timing,
         gamg_timing,
     })
@@ -5345,6 +5533,8 @@ fn validate_laminar_simple_options(options: &LaminarSimpleOptions) -> Result<()>
     }
     validate_linear_tolerance("momentum", options.momentum_linear_tolerance)?;
     validate_linear_tolerance("pressure", options.pressure_linear_tolerance)?;
+    validate_linear_relative_tolerance("momentum", options.momentum_linear_relative_tolerance)?;
+    validate_linear_relative_tolerance("pressure", options.pressure_linear_relative_tolerance)?;
     if options.momentum_linear_solver == LaminarSimpleLinearSolver::Gamg {
         return Err(invalid_input(
             "laminar SIMPLE GAMG is supported for the symmetric pressure equation only".to_string(),
@@ -5364,7 +5554,17 @@ fn validate_laminar_simple_options(options: &LaminarSimpleOptions) -> Result<()>
                 "laminar SIMPLE pressure GAMG requires GAMG options".to_string(),
             ));
         }
-        (LaminarSimpleLinearSolver::Gamg, Some(_)) | (_, None) => {}
+        (LaminarSimpleLinearSolver::Gamg, Some(gamg_options)) => {
+            if options.pressure_linear_relative_tolerance.to_bits()
+                != gamg_options.relative_tolerance.to_bits()
+            {
+                return Err(invalid_input(format!(
+                    "laminar SIMPLE pressure GAMG relTol sources must match exactly, got pressure={} and GAMG={}",
+                    options.pressure_linear_relative_tolerance, gamg_options.relative_tolerance
+                )));
+            }
+        }
+        (_, None) => {}
         (_, Some(_)) => {
             return Err(invalid_input(
                 "laminar SIMPLE pressure GAMG options require the GAMG pressure solver".to_string(),
@@ -5423,6 +5623,15 @@ fn validate_linear_tolerance(name: &str, value: f64) -> Result<()> {
     if !value.is_finite() || value < 0.0 {
         return Err(invalid_input(format!(
             "laminar SIMPLE {name} linear tolerance must be non-negative and finite, got {value}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_linear_relative_tolerance(name: &str, value: f64) -> Result<()> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(invalid_input(format!(
+            "laminar SIMPLE {name} linear relTol must be non-negative and finite, got {value}"
         )));
     }
     Ok(())
@@ -8023,6 +8232,443 @@ mod tests {
         assert!(4.0_f64.sqrt() * tolerance < 1.0);
     }
 
+    fn solve_non_gamg_relative_probe(
+        solver: LaminarSimpleLinearSolver,
+        tolerance: f64,
+        relative_tolerance: f64,
+    ) -> super::ScalarSolveReport {
+        let matrix = CsrMatrix::from_rows(vec![vec![(0, 2.0)], vec![(1, 4.0)]], 2).expect("matrix");
+        let mut workspace = super::ScalarSolveWorkspace::new(2);
+        super::solve_scalar_system_with_workspaces(
+            &matrix,
+            &[2.0, 8.0],
+            None,
+            super::ScalarSolveControls {
+                solver,
+                preconditioner: LaminarSimplePreconditioner::None,
+                tolerance,
+                relative_tolerance,
+                max_iterations: 16,
+                gamg_options: None,
+                profile_gamg: false,
+            },
+            &mut workspace,
+            None,
+            None,
+        )
+        .expect("non-GAMG relative probe")
+    }
+
+    #[test]
+    fn non_gamg_relative_tolerance_uses_strict_openfoam_boundaries_for_every_solver() {
+        let solvers = [
+            LaminarSimpleLinearSolver::BiCgStab,
+            LaminarSimpleLinearSolver::Cg,
+            LaminarSimpleLinearSolver::GaussSeidel,
+            LaminarSimpleLinearSolver::SymGaussSeidel,
+            LaminarSimpleLinearSolver::Pcg,
+            LaminarSimpleLinearSolver::Jacobi,
+        ];
+        for solver in solvers {
+            let zero_rel = solve_non_gamg_relative_probe(solver, 1.0, 0.0);
+            assert_eq!(
+                zero_rel.initial_normalized_residual_norm.to_bits(),
+                1.0f64.to_bits()
+            );
+            assert!(
+                zero_rel.iterations > 0,
+                "{solver} accepted absolute equality"
+            );
+            assert!(zero_rel.converged, "{solver} failed the absolute probe");
+            assert_eq!(
+                zero_rel.stop_reason,
+                super::LinearSolveStopReason::AbsoluteTolerance
+            );
+
+            let absolute_next = solve_non_gamg_relative_probe(solver, 1.0f64.next_up(), 0.0);
+            assert_eq!(absolute_next.iterations, 0, "{solver} missed abs next_up");
+            assert_eq!(
+                absolute_next.effective_normalized_tolerance.to_bits(),
+                1.0f64.next_up().to_bits()
+            );
+
+            let relative_equal = solve_non_gamg_relative_probe(solver, 0.0, 1.0);
+            assert!(
+                relative_equal.iterations > 0,
+                "{solver} accepted relative equality"
+            );
+            assert!(
+                relative_equal.converged,
+                "{solver} failed the relative probe"
+            );
+            assert_eq!(
+                relative_equal.stop_reason,
+                super::LinearSolveStopReason::RelativeTolerance
+            );
+
+            let relative_next = solve_non_gamg_relative_probe(solver, 0.0, 1.0f64.next_up());
+            assert_eq!(relative_next.iterations, 0, "{solver} missed rel next_up");
+            assert_eq!(
+                relative_next.stop_reason,
+                super::LinearSolveStopReason::RelativeTolerance
+            );
+
+            let greater_than_one = solve_non_gamg_relative_probe(solver, 0.0, 2.0);
+            assert_eq!(
+                greater_than_one.iterations, 0,
+                "{solver} artificially capped relTol above one"
+            );
+            assert_eq!(
+                greater_than_one.effective_normalized_tolerance.to_bits(),
+                2.0f64.to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn non_gamg_effective_tolerance_selects_absolute_or_relative_limit_without_a_cap() {
+        assert_eq!(
+            super::effective_non_gamg_normalized_tolerance(0.2, 0.5, 0.25).to_bits(),
+            0.2f64.to_bits()
+        );
+        assert_eq!(
+            super::effective_non_gamg_normalized_tolerance(0.1, 0.5, 0.25).to_bits(),
+            0.125f64.to_bits()
+        );
+        assert_eq!(
+            super::effective_normalized_tolerance_and_reason(
+                LaminarSimpleLinearSolver::Cg,
+                0.125,
+                0.5,
+                0.25,
+            ),
+            (0.125, super::LinearSolveStopReason::AbsoluteTolerance)
+        );
+        assert_eq!(
+            super::effective_non_gamg_normalized_tolerance(
+                0.1,
+                super::OPENFOAM_RELATIVE_TOLERANCE_SMALL,
+                0.25,
+            )
+            .to_bits(),
+            0.1f64.to_bits()
+        );
+        assert_eq!(
+            super::effective_non_gamg_normalized_tolerance(0.0, 8.0, 0.25).to_bits(),
+            2.0f64.to_bits()
+        );
+    }
+
+    #[test]
+    fn gamg_preserves_any_positive_relative_tolerance_while_non_gamg_uses_openfoam_small() {
+        let below_openfoam_small = super::OPENFOAM_RELATIVE_TOLERANCE_SMALL.next_down();
+
+        assert!(super::linear_relative_tolerance_is_active(
+            LaminarSimpleLinearSolver::Gamg,
+            below_openfoam_small
+        ));
+        for solver in [
+            LaminarSimpleLinearSolver::BiCgStab,
+            LaminarSimpleLinearSolver::Cg,
+            LaminarSimpleLinearSolver::GaussSeidel,
+            LaminarSimpleLinearSolver::SymGaussSeidel,
+            LaminarSimpleLinearSolver::Pcg,
+            LaminarSimpleLinearSolver::Jacobi,
+        ] {
+            assert!(!super::linear_relative_tolerance_is_active(
+                solver,
+                below_openfoam_small
+            ));
+        }
+        assert!(!super::linear_relative_tolerance_is_active(
+            LaminarSimpleLinearSolver::Gamg,
+            0.0
+        ));
+        assert_eq!(
+            super::effective_normalized_tolerance_and_reason(
+                LaminarSimpleLinearSolver::Gamg,
+                0.0,
+                below_openfoam_small,
+                1.0,
+            ),
+            (
+                below_openfoam_small,
+                super::LinearSolveStopReason::RelativeTolerance,
+            )
+        );
+        assert_eq!(
+            super::effective_normalized_tolerance_and_reason(
+                LaminarSimpleLinearSolver::Cg,
+                0.0,
+                below_openfoam_small,
+                1.0,
+            ),
+            (0.0, super::LinearSolveStopReason::AbsoluteTolerance)
+        );
+    }
+
+    #[test]
+    fn scalar_relative_tolerance_rejects_invalid_values_before_workspace_mutation() {
+        let matrix = CsrMatrix::from_rows(vec![vec![(0, 1.0)]], 1).expect("matrix");
+        for relative_tolerance in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut workspace = super::ScalarSolveWorkspace::new(1);
+            let pointers = (
+                workspace.zero_initial.as_ptr(),
+                workspace.matrix_product.as_ptr(),
+                workspace.residual.as_ptr(),
+            );
+            let error = super::solve_scalar_system_with_workspaces(
+                &matrix,
+                &[1.0],
+                None,
+                super::ScalarSolveControls {
+                    solver: LaminarSimpleLinearSolver::Cg,
+                    preconditioner: LaminarSimplePreconditioner::None,
+                    tolerance: 0.0,
+                    relative_tolerance,
+                    max_iterations: 1,
+                    gamg_options: None,
+                    profile_gamg: false,
+                },
+                &mut workspace,
+                None,
+                None,
+            )
+            .err()
+            .expect("invalid relTol must fail closed");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "scalar solve relTol must be finite and non-negative, got {relative_tolerance}"
+                )
+            );
+            assert_eq!(
+                (
+                    workspace.zero_initial.as_ptr(),
+                    workspace.matrix_product.as_ptr(),
+                    workspace.residual.as_ptr(),
+                ),
+                pointers
+            );
+            assert_eq!(workspace.matrix_product, [0.0]);
+            assert_eq!(workspace.residual, [0.0]);
+        }
+    }
+
+    #[test]
+    fn mismatched_gamg_relative_tolerance_fails_before_workspace_mutation() {
+        let matrix = CsrMatrix::from_rows(
+            vec![vec![(0, 2.0), (1, -1.0)], vec![(0, -1.0), (1, 2.0)]],
+            2,
+        )
+        .expect("symmetric matrix");
+        let rhs = [1.0, 0.0];
+        let gamg_options = GamgOptions {
+            max_iterations: 2,
+            tolerance: 1.0e-12,
+            relative_tolerance: 0.25,
+            n_cells_in_coarsest_level: 1,
+            direct_solve_coarsest: true,
+            ..GamgOptions::default()
+        };
+        let mut rejected_scalar_workspace = super::ScalarSolveWorkspace::new(2);
+        let scalar_pointers = (
+            rejected_scalar_workspace.zero_initial.as_ptr(),
+            rejected_scalar_workspace.matrix_product.as_ptr(),
+            rejected_scalar_workspace.residual.as_ptr(),
+        );
+        let mut rejected_gamg_workspace =
+            GamgWorkspace::new(&matrix, gamg_options).expect("rejected workspace");
+        let mut pristine_gamg_workspace =
+            GamgWorkspace::new(&matrix, gamg_options).expect("pristine workspace");
+
+        let error = super::solve_scalar_system_with_workspaces(
+            &matrix,
+            &rhs,
+            None,
+            super::ScalarSolveControls {
+                solver: LaminarSimpleLinearSolver::Gamg,
+                preconditioner: LaminarSimplePreconditioner::None,
+                tolerance: gamg_options.tolerance,
+                relative_tolerance: 0.5,
+                max_iterations: gamg_options.max_iterations,
+                gamg_options: Some(gamg_options),
+                profile_gamg: false,
+            },
+            &mut rejected_scalar_workspace,
+            None,
+            Some(&mut rejected_gamg_workspace),
+        )
+        .err()
+        .expect("mismatched GAMG relTol sources must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "GAMG scalar solve relTol sources must match exactly, got controls=0.5 and options=0.25"
+        );
+        assert_eq!(
+            (
+                rejected_scalar_workspace.zero_initial.as_ptr(),
+                rejected_scalar_workspace.matrix_product.as_ptr(),
+                rejected_scalar_workspace.residual.as_ptr(),
+            ),
+            scalar_pointers
+        );
+        assert_eq!(rejected_scalar_workspace.matrix_product, [0.0, 0.0]);
+        assert_eq!(rejected_scalar_workspace.residual, [0.0, 0.0]);
+
+        let accepted_controls = super::ScalarSolveControls {
+            solver: LaminarSimpleLinearSolver::Gamg,
+            preconditioner: LaminarSimplePreconditioner::None,
+            tolerance: gamg_options.tolerance,
+            relative_tolerance: gamg_options.relative_tolerance,
+            max_iterations: gamg_options.max_iterations,
+            gamg_options: Some(gamg_options),
+            profile_gamg: false,
+        };
+        let after_rejection = super::solve_scalar_system_with_workspaces(
+            &matrix,
+            &rhs,
+            None,
+            accepted_controls,
+            &mut rejected_scalar_workspace,
+            None,
+            Some(&mut rejected_gamg_workspace),
+        )
+        .expect("workspace rejected before mutation must remain usable");
+        let mut pristine_scalar_workspace = super::ScalarSolveWorkspace::new(2);
+        let pristine = super::solve_scalar_system_with_workspaces(
+            &matrix,
+            &rhs,
+            None,
+            accepted_controls,
+            &mut pristine_scalar_workspace,
+            None,
+            Some(&mut pristine_gamg_workspace),
+        )
+        .expect("pristine control solve");
+
+        assert_eq!(after_rejection.iterations, pristine.iterations);
+        assert_eq!(after_rejection.termination, pristine.termination);
+        assert_eq!(after_rejection.stop_reason, pristine.stop_reason);
+        assert_eq!(
+            after_rejection.effective_normalized_tolerance.to_bits(),
+            pristine.effective_normalized_tolerance.to_bits()
+        );
+        for (actual, expected) in after_rejection.solution.iter().zip(&pristine.solution) {
+            assert_eq!(actual.to_bits(), expected.to_bits());
+        }
+        assert_eq!(
+            after_rejection.residual_norm.to_bits(),
+            pristine.residual_norm.to_bits()
+        );
+        assert_eq!(
+            after_rejection.normalized_residual_norm.to_bits(),
+            pristine.normalized_residual_norm.to_bits()
+        );
+    }
+
+    #[test]
+    fn gamg_zero_relative_tolerance_wrapper_is_bit_identical_to_normalized_l1_entrypoint() {
+        let matrix = CsrMatrix::from_rows(
+            vec![vec![(0, 4.0), (1, -1.0)], vec![(0, -1.0), (1, 3.0)]],
+            2,
+        )
+        .expect("symmetric matrix");
+        let rhs = [1.0, 2.0];
+        let initial = [0.25, -0.25];
+        let gamg_options = GamgOptions {
+            max_iterations: 3,
+            tolerance: 1.0e-12,
+            relative_tolerance: 0.0,
+            n_cells_in_coarsest_level: 1,
+            direct_solve_coarsest: true,
+            ..GamgOptions::default()
+        };
+        let mut matrix_product = [0.0; 2];
+        matrix
+            .matvec_into(&initial, &mut matrix_product)
+            .expect("initial matrix product");
+        let normalization_factor =
+            super::ldu_l1_residual_normalisation_factor(&matrix, &rhs, &initial, &matrix_product)
+                .expect("normalization factor");
+        let initial_l1 = rhs
+            .iter()
+            .zip(matrix_product)
+            .map(|(source, product)| (source - product).abs())
+            .sum::<f64>();
+        let direct_controls = crate::linear::gamg::NormalizedL1GamgSolveControls {
+            normalization_factor,
+            tolerance: gamg_options.tolerance,
+            relative_tolerance: 0.0,
+            l2_controls: crate::linear::GamgSolveControls {
+                max_iterations: gamg_options.max_iterations,
+                min_iterations: gamg_options.min_iterations,
+                tolerance: super::strict_l2_tolerance_for_l1_limit(
+                    gamg_options.tolerance * normalization_factor,
+                    2.0,
+                ),
+                relative_tolerance: 0.0,
+            },
+        };
+        let mut direct_workspace =
+            GamgWorkspace::new(&matrix, gamg_options).expect("direct workspace");
+        let direct = direct_workspace
+            .solve_normalized_l1_with_controls(&matrix, &rhs, Some(&initial), direct_controls)
+            .expect("direct normalized-L1 solve");
+
+        let mut wrapper_scalar_workspace = super::ScalarSolveWorkspace::new(2);
+        let mut wrapper_gamg_workspace =
+            GamgWorkspace::new(&matrix, gamg_options).expect("wrapper workspace");
+        let wrapper = super::solve_scalar_system_with_workspaces(
+            &matrix,
+            &rhs,
+            Some(&initial),
+            super::ScalarSolveControls {
+                solver: LaminarSimpleLinearSolver::Gamg,
+                preconditioner: LaminarSimplePreconditioner::None,
+                tolerance: gamg_options.tolerance,
+                relative_tolerance: 0.0,
+                max_iterations: gamg_options.max_iterations,
+                gamg_options: Some(gamg_options),
+                profile_gamg: false,
+            },
+            &mut wrapper_scalar_workspace,
+            None,
+            Some(&mut wrapper_gamg_workspace),
+        )
+        .expect("wrapper normalized-L1 solve");
+
+        assert_eq!(wrapper.iterations, direct.iterations);
+        assert_eq!(wrapper.termination, direct.termination);
+        assert_eq!(
+            wrapper.initial_normalized_residual_norm.to_bits(),
+            (initial_l1 / normalization_factor).to_bits()
+        );
+        assert_eq!(
+            wrapper.residual_norm.to_bits(),
+            direct.residual_norm.to_bits()
+        );
+        for (actual, expected) in wrapper.solution.iter().zip(&direct.solution) {
+            assert_eq!(actual.to_bits(), expected.to_bits());
+        }
+        assert_eq!(
+            wrapper.effective_normalized_tolerance.to_bits(),
+            gamg_options.tolerance.to_bits()
+        );
+        assert_eq!(
+            wrapper.stop_reason,
+            match direct.termination {
+                IterativeSolveTermination::Converged => {
+                    super::LinearSolveStopReason::AbsoluteTolerance
+                }
+                IterativeSolveTermination::MaxIterations => {
+                    super::LinearSolveStopReason::MaxIterations
+                }
+                IterativeSolveTermination::Breakdown => super::LinearSolveStopReason::Breakdown,
+            }
+        );
+    }
+
     #[test]
     fn gamg_absolute_normalized_l1_stops_before_conservative_l2() {
         let cell_count = 8;
@@ -8087,6 +8733,7 @@ mod tests {
                 solver: LaminarSimpleLinearSolver::Gamg,
                 preconditioner: LaminarSimplePreconditioner::None,
                 tolerance: gamg_options.tolerance,
+                relative_tolerance: gamg_options.relative_tolerance,
                 max_iterations: gamg_options.max_iterations,
                 gamg_options: Some(gamg_options),
                 profile_gamg: true,
@@ -8145,6 +8792,7 @@ mod tests {
                 solver: LaminarSimpleLinearSolver::Gamg,
                 preconditioner: LaminarSimplePreconditioner::None,
                 tolerance: accepted_options.tolerance,
+                relative_tolerance: accepted_options.relative_tolerance,
                 max_iterations: accepted_options.max_iterations,
                 gamg_options: Some(accepted_options),
                 profile_gamg: true,
@@ -8248,6 +8896,7 @@ mod tests {
                 solver: LaminarSimpleLinearSolver::Gamg,
                 preconditioner: LaminarSimplePreconditioner::None,
                 tolerance: equality_options.tolerance,
+                relative_tolerance: equality_options.relative_tolerance,
                 max_iterations: equality_options.max_iterations,
                 gamg_options: Some(equality_options),
                 profile_gamg: true,
@@ -8360,6 +9009,7 @@ mod tests {
                 solver: LaminarSimpleLinearSolver::Gamg,
                 preconditioner: LaminarSimplePreconditioner::None,
                 tolerance: probe_options.tolerance,
+                relative_tolerance: probe_options.relative_tolerance,
                 max_iterations: probe_options.max_iterations,
                 gamg_options: Some(probe_options),
                 profile_gamg: false,
@@ -8412,6 +9062,7 @@ mod tests {
                 solver: LaminarSimpleLinearSolver::Gamg,
                 preconditioner: LaminarSimplePreconditioner::None,
                 tolerance: accepted_options.tolerance,
+                relative_tolerance: accepted_options.relative_tolerance,
                 max_iterations: accepted_options.max_iterations,
                 gamg_options: Some(accepted_options),
                 profile_gamg: true,
@@ -8513,6 +9164,7 @@ mod tests {
                 solver: LaminarSimpleLinearSolver::Gamg,
                 preconditioner: LaminarSimplePreconditioner::None,
                 tolerance: equality_options.tolerance,
+                relative_tolerance: equality_options.relative_tolerance,
                 max_iterations: equality_options.max_iterations,
                 gamg_options: Some(equality_options),
                 profile_gamg: true,
@@ -8575,6 +9227,7 @@ mod tests {
             solver: LaminarSimpleLinearSolver::SymGaussSeidel,
             preconditioner: LaminarSimplePreconditioner::None,
             tolerance: 1.0e-12,
+            relative_tolerance: 0.0,
             max_iterations: 4,
             gamg_options: None,
             profile_gamg: false,
@@ -8622,6 +9275,7 @@ mod tests {
             solver: LaminarSimpleLinearSolver::Cg,
             preconditioner: LaminarSimplePreconditioner::None,
             tolerance: 1.0e-12,
+            relative_tolerance: 0.0,
             max_iterations,
             gamg_options: None,
             profile_gamg: false,
@@ -8803,6 +9457,7 @@ mod tests {
             solver: LaminarSimpleLinearSolver::Gamg,
             preconditioner: LaminarSimplePreconditioner::None,
             tolerance: 1.0e-10,
+            relative_tolerance: 0.0,
             max_iterations: 100,
             gamg_options: Some(GamgOptions {
                 n_cells_in_coarsest_level: 1,
@@ -8842,6 +9497,8 @@ mod tests {
             max_linear_iterations: 100,
             momentum_linear_tolerance: 1.0e-10,
             pressure_linear_tolerance: 1.0e-10,
+            momentum_linear_relative_tolerance: 0.0,
+            pressure_linear_relative_tolerance: 0.0,
             momentum_max_linear_iterations: 100,
             pressure_max_linear_iterations: 100,
             max_simple_iterations: 3,
@@ -8855,6 +9512,144 @@ mod tests {
             velocity_relaxation: 0.7,
             pressure_relaxation: 0.3,
             schemes: LaminarSimpleSchemes::default(),
+        }
+    }
+
+    #[test]
+    fn laminar_simple_options_reject_invalid_equation_relative_tolerances() {
+        for value in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut momentum = minimal_laminar_options();
+            momentum.momentum_linear_relative_tolerance = value;
+            let momentum_error = super::validate_laminar_simple_options(&momentum)
+                .expect_err("invalid momentum relTol must fail");
+            assert_eq!(
+                momentum_error.to_string(),
+                format!(
+                    "laminar SIMPLE momentum linear relTol must be non-negative and finite, got {value}"
+                )
+            );
+
+            let mut pressure = minimal_laminar_options();
+            pressure.pressure_linear_relative_tolerance = value;
+            let pressure_error = super::validate_laminar_simple_options(&pressure)
+                .expect_err("invalid pressure relTol must fail");
+            assert_eq!(
+                pressure_error.to_string(),
+                format!(
+                    "laminar SIMPLE pressure linear relTol must be non-negative and finite, got {value}"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn public_gamg_relative_tolerance_mismatch_rejects_before_runtime_mutation() {
+        let mut runtime = two_cell_runtime();
+        let before = runtime.clone();
+        let value_pointers = runtime
+            .fields
+            .iter()
+            .map(|field| field.values.as_ref().map(Vec::as_ptr))
+            .collect::<Vec<_>>();
+        let mut options = minimal_laminar_options();
+        options.pressure_linear_solver = LaminarSimpleLinearSolver::Gamg;
+        options.pressure_linear_relative_tolerance = 0.5;
+        options.pressure_gamg_options = Some(GamgOptions {
+            max_iterations: options.pressure_max_linear_iterations,
+            tolerance: options.pressure_linear_tolerance,
+            relative_tolerance: 0.25,
+            n_cells_in_coarsest_level: 1,
+            direct_solve_coarsest: true,
+            ..GamgOptions::default()
+        });
+
+        let error = solve_laminar_simple(&mut runtime, &two_cell_fields(), &options)
+            .expect_err("public GAMG relTol mismatch must fail closed");
+
+        assert_eq!(
+            error.to_string(),
+            "laminar SIMPLE pressure GAMG relTol sources must match exactly, got pressure=0.5 and GAMG=0.25"
+        );
+        assert_eq!(format!("{runtime:?}"), format!("{before:?}"));
+        assert_eq!(
+            runtime
+                .fields
+                .iter()
+                .map(|field| field.values.as_ref().map(Vec::as_ptr))
+                .collect::<Vec<_>>(),
+            value_pointers
+        );
+    }
+
+    #[test]
+    fn active_relative_tolerances_are_reported_through_warm_nonorthogonal_simple_solves() {
+        let mut runtime = two_cell_runtime();
+        runtime.mesh.face_centres[0].y = 0.05;
+        runtime.mesh.cell_centres[1].y = 0.2;
+        let mut options = minimal_laminar_options();
+        options.max_simple_iterations = 1;
+        options.momentum_linear_relative_tolerance = 0.5;
+        options.pressure_linear_relative_tolerance = 0.5;
+        options.non_orthogonal_correctors = 1;
+
+        let report = solve_laminar_simple(&mut runtime, &two_cell_fields(), &options)
+            .expect("active relTol SIMPLE integration solve");
+
+        assert_eq!(report.history.len(), 1);
+        let iteration = &report.history[0];
+        assert_eq!(iteration.pressure_linear_solves, 2);
+        assert!(
+            iteration
+                .momentum_component_linear_solves
+                .iter()
+                .all(|solve| solve.stop_reason != super::LinearSolveStopReason::NotRun)
+        );
+        let pressure_solves =
+            &iteration.pressure_correction_linear_solves[..iteration.pressure_linear_solves];
+        assert_eq!(pressure_solves.len(), 2);
+        assert!(
+            pressure_solves
+                .iter()
+                .all(|solve| solve.stop_reason != super::LinearSolveStopReason::NotRun)
+        );
+        assert!(
+            pressure_solves
+                .iter()
+                .all(|solve| solve.effective_normalized_tolerance.is_finite())
+        );
+        assert!(
+            iteration
+                .momentum_component_linear_solves
+                .iter()
+                .chain(pressure_solves)
+                .any(|solve| solve.stop_reason == super::LinearSolveStopReason::RelativeTolerance)
+        );
+        assert!(
+            pressure_solves[1]
+                .initial_normalized_residual_norm
+                .is_finite()
+        );
+        assert_ne!(
+            pressure_solves[0]
+                .initial_normalized_residual_norm
+                .to_bits(),
+            pressure_solves[1]
+                .initial_normalized_residual_norm
+                .to_bits(),
+            "the second corrected pressure solve must report its warm-started system"
+        );
+        for solve in iteration
+            .momentum_component_linear_solves
+            .iter()
+            .chain(pressure_solves)
+        {
+            let expected = options
+                .momentum_linear_tolerance
+                .max(0.5 * solve.initial_normalized_residual_norm);
+            assert_eq!(
+                solve.effective_normalized_tolerance.to_bits(),
+                expected.to_bits()
+            );
         }
     }
 
