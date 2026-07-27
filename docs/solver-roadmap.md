@@ -930,9 +930,17 @@ The immediate sequence is:
    Smoothing plus scaling currently account for about `86.7%` of Pipe and
    `67.8%` of Channel GAMG profile time, substantially more than hierarchy
    infrastructure.
-7. **F-PERF-GAMG-HIERARCHY-DIAGNOSTIC:** Add contraction, grid/operator
-   complexity, aggregation, weighted-work, and coarse-solve evidence without
-   changing solver behavior.
+7. **F-PERF-GAMG-HIERARCHY-DIAGNOSTIC (implemented locally):** The isolated
+   branch `codex/gamg-hierarchy-diag-5ee13a3c` adds contraction,
+   grid/operator complexity, aggregation, weighted-work, and coarse-solve
+   evidence without changing solver behavior. Commits `87bb766` and
+   `a8626bb` passed the complete workspace, Rust 1.94 locked/offline Clippy,
+   exact reporting-schema, negative contract, and real fixed Pipe/Channel
+   profile gates. The profiles contain 9/8 levels, exact grid-complexity terms
+   `9195/4608` and `3983/2000`, and exact operator-complexity terms
+   `61925/30336` and `19007/9760` for Pipe/Channel respectively. The
+   diagnostics remain local and unmerged while the first hierarchy leaves are
+   falsified.
 8. **F-PERF-GAMG-HIERARCHY-LEAVES:** Test one predeclared variable per A/B:
    coarsest-level target; cached direct versus iterative coarse solve;
    deterministic pairing/coarsening; pre/post/finest sweep placement; weighted
@@ -941,6 +949,18 @@ The immediate sequence is:
    lifecycle. Treat `2-4%` as an experimental pressure-solver hypothesis only
    when V-cycles or weighted work fall on both cases; the approximately `3%`
    measured infrastructure time is a ceiling, not a savings target.
+   The first local leaf, `f13af9b`, made a zero `nPreSweeps` base disable its
+   level multiplier like OpenFOAM Foundation 13. Source, GAMG, workspace, and
+   Clippy gates passed (with the test-only profile update in child commit
+   `a153db2`), but the Native Linux `0+2` Go/No-Go failed decisively: Pipe hit
+   the 1000-iteration pressure limit in all 10 SIMPLE steps (`10000` pressure
+   iterations versus baseline `6995`), while Channel rose to `33950` versus
+   `10654`. Candidate process times were also slower in every Channel run and
+   in both Pipe runs. The leaf remains unmerged and did not proceed to `4+20`.
+   The next isolated hierarchy leaf is therefore deterministic pairing and
+   coarsening quality, focused on the weak Pipe NNZ contraction at levels
+   2->3 and 3->4; it must retain the same convergence and Linux order-cohort
+   gates.
 9. **F-PERF-ADAPTIVE-LINEAR:** After persistence parity, add user-bounded
    adaptive linear tolerances while preserving final outer acceptance and
    reporting effective tolerances and linear work.
