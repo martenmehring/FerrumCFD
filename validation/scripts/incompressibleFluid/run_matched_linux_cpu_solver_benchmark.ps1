@@ -7,7 +7,7 @@ param(
     [string]$CaseName = "all",
     [string]$Distro = "Ubuntu-22.04",
     [string]$CpuSet = "2",
-    [ValidateSet("portable", "native")]
+    [ValidateSet("portable", "native", "native-codegen1", "native-thin-lto", "native-fat-lto")]
     [string]$BuildVariant = "portable",
     [string]$RustToolchain = "1.94.0",
     [string]$SourceRef = "HEAD",
@@ -413,6 +413,26 @@ try {
         throw "recorded templates archive SHA-256 does not match the host input"
     }
     $rustcVerbose = Get-Content -LiteralPath (Join-Path $metadataRoot "rustc-vv.txt") -Raw
+    $recordedBuildVariant = (Get-Content -LiteralPath (Join-Path $metadataRoot "build-variant.txt") -Raw).Trim()
+    if ($recordedBuildVariant -ne $BuildVariant) {
+        throw "recorded Linux build variant '$recordedBuildVariant' does not match requested variant '$BuildVariant'"
+    }
+    $recordedRustFlags = (Get-Content -LiteralPath (Join-Path $metadataRoot "build-rustflags.txt") -Raw).Trim()
+    $recordedCodegenUnits = (Get-Content -LiteralPath (Join-Path $metadataRoot "build-cargo-profile-release-codegen-units.txt") -Raw).Trim()
+    $recordedLto = (Get-Content -LiteralPath (Join-Path $metadataRoot "build-cargo-profile-release-lto.txt") -Raw).Trim()
+    $expectedBuildSettings = switch ($BuildVariant) {
+        "portable" { [pscustomobject]@{ rustflags = ""; codegenUnits = ""; lto = "" } }
+        "native" { [pscustomobject]@{ rustflags = "-C target-cpu=native"; codegenUnits = ""; lto = "" } }
+        "native-codegen1" { [pscustomobject]@{ rustflags = "-C target-cpu=native"; codegenUnits = "1"; lto = "" } }
+        "native-thin-lto" { [pscustomobject]@{ rustflags = "-C target-cpu=native"; codegenUnits = ""; lto = "thin" } }
+        "native-fat-lto" { [pscustomobject]@{ rustflags = "-C target-cpu=native"; codegenUnits = ""; lto = "fat" } }
+        default { throw "unsupported Linux build variant: $BuildVariant" }
+    }
+    if ($recordedRustFlags -ne $expectedBuildSettings.rustflags -or
+        $recordedCodegenUnits -ne $expectedBuildSettings.codegenUnits -or
+        $recordedLto -ne $expectedBuildSettings.lto) {
+        throw "recorded Linux build settings do not match requested variant '$BuildVariant'"
+    }
     $summary = [pscustomobject][ordered]@{
         schemaVersion = 2
         benchmark = "matched-linux-serial-cpu-solver"
@@ -446,7 +466,17 @@ try {
             rustToolchain = $RustToolchain
             rustcVerboseVersion = $rustcVerbose.Trim()
             cargoVersion = (Get-Content -LiteralPath (Join-Path $metadataRoot "cargo-version.txt") -Raw).Trim()
-            rustflags = if ($BuildVariant -eq "native") { "-C target-cpu=native" } else { "" }
+            rustflags = $recordedRustFlags
+            encodedRustflags = $null
+            profileEnvironment = [pscustomobject][ordered]@{
+                CARGO_PROFILE_RELEASE_CODEGEN_UNITS = if ($recordedCodegenUnits) { $recordedCodegenUnits } else { $null }
+                CARGO_PROFILE_RELEASE_LTO = if ($recordedLto) { $recordedLto } else { $null }
+            }
+            sanitizedEnvironment = @(
+                "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS",
+                "CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "CARGO_PROFILE_RELEASE_LTO"
+            )
+            environmentManifest = "metadata/build-environment.tsv"
             binarySha256 = (Get-Content -LiteralPath (Join-Path $metadataRoot "ferrum-binary-sha256.txt") -Raw).Trim()
             wallClockSeconds = $buildTiming.elapsedSeconds
             excludedFromRunTiming = $true
