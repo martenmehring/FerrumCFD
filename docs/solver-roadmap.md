@@ -465,7 +465,28 @@ Current status:
 - pressure solves still dominate both convergence-profile runs: the pipe
   converges in `15.95 s` at iteration `207`, and the channel in `8.16 s` at
   iteration `545`. Both preserve the previous iteration counts and final
-  numerical observables exactly.
+  numerical observables exactly;
+- the canonical Linux-parity lane now builds exact source commit
+  `5ee13a3cde87620460f3b36d8e496a561d3a7601` with Rust `1.94.0` on WSL ext4
+  and runs Ferrum and OpenFOAM Foundation 13 on pinned CPU `2` with the same
+  external GNU-time metric. The portable `1+5` fixed-work run measured Pipe
+  medians of `7.82 s` versus `7.40 s` and Channel medians of `7.21 s` versus
+  `11.61 s`. The separate `target-cpu=native` `1+5` lane measured `7.36 s`
+  versus `6.58 s` for Pipe and `6.27 s` versus `12.04 s` for Channel. A
+  stronger Native Pipe `2+9` run measured a median paired Ferrum/OpenFOAM
+  ratio of `1.2792` with MAD `0.1326`, confirming that Pipe remains slower;
+  the Native Channel `1+5` median paired ratio was `0.5289` with MAD `0.0128`,
+  so Channel is clearly faster in this fixed-work lane. Build time is excluded,
+  engine-native timers remain diagnostic only, and no general all-case speedup
+  is claimed;
+- isolated native build screening did not establish a general compiler-profile
+  gain. Native `codegen-units=1` and Fat-LTO did not improve the Pipe screen.
+  Thin-LTO improved the stronger Pipe `2+9` median paired ratio from `1.2792`
+  to `1.1933`, but paired MAD remained essentially unchanged (`0.1310`) and
+  the ratio of separate medians remained `1.3109`. On Channel, Thin-LTO's
+  `1+5` median paired ratio was `0.5493`, slightly worse than Native's `0.5289`.
+  All profiles remain reproducible lanes, but none supports a general speedup
+  claim; PGO remains a later isolated leaf.
 
 ### Performance Foundation - Scalar CPU
 
@@ -491,6 +512,29 @@ Acceptance criteria for every scalar-CPU optimization:
 - keep current OpenFOAM 13 comparisons external to Ferrum case semantics and
   run them with matched hardware, process/thread counts, schemes, stopping
   criteria, and clearly separated solver/process wall times.
+
+Performance evidence is split into three explicit benchmark lanes:
+
+- `linux-parity` is the canonical solver-comparison lane. Ferrum and OpenFOAM
+  Foundation 13 run inside the same pinned WSL distribution, from a WSL-native
+  ext4 run root. Build Ferrum inside WSL and stage its exact source, binary,
+  cases, and logs on WSL ext4. Use the same CPU affinity, serial thread
+  environment, alternating execution order, cases, controls, and stopping
+  criteria. Pin and record the Rust compiler, OpenFOAM build, kernel, CPU, and
+  power state;
+- `product-host` retains native Windows Ferrum versus WSL OpenFOAM as a
+  secondary end-user workflow measurement. It must be labelled as an
+  OS/toolchain-mixed comparison and must not support a solver-only speed claim;
+- `ferrum-os-parity` runs the same Ferrum commit, build profile, and cases on
+  Windows and WSL to quantify the operating-system/toolchain contribution.
+
+Compilation is excluded from all run medians. The Linux lane records one common
+process measurement for both engines (`elapsed`, `user`, and `system`) and
+retains each engine's native internal timer as a separate diagnostic; ratios
+must not treat Ferrum wall-in-solver time and OpenFOAM CPU `ExecutionTime` as
+the same metric. Portable and `target-cpu=native` builds remain separate lanes.
+For a claimed gain below `5%`, use at least two warmups and nine paired measured
+runs and report MAD or IQR in addition to the median.
 
 The first optimization sequence is tracked as follows:
 
@@ -536,11 +580,26 @@ The first optimization sequence is tracked as follows:
     run was host-load-contaminated and therefore not accepted. PR `#77`
     restored the exact accepted pre-B2 tree from `905d698`; LDU SymGS is not a
     production path and no speedup is claimed;
-18. condition any further hierarchy work on phase diagnostics and the frozen
-    A/B gate showing material hierarchy or transfer cost;
-19. persist SIMPLE and momentum state, then gate adaptive linear tolerances,
-    then SIMPLEC;
-20. accept portable and native scalar profiles, then proceed through SIMD,
+18. persist SIMPLE and momentum state with explicit invalidation and unchanged
+    equations, boundaries, and convergence semantics;
+19. completed: establish the canonical Linux-parity benchmark lane before
+    making further Ferrum-versus-OpenFOAM solver-performance claims;
+20. continue isolated CSR residual, scaling, and row-traversal leaves because
+    smoothing plus scaling dominate the measured GAMG pressure time;
+21. add a GAMG hierarchy diagnostic gate. The accepted `5ee13a3c` fixed-GAMG
+    profile attributes
+    `2.86%` of Pipe and `3.03%` of Channel GAMG time to hierarchy build,
+    refresh, restriction, prolongation, and the coarsest solve. This measured
+    phase total is an approximately `3%` pressure-GAMG infrastructure ceiling,
+    not a savings target. A `2-4%` pressure-solver improvement remains an
+    experimental hypothesis only if hierarchy quality also reduces V-cycles
+    or weighted work;
+22. test hierarchy leaves one at a time: coarsest-level target, cached direct
+    versus iterative coarse solve, deterministic aggregation/coarsening,
+    sweep placement, weighted prolongation, and later GAMG as a PCG/FCG
+    preconditioner. Larger gains require fewer V-cycles or less weighted work;
+23. gate adaptive linear tolerances, then SIMPLEC;
+24. accept portable and native scalar profiles, then proceed through SIMD,
     shared-memory threading, and GPU as separate reviewed leaves.
 
 n8n may build, execute, collect artifacts, compare tolerances, and reject a
@@ -562,9 +621,16 @@ Next performance targets:
 - treat symmetric LDU-addressed pressure Gauss-Seidel as a rejected experiment.
   Reopen it only as a new isolated leaf with a predeclared numerical contract
   and uncontaminated paired A/B evidence against accepted CSR;
-- undertake further GAMG hierarchy work only if phase diagnostics show
-  material hierarchy or transfer cost and the frozen two-case A/B gate
-  justifies the added complexity;
+- profile GAMG hierarchy quality explicitly: rows and nonzeros per level, grid
+  and operator complexity, aggregate-size distribution, unmatched cells,
+  per-level contraction, coarse-solve work, weighted smoothing work, and total
+  V-cycles. Current Pipe/Channel grid complexity is already about `1.99`, so
+  prioritize contraction quality and per-level work while retaining hierarchy
+  depth and the coarsest-level target as isolated variables;
+- run every hierarchy change as an isolated generic A/B leaf. Do not select
+  settings per case, loosen tolerances, add artificial caps, or hide a fallback.
+  Preserve outer convergence and physical accuracy, and report intentional
+  changes in linear work instead of requiring identical V-cycle counts;
 - next persist SIMPLE and momentum topology, coefficients where valid,
   preconditioner state, histories, and workspaces. Define explicit invalidation
   and preserve equations, boundaries, and convergence semantics;
@@ -825,10 +891,9 @@ remains explicitly selectable.
 
 The immediate sequence is:
 
-1. **F-CORRECT-NL1:** Establish strict absolute and relative normalized-L1
-   stopping, preserve exposed L2 telemetry, and freeze the accepted
-   `laminarPipe`/`planeChannel` A/B baseline without tolerance or
-   iteration-budget tuning.
+1. **F-CORRECT-NL1 (completed/accepted):** Strict absolute and relative
+   normalized-L1 stopping is established with exposed L2 telemetry retained
+   and without tolerance or iteration-budget tuning.
 2. **F-PERF-CSR-SYMGS (completed/accepted):** Cached-diagonal,
    allocation-free CSR SymGS is the production baseline and passed the frozen
    two-case parity gate.
@@ -836,41 +901,143 @@ The immediate sequence is:
    accepted because workload parity changed and timing evidence was
    contaminated; PR `#77` restored the exact pre-B2 tree. LDU remains
    experimental only.
-4. **F-PERF-HIERARCHY-CONDITIONAL:** Proceed only if phase diagnostics show
-   material hierarchy or transfer cost and the frozen A/B evidence justifies
-   the complexity.
-5. **F-PERF-SIMPLE-PERSISTENCE:** Persist valid SIMPLE/momentum topology,
-   coefficients, preconditioner state, histories, and workspaces with explicit
-   invalidation and unchanged equations, boundaries, and convergence semantics.
-6. **F-PERF-ADAPTIVE-LINEAR:** After persistence parity, add user-bounded
+4. **F-PERF-SIMPLE-PERSISTENCE (first leaf rejected):** Persist valid
+   SIMPLE/momentum topology, coefficients, preconditioner state, histories, and
+   workspaces with explicit invalidation and unchanged equations, boundaries,
+   and convergence semantics. The first unmerged P1 candidate preserved exact
+   reports, work counters, and final `U`/`p` bits, but the same-session Native
+   Linux `2+10` A/B was order-sensitive in both cases: Pipe had a paired median
+   ratio of `0.9500` with opposing cohorts and Channel `0.9837` with opposing
+   cohorts. It therefore provides no accepted speedup and remains unmerged.
+   Any later persistence leaf must be smaller and independently profiled.
+5. **F-PERF-LINUX-PARITY (completed):** Add the canonical same-WSL
+   Ferrum/OpenFOAM 13 lane,
+   the secondary Windows/WSL product lane, and a Ferrum Windows/WSL self-lane.
+   Stage source, cases, binaries, and logs on WSL ext4, pin Rust `1.94.0` for
+   the reproducible lane, apply identical CPU affinity and serial environment,
+   and record common process plus separate native timers. The same-WSL lane is
+   implemented and has accepted portable, Native `1+5`, and Native Pipe `2+9`
+   baseline evidence; the two secondary diagnostic lanes remain optional.
+6. **F-PERF-GAMG-SCALING-ROW-KERNELS (first leaf rejected):** Continue with
+   isolated CSR residual, scaling, and row-traversal leaves before structural
+   hierarchy changes. A bit-exact paired-dot scaling candidate passed the full
+   workspace and field-parity gates, but the stronger Native Linux `4+20` A/B
+   exposed a dominant order effect in Pipe: candidate-first had median ratio
+   `1.0011`, while candidate-second had `0.8128`. Channel's paired median ratio
+   was `0.9714`, but MAD was `0.0993`. The candidate therefore remains
+   unmerged and supports no speed claim; later row-kernel leaves must retain
+   the same exact-semantics and order-cohort gates.
+   Smoothing plus scaling currently account for about `86.7%` of Pipe and
+   `67.8%` of Channel GAMG profile time, substantially more than hierarchy
+   infrastructure.
+   A second bit-exact leaf (`eb04d7a`) fused the existing CSR matrix-vector
+   traversal with scaling-denominator accumulation while preserving the exact
+   entry, row, and floating-point addition order. It passed the complete
+   workspace, Rust 1.94 Clippy, adversarial re-association, lifecycle, failure-
+   boundary, and field-parity gates. The stronger Native Linux `2+10` A/B
+   nevertheless rejected it: Pipe's process medians were `2.445 vs 2.390 s`,
+   but candidate-first and candidate-second cohorts disagreed, giving an
+   inconclusive paired ratio of `0.9594` with `0.1061` MAD. Channel was slower
+   in both cohorts, with process medians `6.605 vs 6.930 s` and paired ratio
+   `1.0077`. All canonical reports and final `U`/`p` fields remained bit-exact.
+   The leaf therefore stays local and unmerged, and no speedup is claimed.
+7. **F-PERF-GAMG-HIERARCHY-DIAGNOSTIC (implemented locally):** The isolated
+   branch `codex/gamg-hierarchy-diag-5ee13a3c` adds contraction,
+   grid/operator complexity, aggregation, weighted-work, and coarse-solve
+   evidence without changing solver behavior. Commits `87bb766` and
+   `a8626bb` passed the complete workspace, Rust 1.94 locked/offline Clippy,
+   exact reporting-schema, negative contract, and real fixed Pipe/Channel
+   profile gates. The profiles contain 9/8 levels, exact grid-complexity terms
+   `9195/4608` and `3983/2000`, and exact operator-complexity terms
+   `61925/30336` and `19007/9760` for Pipe/Channel respectively. The
+   diagnostics remain local and unmerged while the first hierarchy leaves are
+   falsified.
+8. **F-PERF-GAMG-HIERARCHY-LEAVES (equal-weight pairing accepted locally):** Test one predeclared variable per A/B:
+   coarsest-level target; cached direct versus iterative coarse solve;
+   deterministic pairing/coarsening; pre/post/finest sweep placement; weighted
+   prolongation; and, later, GAMG as a PCG/FCG preconditioner. Invalidate and
+   rebuild any cached direct coarse factorization for every coarse-coefficient
+   lifecycle. Treat `2-4%` as an experimental pressure-solver hypothesis only
+   when V-cycles or weighted work fall on both cases; the approximately `3%`
+   measured infrastructure time is a ceiling, not a savings target.
+   The first local leaf, `f13af9b`, made a zero `nPreSweeps` base disable its
+   level multiplier like OpenFOAM Foundation 13. Source, GAMG, workspace, and
+   Clippy gates passed (with the test-only profile update in child commit
+   `a153db2`), but the Native Linux `0+2` Go/No-Go failed decisively: Pipe hit
+   the 1000-iteration pressure limit in all 10 SIMPLE steps (`10000` pressure
+   iterations versus baseline `6995`), while Channel rose to `33950` versus
+   `10654`. Candidate process times were also slower in every Channel run and
+   in both Pipe runs. The leaf remains unmerged and did not proceed to `4+20`.
+   The next isolated leaf, commit `9b6befb`, keeps connection weight as the
+   unrestricted primary criterion and changes only exact-weight ties: it
+   prefers the pair with the smaller external neighbour stencil, with
+   direction-symmetric canonical endpoint ordering. The one-file candidate
+   passed the complete Rust 1.94 workspace and Clippy gates plus an independent
+   determinism audit. On the profiled Pipe, pressure V-cycles fell from `6995`
+   to `1687`, weighted smoothing visits from `2520214560` to `603028272`, and
+   level-3 nonzeros from `4352` to `4064`; Channel hierarchy, work, and final
+   fields remained exact. The Native Linux `2+10` same-session A/B measured a
+   Pipe internal-time median of `7.3913 -> 2.2088 s` with paired ratio
+   `0.2895`; both order cohorts agreed. Channel retained identical work and
+   fields, while timing remained order-sensitive and is classified neutral.
+   Pipe pointwise relative L2 field differences were `3.17e-11` for `U` and
+   `4.90e-10` for `p`; all pressure solves converged and boundary values were
+   exact. A separate matched Native Linux `2+9` run against OpenFOAM Foundation
+   13 measured process medians of `2.24 vs 6.65 s` for Pipe and
+   `6.47 vs 10.97 s` for Channel, ratios `0.3368` and `0.5898`. These are
+   fixed-work results on the two frozen cases, not a general all-case speed
+   claim. The isolated one-file implementation is published as Draft PR `#79`;
+   CI passed and trusted merge remains pending.
+   A direct child experiment (`73e3c5b`) then replaced the local cell-order
+   pass with deterministic global heavy-edge matching. Its 37 focused GAMG
+   tests, complete workspace, and Rust 1.94 Clippy gates passed after updating
+   the intentionally hierarchy-bound normalized-L1 profile oracle in child
+   commit `c445b39`. The Native Linux `0+2` Go/No-Go nevertheless failed
+   decisively against `9b6befb`: Pipe pressure iterations rose from `1687` to
+   `7764` and process times from `1.98/3.05 s` to `8.15/8.82 s`; Channel rose
+   from `10654` to `16808` iterations and `6.93/6.59 s` to `9.51/8.55 s`.
+   Every pressure solve still converged and boundary fields remained exact,
+   so this is an algorithmic efficiency rejection rather than a breakdown.
+   The global-matching leaf remains local and unmerged.
+   A subsequent control-only `nFinestSweeps 2 -> 1` probe also remains
+   unmerged. Pipe's Native Linux `0+2` gate initially suggested a `0.9679`
+   paired ratio, but the required `2+10` run reversed that result: process
+   medians were `2.29 vs 2.30 s`, the paired median ratio was `1.1141` with
+   `0.1669` MAD, and both order cohorts classified the candidate as slower.
+   Reports and final fields stayed bit-exact. Channel's `0+2` probe was
+   inconclusive because its two order cohorts disagreed, so the predeclared
+   both-case gate stopped before a stronger Channel run.
+9. **F-PERF-ADAPTIVE-LINEAR:** After persistence parity, add user-bounded
    adaptive linear tolerances while preserving final outer acceptance and
    reporting effective tolerances and linear work.
-7. **F-D1-SIMPLEC:** After both preceding gates, implement SIMPLEC on the frozen
-   Pipe/Channel observables before expanding coverage.
-8. **F-PERF-PORTABLE-NATIVE:** Accept separate portable and hardware-specific
-   native profiles, then accept SIMD, shared-memory threading, and GPU in that
-   order as separate leaves. Apply fixed-work plus time-to-accuracy evidence to
-   every leaf.
-9. **F-D1-CYLINDER-LIMITED-SCHEMES / F-D1-CASE-CYLINDER:** Only after all
+10. **F-D1-SIMPLEC:** After the persistence and adaptive-linear gates, implement
+    SIMPLEC on the frozen Pipe/Channel observables before expanding coverage.
+11. **F-PERF-PORTABLE-NATIVE:** A/B-test Thin/Fat LTO, `codegen-units=1`, a
+    separate `target-cpu=native` build, and then PGO. Keep the portable release
+    as the reproducible distribution profile and never mix timing lanes.
+12. **F-PERF-SIMD-THREAD-GPU:** After scalar acceptance, proceed through SIMD,
+    shared-memory threading, and GPU as separate leaves. Apply fixed-work plus
+    time-to-accuracy evidence to every leaf.
+13. **F-D1-CYLINDER-LIMITED-SCHEMES / F-D1-CASE-CYLINDER:** Only after all
    correctness and scalar-performance gates above are accepted, implement the
    required limited schemes and then the Cylinder case. Validation order
    remains Pipe, Channel, then Cylinder.
-10. **F-AUTO-1 (accepted external dependency):** Keep the accepted isolated n8n
+14. **F-AUTO-1 (accepted external dependency):** Keep the accepted isolated n8n
    coding workflow in the AI Dev Orchestrator repository and preserve the
    existing analysis workflow as a separate read-only path.
-11. **F-REF-1:** Keep a focused OpenFOAM 13 module/case reference and
+15. **F-REF-1:** Keep a focused OpenFOAM 13 module/case reference and
    license/provenance note for each newly selected physics area. Expand it only
    when a bounded implementation task needs more detail.
-12. **F-ARCH-1:** Extract the `incompressibleFluid` module registry and common solver
+16. **F-ARCH-1:** Extract the `incompressibleFluid` module registry and common solver
    lifecycle from the transitional combined crates with parity tests.
-13. **F-IO-1:** Specify and implement `FerrumFile v1`; isolate OpenFOAM support behind the
+17. **F-IO-1:** Specify and implement `FerrumFile v1`; isolate OpenFOAM support behind the
    `openfoamIO` interoperability layer.
-14. **F-D1D2-1:** Complete Driver 1 SIMPLE/SIMPLEC and Driver 2 PISO/PIMPLE on the scalar CPU
+18. **F-D1D2-1:** Complete Driver 1 SIMPLE/SIMPLEC and Driver 2 PISO/PIMPLE on the scalar CPU
    reference backend for the frozen selected-case inventory.
-15. **F-BACKEND-1:** After the Driver 1/2 inventory gate, accept `ferrumRun`
+19. **F-BACKEND-1:** After the Driver 1/2 inventory gate, accept `ferrumRun`
    successively on partitioned multi-process CPU, multi-node CPU, multi-GPU,
    and multi-node CPU/GPU integration without changing case numerics, reusing
    the earlier accepted shared-memory and single-GPU leaves.
-16. **F-D3D7-1:** Implement Drivers 3 through 7 in the fixed order above, applying the common
+20. **F-D3D7-1:** Implement Drivers 3 through 7 in the fixed order above, applying the common
    readiness gate and completing coupled `ferrumMultiRun` before Driver 6.
-17. **F-POROUS-1:** Begin porous-media and packed-bed work only after Driver 7 is complete.
+21. **F-POROUS-1:** Begin porous-media and packed-bed work only after Driver 7 is complete.
