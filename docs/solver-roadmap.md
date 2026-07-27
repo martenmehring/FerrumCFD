@@ -918,11 +918,15 @@ The immediate sequence is:
    and record common process plus separate native timers. The same-WSL lane is
    implemented and has accepted portable, Native `1+5`, and Native Pipe `2+9`
    baseline evidence; the two secondary diagnostic lanes remain optional.
-6. **F-PERF-GAMG-SCALING-ROW-KERNELS (in progress):** Continue with isolated
-   CSR residual, scaling, and row-traversal leaves before structural hierarchy
-   changes. The next bounded leaf fuses the two independent dot traversals in
-   correction scaling while preserving each accumulator's exact operation
-   order; it must pass bit-parity gates before any performance A/B.
+6. **F-PERF-GAMG-SCALING-ROW-KERNELS (first leaf rejected):** Continue with
+   isolated CSR residual, scaling, and row-traversal leaves before structural
+   hierarchy changes. A bit-exact paired-dot scaling candidate passed the full
+   workspace and field-parity gates, but the stronger Native Linux `4+20` A/B
+   exposed a dominant order effect in Pipe: candidate-first had median ratio
+   `1.0011`, while candidate-second had `0.8128`. Channel's paired median ratio
+   was `0.9714`, but MAD was `0.0993`. The candidate therefore remains
+   unmerged and supports no speed claim; later row-kernel leaves must retain
+   the same exact-semantics and order-cohort gates.
    Smoothing plus scaling currently account for about `86.7%` of Pipe and
    `67.8%` of Channel GAMG profile time, substantially more than hierarchy
    infrastructure.
