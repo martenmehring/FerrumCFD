@@ -526,10 +526,16 @@ The first optimization sequence is tracked as follows:
     post-flow correctness gate, retaining L2 telemetry wherever it is exposed;
 15. freeze `laminarPipe` and `planeChannel` as the A/B corpus after an accepted
     post-flow clean baseline;
-16. implement allocation-free CSR symmetric Gauss-Seidel with explicit
-    row/diagonal scaling and reusable solve workspaces;
-17. after CSR acceptance, implement symmetric LDU-addressed Gauss-Seidel only
-    for the symmetric pressure equation;
+16. completed and accepted: retain allocation-free cached-diagonal CSR
+    symmetric Gauss-Seidel as the production pressure smoother, preserving the
+    frozen Pipe/Channel numerical, convergence, failure-behavior, and
+    floating-point-order contract;
+17. evaluated and rejected as an experimental leaf: the OpenFOAM-style
+    symmetric LDU-addressed pressure Gauss-Seidel from PR `#76` changed the
+    Pipe fixed-work pressure workload from `6995` to `7059` V-cycles. Its timing
+    run was host-load-contaminated and therefore not accepted. PR `#77`
+    restored the exact accepted pre-B2 tree from `905d698`; LDU SymGS is not a
+    production path and no speedup is claimed;
 18. condition any further hierarchy work on phase diagnostics and the frozen
     A/B gate showing material hierarchy or transfer cost;
 19. persist SIMPLE and momentum state, then gate adaptive linear tolerances,
@@ -551,12 +557,11 @@ Next performance targets:
 - freeze `laminarPipe` and `planeChannel` as the mandatory A/B corpus using
   identical inputs, schemes, controls, hardware lane, process/thread settings,
   and an accepted post-flow clean baseline;
-- implement CSR symmetric Gauss-Seidel first, with explicit row/diagonal
-  scaling and reusable allocation-free solve workspaces. Require Pipe/Channel
-  numerical, convergence, and failure-behavior parity;
-- only after CSR acceptance, implement symmetric LDU-addressed Gauss-Seidel for
-  the symmetric pressure equation. Reject nonsymmetric momentum use and compare
-  it directly with accepted CSR behavior;
+- keep the accepted cached-diagonal CSR symmetric Gauss-Seidel path as the
+  production baseline and preserve its exact frozen Pipe/Channel contract;
+- treat symmetric LDU-addressed pressure Gauss-Seidel as a rejected experiment.
+  Reopen it only as a new isolated leaf with a predeclared numerical contract
+  and uncontaminated paired A/B evidence against accepted CSR;
 - undertake further GAMG hierarchy work only if phase diagnostics show
   material hierarchy or transfer cost and the frozen two-case A/B gate
   justifies the added complexity;
@@ -824,10 +829,13 @@ The immediate sequence is:
    stopping, preserve exposed L2 telemetry, and freeze the accepted
    `laminarPipe`/`planeChannel` A/B baseline without tolerance or
    iteration-budget tuning.
-2. **F-PERF-CSR-SYMGS:** Add explicitly scaled, allocation-free CSR SymGS and
-   pass the frozen two-case numerical, convergence, and failure-behavior gate.
-3. **F-PERF-LDU-PRESSURE-SYMGS:** Add symmetric LDU-addressed SymGS for pressure
-   only, reject nonsymmetric momentum use, and compare directly with CSR.
+2. **F-PERF-CSR-SYMGS (completed/accepted):** Cached-diagonal,
+   allocation-free CSR SymGS is the production baseline and passed the frozen
+   two-case parity gate.
+3. **F-PERF-LDU-PRESSURE-SYMGS (experiment rejected/reset):** PR `#76` was not
+   accepted because workload parity changed and timing evidence was
+   contaminated; PR `#77` restored the exact pre-B2 tree. LDU remains
+   experimental only.
 4. **F-PERF-HIERARCHY-CONDITIONAL:** Proceed only if phase diagnostics show
    material hierarchy or transfer cost and the frozen A/B evidence justifies
    the complexity.
