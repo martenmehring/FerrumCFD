@@ -1782,6 +1782,7 @@ fn pair_map_from_edges(
     forward: bool,
 ) -> Result<(Vec<usize>, usize)> {
     let mut cell_edges = vec![Vec::<usize>::new(); n_cells];
+    let mut cell_neighbours = vec![BTreeSet::<usize>::new(); n_cells];
     for (edge_index, edge) in edges.iter().enumerate() {
         if edge.lower >= n_cells || edge.upper >= n_cells || edge.lower == edge.upper {
             return Err(invalid_input(format!(
@@ -1797,7 +1798,18 @@ fn pair_map_from_edges(
         }
         cell_edges[edge.lower].push(edge_index);
         cell_edges[edge.upper].push(edge_index);
+        cell_neighbours[edge.lower].insert(edge.upper);
+        cell_neighbours[edge.upper].insert(edge.lower);
     }
+    let external_neighbour_counts = edges
+        .iter()
+        .map(|edge| {
+            cell_neighbours[edge.lower]
+                .union(&cell_neighbours[edge.upper])
+                .filter(|&&cell| cell != edge.lower && cell != edge.upper)
+                .count()
+        })
+        .collect::<Vec<_>>();
 
     let mut coarse_map = vec![usize::MAX; n_cells];
     let mut n_coarse = 0usize;
@@ -1812,15 +1824,21 @@ fn pair_map_from_edges(
         }
 
         let mut match_edge = None;
-        let mut max_weight = f64::NEG_INFINITY;
         for &edge_index in &cell_edges[cell] {
             let edge = edges[edge_index];
             if coarse_map[edge.lower] == usize::MAX
                 && coarse_map[edge.upper] == usize::MAX
-                && edge.weight > max_weight
+                && match_edge.is_none_or(|current| {
+                    pair_edge_is_preferred(
+                        edge_index,
+                        current,
+                        edges,
+                        &external_neighbour_counts,
+                        forward,
+                    )
+                })
             {
                 match_edge = Some(edge_index);
-                max_weight = edge.weight;
             }
         }
 
@@ -1830,13 +1848,15 @@ fn pair_map_from_edges(
             coarse_map[edge.upper] = n_coarse;
             n_coarse += 1;
         } else {
-            let mut cluster_edge = None;
-            let mut cluster_weight = f64::NEG_INFINITY;
+            let mut cluster_edge: Option<usize> = None;
             for &edge_index in &cell_edges[cell] {
                 let edge = edges[edge_index];
-                if edge.weight > cluster_weight {
+                if cluster_edge.is_none_or(|current| {
+                    edge.weight > edges[current].weight
+                        || (edge.weight == edges[current].weight
+                            && pair_endpoints_are_preferred(edge, edges[current], forward))
+                }) {
                     cluster_edge = Some(edge_index);
-                    cluster_weight = edge.weight;
                 }
             }
             if let Some(edge_index) = cluster_edge {
@@ -1871,6 +1891,32 @@ fn pair_map_from_edges(
         }
     }
     Ok((coarse_map, n_coarse))
+}
+
+fn pair_edge_is_preferred(
+    candidate: usize,
+    current: usize,
+    edges: &[PairEdge],
+    external_neighbour_counts: &[usize],
+    forward: bool,
+) -> bool {
+    let candidate_edge = edges[candidate];
+    let current_edge = edges[current];
+    candidate_edge.weight > current_edge.weight
+        || (candidate_edge.weight == current_edge.weight
+            && (external_neighbour_counts[candidate] < external_neighbour_counts[current]
+                || (external_neighbour_counts[candidate] == external_neighbour_counts[current]
+                    && pair_endpoints_are_preferred(candidate_edge, current_edge, forward))))
+}
+
+fn pair_endpoints_are_preferred(candidate: PairEdge, current: PairEdge, forward: bool) -> bool {
+    let candidate_pair = ordered_pair(candidate.lower, candidate.upper);
+    let current_pair = ordered_pair(current.lower, current.upper);
+    if forward {
+        candidate_pair < current_pair
+    } else {
+        candidate_pair > current_pair
+    }
 }
 
 fn build_coarse_matrix(
@@ -6255,6 +6301,114 @@ mod tests {
         assert_eq!(coarse_map[1], coarse_map[3]);
         assert_ne!(coarse_map[0], coarse_map[1]);
         assert_eq!(n_coarse, 2);
+    }
+
+    #[test]
+    fn equal_weight_pair_prefers_narrower_external_stencil() {
+        let edges = vec![
+            PairEdge {
+                lower: 0,
+                upper: 2,
+                weight: 10.0,
+            },
+            PairEdge {
+                lower: 2,
+                upper: 3,
+                weight: 1.0,
+            },
+            PairEdge {
+                lower: 2,
+                upper: 4,
+                weight: 1.0,
+            },
+            PairEdge {
+                lower: 0,
+                upper: 1,
+                weight: 10.0,
+            },
+        ];
+
+        let (coarse_map, n_coarse) =
+            pair_map_from_edges(5, &edges, true).expect("equal-weight pair map");
+
+        assert_eq!(coarse_map[0], coarse_map[1]);
+        assert_ne!(coarse_map[0], coarse_map[2]);
+        assert_eq!(coarse_map[2], coarse_map[3]);
+        assert_eq!(coarse_map[2], coarse_map[4]);
+        assert_eq!(n_coarse, 2);
+    }
+
+    #[test]
+    fn pair_map_is_invariant_to_equal_weight_edge_permutation() {
+        let edges = vec![
+            PairEdge {
+                lower: 0,
+                upper: 2,
+                weight: 10.0,
+            },
+            PairEdge {
+                lower: 2,
+                upper: 3,
+                weight: 1.0,
+            },
+            PairEdge {
+                lower: 2,
+                upper: 4,
+                weight: 1.0,
+            },
+            PairEdge {
+                lower: 0,
+                upper: 1,
+                weight: 10.0,
+            },
+        ];
+        let mut reversed = edges.clone();
+        reversed.reverse();
+
+        for forward in [true, false] {
+            let expected = pair_map_from_edges(5, &edges, forward).expect("ordered pair map");
+            let actual = pair_map_from_edges(5, &reversed, forward).expect("reversed pair map");
+
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn stronger_pair_weight_wins_over_stencil_tiebreak() {
+        let edges = vec![
+            PairEdge {
+                lower: 0,
+                upper: 1,
+                weight: 10.0,
+            },
+            PairEdge {
+                lower: 0,
+                upper: 2,
+                weight: 11.0,
+            },
+            PairEdge {
+                lower: 1,
+                upper: 5,
+                weight: 9.0,
+            },
+            PairEdge {
+                lower: 2,
+                upper: 3,
+                weight: 1.0,
+            },
+            PairEdge {
+                lower: 2,
+                upper: 4,
+                weight: 1.0,
+            },
+        ];
+
+        let (coarse_map, _) =
+            pair_map_from_edges(6, &edges, true).expect("stronger-weight pair map");
+
+        assert_eq!(coarse_map[0], coarse_map[2]);
+        assert_ne!(coarse_map[0], coarse_map[1]);
+        assert_eq!(coarse_map[1], coarse_map[5]);
     }
 
     #[test]
