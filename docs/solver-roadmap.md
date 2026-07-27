@@ -976,7 +976,18 @@ The immediate sequence is:
    `6.47 vs 10.97 s` for Channel, ratios `0.3368` and `0.5898`. These are
    fixed-work results on the two frozen cases, not a general all-case speed
    claim. The isolated one-file implementation is published as Draft PR `#79`;
-   CI and trusted merge remain pending.
+   CI passed and trusted merge remains pending.
+   A direct child experiment (`73e3c5b`) then replaced the local cell-order
+   pass with deterministic global heavy-edge matching. Its 37 focused GAMG
+   tests, complete workspace, and Rust 1.94 Clippy gates passed after updating
+   the intentionally hierarchy-bound normalized-L1 profile oracle in child
+   commit `c445b39`. The Native Linux `0+2` Go/No-Go nevertheless failed
+   decisively against `9b6befb`: Pipe pressure iterations rose from `1687` to
+   `7764` and process times from `1.98/3.05 s` to `8.15/8.82 s`; Channel rose
+   from `10654` to `16808` iterations and `6.93/6.59 s` to `9.51/8.55 s`.
+   Every pressure solve still converged and boundary fields remained exact,
+   so this is an algorithmic efficiency rejection rather than a breakdown.
+   The global-matching leaf remains local and unmerged.
 9. **F-PERF-ADAPTIVE-LINEAR:** After persistence parity, add user-bounded
    adaptive linear tolerances while preserving final outer acceptance and
    reporting effective tolerances and linear work.
