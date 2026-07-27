@@ -930,6 +930,17 @@ The immediate sequence is:
    Smoothing plus scaling currently account for about `86.7%` of Pipe and
    `67.8%` of Channel GAMG profile time, substantially more than hierarchy
    infrastructure.
+   A second bit-exact leaf (`eb04d7a`) fused the existing CSR matrix-vector
+   traversal with scaling-denominator accumulation while preserving the exact
+   entry, row, and floating-point addition order. It passed the complete
+   workspace, Rust 1.94 Clippy, adversarial re-association, lifecycle, failure-
+   boundary, and field-parity gates. The stronger Native Linux `2+10` A/B
+   nevertheless rejected it: Pipe's process medians were `2.445 vs 2.390 s`,
+   but candidate-first and candidate-second cohorts disagreed, giving an
+   inconclusive paired ratio of `0.9594` with `0.1061` MAD. Channel was slower
+   in both cohorts, with process medians `6.605 vs 6.930 s` and paired ratio
+   `1.0077`. All canonical reports and final `U`/`p` fields remained bit-exact.
+   The leaf therefore stays local and unmerged, and no speedup is claimed.
 7. **F-PERF-GAMG-HIERARCHY-DIAGNOSTIC (implemented locally):** The isolated
    branch `codex/gamg-hierarchy-diag-5ee13a3c` adds contraction,
    grid/operator complexity, aggregation, weighted-work, and coarse-solve
