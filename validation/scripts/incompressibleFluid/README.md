@@ -75,3 +75,24 @@ records aggregate and per-level phase medians. Profiling remains external
 validation behavior; it is not copied into `fvSolution` or a tutorial default.
 The matched Linux timing lane instead requires GAMG profiling to remain
 disabled.
+
+`run_ferrum_linux_ref_ab_benchmark.ps1` is the fail-closed same-Linux lane for
+one isolated Ferrum change. The candidate must be the direct single-parent
+child of the baseline, the diff must contain exactly `-ExpectedChangedPath`,
+and both commits must carry the identical `Cargo.lock` blob. The worker builds
+the two SHA-bound Git archives in separate symmetric ext4 paths with identical
+sanitized settings and `CARGO_INCREMENTAL=0`, then alternates baseline and
+candidate on the same CPU. `-MeasuredRuns` must be even so candidate-first and
+candidate-second cohorts are balanced. Timing runs do not profile or write
+fields; a separate untimed run strictly parses final `U` and `p` and requires
+their IEEE-754 hashes to match. Canonical solve reports must also be identical
+after removing only path and seconds fields. A performance classification is
+reported only when both order cohorts agree:
+
+```powershell
+.\validation\scripts\incompressibleFluid\run_ferrum_linux_ref_ab_benchmark.ps1 `
+  -BaselineRef <exact-baseline> -CandidateRef <exact-direct-child> `
+  -ExpectedChangedPath src/ferrumMesh/src/flow.rs `
+  -Distro Ubuntu-22.04 -CpuSet 2 -PressureSolver gamg -CaseName all `
+  -WarmupRuns 2 -MeasuredRuns 10 -BuildVariant portable
+```

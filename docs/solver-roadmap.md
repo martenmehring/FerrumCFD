@@ -901,12 +901,15 @@ The immediate sequence is:
    accepted because workload parity changed and timing evidence was
    contaminated; PR `#77` restored the exact pre-B2 tree. LDU remains
    experimental only.
-4. **F-PERF-SIMPLE-PERSISTENCE:** Persist valid SIMPLE/momentum topology,
-   coefficients, preconditioner state, histories, and workspaces with explicit
-   invalidation and unchanged equations, boundaries, and convergence semantics.
-   The first unmerged P1 candidate preserved fixed linear work but did not show
-   a clean Linux gain in separate-session `1+5` measurements; an interleaved
-   main/P1 Ferrum-only A/B is required before acceptance.
+4. **F-PERF-SIMPLE-PERSISTENCE (first leaf rejected):** Persist valid
+   SIMPLE/momentum topology, coefficients, preconditioner state, histories, and
+   workspaces with explicit invalidation and unchanged equations, boundaries,
+   and convergence semantics. The first unmerged P1 candidate preserved exact
+   reports, work counters, and final `U`/`p` bits, but the same-session Native
+   Linux `2+10` A/B was order-sensitive in both cases: Pipe had a paired median
+   ratio of `0.9500` with opposing cohorts and Channel `0.9837` with opposing
+   cohorts. It therefore provides no accepted speedup and remains unmerged.
+   Any later persistence leaf must be smaller and independently profiled.
 5. **F-PERF-LINUX-PARITY (completed):** Add the canonical same-WSL
    Ferrum/OpenFOAM 13 lane,
    the secondary Windows/WSL product lane, and a Ferrum Windows/WSL self-lane.
@@ -915,8 +918,11 @@ The immediate sequence is:
    and record common process plus separate native timers. The same-WSL lane is
    implemented and has accepted portable, Native `1+5`, and Native Pipe `2+9`
    baseline evidence; the two secondary diagnostic lanes remain optional.
-6. **F-PERF-GAMG-SCALING-ROW-KERNELS:** Continue with isolated CSR residual,
-   scaling, and row-traversal leaves before structural hierarchy changes.
+6. **F-PERF-GAMG-SCALING-ROW-KERNELS (in progress):** Continue with isolated
+   CSR residual, scaling, and row-traversal leaves before structural hierarchy
+   changes. The next bounded leaf fuses the two independent dot traversals in
+   correction scaling while preserving each accumulator's exact operation
+   order; it must pass bit-parity gates before any performance A/B.
    Smoothing plus scaling currently account for about `86.7%` of Pipe and
    `67.8%` of Channel GAMG profile time, substantially more than hierarchy
    infrastructure.
