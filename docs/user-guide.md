@@ -696,7 +696,8 @@ By default, the current SIMPLE implementation reads OpenFOAM-style relaxation fa
 `system/fvSolution`: `relaxationFactors.equations.U` for velocity and
 `relaxationFactors.fields.p` for pressure. The CLI flags above are explicit
 overrides for experiments. It also reads `solvers.U.tolerance`,
-`solvers.p.tolerance`, `solvers.p.solver PCG`, `solvers.p.preconditioner DIC`,
+`solvers.p.tolerance`, `solvers.U.relTol`, `solvers.p.relTol`,
+`solvers.p.solver PCG`, `solvers.p.preconditioner DIC`,
 `SIMPLE.nNonOrthogonalCorrectors`, `SIMPLE.pRefCell`, `SIMPLE.pRefValue`, and
 `SIMPLE.consistent`, and optional `maxIter` values from `system/fvSolution`.
 For pressure PCG, OpenFOAM `DIC`/`FDIC` maps to Ferrum's CPU IC(0)
@@ -780,12 +781,24 @@ solves. The linear-solver final residual and convergence flag remain separate
 from this outer SIMPLE decision.
 
 If `tolerance` or `maxIter` is absent, the SIMPLE path uses the OpenFOAM 13
-`lduMatrix::solver` defaults `1e-6` and `1000`. GAMG applies `relTol` to the
-OpenFOAM-normalized LDU L1 residual and honors `minIter`. Its internal L2 stop
-limit is conservatively translated, and Ferrum rechecks the strict L1 criterion
-before reporting convergence. Other current linear solvers reject non-zero `relTol` and
-`minIter`; `smoothSolver nSweeps` values other than `1` are also rejected
-instead of being ignored or replaced silently.
+`lduMatrix::solver` defaults `1e-6` and `1000`. `BiCGStab`, `CG`, `Jacobi`,
+`GaussSeidel`, `symGaussSeidel`, `PCG`, and pressure `GAMG` support finite,
+non-negative `relTol`. For every linear solve the authoritative normalized-L1
+target is
+`max(tolerance, relTol * initialNormalizedResidual)`, and convergence requires
+the final normalized residual to be strictly smaller than that target. As in
+OpenFOAM, non-GAMG solvers activate the relative criterion only for
+`relTol > 1e-15`; the established GAMG compatibility contract activates it for
+every `relTol > 0`. `relTol` is not capped at one. GAMG derives conservative
+internal L2 controls for both normalized-L1 limits and rechecks the strict
+normalized-L1 criterion before reporting convergence.
+
+The configured `relTol` is a static, user-bounded case control. It remains
+active in the accepting steady SIMPLE iteration; Ferrum does not invent a
+synthetic `UFinal` or `pFinal` switch and does not force the last accepted
+solve to `relTol 0`. `minIter` remains supported only by GAMG; a non-zero
+`minIter` on another solver and a `smoothSolver nSweeps` value other than `1`
+are rejected instead of being ignored or replaced silently.
 
 Without `--maxSimpleIterations`, Ferrum uses the positive iteration count
 derived from `controlDict` (`endTime - startTime` divided by `deltaT`). When
@@ -810,7 +823,9 @@ internal fields come from the solved cell values, while the dimensions and
 `boundaryField` entries are preserved from `0/U` and `0/p`.
 
 The generic solver report records residuals, SIMPLE iterations, wall-clock time,
-the active `fvSchemes` subset,
+the active `fvSchemes` subset, resolved absolute and relative linear
+tolerances (`momentumLinearRelativeTolerance` and
+`pressureLinearRelativeTolerance`),
 finite-volume operator summaries, boundary counts, general `U`/`p` field summaries,
 continuity, per-iteration field changes, per-component momentum residuals,
 momentum `A/H1` ranges, `adjustPhi` mass-balance changes, and final
@@ -821,10 +836,17 @@ pressure-equation flux, pressure matrix size/diagonal/off-diagonal summaries,
 pressure flux, and corrected `phi`. JSON and Markdown reports also include a
 `linearSolves` profile with converged/non-converged momentum predictors,
 component momentum solves, pressure-correction solves, max/average linear
-iterations per SIMPLE step, and final linear-solver convergence flags. The
-iteration history, CSV, console, JSON, and Markdown outputs distinguish each
-field's OpenFOAM-normalized initial residual from its final linear residual and
-show the outer `residualControl` state independently.
+iterations per SIMPLE step, and final linear-solver convergence flags. Each
+iteration also contains exactly the `x`, `y`, and `z`
+`momentumComponentLinearSolves` plus the one-based
+`pressureCorrectionLinearSolves`. Every solve records its iteration count,
+convergence flag, initial normalized residual, raw L2 residual, final normalized
+residual, effective normalized tolerance, and stop reason (`NotRun`,
+`ExactZero`, `AbsoluteTolerance`, `RelativeTolerance`, `MaxIterations`, or
+`Breakdown`). These fields are additive: the existing aggregate fields remain
+available. The iteration history, CSV, console, JSON, and Markdown outputs
+distinguish each field's OpenFOAM-normalized initial residual from its final
+linear residual and show the outer `residualControl` state independently.
 The top-level JSON `outerConvergence` object records `status`, `configured`,
 `evaluated`, `converged`, and `reason`. Ferrum
 sets `converged=true` when the configured outer `SIMPLE.residualControl`
