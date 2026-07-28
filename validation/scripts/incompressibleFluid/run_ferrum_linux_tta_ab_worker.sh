@@ -2,6 +2,7 @@
 set -euo pipefail
 
 mode="run"
+experiment="reltol"
 rust_toolchain="1.94.0"
 cpu_set="2"
 build_variant="native"
@@ -39,6 +40,7 @@ require_value() {
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --preflight-only) mode="preflight"; shift ;;
+        --experiment) require_value "$@"; experiment="$2"; shift 2 ;;
         --rust-toolchain) require_value "$@"; rust_toolchain="$2"; shift 2 ;;
         --cpu-set) require_value "$@"; cpu_set="$2"; shift 2 ;;
         --build-variant) require_value "$@"; build_variant="$2"; shift 2 ;;
@@ -329,6 +331,214 @@ else:
 PY
 }
 
+run_simple_consistent_tool() {
+    python3 - "$@" <<'PY'
+import pathlib
+import sys
+from dataclasses import dataclass
+
+class ContractError(RuntimeError):
+    pass
+
+@dataclass(frozen=True)
+class Token:
+    kind: str
+    text: bytes
+    start: int
+    end: int
+
+WHITESPACE = b" \t\r\n\f\v"
+
+def lex(raw):
+    tokens = []
+    index = 3 if raw.startswith(b"\xef\xbb\xbf") else 0
+    while index < len(raw):
+        byte = raw[index]
+        if byte in WHITESPACE:
+            index += 1
+            continue
+        if raw[index:index + 2] == b"//":
+            newline = raw.find(b"\n", index + 2)
+            index = len(raw) if newline < 0 else newline + 1
+            continue
+        if raw[index:index + 2] == b"/*":
+            closing = raw.find(b"*/", index + 2)
+            if closing < 0: raise ContractError(f"unterminated block comment at byte {index}")
+            index = closing + 2
+            continue
+        if byte == ord("#"):
+            line_start = max(raw.rfind(b"\n", 0, index), raw.rfind(b"\r", 0, index)) + 1
+            if raw[line_start:index].strip(b" \t"):
+                raise ContractError(f"directive marker outside logical-line start at byte {index}")
+            newline = raw.find(b"\n", index + 1)
+            end = len(raw) if newline < 0 else newline + 1
+            tokens.append(Token("directive", raw[index:end], index, end))
+            index = end
+            continue
+        if byte in (ord('"'), ord("'")):
+            quote, start = byte, index
+            index += 1
+            while index < len(raw):
+                if raw[index] == ord("\\"):
+                    if index + 1 >= len(raw): break
+                    index += 2
+                    continue
+                if raw[index] == quote:
+                    index += 1
+                    tokens.append(Token("string", raw[start:index], start, index))
+                    break
+                index += 1
+            else:
+                raise ContractError(f"unterminated quoted string at byte {start}")
+            if not tokens or tokens[-1].start != start:
+                raise ContractError(f"unterminated quoted string at byte {start}")
+            continue
+        if byte in (ord("{"), ord("}"), ord(";")):
+            tokens.append(Token("punct", raw[index:index + 1], index, index + 1))
+            index += 1
+            continue
+        start = index
+        while index < len(raw):
+            byte = raw[index]
+            if byte in WHITESPACE or byte in (ord("{"), ord("}"), ord(";"), ord('"'), ord("'"), ord("#")):
+                break
+            if raw[index:index + 2] in (b"//", b"/*"): break
+            index += 1
+        if index == start: raise ContractError(f"unsupported token at byte {index}")
+        tokens.append(Token("word", raw[start:index], start, index))
+    return tokens
+
+def brace_pairs(tokens):
+    stack, pairs = [], {}
+    for index, token in enumerate(tokens):
+        if token.kind != "punct": continue
+        if token.text == b"{": stack.append(index)
+        elif token.text == b"}":
+            if not stack: raise ContractError(f"unmatched closing brace at byte {token.start}")
+            pairs[stack.pop()] = index
+    if stack: raise ContractError(f"unterminated dictionary block at byte {tokens[stack[-1]].start}")
+    return pairs
+
+def direct_entries(tokens, start, end, pairs, description):
+    entries, index = [], start
+    while index < end:
+        key = tokens[index]
+        if key.kind not in ("word", "string"):
+            raise ContractError(f"{description} expected an entry key at byte {key.start}")
+        index += 1
+        if index >= end: raise ContractError(f"{description}.{key.text!r} is missing a value or dictionary")
+        if tokens[index].kind == "punct" and tokens[index].text == b"{":
+            if index not in pairs or pairs[index] >= end:
+                raise ContractError(f"{description}.{key.text!r} has an invalid dictionary block")
+            closing = pairs[index]
+            entries.append({"key": key, "kind": "dictionary", "opening": index, "closing": closing, "values": []})
+            index = closing + 1
+            if index < end and tokens[index].kind == "punct" and tokens[index].text == b";": index += 1
+            continue
+        value_start = index
+        while index < end and not (tokens[index].kind == "punct" and tokens[index].text == b";"):
+            if tokens[index].kind == "punct" and tokens[index].text in (b"{", b"}"):
+                raise ContractError(f"{description}.{key.text!r} contains an unexpected block")
+            index += 1
+        if index >= end: raise ContractError(f"{description}.{key.text!r} is missing its semicolon")
+        entries.append({"key": key, "kind": "scalar", "opening": None, "closing": None, "values": tokens[value_start:index]})
+        index += 1
+    return entries
+
+def ordinary(entries, name):
+    return [entry for entry in entries if entry["key"].kind == "word" and entry["key"].text == name]
+
+def locate(raw):
+    tokens = lex(raw)
+    directives = [token for token in tokens if token.kind == "directive"]
+    if directives: raise ContractError(f"active OpenFOAM directive at byte {directives[0].start}")
+    pairs = brace_pairs(tokens)
+    top = direct_entries(tokens, 0, len(tokens), pairs, "fvSolution")
+    sections = ordinary(top, b"SIMPLE")
+    if len(sections) != 1 or sections[0]["kind"] != "dictionary":
+        raise ContractError("fvSolution must contain exactly one direct ordinary SIMPLE dictionary")
+    section = sections[0]
+    children = direct_entries(tokens, section["opening"] + 1, section["closing"], pairs, "SIMPLE")
+    entries = ordinary(children, b"consistent")
+    if len(entries) != 1 or entries[0]["kind"] != "scalar":
+        raise ContractError("SIMPLE.consistent must be exactly one direct ordinary scalar")
+    values = entries[0]["values"]
+    if len(values) != 1 or values[0].kind != "word" or values[0].text not in (b"false", b"true"):
+        raise ContractError("SIMPLE.consistent must be one direct unquoted lowercase boolean token")
+    return values[0]
+
+def verify(raw, expected):
+    if expected not in ("false", "true"): raise ContractError("expected consistent policy is invalid")
+    token = locate(raw)
+    if token.text != expected.encode("ascii"):
+        raise ContractError(f"SIMPLE.consistent differs from exact expected {expected}")
+
+def patch(raw):
+    token = locate(raw)
+    if token.text != b"false": raise ContractError("candidate source SIMPLE.consistent must be false before patch")
+    expected = raw[:token.start] + b"true" + raw[token.end:]
+    result = raw[:token.start] + b"true" + raw[token.end:]
+    if result != expected: raise ContractError("SIMPLE.consistent patch changed bytes outside the direct token")
+    verify(result, "true")
+    return result
+
+def expect_reject(raw, description):
+    try: locate(raw)
+    except ContractError: return
+    raise ContractError(f"self-test accepted malformed {description}")
+
+def self_test():
+    sample = b'''// SIMPLE { consistent true; }\n"SIMPLE" { consistent true; }\nwrapper { SIMPLE { consistent true; } }\nSIMPLE\n{\n note "consistent true; }";\n consistent false;\n}\n'''
+    token = locate(sample)
+    expected = sample[:token.start] + b"true" + sample[token.end:]
+    result = patch(sample)
+    if result != expected: raise ContractError("self-test changed bytes outside direct SIMPLE.consistent")
+    verify(result, "true")
+    malformed = {
+        "missing SIMPLE": b"// SIMPLE { consistent false; }",
+        "quoted SIMPLE": b'"SIMPLE" { consistent false; }',
+        "nested-only SIMPLE": b"wrapper { SIMPLE { consistent false; } }",
+        "duplicate SIMPLE": b"SIMPLE { consistent false; } SIMPLE { consistent false; }",
+        "scalar SIMPLE": b"SIMPLE false;",
+        "missing consistent": b"SIMPLE { nNonOrthogonalCorrectors 0; }",
+        "duplicate consistent": b"SIMPLE { consistent false; consistent false; }",
+        "nested-only consistent": b"SIMPLE { controls { consistent false; } }",
+        "consistent dictionary": b"SIMPLE { consistent { value false; } }",
+        "quoted consistent": b'SIMPLE { "consistent" false; }',
+        "quoted false": b'SIMPLE { consistent "false"; }',
+        "wrong case": b"SIMPLE { consistent False; }",
+        "numeric boolean": b"SIMPLE { consistent 0; }",
+        "multiple values": b"SIMPLE { consistent false true; }",
+        "directive": b'#include "other"\nSIMPLE { consistent false; }',
+        "unterminated comment": b"SIMPLE { consistent false; } /*",
+        "unterminated string": b'SIMPLE { note "bad; consistent false; }',
+        "unterminated block": b"SIMPLE { consistent false; ",
+    }
+    for description, raw in malformed.items(): expect_reject(raw, description)
+    try: patch(result)
+    except ContractError: pass
+    else: raise ContractError("self-test accepted an already-true candidate source")
+
+mode = sys.argv[1]
+if mode == "self-test":
+    if len(sys.argv) != 2: raise SystemExit("consistent self-test takes no arguments")
+    self_test()
+elif mode == "verify":
+    if len(sys.argv) != 4: raise SystemExit("consistent verify requires path and expected boolean")
+    verify(pathlib.Path(sys.argv[2]).read_bytes(), sys.argv[3])
+elif mode == "patch":
+    if len(sys.argv) != 3: raise SystemExit("consistent patch requires one path")
+    path = pathlib.Path(sys.argv[2])
+    before = path.read_bytes()
+    after = patch(before)
+    if after == before: raise ContractError("SIMPLE.consistent patch made no byte change")
+    path.write_bytes(after)
+    if path.read_bytes() != after: raise ContractError("patched SIMPLE.consistent bytes differ after write")
+else:
+    raise SystemExit(f"unknown consistent tool mode: {mode}")
+PY
+}
+
 run_report_proof_tool() {
     python3 - "$@" <<'PY'
 import hashlib, json, math, os, pathlib, re, sys, tempfile
@@ -429,17 +639,32 @@ def expected_identities(manifest, warmup, measured):
     return result
 
 def finalize(entries_path, export_root, proof_path, proof_hash_path, manifest_path,
-             controls_sha, warmup, measured, max_simple, pressure_solver, pressure_reltol, momentum_reltol):
+             controls_sha, warmup, measured, max_simple, pressure_solver, pressure_reltol, momentum_reltol,
+             experiment, build_mode, baseline_binary_sha, candidate_binary_sha):
     if min(warmup, measured, max_simple) < 1: raise ProofError("report proof run policy is invalid")
     if not SHA256.fullmatch(controls_sha): raise ProofError("report proof controls SHA-256 is invalid")
     manifest_bytes = manifest_path.read_bytes()
     manifest = strict_json_loads(manifest_bytes.decode("utf-8-sig"))
-    if manifest.get("benchmark") != "ferrum-linux-time-to-accuracy-ab": raise ProofError("report proof benchmark differs")
+    if manifest.get("schemaVersion") != 2 or manifest.get("benchmark") != "ferrum-linux-time-to-accuracy-ab":
+        raise ProofError("report proof benchmark/schema differs")
+    if experiment not in ("reltol", "simplec") or manifest.get("experiment") != experiment:
+        raise ProofError("report proof experiment differs")
     if manifest.get("controls", {}).get("archiveSha256") != controls_sha: raise ProofError("report proof controls binding differs")
     if manifest.get("maxSimpleIterations") != max_simple or manifest.get("pressureSolver") != pressure_solver:
         raise ProofError("report proof solver policy differs from manifest")
     if manifest.get("candidateRelTol") != {"p": pressure_reltol, "U": momentum_reltol}:
         raise ProofError("report proof relTol policy differs from manifest")
+    expected_consistent = {"baseline": False, "candidate": experiment == "simplec"}
+    expected_same_binary = experiment == "simplec"
+    expected_build_mode = "shared-single-build" if expected_same_binary else "separate-builds"
+    if build_mode != expected_build_mode or manifest.get("consistentPolicy") != expected_consistent:
+        raise ProofError("report proof consistent/build mode policy differs")
+    if manifest.get("buildPolicy") != {"mode": build_mode, "sameBinary": expected_same_binary}:
+        raise ProofError("report proof build policy differs from manifest")
+    if not SHA256.fullmatch(baseline_binary_sha) or not SHA256.fullmatch(candidate_binary_sha):
+        raise ProofError("report proof binary SHA-256 is invalid")
+    if expected_same_binary and baseline_binary_sha != candidate_binary_sha:
+        raise ProofError("report proof shared binary hashes differ")
     expected = expected_identities(manifest, warmup, measured)
     entries = load_entries(entries_path)
     recorded = {entry["relativePath"]: entry for entry in entries}
@@ -468,11 +693,15 @@ def finalize(entries_path, export_root, proof_path, proof_hash_path, manifest_pa
         "inputManifestSha256": hashlib.sha256(manifest_bytes).hexdigest(),
         "reportCount": len(verified),
         "reports": verified,
-        "runPolicy": {"candidateRelTol": {"U": momentum_reltol, "p": pressure_reltol},
+        "runPolicy": {"buildPolicy": {"baselineBinarySha256": baseline_binary_sha,
+                                       "candidateBinarySha256": candidate_binary_sha,
+                                       "mode": build_mode, "sameBinary": expected_same_binary},
+                      "candidateRelTol": {"U": momentum_reltol, "p": pressure_reltol},
+                      "consistentPolicy": expected_consistent, "experiment": experiment,
                       "maxSimpleIterations": max_simple, "measuredRuns": measured,
                       "pressureSolver": pressure_solver, "warmupRuns": warmup},
-        "schemaVersion": 1,
-        "validator": "worker-python-exact-report-contract-v1",
+        "schemaVersion": 2,
+        "validator": "worker-python-exact-report-contract-v2",
     }
     payload = (json.dumps(proof, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
     for target in (proof_path, proof_hash_path):
@@ -492,7 +721,9 @@ def self_test():
     with tempfile.TemporaryDirectory() as temporary:
         root = pathlib.Path(temporary) / "export"; root.mkdir()
         metadata = root / "metadata"; metadata.mkdir()
-        manifest = {"benchmark": "ferrum-linux-time-to-accuracy-ab", "candidateRelTol": {"p": "0.1", "U": "0.2"},
+        manifest = {"schemaVersion": 2, "benchmark": "ferrum-linux-time-to-accuracy-ab", "experiment": "reltol",
+                    "candidateRelTol": {"p": "0.1", "U": "0.2"}, "consistentPolicy": {"baseline": False, "candidate": False},
+                    "buildPolicy": {"mode": "separate-builds", "sameBinary": False},
                     "controls": {"archiveSha256": "a" * 64}, "maxSimpleIterations": 5,
                     "pressureSolver": "gamg", "cases": [{"name": "caseA"}]}
         manifest_path = metadata / "input-manifest.json"
@@ -508,7 +739,8 @@ def self_test():
         first = next(iter(expected.values())); first_path = root / pathlib.PurePosixPath(first["relativePath"])
         expect_failure(lambda: identity("../bad", "oracle", 0, "baseline"), "an unsafe report identity")
         proof_path = metadata / "exact-report-validation.json"; hash_path = metadata / "exact-report-validation.sha256"
-        finalize(entries_path, root, proof_path, hash_path, manifest_path, "a" * 64, 1, 1, 5, "gamg", "0.1", "0.2")
+        finalize(entries_path, root, proof_path, hash_path, manifest_path, "a" * 64, 1, 1, 5, "gamg", "0.1", "0.2",
+                 "reltol", "separate-builds", "b" * 64, "c" * 64)
         proof = strict_json_loads(proof_path.read_text(encoding="utf-8"))
         if proof["reportCount"] != 6 or hashlib.sha256(proof_path.read_bytes()).hexdigest() != hash_path.read_text().strip():
             raise ProofError("report proof self-test output differs")
@@ -516,32 +748,51 @@ def self_test():
         expect_failure(lambda: strict_json_loads('{"x":NaN}'), "a NaN JSON constant")
         expect_failure(lambda: strict_json_loads('{"x":Infinity}'), "an infinite JSON constant")
         expect_failure(lambda: strict_json_loads('{"x":1e999}'), "an overflowing JSON number")
+        simplec_manifest = dict(manifest)
+        simplec_manifest.update({"experiment": "simplec", "candidateRelTol": {"p": "0", "U": "0"},
+                                 "consistentPolicy": {"baseline": False, "candidate": True},
+                                 "buildPolicy": {"mode": "shared-single-build", "sameBinary": True}})
+        manifest_path.write_text(json.dumps(simplec_manifest), encoding="utf-8")
+        finalize(entries_path, root, proof_path, hash_path, manifest_path, "a" * 64, 1, 1, 5, "gamg", "0", "0",
+                 "simplec", "shared-single-build", "d" * 64, "d" * 64)
+        simplec_proof = strict_json_loads(proof_path.read_text(encoding="utf-8"))
+        if simplec_proof["runPolicy"]["consistentPolicy"] != {"baseline": False, "candidate": True}:
+            raise ProofError("report proof SIMPLEC self-test policy differs")
+        expect_failure(lambda: finalize(entries_path, root, proof_path, hash_path, manifest_path, "a" * 64, 1, 1, 5, "gamg", "0", "0",
+                                        "simplec", "shared-single-build", "d" * 64, "e" * 64), "different shared binary hashes")
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         valid_journal = entries_path.read_bytes(); entries_path.write_bytes(valid_journal + valid_journal.splitlines(keepends=True)[0])
-        expect_failure(lambda: finalize(entries_path, root, proof_path, hash_path, manifest_path, "a" * 64, 1, 1, 5, "gamg", "0.1", "0.2"), "a duplicate report")
+        expect_failure(lambda: finalize(entries_path, root, proof_path, hash_path, manifest_path, "a" * 64, 1, 1, 5, "gamg", "0.1", "0.2",
+                                        "reltol", "separate-builds", "b" * 64, "c" * 64), "a duplicate report")
         entries_path.write_bytes(valid_journal)
         original = first_path.read_bytes(); first_path.write_bytes(b"tampered")
-        expect_failure(lambda: finalize(entries_path, root, proof_path, hash_path, manifest_path, "a" * 64, 1, 1, 5, "gamg", "0.1", "0.2"), "a changed validated report")
+        expect_failure(lambda: finalize(entries_path, root, proof_path, hash_path, manifest_path, "a" * 64, 1, 1, 5, "gamg", "0.1", "0.2",
+                                        "reltol", "separate-builds", "b" * 64, "c" * 64), "a changed validated report")
         first_path.write_bytes(original)
         extra = root / "raw/caseA/unexpected/solve-report.json"; extra.parent.mkdir(parents=True); extra.write_text("extra")
-        expect_failure(lambda: finalize(entries_path, root, proof_path, hash_path, manifest_path, "a" * 64, 1, 1, 5, "gamg", "0.1", "0.2"), "an extra raw report")
+        expect_failure(lambda: finalize(entries_path, root, proof_path, hash_path, manifest_path, "a" * 64, 1, 1, 5, "gamg", "0.1", "0.2",
+                                        "reltol", "separate-builds", "b" * 64, "c" * 64), "an extra raw report")
 
 mode = sys.argv[1]
 if mode == "self-test":
     if len(sys.argv) != 2: raise SystemExit("report proof self-test takes no arguments")
     self_test()
 elif mode == "finalize":
-    if len(sys.argv) != 14: raise SystemExit("report proof finalize argument count differs")
+    if len(sys.argv) != 18: raise SystemExit("report proof finalize argument count differs")
     finalize(pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3]), pathlib.Path(sys.argv[4]), pathlib.Path(sys.argv[5]),
              pathlib.Path(sys.argv[6]), sys.argv[7], int(sys.argv[8]), int(sys.argv[9]), int(sys.argv[10]),
-             sys.argv[11], sys.argv[12], sys.argv[13])
+             sys.argv[11], sys.argv[12], sys.argv[13], sys.argv[14], sys.argv[15], sys.argv[16], sys.argv[17])
 else:
     raise SystemExit(f"unknown report proof tool mode: {mode}")
 PY
 }
 
 run_reltol_tool self-test
+run_simple_consistent_tool self-test
 run_report_proof_tool self-test
 
+[[ "$experiment" == "reltol" || "$experiment" == "simplec" ]] || fail "unsupported experiment: $experiment"
+if [[ "$experiment" == "simplec" ]]; then build_policy_mode="shared-single-build"; else build_policy_mode="separate-builds"; fi
 [[ "$cpu_set" =~ ^[0-9]+([,-][0-9]+)*$ ]] || fail "invalid CPU set: $cpu_set"
 taskset -c "$cpu_set" true >/dev/null 2>&1 || fail "CPU set is not available: $cpu_set"
 [[ "$warmup_runs" =~ ^[0-9]+$ ]] && ((warmup_runs >= 2)) || fail "warmup runs must be at least two"
@@ -550,17 +801,23 @@ taskset -c "$cpu_set" true >/dev/null 2>&1 || fail "CPU set is not available: $c
 [[ "$max_simple_iterations" =~ ^[1-9][0-9]*$ ]] || fail "max SIMPLE iterations must be positive"
 [[ "$pressure_solver" == "pcg" || "$pressure_solver" == "gamg" ]] || fail "unsupported pressure solver: $pressure_solver"
 
-python3 - "$candidate_pressure_reltol" "$candidate_momentum_reltol" <<'PY'
+python3 - "$candidate_pressure_reltol" "$candidate_momentum_reltol" "$experiment" <<'PY'
 import math, sys
-for label, raw in zip(("pressure", "momentum"), sys.argv[1:]):
+for label, raw in zip(("pressure", "momentum"), sys.argv[1:3]):
     try:
         value = float(raw)
     except ValueError as exc:
         raise SystemExit(f"candidate {label} relTol is not numeric: {raw}") from exc
     if not math.isfinite(value) or value < 0.0:
         raise SystemExit(f"candidate {label} relTol must be finite and non-negative")
-if float(sys.argv[1]) == 0.0 and float(sys.argv[2]) == 0.0:
-    raise SystemExit("candidate p and U relTol must not both be zero")
+if sys.argv[3] == "reltol":
+    if float(sys.argv[1]) == 0.0 and float(sys.argv[2]) == 0.0:
+        raise SystemExit("candidate p and U relTol must not both be zero")
+elif sys.argv[3] == "simplec":
+    if float(sys.argv[1]) != 0.0 or float(sys.argv[2]) != 0.0:
+        raise SystemExit("simplec candidate p and U relTol must both be exactly zero")
+else:
+    raise SystemExit("unsupported experiment")
 def active(is_gamg, value):
     return value > (0.0 if is_gamg else 1.0e-15)
 if active(False, 1.0e-15) or not active(False, math.nextafter(1.0e-15, math.inf)):
@@ -596,8 +853,8 @@ home_fstype="$(findmnt -T "$HOME" -n -o FSTYPE | tr -d '[:space:]')"
 [[ "$home_fstype" == "ext4" ]] || fail "WSL home is not on ext4 (found '$home_fstype')"
 
 if [[ "$mode" == "preflight" ]]; then
-    printf 'preflight=pass\nrustc=%s\ncargo=%s\nfilesystem=%s\ncpu_set=%s\nbuild_variant=%s\nreltol_boundary_self_test=pass\ncontract_negative_self_test=pass\nreltol_token_mutation_self_test=pass\nexact_report_proof_self_test=pass\n' \
-        "$rustc_version" "$cargo_version" "$home_fstype" "$cpu_set" "$build_variant"
+    printf 'preflight=pass\nexperiment=%s\nrustc=%s\ncargo=%s\nfilesystem=%s\ncpu_set=%s\nbuild_variant=%s\nreltol_boundary_self_test=pass\ncontract_negative_self_test=pass\nreltol_token_mutation_self_test=pass\nsimple_consistent_token_mutation_self_test=pass\nexact_report_proof_self_test=pass\n' \
+        "$experiment" "$rustc_version" "$cargo_version" "$home_fstype" "$cpu_set" "$build_variant"
     exit 0
 fi
 
@@ -704,9 +961,38 @@ done
 [[ "$(jq -r '.candidate.commit' "$metadata_root/input-manifest.json")" == "$candidate_commit" ]] || fail "manifest candidate commit differs"
 [[ "$(jq -r '.baseline.tree' "$metadata_root/input-manifest.json")" == "$baseline_tree" ]] || fail "manifest baseline tree differs"
 [[ "$(jq -r '.candidate.tree' "$metadata_root/input-manifest.json")" == "$candidate_tree" ]] || fail "manifest candidate tree differs"
+[[ "$(jq -r '.baseline.archiveSha256' "$metadata_root/input-manifest.json")" == "$actual_baseline_archive_sha256" ]] || fail "manifest baseline archive SHA-256 differs"
+[[ "$(jq -r '.candidate.archiveSha256' "$metadata_root/input-manifest.json")" == "$actual_candidate_archive_sha256" ]] || fail "manifest candidate archive SHA-256 differs"
+[[ "$(jq -r '.schemaVersion' "$metadata_root/input-manifest.json")" == "2" ]] || fail "manifest schema version differs"
+[[ "$(jq -r '.experiment' "$metadata_root/input-manifest.json")" == "$experiment" ]] || fail "manifest experiment differs"
 [[ "$(jq -r '.pressureSolver' "$metadata_root/input-manifest.json")" == "$pressure_solver" ]] || fail "manifest pressure solver differs"
+[[ "$(jq -r '.baselineRelTol.p' "$metadata_root/input-manifest.json")" == "0" && "$(jq -r '.baselineRelTol.U' "$metadata_root/input-manifest.json")" == "0" ]] || fail "manifest baseline relTol differs"
 [[ "$(jq -r '.candidateRelTol.p' "$metadata_root/input-manifest.json")" == "$candidate_pressure_reltol" ]] || fail "manifest candidate p relTol differs"
 [[ "$(jq -r '.candidateRelTol.U' "$metadata_root/input-manifest.json")" == "$candidate_momentum_reltol" ]] || fail "manifest candidate U relTol differs"
+
+if [[ "$experiment" == "simplec" ]]; then
+    [[ "$baseline_commit" == "$candidate_commit" && "$baseline_tree" == "$candidate_tree" ]] || fail "simplec source commit/tree bindings differ"
+    [[ "$baseline_archive" == "$candidate_archive" ]] || fail "simplec did not receive one exact shared source archive path"
+    [[ "$actual_baseline_archive_sha256" == "$actual_candidate_archive_sha256" ]] || fail "simplec staged source archives differ"
+    [[ "$(jq -r '.relationship.mode' "$metadata_root/input-manifest.json")" == "identical-source" &&
+       "$(jq -r '.relationship.directChild' "$metadata_root/input-manifest.json")" == "false" &&
+       "$(jq -r '.relationship.identicalSource' "$metadata_root/input-manifest.json")" == "true" &&
+       "$(jq -r '.relationship.exactChangedPaths | length' "$metadata_root/input-manifest.json")" == "0" ]] || fail "simplec source relationship policy differs"
+    [[ "$(jq -r '.consistentPolicy.baseline' "$metadata_root/input-manifest.json")" == "false" &&
+       "$(jq -r '.consistentPolicy.candidate' "$metadata_root/input-manifest.json")" == "true" ]] || fail "simplec consistent policy differs"
+    [[ "$(jq -r '.buildPolicy.mode' "$metadata_root/input-manifest.json")" == "shared-single-build" &&
+       "$(jq -r '.buildPolicy.sameBinary' "$metadata_root/input-manifest.json")" == "true" ]] || fail "simplec build policy differs"
+else
+    [[ "$baseline_commit" != "$candidate_commit" ]] || fail "relTol source commits must differ"
+    [[ "$(jq -r '.relationship.mode' "$metadata_root/input-manifest.json")" == "direct-child-exact-paths" &&
+       "$(jq -r '.relationship.directChild' "$metadata_root/input-manifest.json")" == "true" &&
+       "$(jq -r '.relationship.identicalSource' "$metadata_root/input-manifest.json")" == "false" &&
+       "$(jq -r '.relationship.exactChangedPaths | length' "$metadata_root/input-manifest.json")" -gt 0 ]] || fail "relTol source relationship policy differs"
+    [[ "$(jq -r '.consistentPolicy.baseline' "$metadata_root/input-manifest.json")" == "false" &&
+       "$(jq -r '.consistentPolicy.candidate' "$metadata_root/input-manifest.json")" == "false" ]] || fail "relTol consistent policy differs"
+    [[ "$(jq -r '.buildPolicy.mode' "$metadata_root/input-manifest.json")" == "separate-builds" &&
+       "$(jq -r '.buildPolicy.sameBinary' "$metadata_root/input-manifest.json")" == "false" ]] || fail "relTol build policy differs"
+fi
 
 baseline_lock_sha="$(sha256sum "$workspace/slots/A/source/Cargo.lock" | awk '{print $1}')"
 candidate_lock_sha="$(sha256sum "$workspace/slots/B/source/Cargo.lock" | awk '{print $1}')"
@@ -723,6 +1009,18 @@ for case_name in $(jq -r '.cases[].name' "$metadata_root/input-manifest.json"); 
     done
     expected_solution_hash="$(jq -r --arg case "$case_name" '.cases[] | select(.name == $case) | .baselineFvSolutionSha256' "$metadata_root/input-manifest.json")"
     [[ "$(sha256sum "$case_root/system/fvSolution" | awk '{print $1}')" == "$expected_solution_hash" ]] || fail "$case_name fvSolution differs"
+    run_reltol_tool verify "$case_root/system/fvSolution" 0 0
+    run_simple_consistent_tool verify "$case_root/system/fvSolution" false
+    if [[ "$experiment" == "simplec" ]]; then
+        expected_candidate_solution_hash="$(jq -r --arg case "$case_name" '.cases[] | select(.name == $case) | .candidateFvSolutionSha256' "$metadata_root/input-manifest.json")"
+        [[ "$expected_candidate_solution_hash" =~ ^[0-9a-f]{64}$ ]] || fail "$case_name candidate fvSolution manifest SHA-256 is invalid"
+        candidate_control_probe="$workspace/$case_name-candidate-fvSolution.probe"
+        cp -- "$case_root/system/fvSolution" "$candidate_control_probe"
+        run_simple_consistent_tool patch "$candidate_control_probe"
+        run_reltol_tool verify "$candidate_control_probe" 0 0
+        [[ "$(sha256sum "$candidate_control_probe" | awk '{print $1}')" == "$expected_candidate_solution_hash" ]] || fail "$case_name candidate fvSolution manifest control bytes differ"
+        rm -f -- "$candidate_control_probe"
+    fi
 done
 
 build_environment=("CARGO_INCREMENTAL=0")
@@ -753,10 +1051,16 @@ build_slot() {
     chmod 0555 "$workspace/binaries/$slot/ferrumRun"
 }
 
-build_slot A baseline
-build_slot B candidate
-baseline_binary="$workspace/binaries/A/ferrumRun"
-candidate_binary="$workspace/binaries/B/ferrumRun"
+if [[ "$experiment" == "simplec" ]]; then
+    build_slot A shared
+    baseline_binary="$workspace/binaries/A/ferrumRun"
+    candidate_binary="$baseline_binary"
+else
+    build_slot A baseline
+    build_slot B candidate
+    baseline_binary="$workspace/binaries/A/ferrumRun"
+    candidate_binary="$workspace/binaries/B/ferrumRun"
+fi
 
 printf '%s\n' "$baseline_commit" >"$metadata_root/baseline-commit.txt"
 printf '%s\n' "$baseline_tree" >"$metadata_root/baseline-tree.txt"
@@ -769,6 +1073,12 @@ printf '%s\n' "$actual_controls_sha256" >"$metadata_root/controls-archive-sha256
 printf '%s\n' "$baseline_lock_sha" >"$metadata_root/cargo-lock-sha256.txt"
 sha256sum "$baseline_binary" | awk '{print $1}' >"$metadata_root/baseline-binary-sha256.txt"
 sha256sum "$candidate_binary" | awk '{print $1}' >"$metadata_root/candidate-binary-sha256.txt"
+printf '%s\n' "$build_policy_mode" >"$metadata_root/build-policy-mode.txt"
+printf '%s\n' "$experiment" >"$metadata_root/experiment.txt"
+if [[ "$experiment" == "simplec" ]]; then
+    [[ "$baseline_binary" == "$candidate_binary" ]] || fail "simplec binary path is not shared"
+    [[ "$(sha256sum "$baseline_binary" | awk '{print $1}')" == "$(cat "$metadata_root/candidate-binary-sha256.txt")" ]] || fail "simplec shared binary SHA-256 differs"
+fi
 rustc "+$rust_toolchain" -vV >"$metadata_root/rustc-vv.txt"
 cargo "+$rust_toolchain" --version >"$metadata_root/cargo-version.txt"
 uname -a >"$metadata_root/uname.txt"
@@ -800,6 +1110,11 @@ patch_candidate_reltol() {
 verify_case_reltol() {
     local solution_path="$1" expected_p="$2" expected_u="$3"
     run_reltol_tool verify "$solution_path" "$expected_p" "$expected_u"
+}
+
+verify_case_consistent() {
+    local solution_path="$1" expected="$2"
+    run_simple_consistent_tool verify "$solution_path" "$expected"
 }
 
 canonicalize_report() {
@@ -853,20 +1168,36 @@ PY
 
 prepare_case() {
     local ref_name="$1" case_name="$2" working_case="$3"
+    local expected_solution_hash=""
     mkdir -p "$working_case"
     cp -a "$templates_root/$case_name/." "$working_case/"
-    if [[ "$ref_name" == "candidate" ]]; then
-        patch_candidate_reltol "$working_case/system/fvSolution"
-        verify_case_reltol "$working_case/system/fvSolution" "$candidate_pressure_reltol" "$candidate_momentum_reltol"
+    local solution_path="$working_case/system/fvSolution"
+    if [[ "$experiment" == "simplec" ]]; then
+        verify_case_reltol "$solution_path" 0 0
+        if [[ "$ref_name" == "candidate" ]]; then
+            run_simple_consistent_tool patch "$solution_path"
+            verify_case_consistent "$solution_path" true
+            expected_solution_hash="$(jq -r --arg case "$case_name" '.cases[] | select(.name == $case) | .candidateFvSolutionSha256' "$metadata_root/input-manifest.json")"
+        else
+            verify_case_consistent "$solution_path" false
+            expected_solution_hash="$(jq -r --arg case "$case_name" '.cases[] | select(.name == $case) | .baselineFvSolutionSha256' "$metadata_root/input-manifest.json")"
+        fi
+        [[ "$expected_solution_hash" =~ ^[0-9a-f]{64}$ ]] || fail "$case_name $ref_name expected fvSolution SHA-256 is invalid"
+        [[ "$(sha256sum "$solution_path" | awk '{print $1}')" == "$expected_solution_hash" ]] || fail "$case_name $ref_name fvSolution differs from manifest control bytes"
+    elif [[ "$ref_name" == "candidate" ]]; then
+        patch_candidate_reltol "$solution_path"
+        verify_case_reltol "$solution_path" "$candidate_pressure_reltol" "$candidate_momentum_reltol"
+        verify_case_consistent "$solution_path" false
     else
-        verify_case_reltol "$working_case/system/fvSolution" 0 0
+        verify_case_reltol "$solution_path" 0 0
+        verify_case_consistent "$solution_path" false
     fi
 }
 
 validate_report_contract() {
     local report_path="$1" ref_name="$2" case_name="$3" kind="$4" ordinal="$5"
     python3 - "$report_path" "$ref_name" "$pressure_solver" "$candidate_pressure_reltol" "$candidate_momentum_reltol" "$max_simple_iterations" \
-        "$case_name" "$kind" "$ordinal" "$report_proof_entries_path" "$export_root" <<'PY'
+        "$case_name" "$kind" "$ordinal" "$report_proof_entries_path" "$export_root" "$experiment" <<'PY'
 import hashlib, json, math, os, pathlib, re, sys
 report_path = pathlib.Path(sys.argv[1])
 report_bytes = report_path.read_bytes()
@@ -876,6 +1207,8 @@ expected_momentum_reltol = float(sys.argv[5]) if ref_name == "candidate" else 0.
 max_simple_iterations = int(sys.argv[6])
 case_name, kind, ordinal = sys.argv[7], sys.argv[8], int(sys.argv[9])
 entries_path, export_root = pathlib.Path(sys.argv[10]), pathlib.Path(sys.argv[11])
+experiment = sys.argv[12]
+if experiment not in ("reltol", "simplec"): raise SystemExit("report experiment is invalid")
 
 def strict_json_loads(text):
     def unique_object(pairs):
@@ -974,10 +1307,13 @@ if int_value(linear, "momentumComponentNonConvergedSolves", "$.linearSolves") !=
 momentum_solver = string_value(options, "momentumLinearSolver", "$.options")
 pressure_solver = string_value(options, "pressureLinearSolver", "$.options")
 if pressure_solver.casefold() != requested_pressure_solver.casefold(): raise SystemExit("pressure solver differs from request")
+expected_consistent = experiment == "simplec" and ref_name == "candidate"
+if bool_value(options, "consistent", "$.options") is not expected_consistent:
+    raise SystemExit("reported SIMPLE consistent option differs from staged case")
 momentum_absolute = number_value(options, "momentumLinearTolerance", "$.options")
 pressure_absolute = number_value(options, "pressureLinearTolerance", "$.options")
 if min(momentum_absolute, pressure_absolute) < 0.0: raise SystemExit("linear absolute tolerance is negative")
-if ref_name == "candidate":
+if ref_name == "candidate" or experiment == "simplec":
     if number_value(options, "momentumLinearRelativeTolerance", "$.options") != expected_momentum_reltol:
         raise SystemExit("candidate momentum relTol differs")
     if number_value(options, "pressureLinearRelativeTolerance", "$.options") != expected_pressure_reltol:
@@ -1157,10 +1493,19 @@ for case_name in "${case_rows[@]}"; do
     run_oracle_ref candidate "$candidate_binary" "$case_name" "$raw_root/$case_name/oracle-candidate"
 done
 
+baseline_binary_sha256="$(cat "$metadata_root/baseline-binary-sha256.txt")"
+candidate_binary_sha256="$(cat "$metadata_root/candidate-binary-sha256.txt")"
+[[ "$(sha256sum "$baseline_binary" | awk '{print $1}')" == "$baseline_binary_sha256" ]] || fail "baseline binary changed during benchmark execution"
+[[ "$(sha256sum "$candidate_binary" | awk '{print $1}')" == "$candidate_binary_sha256" ]] || fail "candidate binary changed during benchmark execution"
+if [[ "$experiment" == "simplec" ]]; then
+    [[ "$baseline_binary" == "$candidate_binary" && "$baseline_binary_sha256" == "$candidate_binary_sha256" ]] || fail "simplec shared binary identity changed"
+fi
+
 run_report_proof_tool finalize "$report_proof_entries_path" "$export_root" \
     "$metadata_root/exact-report-validation.json" "$metadata_root/exact-report-validation.sha256" \
     "$metadata_root/input-manifest.json" "$actual_controls_sha256" "$warmup_runs" "$measured_runs" \
-    "$max_simple_iterations" "$pressure_solver" "$candidate_pressure_reltol" "$candidate_momentum_reltol"
+    "$max_simple_iterations" "$pressure_solver" "$candidate_pressure_reltol" "$candidate_momentum_reltol" \
+    "$experiment" "$build_policy_mode" "$baseline_binary_sha256" "$candidate_binary_sha256"
 
 archive_on_ext4="$workspace/ferrum-linux-tta-ab-results.tar"
 tar -cf "$archive_on_ext4" -C "$export_root" .
