@@ -37,7 +37,7 @@ if ([string]::IsNullOrWhiteSpace($ExpectedChangedPath) -or $ExpectedChangedPath.
 if ($null -eq (Get-Command wsl -ErrorAction SilentlyContinue)) { throw "wsl.exe was not found" }
 
 $workerWslPath = ConvertTo-MatchedWslPath $WorkerPath $Distro
-$workerBootstrap = 'set -o pipefail; tr -d ''\r'' < "\$1" | bash -s -- "\${@:2}"'
+$workerBootstrap = 'set -o pipefail; tr -d ''\r'' < "$1" | bash -s -- "${@:2}"'
 $preflightArguments = @(
     "-d", $Distro, "--", "bash", "-c", $workerBootstrap, "ferrum-linux-ref-ab-worker", $workerWslPath,
     "--preflight-only", "--rust-toolchain", $RustToolchain, "--cpu-set", $CpuSet,
