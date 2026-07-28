@@ -585,8 +585,12 @@ The first optimization sequence is tracked as follows:
 20. continue isolated CSR residual, scaling, and row-traversal leaves because
     smoothing plus scaling dominate the measured GAMG pressure time. Cached
     diagonal values made the measured scaling phase faster but failed the
-    frozen two-case total pressure-time gate and remain unmerged. Inspect exact
-    FCG reduction-traversal reuse next before changing arithmetic;
+    frozen two-case total pressure-time gate and remain unmerged. Exact FCG
+    reduction-traversal reuse passed every source and numerical gate and showed
+    a promising Stage A, but the stricter two-case `2+10` decision gate rejected
+    it; that leaf also remains local and unmerged. Evaluate reciprocal-diagonal
+    SymGS only as a separate numerical research leaf with an explicit accuracy
+    and failure-semantics contract because it changes floating-point arithmetic;
 21. completed: add a profiled-only GAMG hierarchy diagnostic gate with exact
     level/transfer shapes, aggregate histograms, grid/operator-complexity terms,
     NNZ-weighted work proxies, and coarsest-iteration counts. Cache the static
@@ -1188,6 +1192,26 @@ The immediate sequence is:
     below `3e-17`. Accept FCG as an explicit opt-in path only. These two
     fixed-work cases do not justify a general speed claim or a default change;
     time-to-accuracy evidence and deferred focused Fable review still follow.
+    A later one-file clean-base leaf on `e0f0c90` fused the six logical FCG
+    scalar reductions into one row-ordered traversal while retaining five
+    independent accumulators and the logical `outerReductions += 6` telemetry.
+    Product order, row order, square roots, comparisons, breakdown precedence,
+    workspace state, reports, and final fields remained exact. Eight focused
+    debug and release FCG proofs, all 53 GAMG tests, the full 489-test workspace
+    gate plus one intentional performance ignore, Rust 1.94 locked/offline
+    Clippy, and two independent source reviews passed. Native Linux CPU2 Stage A
+    was promising, reducing the raw unprofiled pressure median by `13.19%` for
+    Pipe and `14.31%` for Channel. The predeclared unprofiled `2+10` decision
+    gate did not reproduce a robust two-case win. Pipe regressed by `9.41%` raw
+    and `19.48%` paired, won only `4/10` pairs, and split by order cohort into
+    `-14.43%` and `+44.58%`. Channel improved by `6.10%` raw and `8.09%` paired,
+    won `7/10` pairs, and improved both cohorts, but its paired improvement of
+    `0.08090` was below the required `2 * MAD = 0.23528` robustness margin. All
+    canonical reports, final `U`/`p`, counters, and weighted-work values remained
+    exact. The leaf is rejected, local, and unmerged; no speedup or publication
+    claim is made. The `2+10` evidence manifest SHA256 is
+    `69531f6a7952e52646f1a13b193bbdad55be169bb8d74d526ab094d82c0056b6`.
+    Focused Fable review remains deferred with the other accepted-source audits.
 15. **F-PERF-ADAPTIVE-POLICY (telemetry first):** After the FCG experiment,
     record per-solve normalized-L1 reduction, iterations, V-cycles, weighted
     work, and convergence-rate history before changing any tolerance or sweep
