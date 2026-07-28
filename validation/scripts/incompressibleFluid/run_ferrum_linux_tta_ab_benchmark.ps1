@@ -3,6 +3,8 @@ param(
     [string]$BaselineRef,
     [Parameter(Mandatory = $true)]
     [string]$CandidateRef,
+    [ValidateSet("relTol", "simplec")]
+    [string]$Experiment = "relTol",
     [string[]]$ExpectedChangedPaths = @(
         "applications/legacy/ferrumCli/src/lib.rs",
         "src/ferrumMesh/src/flow.rs"
@@ -66,14 +68,36 @@ Assert-ControlSourcesUnchanged "while loading the common helper"
 
 $RepoRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
 $TargetRoot = Join-Path $RepoRoot "target"
+$Experiment = $Experiment.ToLowerInvariant()
+$simplecExperiment = $Experiment -ceq "simplec"
+if ($simplecExperiment) {
+    if ($BaselineRef -cne $CandidateRef) { throw "simplec requires BaselineRef and CandidateRef to be the same exact ref text" }
+    if ($PSBoundParameters.ContainsKey("ExpectedChangedPaths") -and $ExpectedChangedPaths.Count -ne 0) {
+        throw "simplec requires an empty ExpectedChangedPaths set"
+    }
+    if ($PSBoundParameters.ContainsKey("CandidatePressureRelTol") -and $CandidatePressureRelTol -ne 0.0) {
+        throw "simplec requires candidate p relTol to be exactly zero"
+    }
+    if ($PSBoundParameters.ContainsKey("CandidateMomentumRelTol") -and $CandidateMomentumRelTol -ne 0.0) {
+        throw "simplec requires candidate U relTol to be exactly zero"
+    }
+    $CandidatePressureRelTol = 0.0
+    $CandidateMomentumRelTol = 0.0
+    [string[]]$effectiveChangedPaths = @()
+} else {
+    [string[]]$effectiveChangedPaths = @($ExpectedChangedPaths)
+}
+$baselineSimpleConsistent = $false
+$candidateSimpleConsistent = $simplecExperiment
+$buildPolicyMode = if ($simplecExperiment) { "shared-single-build" } else { "separate-builds" }
 if ($WarmupRuns -lt 2) { throw "WarmupRuns must be at least two" }
 if ($MeasuredRuns -lt 10 -or ($MeasuredRuns % 2) -ne 0) { throw "MeasuredRuns must be an even integer of at least ten" }
 if ($MaxSimpleIterations -lt 1) { throw "MaxSimpleIterations must be positive" }
 if ($CpuSet -notmatch "^[0-9]+([,-][0-9]+)*$") { throw "CpuSet is invalid: $CpuSet" }
-if ($ExpectedChangedPaths.Count -eq 0 -or @($ExpectedChangedPaths | Sort-Object -Unique).Count -ne $ExpectedChangedPaths.Count) {
+if (!$simplecExperiment -and ($effectiveChangedPaths.Count -eq 0 -or @($effectiveChangedPaths | Sort-Object -Unique).Count -ne $effectiveChangedPaths.Count)) {
     throw "ExpectedChangedPaths must be a non-empty unique path set"
 }
-foreach ($path in $ExpectedChangedPaths) {
+foreach ($path in $effectiveChangedPaths) {
     if ([string]::IsNullOrWhiteSpace($path) -or $path.Contains("\") -or $path.StartsWith("/") -or $path -match "(^|/)\.\.(/|$)") {
         throw "ExpectedChangedPaths contains an unsafe repository-relative path: $path"
     }
@@ -96,7 +120,7 @@ foreach ($entry in @(
         throw "$name is outside its finite accepted range"
     }
 }
-if ($CandidatePressureRelTol -eq 0.0 -and $CandidateMomentumRelTol -eq 0.0) {
+if (!$simplecExperiment -and $CandidatePressureRelTol -eq 0.0 -and $CandidateMomentumRelTol -eq 0.0) {
     throw "candidate p and U relTol must not both be zero in a TTA experiment"
 }
 function Test-TtaLinearRelTolActive([bool]$IsGamg, [double]$RelTol) {
@@ -329,6 +353,115 @@ function Assert-ZeroProfileRelTol([string]$Path) {
     if (!(Test-Path -LiteralPath $Path -PathType Leaf)) { throw "baseline convergence profile is missing: $Path" }
     Assert-TtaZeroProfileRelTolText (Get-Content -LiteralPath $Path -Raw) $Path
 }
+
+function Get-TtaSimpleConsistentToken([string]$Content, [string]$Description) {
+    $tokens = @(ConvertTo-TtaFoamTokens $Content $Description)
+    $activeDirectives = @($tokens | Where-Object { $_.kind -ceq "directive" })
+    if ($activeDirectives.Count -ne 0) {
+        throw "$Description contains an active OpenFOAM directive at offset $($activeDirectives[0].offset)"
+    }
+    $bracePairs = Get-TtaFoamBracePairs $tokens $Description
+    $topLevel = @(Get-TtaFoamDirectEntries $tokens 0 $tokens.Count $bracePairs $Description)
+    $simpleEntries = @($topLevel | Where-Object { $_.keyKind -ceq "word" -and $_.name -ceq "SIMPLE" })
+    if ($simpleEntries.Count -ne 1 -or $simpleEntries[0].entryKind -cne "dictionary") {
+        throw "$Description must contain exactly one active top-level ordinary SIMPLE dictionary"
+    }
+    $simple = $simpleEntries[0]
+    $simpleOptions = @(Get-TtaFoamDirectEntries $tokens ($simple.openingIndex + 1) $simple.closingIndex $bracePairs "$Description.SIMPLE")
+    $consistentEntries = @($simpleOptions | Where-Object { $_.keyKind -ceq "word" -and $_.name -ceq "consistent" })
+    if ($consistentEntries.Count -ne 1 -or $consistentEntries[0].entryKind -cne "scalar") {
+        throw "$Description.SIMPLE.consistent must be exactly one direct ordinary scalar entry"
+    }
+    $valueTokens = @($consistentEntries[0].valueTokens)
+    if ($valueTokens.Count -ne 1 -or $valueTokens[0].kind -cne "word" -or
+        ($valueTokens[0].text -cne "false" -and $valueTokens[0].text -cne "true")) {
+        throw "$Description.SIMPLE.consistent must contain exactly one direct unquoted lowercase boolean token"
+    }
+    return $valueTokens[0]
+}
+
+function Invoke-TtaSimpleConsistentBytes([byte[]]$Bytes, [bool]$Expected, [bool]$PatchToTrue, [string]$Description) {
+    if ($null -eq $Bytes -or $Bytes.Count -eq 0) { throw "$Description is empty" }
+    $hasBom = $Bytes.Count -ge 3 -and $Bytes[0] -eq 0xef -and $Bytes[1] -eq 0xbb -and $Bytes[2] -eq 0xbf
+    $payloadOffset = if ($hasBom) { 3 } else { 0 }
+    $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
+    try {
+        $text = $utf8.GetString($Bytes, $payloadOffset, $Bytes.Count - $payloadOffset)
+    } catch {
+        throw "$Description is not strict UTF-8: $($_.Exception.Message)"
+    }
+    $token = Get-TtaSimpleConsistentToken $text $Description
+    $expectedText = if ($Expected) { "true" } else { "false" }
+    if ($token.text -cne $expectedText) { throw "$Description.SIMPLE.consistent differs from expected '$expectedText'" }
+    $byteStart = $payloadOffset + $utf8.GetByteCount($text.Substring(0, [int]$token.offset))
+    $tokenByteCount = $utf8.GetByteCount([string]$token.text)
+    $byteEnd = $byteStart + $tokenByteCount
+    if (!$PatchToTrue) {
+        return [pscustomobject][ordered]@{ bytes = [byte[]]$Bytes; tokenStart = $byteStart; tokenEnd = $byteEnd }
+    }
+    if ($Expected) { throw "$Description cannot patch an already-true SIMPLE.consistent token" }
+    [byte[]]$replacement = [System.Text.Encoding]::ASCII.GetBytes("true")
+    [byte[]]$patched = New-Object byte[] ($Bytes.Count - $tokenByteCount + $replacement.Count)
+    [System.Buffer]::BlockCopy($Bytes, 0, $patched, 0, $byteStart)
+    [System.Buffer]::BlockCopy($replacement, 0, $patched, $byteStart, $replacement.Count)
+    [System.Buffer]::BlockCopy($Bytes, $byteEnd, $patched, $byteStart + $replacement.Count, $Bytes.Count - $byteEnd)
+    [void](Invoke-TtaSimpleConsistentBytes $patched $true $false "$Description patched")
+    return [pscustomobject][ordered]@{ bytes = $patched; tokenStart = $byteStart; tokenEnd = $byteStart + $replacement.Count }
+}
+
+function Assert-TtaExpectedSimpleConsistentFailure([scriptblock]$Probe, [string]$Description) {
+    $failed = $false
+    try { & $Probe | Out-Null } catch { $failed = $true }
+    if (!$failed) { throw "SIMPLE.consistent fail-closed self-check accepted $Description" }
+}
+
+function Invoke-TtaSimpleConsistentSelfTest {
+    $utf8 = [System.Text.UTF8Encoding]::new($false)
+    $sample = @'
+// SIMPLE { consistent true; }
+"SIMPLE" { consistent true; }
+wrapper { SIMPLE { consistent true; } }
+SIMPLE
+{
+    nNonOrthogonalCorrectors 0;
+    note "consistent true; }";
+    consistent false;
+}
+'@
+    [byte[]]$before = $utf8.GetBytes($sample)
+    $transformed = Invoke-TtaSimpleConsistentBytes $before $false $true "host SIMPLE.consistent positive self-test"
+    [byte[]]$after = $transformed.bytes
+    [byte[]]$expected = $utf8.GetBytes($sample.Replace("    consistent false;", "    consistent true;"))
+    if ([Convert]::ToBase64String($after) -cne [Convert]::ToBase64String($expected)) {
+        throw "host SIMPLE.consistent self-test changed bytes outside the direct false token"
+    }
+    [void](Invoke-TtaSimpleConsistentBytes $after $true $false "host SIMPLE.consistent true verification self-test")
+    $malformed = [ordered]@{
+        "missing SIMPLE" = "// SIMPLE { consistent false; }"
+        "quoted SIMPLE" = '"SIMPLE" { consistent false; }'
+        "nested-only SIMPLE" = "wrapper { SIMPLE { consistent false; } }"
+        "duplicate SIMPLE" = "SIMPLE { consistent false; } SIMPLE { consistent false; }"
+        "missing consistent" = "SIMPLE { nNonOrthogonalCorrectors 0; }"
+        "duplicate consistent" = "SIMPLE { consistent false; consistent false; }"
+        "nested-only consistent" = "SIMPLE { controls { consistent false; } }"
+        "quoted consistent key" = 'SIMPLE { "consistent" false; }'
+        "quoted boolean value" = 'SIMPLE { consistent "false"; }'
+        "multitoken boolean" = "SIMPLE { consistent false true; }"
+        "dictionary boolean" = "SIMPLE { consistent { value false; } }"
+        "noncanonical boolean" = "SIMPLE { consistent False; }"
+        "active directive" = "#include `"other`"`nSIMPLE { consistent false; }"
+        "unterminated block" = "SIMPLE { consistent false; "
+        "unterminated comment" = "SIMPLE { consistent false; } /*"
+        "unterminated string" = 'SIMPLE { note "bad; consistent false; }'
+    }
+    foreach ($entry in $malformed.GetEnumerator()) {
+        [byte[]]$raw = $utf8.GetBytes([string]$entry.Value)
+        Assert-TtaExpectedSimpleConsistentFailure { Invoke-TtaSimpleConsistentBytes $raw $false $false "host malformed self-test" } $entry.Key
+    }
+    Assert-TtaExpectedSimpleConsistentFailure { Invoke-TtaSimpleConsistentBytes $after $false $true "host already-true patch self-test" } "an already-true candidate source"
+}
+
+Invoke-TtaSimpleConsistentSelfTest
 
 function Assert-TtaPositivePressureSolveCount([long]$Count, [string]$Path) {
     if ($Count -lt 1) { throw "$Path.pressureLinearSolves must be at least one" }
@@ -652,6 +785,7 @@ $workerBootstrap = 'set -o pipefail; tr -d ''\r'' < "\$1" | bash -s -- "\${@:2}"
 $preflightArguments = @(
     "-d", $Distro, "--", "bash", "-c", $workerBootstrap, "ferrum-linux-tta-ab-worker", $workerWslPath,
     "--preflight-only", "--rust-toolchain", $RustToolchain, "--cpu-set", $CpuSet,
+    "--experiment", $Experiment,
     "--build-variant", $BuildVariant,
     "--warmup-runs", $WarmupRuns.ToString([System.Globalization.CultureInfo]::InvariantCulture),
     "--measured-runs", $MeasuredRuns.ToString([System.Globalization.CultureInfo]::InvariantCulture),
@@ -676,6 +810,7 @@ if ($PreflightOnly) {
     Write-Output "host_exact_report_proof_identity_self_test=pass"
     Write-Output "host_contract_negative_self_test=pass"
     Write-Output "host_profile_block_self_test=pass"
+    Write-Output "host_simple_consistent_token_mutation_self_test=pass"
     Write-Output "host_reltol_boundary_self_test=pass"
     $preflightOutput | Write-Output
     return
@@ -688,25 +823,29 @@ function Resolve-ExactCommit([string]$Ref, [string]$Label) {
 }
 
 $baselineCommit = Resolve-ExactCommit $BaselineRef "baseline"
-$candidateCommit = Resolve-ExactCommit $CandidateRef "candidate"
-if ($baselineCommit -eq $candidateCommit) { throw "baseline and candidate commits must differ" }
+$candidateCommit = if ($simplecExperiment) { $baselineCommit } else { Resolve-ExactCommit $CandidateRef "candidate" }
+if (!$simplecExperiment -and $baselineCommit -eq $candidateCommit) { throw "baseline and candidate commits must differ" }
 $baselineTree = (& git -C $RepoRoot rev-parse "$baselineCommit`^{tree}").Trim()
-$candidateTree = (& git -C $RepoRoot rev-parse "$candidateCommit`^{tree}").Trim()
+$candidateTree = if ($simplecExperiment) { $baselineTree } else { (& git -C $RepoRoot rev-parse "$candidateCommit`^{tree}").Trim() }
 if ($baselineTree -notmatch "^[0-9a-f]{40}$" -or $candidateTree -notmatch "^[0-9a-f]{40}$") { throw "could not resolve exact baseline/candidate trees" }
 
-$candidateLine = ((& git -C $RepoRoot rev-list --parents -n 1 $candidateCommit) -join " ").Trim()
-if ($LASTEXITCODE -ne 0) { throw "could not inspect candidate parents" }
-$candidateParts = @($candidateLine -split "\s+" | Where-Object { $_ })
-if ($candidateParts.Count -ne 2 -or $candidateParts[0] -ne $candidateCommit -or $candidateParts[1] -ne $baselineCommit) {
-    throw "candidate must be a single-parent direct child of the exact baseline"
-}
-$changedPaths = [string[]]@(& git -C $RepoRoot diff --name-only --no-renames $baselineCommit $candidateCommit --)
-if ($LASTEXITCODE -ne 0 -or @(Compare-Object ([string[]]@($ExpectedChangedPaths | Sort-Object)) ([string[]]@($changedPaths | Sort-Object)) -CaseSensitive).Count -ne 0) {
-    throw "candidate changed-path set differs; expected '$($ExpectedChangedPaths -join ', ')', found '$($changedPaths -join ', ')'"
+if ($simplecExperiment) {
+    [string[]]$changedPaths = @()
+} else {
+    $candidateLine = ((& git -C $RepoRoot rev-list --parents -n 1 $candidateCommit) -join " ").Trim()
+    if ($LASTEXITCODE -ne 0) { throw "could not inspect candidate parents" }
+    $candidateParts = @($candidateLine -split "\s+" | Where-Object { $_ })
+    if ($candidateParts.Count -ne 2 -or $candidateParts[0] -ne $candidateCommit -or $candidateParts[1] -ne $baselineCommit) {
+        throw "candidate must be a single-parent direct child of the exact baseline"
+    }
+    [string[]]$changedPaths = @(& git -C $RepoRoot diff --name-only --no-renames $baselineCommit $candidateCommit --)
+    if ($LASTEXITCODE -ne 0 -or @(Compare-Object ([string[]]@($effectiveChangedPaths | Sort-Object)) ([string[]]@($changedPaths | Sort-Object)) -CaseSensitive).Count -ne 0) {
+        throw "candidate changed-path set differs; expected '$($effectiveChangedPaths -join ', ')', found '$($changedPaths -join ', ')'"
+    }
 }
 
 $baselineCargoLockBlob = (& git -C $RepoRoot rev-parse "$baselineCommit`:Cargo.lock" 2>$null).Trim()
-$candidateCargoLockBlob = (& git -C $RepoRoot rev-parse "$candidateCommit`:Cargo.lock" 2>$null).Trim()
+$candidateCargoLockBlob = if ($simplecExperiment) { $baselineCargoLockBlob } else { (& git -C $RepoRoot rev-parse "$candidateCommit`:Cargo.lock" 2>$null).Trim() }
 if ($LASTEXITCODE -ne 0 -or $baselineCargoLockBlob -notmatch "^[0-9a-f]{40}$" -or $baselineCargoLockBlob -ne $candidateCargoLockBlob) {
     throw "baseline and candidate must reference the identical Cargo.lock blob"
 }
@@ -719,7 +858,8 @@ $caseSelector = switch ($CaseName) {
     "channel" { "planeChannel" }
 }
 if ([string]::IsNullOrWhiteSpace($OutRoot)) {
-    $OutRoot = Join-Path $TargetRoot "benchmarks\ferrum_linux_tta_ab\$PressureSolver-$BuildVariant"
+    $defaultLeaf = if ($simplecExperiment) { "$PressureSolver-$BuildVariant-simplec" } else { "$PressureSolver-$BuildVariant" }
+    $OutRoot = Join-Path $TargetRoot "benchmarks\ferrum_linux_tta_ab\$defaultLeaf"
 }
 $OutRoot = [System.IO.Path]::GetFullPath($OutRoot)
 $benchmarkOutputRoot = [System.IO.Path]::GetFullPath((Join-Path $TargetRoot "benchmarks\ferrum_linux_tta_ab")).TrimEnd("\", "/")
@@ -749,11 +889,15 @@ try {
     $controlsArchiveSha256 = (Get-FileHash -LiteralPath $controlsArchive -Algorithm SHA256).Hash.ToLowerInvariant()
 
     $baselineArchive = Join-Path $stageRoot "baseline.tar"
-    $candidateArchive = Join-Path $stageRoot "candidate.tar"
     & git -C $RepoRoot archive --format=tar --output=$baselineArchive $baselineCommit
     if ($LASTEXITCODE -ne 0) { throw "could not archive exact baseline commit" }
-    & git -C $RepoRoot archive --format=tar --output=$candidateArchive $candidateCommit
-    if ($LASTEXITCODE -ne 0) { throw "could not archive exact candidate commit" }
+    if ($simplecExperiment) {
+        $candidateArchive = $baselineArchive
+    } else {
+        $candidateArchive = Join-Path $stageRoot "candidate.tar"
+        & git -C $RepoRoot archive --format=tar --output=$candidateArchive $candidateCommit
+        if ($LASTEXITCODE -ne 0) { throw "could not archive exact candidate commit" }
+    }
     Assert-MatchedSafeTarArchive $baselineArchive "exact baseline source"
     Assert-MatchedSafeTarArchive $candidateArchive "exact candidate source"
     $baselineArchiveSha256 = (Get-FileHash -LiteralPath $baselineArchive -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -802,11 +946,19 @@ try {
         New-MatchedFerrumWorkingCase $case $destination $case.profile $templatesRoot | Out-Null
         $canonicalHashes = Get-MatchedPolyMeshHashes $case.ferrumCase
         Assert-MatchedHashesEqual $canonicalHashes (Get-MatchedPolyMeshHashes $destination) "$($case.name) TTA template"
-        $manifestCases += [pscustomobject][ordered]@{
+        $baselineSolutionPath = Join-Path $destination "system\fvSolution"
+        [byte[]]$baselineSolutionBytes = [System.IO.File]::ReadAllBytes($baselineSolutionPath)
+        [void](Invoke-TtaSimpleConsistentBytes $baselineSolutionBytes $false $false "$($case.name) baseline template")
+        $manifestCase = [ordered]@{
             name = $case.name
             canonicalPolyMeshSha256 = $canonicalHashes
-            baselineFvSolutionSha256 = (Get-FileHash -LiteralPath (Join-Path $destination "system\fvSolution") -Algorithm SHA256).Hash.ToLowerInvariant()
+            baselineFvSolutionSha256 = (Get-FileHash -LiteralPath $baselineSolutionPath -Algorithm SHA256).Hash.ToLowerInvariant()
         }
+        if ($simplecExperiment) {
+            $candidateTransform = Invoke-TtaSimpleConsistentBytes $baselineSolutionBytes $false $true "$($case.name) candidate template"
+            $manifestCase.candidateFvSolutionSha256 = Get-TtaSha256Bytes ([byte[]]$candidateTransform.bytes)
+        }
+        $manifestCases += [pscustomobject]$manifestCase
     }
     $templatesArchive = Join-Path $stageRoot "templates.tar"
     & tar -cf $templatesArchive -C $templatesRoot .
@@ -815,15 +967,23 @@ try {
     $templatesArchiveSha256 = (Get-FileHash -LiteralPath $templatesArchive -Algorithm SHA256).Hash.ToLowerInvariant()
 
     $inputManifest = [pscustomobject][ordered]@{
-        schemaVersion = 1
+        schemaVersion = 2
         benchmark = "ferrum-linux-time-to-accuracy-ab"
+        experiment = $Experiment
         baseline = [pscustomobject][ordered]@{ commit = $baselineCommit; tree = $baselineTree; archiveSha256 = $baselineArchiveSha256 }
         candidate = [pscustomobject][ordered]@{ commit = $candidateCommit; tree = $candidateTree; archiveSha256 = $candidateArchiveSha256 }
-        relationship = [pscustomobject][ordered]@{ directChild = $true; exactChangedPaths = [string[]]@($ExpectedChangedPaths | Sort-Object) }
+        relationship = [pscustomobject][ordered]@{
+            mode = $(if ($simplecExperiment) { "identical-source" } else { "direct-child-exact-paths" })
+            directChild = !$simplecExperiment
+            identicalSource = $simplecExperiment
+            exactChangedPaths = [string[]]@($effectiveChangedPaths | Sort-Object)
+        }
         cargoLock = [pscustomobject][ordered]@{ blob = $baselineCargoLockBlob; sha256 = $baselineCargoLockSha256 }
+        buildPolicy = [pscustomobject][ordered]@{ mode = $buildPolicyMode; sameBinary = $simplecExperiment }
         pressureSolver = $PressureSolver
         baselineRelTol = [pscustomobject][ordered]@{ p = "0"; U = "0" }
         candidateRelTol = [pscustomobject][ordered]@{ p = $pressureRelTolText; U = $momentumRelTolText }
+        consistentPolicy = [pscustomobject][ordered]@{ baseline = $baselineSimpleConsistent; candidate = $candidateSimpleConsistent }
         maxSimpleIterations = $MaxSimpleIterations
         controls = [pscustomobject][ordered]@{ archiveSha256 = $controlsArchiveSha256; files = $manifestControls }
         cases = $manifestCases
@@ -837,6 +997,7 @@ try {
     $runArguments = @(
         "-d", $Distro, "--", "bash", "-c", $workerBootstrap, "ferrum-linux-tta-ab-worker", $boundWorkerWslPath,
         "--rust-toolchain", $RustToolchain, "--cpu-set", $CpuSet, "--build-variant", $BuildVariant,
+        "--experiment", $Experiment,
         "--warmup-runs", $WarmupRuns.ToString([System.Globalization.CultureInfo]::InvariantCulture),
         "--measured-runs", $MeasuredRuns.ToString([System.Globalization.CultureInfo]::InvariantCulture),
         "--pressure-solver", $PressureSolver,
@@ -894,6 +1055,17 @@ try {
     }
     if ((Get-Content -LiteralPath (Join-Path $OutRoot "metadata\controls-archive-sha256.txt") -Raw).Trim() -ne $controlsArchiveSha256) {
         throw "worker control archive hash binding differs"
+    }
+    $actualBuildPolicyMode = (Get-Content -LiteralPath (Join-Path $OutRoot "metadata\build-policy-mode.txt") -Raw).Trim()
+    $actualExperiment = (Get-Content -LiteralPath (Join-Path $OutRoot "metadata\experiment.txt") -Raw).Trim()
+    $baselineBinarySha256 = (Get-Content -LiteralPath (Join-Path $OutRoot "metadata\baseline-binary-sha256.txt") -Raw).Trim()
+    $candidateBinarySha256 = (Get-Content -LiteralPath (Join-Path $OutRoot "metadata\candidate-binary-sha256.txt") -Raw).Trim()
+    if ($actualExperiment -cne $Experiment -or $actualBuildPolicyMode -cne $buildPolicyMode -or $baselineBinarySha256 -notmatch '^[0-9a-f]{64}$' -or
+        $candidateBinarySha256 -notmatch '^[0-9a-f]{64}$') {
+        throw "worker build-policy or binary SHA-256 metadata differs"
+    }
+    if ($simplecExperiment -and $baselineBinarySha256 -cne $candidateBinarySha256) {
+        throw "simplec did not use one exact shared binary"
     }
     Assert-ControlSourcesUnchanged "after result extraction"
 
@@ -962,9 +1134,9 @@ try {
         Remove-Item -LiteralPath $proofSnapshotPath -Force -ErrorAction SilentlyContinue
     }
     Assert-TtaExactJsonProperties $proof @("benchmark", "controlsArchiveSha256", "inputManifestSha256", "reportCount", "reports", "runPolicy", "schemaVersion", "validator") "$.exactReportProof"
-    if ((Get-TtaRequiredJsonInteger $proof "schemaVersion" "$.exactReportProof") -ne 1 -or
+    if ((Get-TtaRequiredJsonInteger $proof "schemaVersion" "$.exactReportProof") -ne 2 -or
         (Get-TtaRequiredJsonString $proof "benchmark" "$.exactReportProof") -cne "ferrum-linux-time-to-accuracy-ab" -or
-        (Get-TtaRequiredJsonString $proof "validator" "$.exactReportProof") -cne "worker-python-exact-report-contract-v1" -or
+        (Get-TtaRequiredJsonString $proof "validator" "$.exactReportProof") -cne "worker-python-exact-report-contract-v2" -or
         (Get-TtaRequiredJsonString $proof "controlsArchiveSha256" "$.exactReportProof") -cne $controlsArchiveSha256) {
         throw "worker exact-report validation proof metadata differs"
     }
@@ -976,15 +1148,26 @@ try {
         throw "worker exact-report validation proof manifest binding differs"
     }
     $proofRunPolicy = Get-TtaRequiredJsonObject $proof "runPolicy" "$.exactReportProof"
-    Assert-TtaExactJsonProperties $proofRunPolicy @("candidateRelTol", "maxSimpleIterations", "measuredRuns", "pressureSolver", "warmupRuns") "$.exactReportProof.runPolicy"
+    Assert-TtaExactJsonProperties $proofRunPolicy @("buildPolicy", "candidateRelTol", "consistentPolicy", "experiment", "maxSimpleIterations", "measuredRuns", "pressureSolver", "warmupRuns") "$.exactReportProof.runPolicy"
     $proofCandidateRelTol = Get-TtaRequiredJsonObject $proofRunPolicy "candidateRelTol" "$.exactReportProof.runPolicy"
     Assert-TtaExactJsonProperties $proofCandidateRelTol @("U", "p") "$.exactReportProof.runPolicy.candidateRelTol"
+    $proofConsistentPolicy = Get-TtaRequiredJsonObject $proofRunPolicy "consistentPolicy" "$.exactReportProof.runPolicy"
+    Assert-TtaExactJsonProperties $proofConsistentPolicy @("baseline", "candidate") "$.exactReportProof.runPolicy.consistentPolicy"
+    $proofBuildPolicy = Get-TtaRequiredJsonObject $proofRunPolicy "buildPolicy" "$.exactReportProof.runPolicy"
+    Assert-TtaExactJsonProperties $proofBuildPolicy @("baselineBinarySha256", "candidateBinarySha256", "mode", "sameBinary") "$.exactReportProof.runPolicy.buildPolicy"
     if ((Get-TtaRequiredJsonInteger $proofRunPolicy "warmupRuns" "$.exactReportProof.runPolicy") -ne $WarmupRuns -or
         (Get-TtaRequiredJsonInteger $proofRunPolicy "measuredRuns" "$.exactReportProof.runPolicy") -ne $MeasuredRuns -or
         (Get-TtaRequiredJsonInteger $proofRunPolicy "maxSimpleIterations" "$.exactReportProof.runPolicy") -ne $MaxSimpleIterations -or
         (Get-TtaRequiredJsonString $proofRunPolicy "pressureSolver" "$.exactReportProof.runPolicy") -cne $PressureSolver -or
+        (Get-TtaRequiredJsonString $proofRunPolicy "experiment" "$.exactReportProof.runPolicy") -cne $Experiment -or
         (Get-TtaRequiredJsonString $proofCandidateRelTol "p" "$.exactReportProof.runPolicy.candidateRelTol") -cne $pressureRelTolText -or
-        (Get-TtaRequiredJsonString $proofCandidateRelTol "U" "$.exactReportProof.runPolicy.candidateRelTol") -cne $momentumRelTolText) {
+        (Get-TtaRequiredJsonString $proofCandidateRelTol "U" "$.exactReportProof.runPolicy.candidateRelTol") -cne $momentumRelTolText -or
+        (Get-TtaRequiredJsonBoolean $proofConsistentPolicy "baseline" "$.exactReportProof.runPolicy.consistentPolicy") -ne $baselineSimpleConsistent -or
+        (Get-TtaRequiredJsonBoolean $proofConsistentPolicy "candidate" "$.exactReportProof.runPolicy.consistentPolicy") -ne $candidateSimpleConsistent -or
+        (Get-TtaRequiredJsonString $proofBuildPolicy "mode" "$.exactReportProof.runPolicy.buildPolicy") -cne $buildPolicyMode -or
+        (Get-TtaRequiredJsonBoolean $proofBuildPolicy "sameBinary" "$.exactReportProof.runPolicy.buildPolicy") -ne $simplecExperiment -or
+        (Get-TtaRequiredJsonString $proofBuildPolicy "baselineBinarySha256" "$.exactReportProof.runPolicy.buildPolicy") -cne $baselineBinarySha256 -or
+        (Get-TtaRequiredJsonString $proofBuildPolicy "candidateBinarySha256" "$.exactReportProof.runPolicy.buildPolicy") -cne $candidateBinarySha256) {
         throw "worker exact-report validation proof run policy differs"
     }
     if ((Get-TtaRequiredJsonInteger $proof "reportCount" "$.exactReportProof") -ne $expectedProofReportCount) {
@@ -1045,7 +1228,7 @@ try {
         throw "worker exact-report validation proof changed during host validation"
     }
     $validatedReportProof = [pscustomobject][ordered]@{
-        contract = "worker-python-exact-report-contract-v1"
+        contract = "worker-python-exact-report-contract-v2"
         artifact = Get-ArtifactRelativePath $proofPath
         sha256Artifact = Get-ArtifactRelativePath $proofHashPath
         sha256 = $actualProofSha256
@@ -1132,13 +1315,17 @@ try {
         $history = @(Get-TtaRequiredJsonArray $Report "history" "`$")
         $expectedMomentumRelTol = if ($RefName -eq "candidate") { $CandidateMomentumRelTol } else { 0.0 }
         $expectedPressureRelTol = if ($RefName -eq "candidate") { $CandidatePressureRelTol } else { 0.0 }
+        $expectedConsistent = $simplecExperiment -and $RefName -ceq "candidate"
         $momentumSolver = Get-TtaRequiredJsonString $options "momentumLinearSolver" "`$.options"
         $actualPressureSolver = Get-TtaRequiredJsonString $options "pressureLinearSolver" "`$.options"
         if ($actualPressureSolver -ine $PressureSolver) { throw "$Description pressure solver differs from the requested solver" }
+        if ((Get-TtaRequiredJsonBoolean $options "consistent" "`$.options") -ne $expectedConsistent) {
+            throw "$Description SIMPLE consistent option differs from the staged case"
+        }
         $momentumAbsolute = Get-TtaRequiredJsonNumber $options "momentumLinearTolerance" "`$.options"
         $pressureAbsolute = Get-TtaRequiredJsonNumber $options "pressureLinearTolerance" "`$.options"
         if ($momentumAbsolute -lt 0.0 -or $pressureAbsolute -lt 0.0) { throw "$Description contains a negative absolute tolerance" }
-        if ($RefName -eq "candidate") {
+        if ($RefName -eq "candidate" -or $simplecExperiment) {
             if ((Get-TtaRequiredJsonNumber $options "momentumLinearRelativeTolerance" "`$.options") -ne $expectedMomentumRelTol -or
                 (Get-TtaRequiredJsonNumber $options "pressureLinearRelativeTolerance" "`$.options") -ne $expectedPressureRelTol) {
                 throw "$Description did not report the exact configured candidate relTol controls"
@@ -1295,7 +1482,7 @@ try {
 
     function Read-TtaRun($Case, [string]$Kind, [int]$Ordinal, [string]$RefName) {
         $runRoot = Join-Path $rawRoot "$($Case.name)\$Kind-$Ordinal-$RefName"
-        foreach ($name in @("canonical-report.json", "canonical-report.sha256", "ferrum.log", "process-time.env", "solve-report.json", "case-fvSolution.sha256")) {
+        foreach ($name in @("canonical-report.json", "canonical-report.sha256", "ferrum.log", "process-time.env", "solve-report.json", "case-fvSolution.sha256", "case\system\fvSolution")) {
             if (!(Test-Path -LiteralPath (Join-Path $runRoot $name) -PathType Leaf)) { throw "$($Case.name) $Kind $Ordinal $RefName is missing $name" }
         }
         $timing = Read-MatchedGnuTime (Join-Path $runRoot "process-time.env")
@@ -1306,6 +1493,12 @@ try {
         Assert-EffectiveLinearThresholds $report $RefName "$($Case.name) $Kind $Ordinal $RefName"
         $canonicalHash = Assert-CanonicalReport (Join-Path $runRoot "canonical-report.json") (Join-Path $runRoot "canonical-report.sha256")
         $key = "$($Case.name)|$Kind|$Ordinal|$RefName"
+        $fvSolutionPath = Join-Path $runRoot "case\system\fvSolution"
+        $fvSolutionSha256 = (Get-Content -LiteralPath (Join-Path $runRoot "case-fvSolution.sha256") -Raw).Trim()
+        if ($fvSolutionSha256 -notmatch '^[0-9a-f]{64}$' -or
+            (Get-FileHash -LiteralPath $fvSolutionPath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $fvSolutionSha256) {
+            throw "$($Case.name) $Kind $Ordinal $RefName fvSolution sidecar differs from the exact staged bytes"
+        }
         return [pscustomobject][ordered]@{
             kind = $Kind; ordinal = $Ordinal; ref = $RefName; orderPosition = [int]$expectedOrder[$key]
             commonProcessElapsedSeconds = [double]$timing.elapsedSeconds
@@ -1313,7 +1506,8 @@ try {
             processSystemSeconds = [double]$timing.systemSeconds
             maxResidentSetKiB = [double]$timing.maxRssKiB
             canonicalReportSha256 = $canonicalHash
-            fvSolutionSha256 = (Get-Content -LiteralPath (Join-Path $runRoot "case-fvSolution.sha256") -Raw).Trim()
+            fvSolutionSha256 = $fvSolutionSha256
+            fvSolutionArtifact = Get-ArtifactRelativePath $fvSolutionPath
             simpleIterations = [int]$report.solve.simpleIterations
             momentumLinearIterations = [int]$report.solve.momentumLinearIterations
             pressureLinearIterations = [int]$report.solve.pressureLinearIterations
@@ -1324,7 +1518,7 @@ try {
 
     function Read-TtaOracle($Case, [string]$RefName) {
         $runRoot = Join-Path $rawRoot "$($Case.name)\oracle-$RefName"
-        foreach ($name in @("canonical-report.json", "canonical-report.sha256", "ferrum.log", "solve-report.json", "field-values.json", "case-fvSolution.sha256")) {
+        foreach ($name in @("canonical-report.json", "canonical-report.sha256", "ferrum.log", "solve-report.json", "field-values.json", "case-fvSolution.sha256", "case\system\fvSolution")) {
             if (!(Test-Path -LiteralPath (Join-Path $runRoot $name) -PathType Leaf)) { throw "$($Case.name) $RefName oracle is missing $name" }
         }
         foreach ($fieldName in @("U", "p")) {
@@ -1359,10 +1553,17 @@ try {
             $number = [double]$pValues[$index]
             if ([double]::IsNaN($number) -or [double]::IsInfinity($number)) { throw "$($Case.name) $RefName p[$index] must be finite" }
         }
+        $fvSolutionPath = Join-Path $runRoot "case\system\fvSolution"
+        $fvSolutionSha256 = (Get-Content -LiteralPath (Join-Path $runRoot "case-fvSolution.sha256") -Raw).Trim()
+        if ($fvSolutionSha256 -notmatch '^[0-9a-f]{64}$' -or
+            (Get-FileHash -LiteralPath $fvSolutionPath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $fvSolutionSha256) {
+            throw "$($Case.name) $RefName oracle fvSolution sidecar differs from the exact staged bytes"
+        }
         return [pscustomobject][ordered]@{
             ref = $RefName
             canonicalReportSha256 = $canonicalHash
-            fvSolutionSha256 = (Get-Content -LiteralPath (Join-Path $runRoot "case-fvSolution.sha256") -Raw).Trim()
+            fvSolutionSha256 = $fvSolutionSha256
+            fvSolutionArtifact = Get-ArtifactRelativePath $fvSolutionPath
             report = $report
             fieldValues = $fieldValues
             manifest = Get-ArtifactRelativePath (Join-Path $runRoot "field-values.json")
@@ -1437,6 +1638,27 @@ try {
         if ($baselineSolutionHashes.Count -ne 1 -or $candidateSolutionHashes.Count -ne 1 -or $baselineSolutionHashes[0] -eq $candidateSolutionHashes[0]) {
             throw "$($case.name) staged fvSolution mutation contract failed"
         }
+        $manifestCase = @($manifestCases | Where-Object { $_.name -ceq $case.name })
+        if ($manifestCase.Count -ne 1 -or $baselineSolutionHashes[0] -cne $manifestCase[0].baselineFvSolutionSha256) {
+            throw "$($case.name) baseline fvSolution hash differs from the exact manifest"
+        }
+        $baselineFvSolutionPath = Join-Path $OutRoot $baselineRuns[0].fvSolutionArtifact.Replace('/', '\')
+        $candidateFvSolutionPath = Join-Path $OutRoot $candidateRuns[0].fvSolutionArtifact.Replace('/', '\')
+        [byte[]]$baselineFvSolutionBytes = [System.IO.File]::ReadAllBytes($baselineFvSolutionPath)
+        [byte[]]$candidateFvSolutionBytes = [System.IO.File]::ReadAllBytes($candidateFvSolutionPath)
+        [void](Invoke-TtaSimpleConsistentBytes $baselineFvSolutionBytes $false $false "$($case.name) result baseline")
+        if ($simplecExperiment) {
+            [void](Invoke-TtaSimpleConsistentBytes $candidateFvSolutionBytes $true $false "$($case.name) result candidate")
+            if ($candidateSolutionHashes[0] -cne $manifestCase[0].candidateFvSolutionSha256) {
+                throw "$($case.name) candidate SIMPLEC fvSolution hash differs from the exact manifest"
+            }
+            $expectedCandidateTransform = Invoke-TtaSimpleConsistentBytes $baselineFvSolutionBytes $false $true "$($case.name) exact SIMPLEC delta"
+            if ([Convert]::ToBase64String([byte[]]$expectedCandidateTransform.bytes) -cne [Convert]::ToBase64String($candidateFvSolutionBytes)) {
+                throw "$($case.name) candidate fvSolution differs by more than the direct SIMPLE.consistent false-to-true token"
+            }
+        } else {
+            [void](Invoke-TtaSimpleConsistentBytes $candidateFvSolutionBytes $false $false "$($case.name) result candidate")
+        }
 
         $fields = Compare-OracleFields $baselineOracle $candidateOracle
         $baselineReport = $baselineOracle.report; $candidateReport = $candidateOracle.report
@@ -1506,7 +1728,8 @@ try {
     if ($accuracyFailures.Count -gt 0) {
         $rejectionPath = Join-Path $OutRoot "accuracy-rejection.json"
         [pscustomobject][ordered]@{
-            schemaVersion = 1; benchmark = "ferrum-linux-time-to-accuracy-ab"; performanceClassified = $false
+            schemaVersion = 2; benchmark = "ferrum-linux-time-to-accuracy-ab"; experiment = $Experiment; performanceClassified = $false
+            consistentPolicy = [pscustomobject][ordered]@{ baseline = $baselineSimpleConsistent; candidate = $candidateSimpleConsistent }
             failures = [string[]]$accuracyFailures; cases = @($caseData | ForEach-Object { [pscustomobject][ordered]@{ name = $_.name; accuracy = $_.accuracy } })
         } | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath $rejectionPath -Encoding UTF8
         throw "accuracy/work gates rejected the candidate before performance classification: $($accuracyFailures -join ', ')"
@@ -1607,12 +1830,20 @@ try {
     Assert-ControlSourcesUnchanged "before summary generation"
 
     $summary = [pscustomobject][ordered]@{
-        schemaVersion = 1
+        schemaVersion = 2
         benchmark = "ferrum-linux-time-to-accuracy-ab"
+        experiment = $Experiment
         generatedAtUtc = [DateTime]::UtcNow.ToString("o")
-        baseline = [pscustomobject][ordered]@{ ref = $BaselineRef; commit = $baselineCommit; tree = $baselineTree; archiveSha256 = $baselineArchiveSha256; relTol = [pscustomobject][ordered]@{ p = 0.0; U = 0.0 } }
-        candidate = [pscustomobject][ordered]@{ ref = $CandidateRef; commit = $candidateCommit; tree = $candidateTree; archiveSha256 = $candidateArchiveSha256; relTol = [pscustomobject][ordered]@{ p = $CandidatePressureRelTol; U = $CandidateMomentumRelTol } }
-        relationship = [pscustomobject][ordered]@{ candidateDirectChildOfBaseline = $true; exactChangedPaths = [string[]]@($ExpectedChangedPaths | Sort-Object); cargoLockBlob = $baselineCargoLockBlob; cargoLockSha256 = $baselineCargoLockSha256 }
+        baseline = [pscustomobject][ordered]@{ ref = $BaselineRef; commit = $baselineCommit; tree = $baselineTree; archiveSha256 = $baselineArchiveSha256; relTol = [pscustomobject][ordered]@{ p = 0.0; U = 0.0 }; consistent = $baselineSimpleConsistent }
+        candidate = [pscustomobject][ordered]@{ ref = $CandidateRef; commit = $candidateCommit; tree = $candidateTree; archiveSha256 = $candidateArchiveSha256; relTol = [pscustomobject][ordered]@{ p = $CandidatePressureRelTol; U = $CandidateMomentumRelTol }; consistent = $candidateSimpleConsistent }
+        relationship = [pscustomobject][ordered]@{
+            mode = $(if ($simplecExperiment) { "identical-source" } else { "direct-child-exact-paths" })
+            candidateDirectChildOfBaseline = !$simplecExperiment
+            identicalSource = $simplecExperiment
+            exactChangedPaths = [string[]]@($effectiveChangedPaths | Sort-Object)
+            cargoLockBlob = $baselineCargoLockBlob
+            cargoLockSha256 = $baselineCargoLockSha256
+        }
         controls = [pscustomobject][ordered]@{
             archiveSha256 = $controlsArchiveSha256
             files = @($manifestControls | ForEach-Object {
@@ -1624,7 +1855,11 @@ try {
         sourceWorktreeCleanAtLaunch = $sourceWorktreeCleanAtLaunch
         launchStatusPorcelain = $launchStatus
         pressureSolver = $PressureSolver
-        build = [pscustomobject][ordered]@{ variant = $BuildVariant; rustToolchain = $RustToolchain; cargoIncremental = 0 }
+        build = [pscustomobject][ordered]@{
+            variant = $BuildVariant; rustToolchain = $RustToolchain; cargoIncremental = 0
+            mode = $buildPolicyMode; sameBinary = $simplecExperiment
+            baselineBinarySha256 = $baselineBinarySha256; candidateBinarySha256 = $candidateBinarySha256
+        }
         platform = [pscustomobject][ordered]@{
             lane = "WSL2 Linux ext4"; distro = (Get-Content -LiteralPath (Join-Path $OutRoot "metadata\distro-release.txt") -Raw).Trim()
             kernel = (Get-Content -LiteralPath (Join-Path $OutRoot "metadata\uname.txt") -Raw).Trim()
@@ -1632,7 +1867,7 @@ try {
         }
         policy = [pscustomobject][ordered]@{
             warmupRuns = $WarmupRuns; measuredRuns = $MeasuredRuns; alternatingOrder = $true; balancedCohorts = $true
-            separateBuilds = $true; ext4Workspace = $true; timedRunsDoNotWriteFields = $true; untimedFinalFieldOracle = $true
+            separateBuilds = !$simplecExperiment; sharedSingleBuild = $simplecExperiment; ext4Workspace = $true; timedRunsDoNotWriteFields = $true; untimedFinalFieldOracle = $true
             accuracyBeforePerformance = $true; noSteadyFinalRelTolOverride = $true; maxSimpleIterations = $MaxSimpleIterations
         }
         gates = [pscustomobject][ordered]@{
@@ -1661,11 +1896,20 @@ try {
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add("# Ferrum Linux Time-to-Accuracy A/B Benchmark")
     $lines.Add("")
-    $lines.Add("Baseline: ``$baselineCommit`` (p/U relTol 0); candidate: ``$candidateCommit`` (p=$pressureRelTolText, U=$momentumRelTolText).")
-    $lines.Add("Exact changed paths: ``$($ExpectedChangedPaths -join '`, `')``")
+    if ($simplecExperiment) {
+        $lines.Add("Experiment: ``simplec`` on one exact source/tree/archive and one shared built binary ``$baselineBinarySha256``.")
+        $lines.Add("Baseline/candidate: ``$baselineCommit`` with p/U relTol 0/0 and exact direct ``SIMPLE.consistent false -> true`` control delta.")
+    } else {
+        $lines.Add("Experiment: ``relTol``. Baseline: ``$baselineCommit`` (p/U relTol 0); candidate: ``$candidateCommit`` (p=$pressureRelTolText, U=$momentumRelTolText).")
+        $lines.Add("Exact changed paths: ``$($effectiveChangedPaths -join '`, `')``")
+    }
     $lines.Add("WSL2/ext4/build: ``$Distro`` / ``$BuildVariant``; warm-up/measured pairs: ``$WarmupRuns/$MeasuredRuns``.")
     $lines.Add("")
-    $lines.Add("Accuracy and work gates passed before performance was classified. Static relTol remains active in the accepting steady SIMPLE step, matching OpenFOAM Foundation 13 steady semantics.")
+    if ($simplecExperiment) {
+        $lines.Add("Accuracy and work gates passed before performance was classified. Every report attested ``options.consistent`` false/true while both p/U relTol controls remained exactly zero.")
+    } else {
+        $lines.Add("Accuracy and work gates passed before performance was classified. Static relTol remains active in the accepting steady SIMPLE step, matching OpenFOAM Foundation 13 steady semantics.")
+    }
     $lines.Add("")
     $lines.Add("| Case | U rel L2/Linf | p gauge rel L2/Linf | continuity max ratio | work reduction | elapsed ratio medians | paired median (MAD) | wins | cohorts | accepted |")
     $lines.Add("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |")
