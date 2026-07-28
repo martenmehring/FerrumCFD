@@ -588,9 +588,13 @@ The first optimization sequence is tracked as follows:
     frozen two-case total pressure-time gate and remain unmerged. Exact FCG
     reduction-traversal reuse passed every source and numerical gate and showed
     a promising Stage A, but the stricter two-case `2+10` decision gate rejected
-    it; that leaf also remains local and unmerged. Evaluate reciprocal-diagonal
-    SymGS only as a separate numerical research leaf with an explicit accuracy
-    and failure-semantics contract because it changes floating-point arithmetic;
+    it; that leaf also remains local and unmerged. The separate
+    reciprocal-diagonal SymGS research leaf used an explicit accuracy and
+    failure-semantics contract because it changes floating-point arithmetic. It
+    passed its source and field-accuracy gates but changed
+    the frozen pressure-work fingerprint in both cases, so it stopped before
+    Stage A and remains local and unmerged. Return to isolated hierarchy and
+    exact-work reductions before attempting further arithmetic substitutions;
 21. completed: add a profiled-only GAMG hierarchy diagnostic gate with exact
     level/transfer shapes, aggregate histograms, grid/operator-complexity terms,
     NNZ-weighted work proxies, and coarsest-iteration counts. Cache the static
@@ -1175,6 +1179,34 @@ The immediate sequence is:
     and Stage B. The leaf stays local and unmerged, and no speedup is claimed.
     Evidence manifest SHA256 is
     `d70997d936d10bfd1c960cbb04028e32432c7f1eedaaedfc63fe8bf6e58064d6`.
+    A subsequent two-file clean-base research leaf on `5608321` replaced the
+    private per-level GAMG diagonal-value cache with same-sized reciprocal
+    storage. It used multiplication only for normal reciprocals and finite
+    products separated from IEEE underflow and overflow boundaries; signed
+    zero, subnormal, non-finite, and extreme updates retained the exact prior
+    CSR-diagonal division. This selected arithmetic rather than clamping a
+    result, added no second cache, and left public standalone Gauss-Seidel,
+    hierarchy, sweeps, tolerances, FCG recurrence, scaling, and interpolation
+    semantics unchanged. Eleven focused reciprocal proofs, 56/56 debug and
+    56/56 release GAMG tests, all workspace and integration gates, Rust 1.94
+    locked/offline Clippy, and two independent source audits passed. The final
+    audit included `faceAreaPair`, `symGaussSeidel`, iterative coarse solve, L2
+    and normalized L1, profile parity, and a scanned-division oracle.
+
+    A fresh Native Linux CPU2 converged pre-gate then ran exact base/candidate
+    binaries for Pipe and Channel. All four jobs exited successfully with empty
+    stderr. Both cases retained their SIMPLE counts, exact written boundary
+    blocks, convergence, continuity below `3e-17`, and field and pressure-drop
+    differences inside the frozen contract. The complete pressure-work
+    fingerprint nevertheless changed. Pipe pressure iterations and V-cycles
+    increased from `11725` to `11735`, and logical reductions increased from
+    `105318` to `105408`. Channel retained `7381` pressure V-cycles but increased
+    iterative coarsest-level work from `7131` to `7133` iterations. The
+    predeclared gate therefore rejected the leaf before any Stage A timing;
+    Stage A and `2+10` each ran zero jobs. The code stays local and unmerged, and
+    no speedup or publication claim is made. The 546-entry evidence manifest
+    SHA256 is
+    `31a155c59a2b70700cfe2c498439090eefb6cbb7e63b1608a20f992e5807c86a`.
 14. **F-PERF-GAMG-FCG (accepted opt-in scalar path; default unchanged):** The
     existing GAMG V-cycle is now available as the explicit preconditioner for
     an `outerSolver FCG` pressure path. Seven focused proofs cover the real
