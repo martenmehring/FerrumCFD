@@ -584,18 +584,17 @@ The first optimization sequence is tracked as follows:
     making further Ferrum-versus-OpenFOAM solver-performance claims;
 20. continue isolated CSR residual, scaling, and row-traversal leaves because
     smoothing plus scaling dominate the measured GAMG pressure time;
-21. add a GAMG hierarchy diagnostic gate. The accepted `5ee13a3c` fixed-GAMG
-    profile attributes
-    `2.86%` of Pipe and `3.03%` of Channel GAMG time to hierarchy build,
-    refresh, restriction, prolongation, and the coarsest solve. This measured
-    phase total is an approximately `3%` pressure-GAMG infrastructure ceiling,
-    not a savings target. A `2-4%` pressure-solver improvement remains an
-    experimental hypothesis only if hierarchy quality also reduces V-cycles
-    or weighted work;
-22. test hierarchy leaves one at a time: coarsest-level target, cached direct
-    versus iterative coarse solve, deterministic aggregation/coarsening,
-    sweep placement, weighted prolongation, and later GAMG as a PCG/FCG
-    preconditioner. Larger gains require fewer V-cycles or less weighted work;
+21. completed: add a profiled-only GAMG hierarchy diagnostic gate with exact
+    level/transfer shapes, aggregate histograms, grid/operator-complexity terms,
+    NNZ-weighted work proxies, and coarsest-iteration counts. Cache the static
+    descriptor after the first successful profiled solve; the unprofiled path
+    and all solver controls remain unchanged;
+22. test hierarchy leaves one at a time. Start with an explicit opt-in
+    `mergeLevels 2` experiment while retaining default `mergeLevels 1`, then
+    evaluate cached direct coarse factorization as a separate package. Keep
+    coarsest-level target, deterministic aggregation/coarsening, sweep
+    placement, and weighted prolongation isolated. Larger gains require fewer
+    V-cycles or less weighted work in both frozen cases;
 23. completed: gate the static user-bounded `relTol` implementation with Linux
     time-to-accuracy evidence and evaluate SIMPLEC as a separate same-binary
     leaf. SIMPLEC passed the frozen Channel gate but failed the frozen Pipe
@@ -624,12 +623,13 @@ Next performance targets:
 - treat symmetric LDU-addressed pressure Gauss-Seidel as a rejected experiment.
   Reopen it only as a new isolated leaf with a predeclared numerical contract
   and uncontaminated paired A/B evidence against accepted CSR;
-- profile GAMG hierarchy quality explicitly: rows and nonzeros per level, grid
-  and operator complexity, aggregate-size distribution, unmatched cells,
-  per-level contraction, coarse-solve work, weighted smoothing work, and total
-  V-cycles. Current Pipe/Channel grid complexity is already about `1.99`, so
-  prioritize contraction quality and per-level work while retaining hierarchy
-  depth and the coarsest-level target as isolated variables;
+- retain the accepted profiled-only hierarchy quality telemetry: rows and
+  nonzeros per level, exact grid/operator-complexity terms, aggregate-size
+  distribution, unmatched cells, per-level contraction, coarse-solve work,
+  NNZ-weighted work proxies, and total V-cycles. Current Pipe/Channel grid
+  complexity is already about `1.99`, so prioritize contraction quality and
+  per-level work while retaining hierarchy depth and the coarsest-level target
+  as isolated variables;
 - run every hierarchy change as an isolated generic A/B leaf. Do not select
   settings per case, loosen tolerances, add artificial caps, or hide a fallback.
   Preserve outer convergence and physical accuracy, and report intentional
@@ -945,17 +945,25 @@ The immediate sequence is:
    in both cohorts, with process medians `6.605 vs 6.930 s` and paired ratio
    `1.0077`. All canonical reports and final `U`/`p` fields remained bit-exact.
    The leaf therefore stays local and unmerged, and no speedup is claimed.
-7. **F-PERF-GAMG-HIERARCHY-DIAGNOSTIC (implemented locally):** The isolated
-   branch `codex/gamg-hierarchy-diag-5ee13a3c` adds contraction,
-   grid/operator complexity, aggregation, weighted-work, and coarse-solve
-   evidence without changing solver behavior. Commits `87bb766` and
-   `a8626bb` passed the complete workspace, Rust 1.94 locked/offline Clippy,
-   exact reporting-schema, negative contract, and real fixed Pipe/Channel
-   profile gates. The profiles contain 9/8 levels, exact grid-complexity terms
-   `9195/4608` and `3983/2000`, and exact operator-complexity terms
-   `61925/30336` and `19007/9760` for Pipe/Channel respectively. The
-   diagnostics remain local and unmerged while the first hierarchy leaves are
-   falsified.
+7. **F-PERF-GAMG-HIERARCHY-DIAGNOSTIC (accepted telemetry-only package):** A
+   clean-base package on `517fdfa` adds exact level and transfer shapes,
+   aggregate-size histograms, unmatched-cell counts, grid/operator-complexity
+   terms, NNZ-weighted work proxies, and iterative coarsest-solve counts. The
+   static descriptor is cached only after the first successful profiled solve
+   and then reused by `Arc`; unprofiled solves perform no diagnostic build.
+   Rust 1.94 formatting, locked/offline all-target Clippy, 488 workspace tests
+   plus one intentionally ignored release-only performance test, exact schema,
+   fail-closed, accumulation-atomicity, cache-lifecycle, and ten-coefficient
+   proofs passed. Fresh WSL2/ext4 CPU2 profiled FCG oracles retained exactly
+   `745/7021` Pipe/Channel V-cycles, all prior counters, byte-identical final
+   `U` and `p`, and reports identical to the prior profiled oracles after
+   removing timing and the new telemetry. Pipe/Channel have 9/8 levels, exact
+   grid-complexity terms `9197/4608` and `3983/2000`, and exact
+   operator-complexity terms `61667/30336` and `19007/9760`. Their
+   NNZ-weighted smoothing/sparse-work proxies are respectively
+   `266304720/381274010` and `736011430/1071131186`; iterative coarsest work is
+   `2137/6771` iterations. These profiled oracles prove observational parity,
+   not a speedup. Focused Fable review remains explicitly deferred.
 8. **F-PERF-GAMG-HIERARCHY-LEAVES (equal-weight pairing accepted):** Test one predeclared variable per A/B:
    coarsest-level target; cached direct versus iterative coarse solve;
    deterministic pairing/coarsening; pre/post/finest sweep placement; weighted
