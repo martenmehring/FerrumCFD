@@ -1272,6 +1272,39 @@ The immediate sequence is:
     `e345cafd36641646d776089af793adbafec7c8846b6410acbcd49adb0f859db5`;
     its manifest-seal SHA256 is
     `82579ff52d8ff35a632cf3837fbbb6fa37203b24652b5c0863c20152aecba120`.
+    A later one-file clean-base leaf on `970a20d` retained the checked public
+    `CsrMatrix::matvec_into` contract but moved its hot loop into a private
+    validated kernel. Narrowly documented unchecked access removed redundant
+    row-offset, entry, and gathered-vector bounds checks after constructor and
+    shape validation. The exact row order, CSR-entry order, multiplication and
+    addition expression, error order and text, pre-error output invariance,
+    allocation behavior, and public API remained unchanged. Five focused
+    debug and release proofs covered every public constructor, rectangular and
+    zero-column CSR, unsorted duplicate columns, ten `values_mut` coefficient
+    lifecycles including IEEE special values, legal disjoint alias sources, and
+    exact bit parity with the former safe-index oracle. All 52 debug and 52
+    release GAMG tests, 493 workspace tests plus one intentional performance
+    ignore, the release pressure-matrix gate, Rust 1.94 locked/offline Clippy,
+    formatting, and an independent unsafe-soundness review passed.
+
+    Native Linux CPU2 pre-gates passed all 16 jobs with exact fields, reports,
+    hierarchy, options, stop reasons, convergence, and work fingerprints.
+    Stage A completed 48 further jobs with exact semantics, but did not pass the
+    frozen robustness gate. Pipe's raw and paired pressure medians improved by
+    `10.41%` and `4.59%`, yet only `3/5` pairs won and the B-leading cohort
+    regressed to a `1.1355` candidate/base ratio. Channel improved by `3.44%`
+    raw and `3.40%` paired with both cohorts below one, but also won only `3/5`
+    pairs instead of the required four. Supporting profiled smoothing medians,
+    which this leaf does not change, regressed by `20.04%` for Pipe and `4.06%`
+    for Channel, confirming material run-order drift rather than a robust local
+    kernel result. One malformed non-primary GNU-time wall sample caused by a
+    WSL clock jump was excluded and documented without a rerun; every primary
+    internal report remained valid. Stage B and all additional measurements
+    stayed at zero. The source remains local and unmerged, and no speedup is
+    claimed. The 1,602-entry evidence manifest SHA256 is
+    `77cd6b32859edff70c258b3afbcef37cdfaa7923a7081969655c298567e0945b`;
+    its manifest-seal SHA256 is
+    `79bfdfada22d0ec6c75035a0a9efaa28b88820656ebc4705bff367744574ab41`.
 14. **F-PERF-GAMG-FCG (accepted opt-in scalar path; default unchanged):** The
     existing GAMG V-cycle is now available as the explicit preconditioner for
     an `outerSolver FCG` pressure path. Seven focused proofs cover the real
