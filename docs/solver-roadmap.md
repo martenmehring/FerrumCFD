@@ -1227,6 +1227,23 @@ The immediate sequence is:
     time-to-accuracy runs followed, no source default changed, and no speedup
     is claimed. The 1,575-entry evidence manifest SHA256 is
     `ca7700052f30a37b24448f19a27a38065ce9f41949eda488ceeaa44f8dd638b0`.
+    A further same-binary Native Linux CPU2 smoke changed only
+    `scaleCorrection true -> false` in external copies of the same frozen FCG
+    cases. All 16 fixed-work processes exited successfully with empty stderr,
+    all linear solves completed, the candidate recorded zero scaling calls and
+    scaling time on every GAMG level, and the final fields, gauge pressure,
+    pressure-drop proxy, hierarchy, and boundaries stayed inside the frozen
+    A/B contract. Pipe pressure V-cycles fell `745 -> 667` and weighted sparse
+    work fell `381274010 -> 289916094` (`-23.96%`), but the candidate's final
+    continuity L2 was `3.16860996327233e-17`, above the strict `3e-17` gate.
+    Channel exposed the decisive generic regression: pressure V-cycles and
+    linear iterations rose `7021 -> 18270` (`2.6022x`), iterative coarsest work
+    rose `6771 -> 17468` (`2.5798x`), and weighted sparse work rose
+    `1071131186 -> 2357471360` (`+120.09%`). The smoke therefore stopped before
+    `2+10`; `scaleCorrection=true` remains the generic default, no source or
+    case changed, and no speedup is claimed. The 389-entry failure-evidence
+    manifest SHA256 is
+    `699ddbbc4ce725e8b1a077034544544c0195245a68b551a36ffd157189b24cfa`.
 14. **F-PERF-GAMG-FCG (accepted opt-in scalar path; default unchanged):** The
     existing GAMG V-cycle is now available as the explicit preconditioner for
     an `outerSolver FCG` pressure path. Seven focused proofs cover the real
