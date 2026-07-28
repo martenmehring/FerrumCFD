@@ -11,6 +11,7 @@ numerical readiness issue. They are not part of the public solver API.
 | --- | --- | --- |
 | Canonical comparison | `run_openfoam_laminar_pipe`, `run_poiseuille_benchmark`, `run_laminar_simple_matched_time_benchmark` | Keep until equivalent Rust validation commands exist |
 | Performance regression | `run_cpu_performance_baseline` | Keep while scalar-CPU hot paths are profiled and optimized; it must use a prebuilt release executable |
+| Same-Linux build optimization | `run_matched_linux_cpu_solver_benchmark`, `run_ferrum_linux_ref_ab_benchmark`, `run_ferrum_linux_pgo_ab_benchmark` | Keep as fail-closed ext4 lanes; PGO is host-specific and must never alter or stand in for the portable release profile |
 | Reference convergence | `run_openfoam_laminar_pipe_step_sweep`, `run_laminar_simple_iteration_sweep`, `run_laminar_simple_mesh_study`, `run_laminar_simple_pressure_sweep` | Keep while their readiness questions remain open |
 | Reproducible case preparation | `generate_laminar_pipe_case`, `prepare_plane_channel_case` | Keep until native case tooling provides parity |
 | Transitional smoke/wrapper | `run_gmsh_pipe_import`, `run_laminar_simple_benchmark` | Remove after direct commands and documentation replace them |
@@ -44,3 +45,11 @@ inputs to the generic solver case.
 Generated meshes, time directories, logs, plots, JSON, and Markdown reports
 must stay below `target/`; only source cases, scripts, and stable reference
 summaries are versioned.
+
+The Native-PGO lane is deliberately narrower than a general build matrix. It
+uses one exact source archive, exact Rust `1.94.0`, explicit Linux target,
+sanitized Cargo/Rust optimization variables, separate ext4 target directories,
+and only the toolchain-bound `llvm-profdata`. Its `0+2/all` mode is a smoke;
+only `2+20/all` may make a decision, and only when both canonical cases pass
+the predeclared timing and exact-semantic gates. Training, compilation, and
+profile merging are never included in solve-time medians.
