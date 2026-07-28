@@ -1017,12 +1017,18 @@ The immediate sequence is:
    Reports and final fields stayed bit-exact. Channel's `0+2` probe was
    inconclusive because its two order cohorts disagreed, so the predeclared
    both-case gate stopped before a stronger Channel run.
-9. **F-PERF-ADAPTIVE-LINEAR (implementation and proof candidate):** Local commit
-   `206f7ee` implements static, user-bounded OpenFOAM-style `relTol` for all
-   current scalar linear solvers while preserving final outer acceptance. It
-   reports every effective target, stop reason, and linear-work contribution.
-   This is not an autonomous runtime controller. Publication remains gated on
-   the canonical same-Linux Pipe/Channel time-to-accuracy proof.
+9. **F-PERF-ADAPTIVE-LINEAR (semantics/work accepted; timing not accepted):**
+   Commit `206f7ee` implements static, user-bounded OpenFOAM-style `relTol` for
+   all current scalar linear solvers while preserving final outer acceptance.
+   It reports every effective target, stop reason, and linear-work contribution.
+   This is not an autonomous runtime controller. The canonical same-Linux
+   `2+10` Pipe/Channel proof passed every accuracy and work gate, reducing total
+   linear work by `22.37%` and `38.34%`. Pipe's process median was `13.34%`
+   lower with `9/10` wins, but its gain did not exceed `2 x MAD`; Channel's
+   median was `4.55%` lower with only `6/10` wins and opposing order cohorts.
+   The feature is therefore publishable as a correctness, compatibility, and
+   work-reduction package, but the performance leaf remains unaccepted and no
+   stable end-to-end speedup is claimed.
 10. **F-D1-SIMPLEC:** Implement SIMPLEC as an isolated leaf on the frozen
     Pipe/Channel observables before expanding coverage. A future autonomous
     tolerance controller remains a separate user-bounded experiment.
