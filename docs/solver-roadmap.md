@@ -1053,19 +1053,25 @@ The immediate sequence is:
     order cohorts faster. SIMPLEC therefore remains an explicit opt-in with no
     general speed claim or global-default change. A future autonomous tolerance
     controller remains a separate user-bounded experiment.
-11. **F-PERF-PORTABLE-NATIVE / NATIVE-PGO (harness implemented, measurement
-    pending):** Thin/Fat LTO, `codegen-units=1`, and the separate
+11. **F-PERF-PORTABLE-NATIVE / NATIVE-PGO (harness accepted, performance leaf
+    rejected):** Thin/Fat LTO, `codegen-units=1`, and the separate
     `target-cpu=native` leaves did not establish a both-case general win. The
-    isolated Native-PGO lane now builds one exact commit three ways (Native,
+    isolated Native-PGO lane builds one exact commit three ways (Native,
     instrumented, PGO), trains only on canonical fixed-work GAMG Pipe then
     Channel, and binds the toolchain LLVM/profile/binary evidence. Smoke is
     exactly `0+2/all` and never decision-eligible; only `2+20/all` may be
     accepted, and both cases must independently pass median, `14/20` wins,
     both-order-cohort, `> 2 x MAD`, canonical-report, and final-field IEEE-754
-    gates. Keep the portable release as the reproducible distribution profile
-    regardless of the PGO result. Focused Fable review is deferred until its
-    quota is available; no Fable approval is claimed by this harness package.
-    After the isolated PGO result, the next separate hierarchy leaf is
+    gates. The exact `2f16dd9` decision run preserved canonical reports and
+    final `U`/`p` bits but rejected PGO. Pipe medians were `3.12 -> 3.38 s`
+    (ratio of medians `1.0833`, paired ratio `1.0443`, `7/20` wins); both order
+    cohorts were slower. Channel medians were `6.67 -> 6.305 s`, but only
+    `11/20` pairs won, order cohorts disagreed (`1.0356` versus `0.9260`), and
+    the gain did not exceed `2 x MAD`. Native-PGO therefore remains a
+    reproducible diagnostic lane, not a default or a general speed claim. Keep
+    the portable release as the distribution profile. Focused Fable review is
+    deferred until its quota is available; no Fable approval is claimed by
+    this harness package. The next separate hierarchy leaf is
     `interpolateCorrection`, disabled by default and evaluated without mixing
     its numerical-path change into this build-only experiment.
 12. **F-PERF-SIMD-THREAD-GPU:** After scalar acceptance, proceed through SIMD,
