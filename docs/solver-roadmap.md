@@ -583,7 +583,10 @@ The first optimization sequence is tracked as follows:
 19. completed: establish the canonical Linux-parity benchmark lane before
     making further Ferrum-versus-OpenFOAM solver-performance claims;
 20. continue isolated CSR residual, scaling, and row-traversal leaves because
-    smoothing plus scaling dominate the measured GAMG pressure time;
+    smoothing plus scaling dominate the measured GAMG pressure time. Cached
+    diagonal values made the measured scaling phase faster but failed the
+    frozen two-case total pressure-time gate and remain unmerged. Inspect exact
+    FCG reduction-traversal reuse next before changing arithmetic;
 21. completed: add a profiled-only GAMG hierarchy diagnostic gate with exact
     level/transfer shapes, aggregate histograms, grid/operator-complexity terms,
     NNZ-weighted work proxies, and coarsest-iteration counts. Cache the static
@@ -1149,6 +1152,25 @@ The immediate sequence is:
     fell `118,461,826 -> 115,527,873`. The option-only leaves are therefore
     case-dependent controls, not global defaults. No general speedup is
     claimed from these smoke runs.
+    A later one-file clean-base leaf on `ec791d8` reused the existing contiguous
+    per-level diagonal-value cache in correction scaling instead of loading
+    each diagonal through its CSR slot. It changed no arithmetic, division,
+    traversal, allocation, counter, hierarchy, tolerance, or failure order.
+    Its focused legacy oracle, 53 GAMG tests, 489 workspace tests plus one
+    intentional performance ignore, Rust 1.94 locked/offline Clippy, and two
+    independent reviews passed. A fresh Native Linux CPU2 Stage A then ran 48
+    valid FCG Pipe/Channel jobs with one warmup plus five measured runs per
+    variant and mode. Reports, final `U`/`p`, residuals, iterations, V-cycles,
+    hierarchy, and weighted work remained bit-exact. The profiled scaling
+    medians improved by `7.21%` for Pipe and `2.69%` for Channel, confirming the
+    intended local effect. The primary unprofiled pressure gate nevertheless
+    regressed: Pipe raw and paired medians increased by `16.04%` and `19.35%`,
+    with both order cohorts slower; Channel's raw median increased by `20.89%`
+    under high drift and its paired median increased by `0.52%`, again with
+    both cohorts slower. The predeclared gate therefore stopped before `2+10`
+    and Stage B. The leaf stays local and unmerged, and no speedup is claimed.
+    Evidence manifest SHA256 is
+    `d70997d936d10bfd1c960cbb04028e32432c7f1eedaaedfc63fe8bf6e58064d6`.
 14. **F-PERF-GAMG-FCG (accepted opt-in scalar path; default unchanged):** The
     existing GAMG V-cycle is now available as the explicit preconditioner for
     an `outerSolver FCG` pressure path. Seven focused proofs cover the real
