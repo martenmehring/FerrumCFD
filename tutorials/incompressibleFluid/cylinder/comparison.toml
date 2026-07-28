@@ -8,7 +8,6 @@ title = "Two-dimensional Re=1 cylinder flow"
 
 [implementations]
 ferrum_case = "ferrum/case"
-openfoam_v13_case = "openfoam-v13/case"
 
 [reference]
 kind = "documented-benchmark"

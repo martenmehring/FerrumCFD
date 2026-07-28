@@ -1,16 +1,14 @@
 # Gmsh Pipe Mesh Study
 
-Local benchmark run on the Gmsh pipe mesh study with WSL OpenFOAM. This is the
-historical OpenFOAM reference record; the current script also writes FerrumCFD
-Poiseuille solve error and timing columns for new runs.
+Local benchmark run on the Gmsh pipe mesh study with WSL OpenFOAM. This is a
+historical external reference record; no generation or comparison script is
+distributed with FerrumCFD.
 All FerrumCFD-facing values are SI. OpenFOAM incompressible pressure is
 converted from kinematic pressure to Pa with `rho = 998.2 kg/m3`.
 
-Run command:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_gmsh_pipe_mesh_study.ps1 -OpenFoamSteps 1000
-```
+The table below is an archived maintainer measurement. Its external
+case-generation and comparison harness is intentionally not distributed with
+FerrumCFD.
 
 Reference:
 

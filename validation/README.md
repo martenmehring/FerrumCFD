@@ -6,8 +6,6 @@ generated meshes, fields, logs, JSON, and Markdown reports belong under
 `target/`.
 
 Every accepted application driver must satisfy the common readiness gate in
-`docs/solver-roadmap.md`.
-
-PowerShell orchestration lives under `scripts/` and is validation/developer
-tooling, not the public user interface. Its retention and replacement policy
-is documented in `docs/development/script-policy.md`.
+`docs/solver-roadmap.md`. The tracked validation surface consists only of
+portable data and Rust tests; generated benchmark harnesses and reports stay
+outside the product repository.

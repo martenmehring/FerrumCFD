@@ -25,33 +25,28 @@ src/
   ferrumMesh/
   ferrumFiniteVolume/
   ferrumIO/
-  openfoamIO/                # interoperability only
   ferrumModels/
 tutorials/
   incompressibleFluid/
     <case>/
       ferrum/case/
-      openfoam-v13/case/
       analytical/            # optional when a useful solution exists
       shared/                # optional neutral inputs
       comparison.toml        # optional reference mapping
       README.md
-validation/
-  scripts/
 test/
 docs/
 target/                      # generated and ignored
 ```
 
-Every tutorial presents independent program-specific references, not one
-shared runtime case. The current `ferrum/case` compatibility directory and the
-native `openfoam-v13/case` directory must each run independently. `shared/` may
-contain neutral geometry, units, and physical inputs, but never
-program-specific dictionaries. Each program converts the shared geometry into
-its own native mesh and owns its numerical configuration.
+Every tutorial contains an independently authored Ferrum runtime case.
+`shared/` may contain neutral geometry, units, and physical inputs, but never
+third-party program dictionaries. External reference cases are not bundled;
+their exact version, protocol, and recorded results belong in benchmark
+documentation.
 
-Small canonical validation meshes may be versioned in each program-specific
-source case so a clean checkout is independently runnable. Regenerated mesh
+Small canonical Ferrum validation meshes may be versioned with a source case
+so a clean checkout is independently runnable. Regenerated mesh
 variants, time directories, logs, and reports belong below `target/`. An
 `analytical/` directory is included only when a useful closed-form,
 semi-analytical, or manufactured solution exists. Otherwise the case README
@@ -149,7 +144,7 @@ cancellation/error propagation, and conservation checks with stated
 tolerances. Independent cases and parameter studies will use a separate future
 batch/sweep tool so multi-region semantics remain clear.
 
-## Native Ferrum And OpenFOAM Boundary
+## Native Ferrum And External Compatibility Boundary
 
 The target Ferrum case format is native:
 
@@ -162,11 +157,11 @@ The target Ferrum case format is native:
 - the user-facing command flow remains `initFerrumCase`, `gmshToFerrum`,
   `checkFerrumMesh`, `splitFerrumMeshRegions`, and `ferrumRun`.
 
-The sibling `openfoam-v13/` case remains a genuine OpenFOAM 13 case. It uses
-`FoamFile`, OpenFOAM dictionaries and parameter names, and its own mesh
-conversion and run commands. OpenFOAM parsing and conversion belong in the
-separate `openfoamIO` interoperability layer and must not define the native
-Ferrum format.
+FerrumCFD does not distribute third-party solver cases, sources, or runtime
+tools. Compatibility parsing and conversion must remain independently
+implemented and must not define the native Ferrum format. External comparisons
+are documented using an exact upstream version and protocol rather than a
+bundled runtime case.
 
 This is the target contract. Until `FerrumFile v1` and its reader/writer are
 implemented, the existing OpenFOAM-like Ferrum reader remains a documented
@@ -571,15 +566,15 @@ component and pressure-correction solve.
 Continuity is diagnostic and is not an extra hidden convergence gate.
 Ferrum-specific SIMPLE entries can additionally set `minSimpleIterations`.
 Only OpenFOAM-style residual controls can mark the generic solver converged.
-Hagen-Poiseuille acceptance, OpenFOAM comparison, and matched-time decisions
-belong to the external benchmark scripts and never alter SIMPLE convergence.
+Hagen-Poiseuille acceptance and external comparison decisions are independent
+validation evidence and never alter SIMPLE convergence.
 The SIMPLE options/report types contain no pipe diameter, pipe length, named
 inlet/outlet reference, pressure-loss target, or analytic solution. External
 validation tooling may read already written `U`/`p` fields and add those
-case-specific diagnostics without changing solver behavior. Validation profiles
-and reference inputs are stored under `validation/`; generated comparison
-artifacts remain under `target/benchmarks`, never inside a simulation case's
-`constant/` directory.
+case-specific diagnostics without changing solver behavior. Recorded results
+and their provenance are stored under `docs/benchmarks/`; generated comparison
+artifacts remain below `target/`, never inside a simulation case's `constant/`
+directory.
 The production-readiness plan for this solver lives in
 `docs/solver-roadmap.md`; it tracks the remaining numerical, boundary-condition,
 scheme, benchmark, performance, and generalization work.

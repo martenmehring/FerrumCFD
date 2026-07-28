@@ -6,18 +6,17 @@
 
 <p align="center">
   Rust CFD program focused on native, backend-aware finite-volume solvers<br>
-  and reproducible comparison with OpenFOAM 13 and analytical references.
+  and documented validation against analytical and external references.
 </p>
 
 ---
 
 **Current project version:** `0.1.0` (pre-stable).
 
-FerrumCFD is an independent Rust project. OpenFOAM Foundation 13 is an optional
-external interoperability and numerical-validation reference, not an
-affiliated distribution or a FerrumCFD runtime dependency. Checked-in sibling
-reference cases can be executed independently on a supported Linux system;
-`ferrumRun` itself does not require an OpenFOAM executable.
+FerrumCFD is an independent Rust project. It does not bundle OpenFOAM source
+code, binaries, or reference cases. Published comparison reports identify the
+external solver version, protocol, and recorded results; the FerrumCFD runtime
+does not require an OpenFOAM executable.
 
 The first executable application module is `incompressibleFluid`. Its current
 CPU implementation covers steady laminar SIMPLE cases and has validation
@@ -33,27 +32,16 @@ by the case. There is no separate algorithm-named solver executable.
 
 ## Quick Start
 
-The product requirement is a current Rust toolchain. PowerShell is optional
-maintainer tooling for the scripts under `validation/`. Gmsh and a local
-OpenFOAM 13 installation are optional and needed only to regenerate meshes or
-external reference runs.
+Building, testing, and running FerrumCFD requires only a current Rust toolchain.
+The commands below use Cargo directly and do not require an external reference
+solver or benchmark environment.
 
-```powershell
+```console
+cargo build --workspace --release
 cargo test --workspace
-
-cargo run -p ferrum-cli --bin checkFerrumMesh -- `
-  -case tutorials\incompressibleFluid\laminarPipe\ferrum\case
-
-cargo run -p ferrum-run --bin ferrumRun -- `
-  -solver incompressibleFluid `
-  -case tutorials\incompressibleFluid\laminarPipe\ferrum\case `
-  --preflight `
-  --planJson target\ferrumRunPlan.json
-
-cargo run -p ferrum-run --bin ferrumRun -- `
-  -solver incompressibleFluid `
-  -case tutorials\incompressibleFluid\laminarPipe\ferrum\case `
-  --maxSimpleIterations 2
+cargo run -p ferrum-cli --bin checkFerrumMesh -- -case tutorials/incompressibleFluid/laminarPipe/ferrum/case
+cargo run -p ferrum-run --bin ferrumRun -- -solver incompressibleFluid -case tutorials/incompressibleFluid/laminarPipe/ferrum/case --preflight --planJson target/ferrumRunPlan.json
+cargo run -p ferrum-run --bin ferrumRun -- -solver incompressibleFluid -case tutorials/incompressibleFluid/laminarPipe/ferrum/case --maxSimpleIterations 2
 ```
 
 The `solver incompressibleFluid;` entry is already present in the curated
@@ -65,8 +53,8 @@ in examples makes module selection explicit.
 ```text
 applications/    public runners, runtime modules, and utilities
 src/             reusable Rust mesh, finite-volume, I/O, and model libraries
-tutorials/       independent Ferrum, OpenFOAM 13, and reference case bundles
-validation/      comparison automation and stable validation contracts
+tutorials/       Ferrum-owned cases and analytical reference material
+validation/      Ferrum validation profiles and stable contracts
 test/            cross-package test contracts
 docs/            user guide, architecture, roadmap, and benchmark reports
 target/          generated build and validation artifacts
@@ -111,27 +99,33 @@ rules, results, and publication status are recorded in the
 - [Versioning And Releases](docs/versioning.md)
 - [OpenAI Build Week 2026 Development Record](docs/build-week-2026.md)
 - [Continuous Integration](docs/development/continuous-integration.md)
-- [Validation Script Policy](docs/development/script-policy.md)
 - [Benchmark Reports](docs/benchmarks)
 - [Changelog](CHANGELOG.md)
 - [Security Policy](SECURITY.md)
 
-Local tutorial `README.md` files stay beside their cases because they describe
-the Ferrum compatibility case, native OpenFOAM 13 case, and available reference. Project
-manuals and design documents live under `docs/`. Standard repository metadata
-(`LICENSE`, `CHANGELOG.md`, and `SECURITY.md`) remains at the root for GitHub
-discovery.
+Local tutorial `README.md` files stay beside Ferrum-owned cases and analytical
+reference material. Recorded comparisons against separately installed external
+software live in `docs/`; external source code, binaries, and cases are not
+redistributed. Project manuals and design documents live under `docs/`.
+Standard repository metadata (`LICENSE`, `CHANGELOG.md`, and `SECURITY.md`)
+remains at the root for GitHub discovery.
 
-## Developer Validation
+## Reproducibility
 
-PowerShell files under `validation/scripts/` are reproducibility and developer
-tools, not public solver commands or a required tutorial workflow. Their scope
-and retention policy is documented in
-[`docs/development/script-policy.md`](docs/development/script-policy.md).
-Generated meshes, fields, logs, plots, and reports belong below `target/`.
+Benchmark documentation records the external implementation and version,
+measurement protocol, machine context, and result interpretation. Reproducing
+an external comparison requires users to obtain that software independently.
+Generated meshes, fields, logs, plots, and local reports belong below `target/`.
 
 ## License
 
-FerrumCFD is licensed under the [MIT License](LICENSE).
+FerrumCFD is licensed under the
+[GNU General Public License v3.0 or later](LICENSE) (`GPL-3.0-or-later`).
+Copyright (C) 2026 Marten Mehring.
+
+FerrumCFD is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+A PARTICULAR PURPOSE. See the [license](LICENSE) for details.
+
 External validation tools, compatibility formats, and tutorial provenance are
 documented in [Third-party notices](THIRD_PARTY_NOTICES.md).

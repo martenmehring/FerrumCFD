@@ -1,6 +1,6 @@
 SetFactory("OpenCASCADE");
 
-// Simple SI pipe mesh for FerrumCFD import and OpenFOAM comparison.
+// Simple SI pipe mesh for FerrumCFD import and validation.
 // Units: m, s, kg, K. The boundary layer field creates two near-wall layers.
 // Parameters can be overridden from the CLI, for example:
 // gmsh -3 pipe_prism2.geo -format msh2 -setnumber axial_cells 48 -o pipe.msh

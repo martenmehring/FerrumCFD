@@ -18,7 +18,6 @@ const MU: f64 = 0.001002;
 const MEAN_U: f64 = 0.02;
 const DELTA_P: f64 = 0.6012;
 const NATIVE_NU: f64 = 1.0038e-6;
-const EXACT_NU: f64 = 1.0038068513323983e-6;
 const EPS: f64 = 1.0e-12;
 
 #[derive(Debug)]
@@ -179,7 +178,6 @@ fn validate_metadata(comparison: &str, physical: &str) -> CheckResult {
         &comparison.tables["implementations"],
         &[
             ("ferrum_case", "\"ferrum/case\""),
-            ("openfoam_v13_case", "\"openfoam-v13/case\""),
             ("reference", "\"analytical/planeChannelBenchmark\""),
         ],
     )?;
@@ -308,7 +306,7 @@ fn assert_dimensioned(
     Ok(())
 }
 
-fn validate_properties(case_name: &str, dictionaries: &[PropertyDictionary]) -> CheckResult {
+fn validate_properties(dictionaries: &[PropertyDictionary]) -> CheckResult {
     let mut by_name = BTreeMap::new();
     for dictionary in dictionaries {
         if by_name
@@ -318,59 +316,29 @@ fn validate_properties(case_name: &str, dictionaries: &[PropertyDictionary]) -> 
             return Err("duplicate property dictionary".into());
         }
     }
-    if case_name == "ferrum" {
-        if by_name.keys().copied().collect::<BTreeSet<_>>()
-            != BTreeSet::from(["transportProperties"])
-        {
-            return Err("Ferrum property dictionary set mismatch".into());
-        }
-        let entries = entry_map(by_name["transportProperties"])?;
-        if entries.keys().copied().collect::<BTreeSet<_>>()
-            != BTreeSet::from(["transportModel", "rho", "mu", "nu"])
-            || entries["transportModel"].value != ["Newtonian"]
-        {
-            return Err("Ferrum property semantics mismatch".into());
-        }
-        assert_dimensioned(entries["rho"], "rho", [1, -3, 0, 0, 0, 0, 0], RHO, 0.0)?;
-        assert_dimensioned(entries["mu"], "mu", [1, -1, -1, 0, 0, 0, 0], MU, 0.0)?;
-        assert_dimensioned(
-            entries["nu"],
-            "nu",
-            [0, 2, -1, 0, 0, 0, 0],
-            NATIVE_NU,
-            1.0e-15,
-        )?;
-    } else {
-        if by_name.keys().copied().collect::<BTreeSet<_>>()
-            != BTreeSet::from(["momentumTransport", "physicalProperties"])
-        {
-            return Err("OpenFOAM property dictionary set mismatch".into());
-        }
-        let momentum = entry_map(by_name["momentumTransport"])?;
-        if momentum.keys().copied().collect::<BTreeSet<_>>() != BTreeSet::from(["simulationType"])
-            || momentum["simulationType"].value != ["laminar"]
-        {
-            return Err("momentum transport mismatch".into());
-        }
-        let physical = entry_map(by_name["physicalProperties"])?;
-        if physical.keys().copied().collect::<BTreeSet<_>>()
-            != BTreeSet::from(["viscosityModel", "nu"])
-            || physical["viscosityModel"].value != ["constant"]
-        {
-            return Err("physical properties mismatch".into());
-        }
-        assert_dimensioned(
-            physical["nu"],
-            "nu",
-            [0, 2, -1, 0, 0, 0, 0],
-            EXACT_NU,
-            1.0e-18,
-        )?;
+    if by_name.keys().copied().collect::<BTreeSet<_>>() != BTreeSet::from(["transportProperties"]) {
+        return Err("Ferrum property dictionary set mismatch".into());
     }
+    let entries = entry_map(by_name["transportProperties"])?;
+    if entries.keys().copied().collect::<BTreeSet<_>>()
+        != BTreeSet::from(["transportModel", "rho", "mu", "nu"])
+        || entries["transportModel"].value != ["Newtonian"]
+    {
+        return Err("Ferrum property semantics mismatch".into());
+    }
+    assert_dimensioned(entries["rho"], "rho", [1, -3, 0, 0, 0, 0, 0], RHO, 0.0)?;
+    assert_dimensioned(entries["mu"], "mu", [1, -1, -1, 0, 0, 0, 0], MU, 0.0)?;
+    assert_dimensioned(
+        entries["nu"],
+        "nu",
+        [0, 2, -1, 0, 0, 0, 0],
+        NATIVE_NU,
+        1.0e-15,
+    )?;
     Ok(())
 }
 
-fn validate_foam_header(text: &str, object: &str) -> CheckResult {
+fn validate_dictionary_header(text: &str, object: &str) -> CheckResult {
     let start = text
         .find("FoamFile")
         .ok_or_else(|| "missing FoamFile".to_string())?;
@@ -480,12 +448,8 @@ fn validate_u(field: &FieldFile) -> CheckResult {
     Ok(())
 }
 
-fn validate_p(field: &FieldFile, openfoam: bool) -> CheckResult {
-    let dimensions: &[&str] = if openfoam {
-        &["0", "2", "-2", "0", "0", "0", "0"]
-    } else {
-        &["1", "-1", "-2", "0", "0", "0", "0"]
-    };
+fn validate_p(field: &FieldFile) -> CheckResult {
+    let dimensions: &[&str] = &["1", "-1", "-2", "0", "0", "0", "0"];
     let actual_dimensions = field
         .dimensions
         .as_ref()
@@ -501,8 +465,7 @@ fn validate_p(field: &FieldFile, openfoam: bool) -> CheckResult {
     if values.len() != 1 || !values[0].is_finite() {
         return Err("p internal scalar arity or finiteness mismatch".into());
     }
-    let scale = if openfoam { RHO } else { 1.0 };
-    close(values[0] * scale, DELTA_P / 2.0, EPS)?;
+    close(values[0], DELTA_P / 2.0, EPS)?;
     let patches = patches(field)?;
     for (name, kind, expected) in [
         ("inlet", "fixedValue", Some(DELTA_P)),
@@ -521,7 +484,7 @@ fn validate_p(field: &FieldFile, openfoam: bool) -> CheckResult {
                 if values.len() != 1 || !values[0].is_finite() {
                     return Err(format!("p patch {name} scalar arity mismatch"));
                 }
-                close(values[0] * scale, expected, EPS)?;
+                close(values[0], expected, EPS)?;
             }
             None if patch.value.is_none() => {}
             None => return Err(format!("unexpected p value on {name}")),
@@ -530,7 +493,7 @@ fn validate_p(field: &FieldFile, openfoam: bool) -> CheckResult {
     Ok(())
 }
 
-fn validate_fields(fields: &[FieldFile], openfoam: bool) -> CheckResult {
+fn validate_fields(fields: &[FieldFile]) -> CheckResult {
     if fields.len() != 2 || fields.iter().any(|field| field.region.is_some()) {
         return Err("expected exactly two root-region fields".into());
     }
@@ -544,7 +507,7 @@ fn validate_fields(fields: &[FieldFile], openfoam: bool) -> CheckResult {
         return Err("field name set mismatch".into());
     }
     validate_u(by_name["U"])?;
-    validate_p(by_name["p"], openfoam)
+    validate_p(by_name["p"])
 }
 
 fn raw_normal(mesh: &PolyMesh, face_index: usize) -> CheckResult<Point3> {
@@ -670,37 +633,37 @@ fn plane_channel_positive_contract() {
     let comparison = fs::read_to_string(directory.join("comparison.toml")).unwrap();
     let physical = fs::read_to_string(directory.join("shared/physicalParameters.toml")).unwrap();
     validate_metadata(&comparison, &physical).unwrap();
-    for (name, openfoam) in [("ferrum", false), ("openfoam-v13", true)] {
-        let case = case(name);
-        let properties = read_case_properties(&case).unwrap();
-        validate_properties(
-            if openfoam { "openfoam-v13" } else { "ferrum" },
-            &properties,
-        )
-        .unwrap();
-        let fields = read_initial_fields(&case).unwrap();
-        validate_fields(&fields.fields, openfoam).unwrap();
-        validate_mesh(&PolyMesh::read(&case.join("constant/polyMesh")).unwrap()).unwrap();
-    }
-    for object in ["momentumTransport", "physicalProperties"] {
-        let text = fs::read_to_string(case("openfoam-v13").join("constant").join(object)).unwrap();
-        validate_foam_header(&text, object).unwrap();
+    let case = case("ferrum");
+    let properties = read_case_properties(&case).unwrap();
+    validate_properties(&properties).unwrap();
+    let fields = read_initial_fields(&case).unwrap();
+    validate_fields(&fields.fields).unwrap();
+    validate_mesh(&PolyMesh::read(&case.join("constant/polyMesh")).unwrap()).unwrap();
+}
+
+#[test]
+fn dictionary_header_mutation_probes_are_rejected() {
+    for object in ["transportProperties", "fvSolution"] {
+        let text = format!(
+            "FoamFile\n{{\n    version 2.0;\n    format ascii;\n    class dictionary;\n    location \"constant\";\n    object {object};\n}}\n"
+        );
+        validate_dictionary_header(&text, object).unwrap();
         assert!(
-            validate_foam_header(
+            validate_dictionary_header(
                 &text.replacen("class dictionary;", "class scalar;", 1),
                 object
             )
             .is_err()
         );
         assert!(
-            validate_foam_header(
+            validate_dictionary_header(
                 &text.replacen("format ascii;", "format ascii; extra bad;", 1),
                 object
             )
             .is_err()
         );
         assert!(
-            validate_foam_header(
+            validate_dictionary_header(
                 &text.replacen(&format!("object {object};"), "object substituted;", 1),
                 object
             )
@@ -784,16 +747,16 @@ fn field_mutation_probes_are_rejected() {
         .find(|field| field.name == "p")
         .unwrap();
     p.internal_field = Some(FieldValueSummary::Uniform("(0.3006 9)".into()));
-    assert!(validate_fields(&fields.fields, false).is_err());
+    assert!(validate_fields(&fields.fields).is_err());
     let mut fields = load();
     fields.fields[0].name = "bad".into();
-    assert!(validate_fields(&fields.fields, false).is_err());
+    assert!(validate_fields(&fields.fields).is_err());
     let mut fields = load();
     fields.fields[0].class_name = Some("wrongClass".into());
-    assert!(validate_fields(&fields.fields, false).is_err());
+    assert!(validate_fields(&fields.fields).is_err());
     let mut fields = load();
     fields.fields[0].region = Some("fluid".into());
-    assert!(validate_fields(&fields.fields, false).is_err());
+    assert!(validate_fields(&fields.fields).is_err());
     let mut fields = load();
     let u = fields
         .fields
@@ -801,7 +764,7 @@ fn field_mutation_probes_are_rejected() {
         .find(|field| field.name == "U")
         .unwrap();
     u.internal_field = Some(FieldValueSummary::Uniform("(0.02 0)".into()));
-    assert!(validate_fields(&fields.fields, false).is_err());
+    assert!(validate_fields(&fields.fields).is_err());
     let mut fields = load();
     let p = fields
         .fields
@@ -809,7 +772,7 @@ fn field_mutation_probes_are_rejected() {
         .find(|field| field.name == "p")
         .unwrap();
     p.internal_field = Some(FieldValueSummary::Uniform("0.4".into()));
-    assert!(validate_fields(&fields.fields, false).is_err());
+    assert!(validate_fields(&fields.fields).is_err());
     let mut fields = load();
     let u = fields
         .fields
@@ -817,7 +780,7 @@ fn field_mutation_probes_are_rejected() {
         .find(|field| field.name == "U")
         .unwrap();
     u.boundary_patches[0].patch_type = Some("fixedValue".into());
-    assert!(validate_fields(&fields.fields, false).is_err());
+    assert!(validate_fields(&fields.fields).is_err());
 }
 
 #[test]

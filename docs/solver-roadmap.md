@@ -2,8 +2,8 @@
 
 This roadmap first completes and broadens the steady laminar incompressible
 foundation, then implements exactly six additional application drivers in a
-fixed order. Every driver is validated with independent Ferrum and OpenFOAM 13
-cases and an analytical, manufactured, or documented benchmark reference.
+fixed order. Every driver is validated with independently authored Ferrum cases
+and an analytical, manufactured, or documented external benchmark reference.
 Porous-media, Ergun, and packed-bed development starts only after all seven
 application drivers have passed their readiness gates.
 
@@ -35,7 +35,6 @@ FerrumCFD/
 |   |-- ferrumMesh/
 |   |-- ferrumFiniteVolume/
 |   |-- ferrumIO/
-|   |-- openfoamIO/                  # interoperability only
 |   `-- ferrumModels/
 |-- tutorials/
 |   |-- incompressibleFluid/
@@ -43,8 +42,6 @@ FerrumCFD/
 |   |   |   |-- shared/               # optional neutral inputs
 |   |   |   |   `-- geometry/
 |   |   |   |-- ferrum/
-|   |   |   |   `-- case/
-|   |   |   |-- openfoam-v13/
 |   |   |   |   `-- case/
 |   |   |   |-- analytical/           # optional when useful
 |   |   |   |-- comparison.toml       # optional reference mapping
@@ -67,18 +64,17 @@ reusable implementation belongs under `src`.
 
 Only `incompressibleFluid` is currently a confirmed permanent module name.
 `thermalFluid`, `speciesTransport`, `porousMedia`, and `chemistry` preserve the
-requested target-tree intent but remain provisional until their OpenFOAM 13 and
-mathematical ownership audits decide whether each is an application module, a
+requested target-tree intent but remain provisional until their external
+behavioral-reference and mathematical ownership audits decide whether each is an application module, a
 reusable `ferrumModels` capability, or part of another module. Renaming a
 provisional boundary requires a recorded architecture decision, not guesswork.
 
 Every selected tutorial has a small user-facing contract:
 
 - one independently runnable Ferrum case;
-- one independently runnable OpenFOAM Foundation 13 case;
 - an analytical reference when a useful closed form exists, otherwise a
   documented benchmark reference;
-- an English README that explains the physics, assumptions, and program-specific run
+- an English README that explains the physics, assumptions, and Ferrum run
   commands;
 - an optional stable result summary when maintainers have recorded a run.
 
@@ -86,17 +82,18 @@ Every selected tutorial has a small user-facing contract:
 generation helpers, machine-readable reports, and refinement studies are
 optional maintainer tools. They are added only when they materially help a
 specific case, are never runtime dependencies, and are not prerequisites for a
-user to run either case.
+user to run the Ferrum case.
 
 `laminarPipe` and `planeChannel` are established functional bundles. Their
 current tests and metadata remain useful, but no retrospective parity,
 parameter-hash, lexical-hardening, or source-drift project blocks the next
 physics case.
 
-## Focused OpenFOAM 13 Reference Check
+## Focused External Reference Check
 
-OpenFOAM Foundation v13 MUST be inspected before a new Ferrum physics module,
-solver behavior, tutorial case, or permanent ownership boundary is implemented.
+The relevant external implementation and independent mathematical literature
+MUST be inspected before a new Ferrum physics module, solver behavior, tutorial
+case, or permanent ownership boundary is implemented.
 Routine documentation, case-data maintenance, and unrelated utilities do not
 need a new audit. Guessing from executable names or older OpenFOAM releases is
 not an acceptable substitute.
@@ -105,17 +102,19 @@ Before implementing a new physics capability or case, inspect the relevant
 OpenFOAM 13 module and tutorial rather than guessing from an older executable
 name. Record only what is needed for the bounded work:
 
-1. the OpenFOAM 13 module or application and the native case used as reference;
+1. the external module or application and case used as a behavioral reference;
 2. the fields, models, boundary conditions, schemes, and coupling algorithm
    required by that case;
 3. the corresponding Ferrum ownership and any capability that is still
    missing;
 4. an independent mathematical or published reference where useful;
-5. license and provenance information for copied case or mesh material.
+5. license and provenance information for the external references. External
+   case or mesh material is not added to the FerrumCFD repository.
 
-Source hashes, exhaustive inventories, unchanged reference runs, decomposition
-audits, and detailed decision tables are produced only when the task actually
-depends on them. They do not block a normal tutorial-case addition.
+Source hashes, exhaustive inventories, unchanged external reference runs,
+decomposition audits, and detailed decision tables are produced only in the
+maintainer environment when the task actually depends on them. They are not
+distributed as part of a normal tutorial-case addition.
 
 The currently verified local baseline is OpenFOAM Foundation 13 package/tag
 `20260407`, build `13-441953dfbb42`, under `/opt/openfoam13`. Its `foamRun` path selects one module
@@ -148,22 +147,15 @@ official tutorial directories with those names; reports must not label them as
 official OpenFOAM tutorials.
 
 The audit is architectural and behavioral reference work, not source copying.
-Ferrum remains MIT-licensed: GPL-licensed OpenFOAM implementation code is not
-copied into Ferrum crates. External OpenFOAM names and formats are confined to
-`openfoamIO`, independently runnable `openfoam-v13` cases, provenance records,
-and comparison tooling.
-
-Every distributed `openfoam-v13` bundle receives an explicit classification:
-either independently authored/generated, or derived from OpenFOAM material. A
-derived bundle is excluded from the MIT license scope and carries the required
-upstream license plus a root `THIRD_PARTY_NOTICES` entry. A provenance note by
-itself is not a license grant.
+Ferrum is licensed under `GPL-3.0-or-later`; it bundles no OpenFOAM source,
+binary, tutorial case, or distribution artifact. External version, protocol,
+and result provenance remains documentation-only. Compatible dictionary and
+mesh parsing is independently authored Rust inside Ferrum's I/O boundary.
 
 Before Driver 2 is accepted, the roadmap lists the Driver 1 cases that were
-actually selected and implemented, with their Ferrum case, independent
-OpenFOAM v13 sibling, available reference, and status. The list may grow as
-useful official cases are evaluated; an exhaustive tutorial inventory does not
-block the next bounded case.
+actually selected and implemented, with their Ferrum case, available
+analytical or documented external reference, and status. External cases stay
+outside this repository.
 
 The native source split follows a reviewed, acyclic dependency graph:
 
@@ -172,13 +164,13 @@ The native source split follows a reviewed, acyclic dependency graph:
 - `ferrumMesh`: topology, geometry, decomposition, partitions, and interfaces;
 - `ferrumFiniteVolume`: fields, operators, matrices, discretization, and
   equation assembly;
-- `ferrumIO`: native `FerrumFile` parsing, writing, and case I/O;
-- `openfoamIO`: OpenFOAM import/export adapters only;
+- `ferrumIO`: native `FerrumFile` parsing, writing, case I/O, and isolated
+  independently authored compatibility adapters;
 - `ferrumModels`: reusable physical and constitutive models.
 
 Applications may depend on these libraries, but the libraries never depend on
-an application executable. `ferrumIO` owns the native format; `openfoamIO` is
-an optional adapter and must not define native Ferrum semantics.
+an application executable. `ferrumIO` owns native Ferrum semantics; external
+format compatibility remains an isolated adapter concern.
 
 ## Current Status
 
@@ -414,9 +406,9 @@ Current status:
 - solver report schema version 2 now includes additive phase timings for setup,
   momentum matrix assembly, momentum linear solves, pressure matrix assembly,
   pressure linear solves, finalization, and remaining solver work;
-- `run_cpu_performance_baseline.ps1` builds `ferrumRun` once in release mode,
-  excludes compilation and warmup runs from medians, and executes the existing
-  `laminarPipe` and `planeChannel` cases as independent regressions.
+- recorded CPU baselines exclude compilation and warmup runs from medians and
+  execute the `laminarPipe` and `planeChannel` cases as independent
+  regressions; their external harness is not part of the product repository.
 - The first 2026-07-16 release diagnostic identified redundant per-iteration
   convection diagnostics. Deferring that diagnostic operator to finalization
   reduced the pipe from `64.75 s` to `16.64 s` and the plane channel from
@@ -473,7 +465,7 @@ Current status:
   converges in `15.95 s` at iteration `207`, and the channel in `8.16 s` at
   iteration `545`. Both preserve the previous iteration counts and final
   numerical observables exactly;
-- the canonical Linux-parity lane now builds exact source commit
+- the recorded canonical Linux-parity measurement built exact source commit
   `5ee13a3cde87620460f3b36d8e496a561d3a7601` with Rust `1.94.0` on WSL ext4
   and runs Ferrum and OpenFOAM Foundation 13 on pinned CPU `2` with the same
   external GNU-time metric. The portable `1+5` fixed-work run measured Pipe
@@ -520,20 +512,17 @@ Acceptance criteria for every scalar-CPU optimization:
   run them with matched hardware, process/thread counts, schemes, stopping
   criteria, and clearly separated solver/process wall times.
 
-Performance evidence is split into three explicit benchmark lanes:
+Performance evidence uses external maintainer environments rather than tracked
+launchers or reference cases:
 
-- `linux-parity` is the canonical solver-comparison lane. Ferrum and OpenFOAM
-  Foundation 13 run inside the same pinned WSL distribution, from a WSL-native
-  ext4 run root. Build Ferrum inside WSL and stage its exact source, binary,
-  cases, and logs on WSL ext4. Use the same CPU affinity, serial thread
-  environment, alternating execution order, cases, controls, and stopping
-  criteria. Pin and record the Rust compiler, OpenFOAM build, kernel, CPU, and
-  power state;
-- `product-host` retains native Windows Ferrum versus WSL OpenFOAM as a
-  secondary end-user workflow measurement. It must be labelled as an
-  OS/toolchain-mixed comparison and must not support a solver-only speed claim;
-- `ferrum-os-parity` runs the same Ferrum commit, build profile, and cases on
-  Windows and WSL to quantify the operating-system/toolchain contribution.
+- same-Linux parity is the canonical external solver-comparison protocol.
+  Ferrum and the reference solver run inside the same pinned native Linux
+  environment with the same CPU affinity, serial thread environment,
+  alternating execution order, controls, and stopping criteria. Record the
+  exact Rust compiler, external solver build, kernel, CPU, and power state;
+- Ferrum operating-system parity may run the same commit, build profile, and
+  Ferrum-owned cases on Windows and Linux to quantify the
+  operating-system/toolchain contribution. It is diagnostic only.
 
 Compilation is excluded from all run medians. The Linux lane records one common
 process measurement for both engines (`elapsed`, `user`, and `system`) and
@@ -724,9 +713,9 @@ tutorial matrix:
 | 5 | `backwardFacingStep` | separation, reattachment, and outlet robustness | Published benchmark |
 | 6 | `axisymmetricPipe` | `wedge` handling | Hagen-Poiseuille analytical solution |
 
-Every case contains independently runnable `ferrum/case` and
-`openfoam-v13/case` directories, an English README, and an analytical reference
-when one is useful. Otherwise the README points to a documented benchmark.
+Every case contains an independently runnable `ferrum/case` directory, an
+English README, and an analytical reference when one is useful. Otherwise the
+README points to a documented external benchmark.
 Shared inputs, comparison metadata, recorded results, and mesh variants are
 optional and case-specific. No combined runner is required.
 
@@ -829,7 +818,6 @@ A driver is complete only when:
 
 - its selected Ferrum cases run from a clean checkout using the supported
   compatibility format until `FerrumFile v1` is complete;
-- each OpenFOAM 13 sibling case runs independently without Ferrum conversion;
 - an analytical reference is supplied where useful, otherwise a documented
   benchmark identifies the source and observables;
 - implemented solver behavior has focused automated unit or integration
@@ -837,9 +825,9 @@ A driver is complete only when:
 - maintainers record at least one successful result for each selected case;
 - case-specific reference logic remains outside the generic driver.
 
-Master comparison runners and exhaustive refinement studies remain optional
-engineering tools selected for a concrete numerical risk. They are not part of
-the user-facing case contract.
+External comparison runners and exhaustive refinement studies remain optional
+maintainer tools selected for a concrete numerical risk. They are not tracked
+product files or part of the user-facing case contract.
 
 ## Roadmap Execution Through The Coding-Agent Workflow
 
@@ -928,15 +916,12 @@ The immediate sequence is:
    ratio of `0.9500` with opposing cohorts and Channel `0.9837` with opposing
    cohorts. It therefore provides no accepted speedup and remains unmerged.
    Any later persistence leaf must be smaller and independently profiled.
-5. **F-PERF-LINUX-PARITY (completed):** Add the canonical same-WSL
-   Ferrum/OpenFOAM 13 lane,
-   the secondary Windows/WSL product lane, and a Ferrum Windows/WSL self-lane.
-   Stage source, cases, binaries, and logs on WSL ext4, pin Rust `1.94.0` for
-   the reproducible lane, apply identical CPU affinity and serial environment,
-   and record common process plus separate native timers. The same-WSL lane is
-   implemented and has accepted portable, Native `1+5`, and Native Pipe `2+9`
-   baseline evidence. PR `#80` merged this lane as `7f71427`; the two secondary
-   diagnostic lanes remain optional.
+5. **F-PERF-LINUX-PARITY (completed evidence, harness retired):** The external
+   same-Linux protocol produced accepted portable, Native `1+5`, and Native
+   Pipe `2+9` baseline evidence with pinned Rust, CPU affinity, serial
+   environment, and common process timing. PR `#80` merged the former harness
+   as `7f71427`; the July 2026 repository cleanup removed that harness and all
+   external cases while retaining version, protocol, and result provenance.
 6. **F-PERF-GAMG-SCALING-ROW-KERNELS (first leaf rejected):** Continue with
    isolated CSR residual, scaling, and row-traversal leaves before structural
    hierarchy changes. A bit-exact paired-dot scaling candidate passed the full
@@ -1084,13 +1069,14 @@ The immediate sequence is:
 14. **F-AUTO-1 (accepted external dependency):** Keep the accepted isolated n8n
    coding workflow in the AI Dev Orchestrator repository and preserve the
    existing analysis workflow as a separate read-only path.
-15. **F-REF-1:** Keep a focused OpenFOAM 13 module/case reference and
-   license/provenance note for each newly selected physics area. Expand it only
-   when a bounded implementation task needs more detail.
+15. **F-REF-1:** Keep focused, documentation-only external version, result, and
+   protocol provenance for each newly selected physics area. Do not bundle
+   external solver cases or sources.
 16. **F-ARCH-1:** Extract the `incompressibleFluid` module registry and common solver
    lifecycle from the transitional combined crates with parity tests.
-17. **F-IO-1:** Specify and implement `FerrumFile v1`; isolate OpenFOAM support behind the
-   `openfoamIO` interoperability layer.
+17. **F-IO-1:** Specify and implement `FerrumFile v1`; isolate independently
+   authored external-format compatibility behind the `ferrumIO` adapter
+   boundary.
 18. **F-D1D2-1:** Complete Driver 1 SIMPLE/SIMPLEC and Driver 2 PISO/PIMPLE on the scalar CPU
    reference backend for the frozen selected-case inventory.
 19. **F-BACKEND-1:** After the Driver 1/2 inventory gate, accept `ferrumRun`
