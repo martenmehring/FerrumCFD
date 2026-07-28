@@ -7,7 +7,8 @@ use crate::{MeshError, Result};
 pub mod gamg;
 pub use gamg::{
     GamgAgglomerator, GamgFacePairWeight, GamgKernelTiming, GamgLevelTiming, GamgOptions,
-    GamgSmoother, GamgSolveControls, GamgWorkspace, ProfiledGamgSolveReport, gamg_solve,
+    GamgOuterSolver, GamgSmoother, GamgSolveControls, GamgWorkspace, ProfiledGamgSolveReport,
+    gamg_solve,
 };
 
 #[derive(Clone, Debug)]
@@ -1669,7 +1670,7 @@ fn dot(left: &[f64], right: &[f64]) -> f64 {
         .sum()
 }
 
-fn dot_product_is_singular(value: f64, left: &[f64], right: &[f64]) -> bool {
+pub(super) fn dot_product_is_singular(value: f64, left: &[f64], right: &[f64]) -> bool {
     let scale = l2_norm(left) * l2_norm(right);
     scale == 0.0 || !scale.is_finite() || value.abs() <= f64::EPSILON * scale
 }
