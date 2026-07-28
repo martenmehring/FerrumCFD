@@ -712,10 +712,12 @@ Ferrum reads `minIter`, `maxIter`, the pre/post sweep level multipliers and
 maximums, and all controls shown above. If `agglomerator` is omitted,
 OpenFOAM's `faceAreaPair` default is used. `faceAreaPair` consumes the runtime
 mesh geometry; `algebraicPair` uses pressure-matrix connection strengths.
-`mergeLevels` currently must be `1`, and `interpolateCorrection` currently
-must be `false`; other values produce an explicit error. GAMG cannot be chosen
-for `solvers.U`. There is no PCG fallback. JSON and Markdown solve reports
-record the effective controls under `options.pressureGamg`.
+`mergeLevels` currently must be `1`. `interpolateCorrection` defaults to
+`false`; `true` is an explicit compatibility and experimentation control for
+the serial symmetric-CSR GAMG path, not a performance recommendation or a
+default. GAMG cannot be chosen for `solvers.U`. There is no PCG fallback. JSON
+and Markdown solve reports record the effective controls under
+`options.pressureGamg`.
 
 ```text
 SIMPLE
