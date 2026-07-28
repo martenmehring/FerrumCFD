@@ -1244,6 +1244,34 @@ The immediate sequence is:
     case changed, and no speedup is claimed. The 389-entry failure-evidence
     manifest SHA256 is
     `699ddbbc4ce725e8b1a077034544544c0195245a68b551a36ffd157189b24cfa`.
+    A subsequent two-file clean-base research leaf on `48f3bc5` packed each
+    GAMG level's off-diagonal CSR row entries into reusable contiguous storage.
+    Column indices used a lossless `u32` representation when possible and an
+    automatic `usize` fallback otherwise. Values were refreshed in place after
+    each finest or coarse coefficient update. Diagonal division, row and
+    arithmetic order, hierarchy, sweeps, tolerances, failure semantics, public
+    APIs, and work counters remained unchanged. Five focused packed-layout
+    proofs, an integrated FCG/`faceAreaPair` cross-product proof, all 58 debug
+    and 58 release GAMG tests, the full 494-test workspace gate plus one
+    intentional performance ignore, the release pressure-matrix gate, Rust
+    1.94 locked/offline Clippy, and two independent source audits passed.
+
+    Native Linux CPU2 pre-gates then passed all 16 jobs with bit-exact reports,
+    fields, stop reasons, hierarchy, options, and work fingerprints. Stage A
+    completed all 48 planned jobs with exact semantics. The primary unprofiled
+    pressure medians improved by `8.03%` for Pipe and `4.09%` for Channel, and
+    paired medians improved by `10.52%` and `2.79%`. The strict robustness gate
+    nevertheless rejected the leaf: Pipe won only `3/5` pairs and its
+    B-leading cohort regressed to a `1.08252` candidate/base ratio, despite an
+    A-leading ratio of `0.89485`. Profiled evidence also showed smoothing
+    regressions of `17.48%` for Pipe and `9.33%` for Channel, with total
+    profiled GAMG-path regressions of `23.26%` and `17.52%`. Stage B and all
+    additional measurements therefore remained at zero. The source stays local
+    and unmerged; no speedup or publication claim is made. The 1,593-entry
+    evidence manifest SHA256 is
+    `e345cafd36641646d776089af793adbafec7c8846b6410acbcd49adb0f859db5`;
+    its manifest-seal SHA256 is
+    `82579ff52d8ff35a632cf3837fbbb6fa37203b24652b5c0863c20152aecba120`.
 14. **F-PERF-GAMG-FCG (accepted opt-in scalar path; default unchanged):** The
     existing GAMG V-cycle is now available as the explicit preconditioner for
     an `outerSolver FCG` pressure path. Seven focused proofs cover the real
