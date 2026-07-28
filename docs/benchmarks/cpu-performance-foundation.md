@@ -332,7 +332,7 @@ contracts rather than on a case-specific pressure shortcut.
 The implementation is independently authored Rust over Ferrum's CSR API. The
 official OpenFOAM links document behavior, controls, and defaults used for
 compatibility; no OpenFOAM C++ source or derived source file is included in the
-MIT-licensed Ferrum crates.
+`GPL-3.0-or-later`-licensed Ferrum crates.
 
 The Rust foundation provides:
 
@@ -365,7 +365,7 @@ own convergence gate. Mesh-weight and SIMPLE pressure-correction tests cover
 `faceAreaPair`. Four CLI tests verify dictionary mapping, resolved runtime
 options, pressure-only selection, and fail-closed validation.
 
-```powershell
+```console
 cargo test -p ferrum-mesh linear::gamg -- --nocapture
 cargo test -p ferrum-mesh face_area_pair -- --nocapture
 cargo test -p ferrum-mesh runs_minimal_simple_pressure_correction_with_face_area_gamg -- --nocapture
@@ -623,6 +623,24 @@ Named-patch owner-cell pressure differences are retained as field diagnostics,
 but they are not used as the primary full-length analytic metric because owner
 centres do not lie on the physical boundary planes.
 
+## Latest Matched Native Linux Fixed-Work Comparison
+
+The latest accepted same-Linux comparison used two warmups and nine measured
+runs for each frozen case. Ferrum candidate `9b6befb`, later merged as
+`4a0e2f3`, was compared with a separately installed OpenFOAM Foundation 13
+baseline (package/tag `20260407`, build `13-441953dfbb42`). Process elapsed
+time is the primary metric:
+
+| Case | Ferrum median [s] | OpenFOAM 13 median [s] | Ferrum / OpenFOAM | Approximate Ferrum speed |
+| --- | ---: | ---: | ---: | ---: |
+| Laminar pipe | 2.24 | 6.65 | 0.3368 | 2.97x faster |
+| Plane channel | 6.47 | 10.97 | 0.5898 | 1.70x faster |
+
+These are fixed-work results on two frozen cases, not a general claim that
+Ferrum is faster for every mesh, solver configuration, accuracy target, or
+physics model. OpenFOAM cases, executables, and the external comparison harness
+are not distributed with FerrumCFD.
+
 ## Next Performance Target
 
 Pressure linear solves still dominate converged runtime. GAMG integration,
@@ -638,16 +656,14 @@ roadmap.
 Parallel CPU and GPU work must retain the same operator and convergence
 contracts.
 
-Reproduction commands:
+Portable Rust validation commands:
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_cpu_performance_baseline.ps1 -RunProfile fixed -PressureSolver pcg
-powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_cpu_performance_baseline.ps1 -RunProfile fixed -PressureSolver gamg
-powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_cpu_performance_baseline.ps1 -RunProfile converged -PressureSolver gamg -WarmupRuns 0 -MeasuredRuns 1 -RequireConverged
+```console
 cargo test -p ferrum-mesh --test pressure_mesh_gate -- --nocapture
 cargo test --release -p ferrum-mesh --test pressure_mesh_gate -- --nocapture
 cargo test --release -p ferrum-mesh benchmarks_flat_ic0_dependency_layout_against_nested_rows -- --ignored --nocapture
 ```
 
-Generated logs, working cases, fields, JSON, and Markdown remain below
-`target/benchmarks`; only this stable summary is versioned.
+The historical external benchmark harness is not distributed with FerrumCFD.
+Generated logs, working cases, fields, JSON, and Markdown remain untracked;
+only this stable result and protocol summary is versioned.
