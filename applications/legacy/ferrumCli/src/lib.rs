@@ -9584,7 +9584,7 @@ mod tests {
             ("postSweepsLevelMultiplier", "2"),
             ("maxPostSweeps", "6"),
             ("nFinestSweeps", "4"),
-            ("interpolateCorrection", "false"),
+            ("interpolateCorrection", "true"),
             ("scaleCorrection", "false"),
             ("directSolveCoarsest", "true"),
         ] {
@@ -9616,7 +9616,7 @@ mod tests {
         assert_eq!(options.post_sweeps_level_multiplier, 2);
         assert_eq!(options.max_post_sweeps, 6);
         assert_eq!(options.n_finest_sweeps, 4);
-        assert!(!options.interpolate_correction);
+        assert!(options.interpolate_correction);
         assert!(!options.scale_correction);
         assert!(options.direct_solve_coarsest);
     }
@@ -9642,6 +9642,7 @@ mod tests {
             ("nPreSweeps", "1"),
             ("nPostSweeps", "3"),
             ("nFinestSweeps", "4"),
+            ("interpolateCorrection", "true"),
         ] {
             plan.numerics
                 .fv_solution
@@ -9692,6 +9693,7 @@ mod tests {
         assert_eq!(gamg.n_pre_sweeps, 1);
         assert_eq!(gamg.n_post_sweeps, 3);
         assert_eq!(gamg.n_finest_sweeps, 4);
+        assert!(gamg.interpolate_correction);
     }
 
     #[test]
