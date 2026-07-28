@@ -589,12 +589,13 @@ The first optimization sequence is tracked as follows:
     NNZ-weighted work proxies, and coarsest-iteration counts. Cache the static
     descriptor after the first successful profiled solve; the unprofiled path
     and all solver controls remain unchanged;
-22. test hierarchy leaves one at a time. Start with an explicit opt-in
-    `mergeLevels 2` experiment while retaining default `mergeLevels 1`, then
-    evaluate cached direct coarse factorization as a separate package. Keep
-    coarsest-level target, deterministic aggregation/coarsening, sweep
-    placement, and weighted prolongation isolated. Larger gains require fewer
-    V-cycles or less weighted work in both frozen cases;
+22. continue testing hierarchy leaves one at a time. The isolated
+    `mergeLevels 2` experiment failed the frozen two-case work gate and remains
+    unmerged; production keeps requiring `mergeLevels 1`. Evaluate cached
+    direct coarse factorization next as a separate package. Keep coarsest-level
+    target, deterministic aggregation/coarsening, sweep placement, and weighted
+    prolongation isolated. Larger gains require fewer V-cycles or less weighted
+    work in both frozen cases;
 23. completed: gate the static user-bounded `relTol` implementation with Linux
     time-to-accuracy evidence and evaluate SIMPLEC as a separate same-binary
     leaf. SIMPLEC passed the frozen Channel gate but failed the frozen Pipe
@@ -964,7 +965,7 @@ The immediate sequence is:
    `266304720/381274010` and `736011430/1071131186`; iterative coarsest work is
    `2137/6771` iterations. These profiled oracles prove observational parity,
    not a speedup. Focused Fable review remains explicitly deferred.
-8. **F-PERF-GAMG-HIERARCHY-LEAVES (equal-weight pairing accepted):** Test one predeclared variable per A/B:
+8. **F-PERF-GAMG-HIERARCHY-LEAVES (equal-weight pairing accepted; `mergeLevels 2` rejected):** Test one predeclared variable per A/B:
    coarsest-level target; cached direct versus iterative coarse solve;
    deterministic pairing/coarsening; pre/post/finest sweep placement; weighted
    prolongation; and, later, GAMG as a PCG/FCG preconditioner. Invalidate and
@@ -1019,6 +1020,22 @@ The immediate sequence is:
    Reports and final fields stayed bit-exact. Channel's `0+2` probe was
    inconclusive because its two order cohorts disagreed, so the predeclared
    both-case gate stopped before a stronger Channel run.
+   A later clean-base `mergeLevels 2` implementation on `44946ce` matched
+   OpenFOAM Foundation 13 grouping semantics, retained a separate exact
+   `mergeLevels 1` path, and passed its focused/GAMG, formatting, Clippy, and
+   independent-review gates. The fresh Native Linux CPU2 `A-B-B-A` Go/No-Go
+   nevertheless rejected it as a generic default. Pipe levels fell `9 -> 5`
+   and NNZ-weighted sparse work fell `381274010 -> 345285600` (`-9.44%`), even
+   though V-cycles rose `745 -> 1215`; its two-run process and internal
+   pressure medians improved by about `13.33%` and `11.94%`. Channel levels
+   fell `8 -> 5`, but V-cycles rose `7021 -> 18776`, sparse work rose
+   `1071131186 -> 1654088736` (`+54.42%`), and process and internal pressure
+   medians regressed by about `19.55%` and `37.95%`. All sampled final linear
+   solves converged and final continuity remained near `1e-18`, but the
+   predeclared both-case work gate failed, so the expensive `2+10` and
+   converged runs were not started. The implementation remains unmerged,
+   `mergeLevels 1` remains the default, and no speedup is claimed. Focused
+   Fable review remains deferred.
 9. **F-PERF-ADAPTIVE-LINEAR (semantics/work accepted; timing not accepted):**
    Commit `206f7ee` implements static, user-bounded OpenFOAM-style `relTol` for
    all current scalar linear solvers while preserving final outer acceptance.
