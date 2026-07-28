@@ -1801,14 +1801,12 @@ fn pair_map_from_edges(
         cell_neighbours[edge.lower].insert(edge.upper);
         cell_neighbours[edge.upper].insert(edge.lower);
     }
+    // Use the combined endpoint degrees as a bounded-cost stencil-width proxy.
+    // Computing the exact union for every edge makes sparse high-degree graphs
+    // (for example, a star) take quadratic time during hierarchy construction.
     let external_neighbour_counts = edges
         .iter()
-        .map(|edge| {
-            cell_neighbours[edge.lower]
-                .union(&cell_neighbours[edge.upper])
-                .filter(|&&cell| cell != edge.lower && cell != edge.upper)
-                .count()
-        })
+        .map(|edge| cell_neighbours[edge.lower].len() + cell_neighbours[edge.upper].len() - 2)
         .collect::<Vec<_>>();
 
     let mut coarse_map = vec![usize::MAX; n_cells];
@@ -6371,6 +6369,24 @@ mod tests {
 
             assert_eq!(actual, expected);
         }
+    }
+
+    #[test]
+    fn high_degree_pair_map_has_linear_sized_work() {
+        const N_CELLS: usize = 20_000;
+        let edges = (1..N_CELLS)
+            .map(|upper| PairEdge {
+                lower: 0,
+                upper,
+                weight: 1.0,
+            })
+            .collect::<Vec<_>>();
+
+        let (coarse_map, n_coarse) =
+            pair_map_from_edges(N_CELLS, &edges, true).expect("star pair map");
+
+        assert_eq!(coarse_map.len(), N_CELLS);
+        assert_eq!(n_coarse, 1);
     }
 
     #[test]
