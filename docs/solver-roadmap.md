@@ -1056,33 +1056,48 @@ The immediate sequence is:
     reproducible diagnostic lane, not a default or a general speed claim. Keep
     the portable release as the distribution profile. Focused Fable review is
     deferred until its quota is available; no Fable approval is claimed by
-    this harness package. The next separate hierarchy leaf is
-    `interpolateCorrection`, disabled by default and evaluated without mixing
-    its numerical-path change into this build-only experiment.
-12. **F-PERF-SIMD-THREAD-GPU:** After scalar acceptance, proceed through SIMD,
+    this harness package.
+12. **F-PERF-GAMG-INTERPOLATE-CORRECTION (capability accepted; performance leaf
+    rejected):** PR `#93` implemented Foundation-style correction
+    interpolation for the serial symmetric-CSR GAMG path while keeping it
+    disabled by default. Rust 1.94 formatting, Clippy, 477 passed tests plus one
+    intentionally ignored performance test, release preflights, PR CI, Trusted
+    Merge, and exact post-merge CI passed on merge `be039401`; focused Fable
+    review remains deferred. A same-binary
+    Native Linux `0+2` go/no-go then changed only the direct
+    `solvers.p.interpolateCorrection false -> true` control. Pipe pressure work
+    increased `1687 -> 2448` iterations and its process median increased
+    `2.645 -> 4.225 s` (ratio `1.5974`). Channel pressure work increased
+    `10654 -> 11064` iterations and its process median increased
+    `6.815 -> 8.125 s` (ratio `1.1922`). All linear solves completed and the
+    report-level velocity/pressure L2 differences stayed below `4e-11`, but the
+    work and timing regressions in both cases stopped the expensive `2+10`
+    decision run. Keep the option explicit and default-off for compatibility;
+    do not use it as a performance default or claim a speedup from it.
+13. **F-PERF-SIMD-THREAD-GPU:** After scalar acceptance, proceed through SIMD,
     shared-memory threading, and GPU as separate leaves. Apply fixed-work plus
     time-to-accuracy evidence to every leaf.
-13. **F-D1-CYLINDER-LIMITED-SCHEMES / F-D1-CASE-CYLINDER:** Only after all
+14. **F-D1-CYLINDER-LIMITED-SCHEMES / F-D1-CASE-CYLINDER:** Only after all
    correctness and scalar-performance gates above are accepted, implement the
    required limited schemes and then the Cylinder case. Validation order
    remains Pipe, Channel, then Cylinder.
-14. **F-AUTO-1 (accepted external dependency):** Keep the accepted isolated n8n
+15. **F-AUTO-1 (accepted external dependency):** Keep the accepted isolated n8n
    coding workflow in the AI Dev Orchestrator repository and preserve the
    existing analysis workflow as a separate read-only path.
-15. **F-REF-1:** Keep focused, documentation-only external version, result, and
+16. **F-REF-1:** Keep focused, documentation-only external version, result, and
    protocol provenance for each newly selected physics area. Do not bundle
    external solver cases or sources.
-16. **F-ARCH-1:** Extract the `incompressibleFluid` module registry and common solver
+17. **F-ARCH-1:** Extract the `incompressibleFluid` module registry and common solver
    lifecycle from the transitional combined crates with parity tests.
-17. **F-IO-1:** Specify and implement `FerrumFile v1`; isolate independently
+18. **F-IO-1:** Specify and implement `FerrumFile v1`; isolate independently
    authored external-format compatibility behind the `ferrumIO` adapter
    boundary.
-18. **F-D1D2-1:** Complete Driver 1 SIMPLE/SIMPLEC and Driver 2 PISO/PIMPLE on the scalar CPU
+19. **F-D1D2-1:** Complete Driver 1 SIMPLE/SIMPLEC and Driver 2 PISO/PIMPLE on the scalar CPU
    reference backend for the frozen selected-case inventory.
-19. **F-BACKEND-1:** After the Driver 1/2 inventory gate, accept `ferrumRun`
+20. **F-BACKEND-1:** After the Driver 1/2 inventory gate, accept `ferrumRun`
    successively on partitioned multi-process CPU, multi-node CPU, multi-GPU,
    and multi-node CPU/GPU integration without changing case numerics, reusing
    the earlier accepted shared-memory and single-GPU leaves.
-20. **F-D3D7-1:** Implement Drivers 3 through 7 in the fixed order above, applying the common
+21. **F-D3D7-1:** Implement Drivers 3 through 7 in the fixed order above, applying the common
    readiness gate and completing coupled `ferrumMultiRun` before Driver 6.
-21. **F-POROUS-1:** Begin porous-media and packed-bed work only after Driver 7 is complete.
+22. **F-POROUS-1:** Begin porous-media and packed-bed work only after Driver 7 is complete.
