@@ -80,7 +80,7 @@ pub fn write_openfoam_case_with_options(
     for (patch, patch_type) in &options.patch_types {
         validate_openfoam_word(patch_type).map_err(|reason| {
             MeshError::InvalidInput(format!(
-                "invalid OpenFOAM patch type '{patch_type}' for patch '{patch}': {reason}"
+                "invalid supported patch type '{patch_type}' for patch '{patch}': {reason}"
             ))
         })?;
     }
@@ -652,7 +652,7 @@ fn validate_openfoam_word(value: &str) -> std::result::Result<(), &'static str> 
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
     {
-        return Err("value must contain only OpenFOAM word characters");
+        return Err("value must contain only FOAM dictionary word characters");
     }
     Ok(())
 }

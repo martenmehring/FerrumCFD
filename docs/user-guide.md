@@ -6,26 +6,28 @@ patterns where that helps users keep their existing habits.
 
 ## Build
 
-From the repository root:
+The only normal build prerequisite is a current Rust toolchain. From the
+repository root:
 
-```powershell
+```console
 cargo build --bins
 ```
 
-The debug binaries are written to:
+The debug binaries are written below `target/debug/`. On Windows, executable
+names receive the normal `.exe` suffix:
 
 ```text
-target/debug/ferrum.exe
-target/debug/initFerrumCase.exe
-target/debug/gmshToFerrum.exe
-target/debug/checkFerrumMesh.exe
-target/debug/splitFerrumMeshRegions.exe
-target/debug/ferrumRun.exe
+target/debug/ferrum
+target/debug/initFerrumCase
+target/debug/gmshToFerrum
+target/debug/checkFerrumMesh
+target/debug/splitFerrumMeshRegions
+target/debug/ferrumRun
 ```
 
 During development, commands can also be run through Cargo:
 
-```powershell
+```console
 cargo run -p ferrum-cli --bin gmshToFerrum -- --help
 ```
 
@@ -33,20 +35,20 @@ cargo run -p ferrum-cli --bin gmshToFerrum -- --help
 
 Create a basic FerrumCFD case structure with:
 
-```powershell
-initFerrumCase cases\my_case
+```console
+initFerrumCase cases/my_case
 ```
 
 Equivalent combined command:
 
-```powershell
-ferrum initFerrumCase cases\my_case
+```console
+ferrum initFerrumCase cases/my_case
 ```
 
 For a multi-region case, region folders can be created immediately:
 
-```powershell
-initFerrumCase cases\reactor --regions inner_zone,membrane,outer_zone
+```console
+initFerrumCase cases/reactor --regions inner_zone,membrane,outer_zone
 ```
 
 The initializer writes templates for:
@@ -189,14 +191,14 @@ initial fields:
 The first supported mesh path is Gmsh 2.2 ASCII with `tri3`/`quad4` physical
 surfaces and `prism6`/`hex8` physical volumes:
 
-```powershell
-gmshToFerrum path\to\mesh.msh -case cases\my_case
+```console
+gmshToFerrum path/to/mesh.msh -case cases/my_case
 ```
 
 Equivalent Cargo command:
 
-```powershell
-cargo run -p ferrum-cli --bin gmshToFerrum -- path\to\mesh.msh -case cases\my_case
+```console
+cargo run -p ferrum-cli --bin gmshToFerrum -- path/to/mesh.msh -case cases/my_case
 ```
 
 The importer maps:
@@ -209,10 +211,9 @@ Internal multi-region interfaces are therefore preserved as `faceZones` even
 when they are not external boundary patches.
 
 The repository also contains neutral Gmsh source examples under the tutorial
-bundles. Users may process them directly with Gmsh and `gmshToFerrum`; no
-repository wrapper or combined Ferrum/OpenFOAM workflow is required. Optional
-case-generation, mesh-study, and historical reproduction helpers are
-maintainer tools documented in `docs/development/script-policy.md`.
+bundles. Users who already have a Gmsh mesh may import its supported 2.2 ASCII
+form with `gmshToFerrum`; Gmsh is not required to build or solve the checked-in
+Ferrum cases. No repository wrapper or combined solver workflow is required.
 
 ## Interface Registry
 
@@ -245,8 +246,8 @@ species-transfer, membrane, conjugate, or other coupled-interface laws.
 
 Run:
 
-```powershell
-checkFerrumMesh -case cases\my_case
+```console
+checkFerrumMesh -case cases/my_case
 ```
 
 The current checker reports:
@@ -284,8 +285,8 @@ mesh patch type, for example `empty` on an `empty` patch or `wedge` on a
 When a mesh contains volume physical groups, the importer writes them as
 `cellZones`. Region meshes can then be written with:
 
-```powershell
-splitFerrumMeshRegions -case cases\my_case -cellZones
+```console
+splitFerrumMeshRegions -case cases/my_case -cellZones
 ```
 
 The splitter reads the Ferrum-generated ASCII `constant/polyMesh` and writes one
@@ -322,8 +323,8 @@ FerrumCFD follows the OpenFOAM convention: a 2D case is represented as a thin
 
 Example:
 
-```powershell
-gmshToFerrum path\to\mesh2d.msh -case cases\plate2d -emptyPatch frontAndBack
+```console
+gmshToFerrum path/to/mesh2d.msh -case cases/plate2d -emptyPatch frontAndBack
 ```
 
 This writes:
@@ -350,8 +351,8 @@ two angular patches must be separate patches of type `wedge`.
 
 Example:
 
-```powershell
-gmshToFerrum path\to\axisymmetric.msh -case cases\reactor_axi -wedgePatch wedgeMin -wedgePatch wedgeMax
+```console
+gmshToFerrum path/to/axisymmetric.msh -case cases/reactor_axi -wedgePatch wedgeMin -wedgePatch wedgeMax
 ```
 
 Important solver rule: `wedge` must later be interpreted as an axisymmetric
@@ -363,13 +364,13 @@ patches is odd, because axisymmetric wedge patches normally come in pairs.
 
 OpenFOAM-compatible patch types can be assigned during import:
 
-```powershell
-gmshToFerrum path\to\mesh.msh -case cases\my_case -patchType symmetry=symmetryPlane
+```console
+gmshToFerrum path/to/mesh.msh -case cases/my_case -patchType symmetry=symmetryPlane
 ```
 
 Shortcuts:
 
-```powershell
+```console
 -emptyPatch <patch>       # writes type empty
 -wedgePatch <patch>       # writes type wedge
 -symmetryPatch <patch>    # writes type symmetryPlane
@@ -381,18 +382,18 @@ The `ferrum` binary exposes lowerCamelCase commands. Utilities inspired by an
 OpenFOAM workflow include `Ferrum` in their name so that FerrumCFD commands are
 unambiguous:
 
-```powershell
-ferrum initFerrumCase cases\my_case
-ferrum gmshToFerrum path\to\mesh.msh -case cases\my_case
-ferrum checkFerrumMesh -case cases\my_case
-ferrum splitFerrumMeshRegions -case cases\my_case -cellZones
-ferrum run -solver incompressibleFluid -case cases\my_case --preflight --planJson target\ferrumRunPlan.json
-ferrum run -solver incompressibleFluid -case cases\my_case --runnerDryRun --maxRunnerSteps 2
+```console
+ferrum initFerrumCase cases/my_case
+ferrum gmshToFerrum path/to/mesh.msh -case cases/my_case
+ferrum checkFerrumMesh -case cases/my_case
+ferrum splitFerrumMeshRegions -case cases/my_case -cellZones
+ferrum run -solver incompressibleFluid -case cases/my_case --preflight --planJson target/ferrumRunPlan.json
+ferrum run -solver incompressibleFluid -case cases/my_case --runnerDryRun --maxRunnerSteps 2
 ```
 
 The same naming convention is used by the dedicated binaries:
 
-```powershell
+```console
 initFerrumCase
 gmshToFerrum
 checkFerrumMesh
@@ -421,33 +422,25 @@ If a future parser accepts unit suffixes, non-SI values must be explicit, such
 as `1 km` or `25 degC`. A bare `1` for a length-like quantity means `1 m`, not
 `1 mm`, `1 cm`, or a solver-specific display unit.
 
-OpenFOAM comparison cases are allowed to use OpenFOAM's native conventions when
-needed. For example, incompressible OpenFOAM solvers commonly store `p` as
-kinematic pressure in `m2/s2`. FerrumCFD benchmark scripts must convert those
-results back to SI pressure in `Pa` before comparison.
+Archived external comparisons use the external solver's native conventions.
+For example, incompressible OpenFOAM solvers commonly store `p` as kinematic
+pressure in `m2/s2`. The recorded reports convert those results back to SI
+pressure in `Pa` before comparison.
 
-## Laminar Pipe Benchmark
+## Laminar Pipe Tutorial
 
-`tutorials/incompressibleFluid/laminarPipe/` contains three independent
-references: a Ferrum compatibility case, a native OpenFOAM Foundation 13 case,
-and the Hagen-Poiseuille analytical reference. Run either case from the
-repository root:
+`tutorials/incompressibleFluid/laminarPipe/` contains an independently
+authored Ferrum case and the Hagen-Poiseuille analytical reference. Run the
+Ferrum case from the repository root:
 
-```powershell
-cargo run --locked -p ferrum-run --bin ferrumRun -- -solver incompressibleFluid -case tutorials\incompressibleFluid\laminarPipe\ferrum\case
+```console
+cargo run --locked -p ferrum-run --bin ferrumRun -- -solver incompressibleFluid -case tutorials/incompressibleFluid/laminarPipe/ferrum/case
 ```
 
-```bash
-mkdir -p target
-case_dir="$(mktemp -d target/openfoam-laminarPipe.XXXXXX)"
-cp -R tutorials/incompressibleFluid/laminarPipe/openfoam-v13/case/. "$case_dir/"
-foamRun -solver incompressibleFluid -case "$case_dir"
-```
-
-No shared mesh or comparison runner is required. Stable recorded results are
-kept in `docs/benchmarks/laminar-pipe-poiseuille.md`. Mesh generation,
-OpenFOAM comparison, parameter sweeps, and historical reproduction scripts are
-optional maintainer tools listed in `docs/development/script-policy.md`.
+Stable analytical and external OpenFOAM Foundation 13 comparison results,
+including the tested version and protocol, are retained in
+`docs/benchmarks/laminar-pipe-poiseuille.md`. External reference cases and
+their execution tooling are not distributed with FerrumCFD.
 
 ## Solver Selection And Preflight
 
@@ -455,10 +448,10 @@ optional maintainer tools listed in `docs/development/script-policy.md`.
 `--runnerDryRun` modes do not execute CFD kernels; they read the case and print
 the solver-neutral run plan used by current CPU and later GPU solver paths.
 
-```powershell
-ferrumRun -solver incompressibleFluid -case cases\my_case --preflight
-ferrumRun -solver incompressibleFluid -case cases\my_case --preflight --planJson target\ferrumRunPlan.json
-ferrumRun -solver incompressibleFluid -case cases\my_case --runnerDryRun --maxRunnerSteps 2
+```console
+ferrumRun -solver incompressibleFluid -case cases/my_case --preflight
+ferrumRun -solver incompressibleFluid -case cases/my_case --preflight --planJson target/ferrumRunPlan.json
+ferrumRun -solver incompressibleFluid -case cases/my_case --runnerDryRun --maxRunnerSteps 2
 ```
 
 The solver may instead be selected in `system/controlDict`:
@@ -469,24 +462,16 @@ solver incompressibleFluid;
 ```
 
 Control-dictionary fallback is accepted only with the explicit
-`application ferrumRun;` marker, so a sibling OpenFOAM case is not silently
-adopted as a Ferrum case. An explicit CLI `-solver` is the deliberate
-interoperability override. Plan JSON keeps the raw control values and records
-the effective dispatch separately as `dispatch.module` and
+`application ferrumRun;` marker, so an unrelated case is not silently adopted
+as a Ferrum case. An explicit CLI `-solver` is the deliberate module-selection
+override. Plan JSON keeps the raw control values and records the effective
+dispatch separately as `dispatch.module` and
 `dispatch.source=cli|controlDict`.
-
-The following low-level developer commands remain useful to validation
-automation, but they are not application solver entry points:
-
-```powershell
-ferrum solve -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --solveScalarDiffusion T --diffusivity 1 --linearSolver cg
-ferrum solve -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --solvePoiseuille --linearSolver cg
-```
 
 Equivalent combined command:
 
-```powershell
-ferrum run -solver incompressibleFluid -case cases\my_case --preflight --planJson target\ferrumRunPlan.json
+```console
+ferrum run -solver incompressibleFluid -case cases/my_case --preflight --planJson target/ferrumRunPlan.json
 ```
 
 The preflight reads:
@@ -562,14 +547,10 @@ diffusive boundary faces. This is still an internal solver building block; it
 is not yet automatically driven by `fvSchemes`, `fvSolution`, or a full
 time-loop.
 
-`--solveScalarDiffusion <field>` is the first opt-in executable equation path.
-It reads the selected `volScalarField` from `0/`, converts supported
-`boundaryField` entries into diffusion boundary conditions, assembles a CPU CSR
-system, and solves it with `cg` or `jacobi`:
-
-```powershell
-ferrum solve -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --solveScalarDiffusion T --diffusivity 1 --linearSolver cg --solveTolerance 1e-8 --maxIterations 20000
-```
+`--solveScalarDiffusion <field>` is a low-level developer equation path rather
+than a normal application command. It reads the selected `volScalarField` from
+`0/`, converts supported `boundaryField` entries into diffusion boundary
+conditions, assembles a CPU CSR system, and solves it with `cg` or `jacobi`.
 
 Supported field boundary types for this path are currently `fixedValue uniform
 <scalar>`, `zeroGradient`, and the constraint types `empty`, `wedge`, and
@@ -584,13 +565,10 @@ fully developed axial Stokes balance as a source-driven scalar equation:
 -mu * laplacian(Ux) = deltaP / L
 ```
 
-with `Ux=0` on wall patches and `zeroGradient` elsewhere. It is
-benchmark-oriented. `deltaP`, `L`, and `D` must be supplied explicitly;
-`mu` may be explicit or read from `constant/transportProperties`:
-
-```powershell
-ferrum solve -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --solvePoiseuille --pressureDrop 1.6032 --mu 0.001002 --length 1 --diameter 0.02 --wallPatch wall --linearSolver cg
-```
+with `Ux=0` on wall patches and `zeroGradient` elsewhere. It is an internal
+benchmark utility, not part of the normal user workflow. `deltaP`, `L`, and
+`D` must be supplied explicitly; `mu` may be explicit or read from
+`constant/transportProperties`.
 
 The analytical reference is Hagen-Poiseuille:
 
@@ -651,9 +629,9 @@ boundary-condition contract is:
 
 Current practical command:
 
-```powershell
-ferrumRun -solver incompressibleFluid -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --solveTolerance 1e-6 --maxIterations 100 --solveReportJson target\benchmarks\laminar_pipe_laminar_simple.json --solveReportMarkdown target\benchmarks\laminar_pipe_laminar_simple.md
-ferrumRun -solver incompressibleFluid -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --maxSimpleIterations 2 --writeFinalFields target\benchmarks\laminar_pipe_fields\1
+```console
+ferrumRun -solver incompressibleFluid -case tutorials/incompressibleFluid/laminarPipe/ferrum/case --solveTolerance 1e-6 --maxIterations 100 --solveReportJson target/laminar-pipe.json --solveReportMarkdown target/laminar-pipe.md
+ferrumRun -solver incompressibleFluid -case tutorials/incompressibleFluid/laminarPipe/ferrum/case --maxSimpleIterations 2 --writeFinalFields target/laminar-pipe-fields/1
 ```
 
 Solver report schema version 2 records `solver=incompressibleFluid`,
@@ -664,32 +642,20 @@ solve, pressure-coupling setup, pressure assembly/solve, field correction,
 finalization, and remaining solver work. These timings measure the executable
 solver only; they never include Cargo compilation.
 
-For reproducible CPU performance measurements of both validated flow cases:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File validation\scripts\incompressibleFluid\run_cpu_performance_baseline.ps1
-```
-
-The script builds `target\release\ferrumRun.exe` once, performs one warmup and
-five measured runs per case, and writes median timing plus numerical regression
-observables below `target\benchmarks\cpu_performance_baseline\fixed`. Use
-`-RunProfile converged` for the external residual-control profiles. It is validation
-automation, not part of the public solver interface.
-
 Both commands are geometry-independent SIMPLE execution. Analytic formulas,
-OpenFOAM comparisons, and geometry-specific field integration remain external
-validation work under `validation/` and `target/benchmarks`. Parameters such as
+external comparisons, and geometry-specific field integration are separate
+from the normal user workflow. Parameters such as
 pipe length, diameter, analytic pressure loss, and sampling patch names are
 intentionally rejected by the generic `incompressibleFluid` execution path.
 
 The generic `--linearSolver` value is still accepted, but the laminar SIMPLE
 path can also split the linear solver choice and linear controls by equation:
 
-```powershell
-ferrumRun -solver incompressibleFluid -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --momentumLinearSolver bicgstab --pressureLinearSolver pcg --pressurePreconditioner DIC --maxSimpleIterations 20
-ferrumRun -solver incompressibleFluid -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --momentumSolveTolerance 1e-7 --pressureSolveTolerance 1e-9 --momentumMaxIterations 300 --pressureMaxIterations 400
-ferrumRun -solver incompressibleFluid -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --nNonOrthogonalCorrectors 1 --pRefCell 0 --pRefValue 0
-ferrumRun -solver incompressibleFluid -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --simpleConsistent true --maxSimpleIterations 20
+```console
+ferrumRun -solver incompressibleFluid -case tutorials/incompressibleFluid/laminarPipe/ferrum/case --momentumLinearSolver bicgstab --pressureLinearSolver pcg --pressurePreconditioner DIC --maxSimpleIterations 20
+ferrumRun -solver incompressibleFluid -case tutorials/incompressibleFluid/laminarPipe/ferrum/case --momentumSolveTolerance 1e-7 --pressureSolveTolerance 1e-9 --momentumMaxIterations 300 --pressureMaxIterations 400
+ferrumRun -solver incompressibleFluid -case tutorials/incompressibleFluid/laminarPipe/ferrum/case --nNonOrthogonalCorrectors 1 --pRefCell 0 --pRefValue 0
+ferrumRun -solver incompressibleFluid -case tutorials/incompressibleFluid/laminarPipe/ferrum/case --simpleConsistent true --maxSimpleIterations 20
 ```
 
 By default, the current SIMPLE implementation reads OpenFOAM-style relaxation factors from
@@ -751,20 +717,6 @@ must be `false`; other values produce an explicit error. GAMG cannot be chosen
 for `solvers.U`. There is no PCG fallback. JSON and Markdown solve reports
 record the effective controls under `options.pressureGamg`.
 
-For a release diagnostic of the selected GAMG pressure path, add
-`--profileGamg` and write a normal solve report:
-
-```powershell
-ferrumRun -solver incompressibleFluid -case tutorials\incompressibleFluid\laminarPipe\ferrum\case --profileGamg --solveReportJson target\benchmarks\gamg-profile.json --solveReportMarkdown target\benchmarks\gamg-profile.md
-```
-
-The flag is valid only when `solvers.p.solver` resolves to `GAMG`. It is not an
-`fvSolution` entry and changes no cycle or stopping control. Console, JSON, and
-Markdown output split the pressure time into hierarchy, residual, V-cycle,
-transfer, smoothing, scaling, correction, and coarsest-solve phases and list
-cells, nonzeros, calls, and sweeps for every level. Omitting the flag keeps the
-unprofiled execution path.
-
 ```text
 SIMPLE
 {
@@ -816,10 +768,9 @@ Without `residualControl`, the solver runs to `--maxSimpleIterations`, reports
 `converged=false`, and records outer convergence as `not-evaluated` with stop
 reason `ConvergenceCriteriaNotConfigured`. Configured criteria that are not met
 within the budget report `not-reached`. Hagen-Poiseuille
-error, OpenFOAM comparison, and matched-time acceptance are evaluated by the
-external benchmark scripts; they cannot stop, cap, roll back, or force a flow
-direction in the generic solver. `minSimpleIterations` can still be set as a
-case-level `SIMPLE` value.
+error and external comparison acceptance are independent validation decisions;
+they cannot stop, cap, roll back, or force a flow direction in the generic
+solver. `minSimpleIterations` can still be set as a case-level `SIMPLE` value.
 
 Without `--writeFinalFields`, the current `incompressibleFluid` SIMPLE path only reports and does not
 write fields back to the case. With `--writeFinalFields <dir>`, Ferrum writes
@@ -883,15 +834,13 @@ simulation. OpenFOAM's kinematic incompressible pressure must be multiplied by
 and SI inputs are under `tutorials/incompressibleFluid/planeChannel/`.
 
 Recorded pipe and plane-channel results are available under `docs/benchmarks`.
-They document maintainer runs and are not a required user workflow. Optional
-comparison, sweep, and reproduction tools remain under `validation/scripts`
-and are indexed in `docs/development/script-policy.md` instead of being part of
-the normal solver instructions.
+They document external reference versions, protocols, and maintainer runs and
+are not a required user workflow. Reference cases and benchmark orchestration
+are not distributed as part of FerrumCFD.
 
 The solver roadmap in `docs/solver-roadmap.md` records the remaining physics,
-case, and backend work. Users can run each Ferrum or OpenFOAM case
-independently and decide which meshes and comparisons are appropriate for their
-own study.
+case, and backend work. Users run Ferrum cases directly and may choose their
+own external references and meshes for independent studies.
 
 It also checks basic `controlDict` consistency: recognized `startFrom`,
 `stopAt`, and `writeControl` modes, positive finite `deltaT`, valid
@@ -911,7 +860,7 @@ If plan-only creation fails while creating a missing parent or the final leaf,
 rollback removes only newly created empty directories, preserves the original
 error, and may leave nonempty residue. Existing or concurrent content is never
 deleted, and this rollback does not apply to strict case roots.
-That file is intended for future run managers, GUI tools, benchmark scripts,
+That file is intended for future run managers, GUI tools, measurement tooling,
 and CPU/GPU solver launch code. The text preflight remains the normal
 human-readable output.
 

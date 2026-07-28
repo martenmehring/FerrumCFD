@@ -1,26 +1,23 @@
 # Tutorials
 
 Tutorials are grouped by public application module. Their user-facing purpose
-is to provide independent Ferrum and OpenFOAM 13 cases beside a mathematical or
-published reference:
+is to provide independently authored Ferrum cases beside a mathematical or
+documented external reference:
 
 ```text
 <module>/<case>/
   ferrum/case/
-  openfoam-v13/case/
   analytical/       # when a useful closed form exists
   README.md
 ```
 
-`ferrum/case` and `openfoam-v13/case` must each be independently runnable. The
-user chooses which case, mesh, and comparison to execute. A master script is
-not required. Small canonical meshes may be versioned inside either
-program-specific case; generated time directories and logs belong below
-`target/`.
+`ferrum/case` is independently runnable with the Rust tools shipped by this
+repository. Small canonical Ferrum meshes may be versioned with the tutorial;
+generated time directories and logs belong below `target/`. External solver
+cases and execution scripts are not bundled.
 
-`shared/`, `comparison.toml`, benchmark data, and maintainer scripts are
-optional case-specific aids. Neither solver case may depend on shared metadata
-at runtime.
+`shared/`, `comparison.toml`, and benchmark metadata are optional
+case-specific aids. A Ferrum solver case must not depend on them at runtime.
 
 When present, `comparison.toml` records `module`, `readiness_driver`,
 `algorithm`, and `regime` separately. This keeps the shared

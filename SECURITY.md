@@ -13,10 +13,9 @@ and shared HPC front ends that expose FerrumCFD to other users must constrain
 those operator-controlled arguments and enforce process-level CPU, memory,
 wall-time, filesystem, and GPU quotas.
 
-Files below `validation/scripts/` are local development and benchmark tooling. They are
-not a hosted service interface. Scripts may execute only explicitly selected
-tools or applications resolved through `PATH`; they must not auto-execute a
-binary discovered in user-writable download folders.
+FerrumCFD does not bundle benchmark launchers or external solver runners.
+Maintainer measurements must run outside the product repository and must not
+turn candidate-controlled paths or output into trusted execution controls.
 
 The supported code is the current default branch. Report suspected
 vulnerabilities privately through the repository's GitHub security advisory

@@ -9,7 +9,6 @@ physical_parameters = "shared/physicalParameters.toml"
 
 [implementations]
 ferrum_case = "ferrum/case"
-openfoam_v13_case = "openfoam-v13/case"
 reference = "analytical/pipeBenchmark"
 
 [physics]

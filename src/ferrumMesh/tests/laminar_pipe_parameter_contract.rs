@@ -57,7 +57,6 @@ const LENGTH: f64 = 1.0;
 const DIAMETER: f64 = 0.02;
 const RHO: f64 = 998.2;
 const MU: f64 = 0.001002;
-const EXACT_NU: f64 = 1.0038068513323983e-6;
 const FERRUM_NU: f64 = 1.0038e-6;
 const MEAN_U: f64 = 0.02;
 const EPS: f64 = 1.0e-12;
@@ -233,7 +232,6 @@ fn validate_metadata(comparison: &str, physical: &str) -> CheckResult {
         &comparison.tables["implementations"],
         &[
             ("ferrum_case", "\"ferrum/case\""),
-            ("openfoam_v13_case", "\"openfoam-v13/case\""),
             ("reference", "\"analytical/pipeBenchmark\""),
         ],
     )?;
@@ -359,7 +357,7 @@ fn assert_dimensioned(
     close(value, expected, tolerance)
 }
 
-fn validate_properties(name: &str, dictionaries: &[PropertyDictionary]) -> CheckResult {
+fn validate_properties(dictionaries: &[PropertyDictionary]) -> CheckResult {
     let mut by_name = BTreeMap::new();
     for dictionary in dictionaries {
         if by_name
@@ -369,46 +367,22 @@ fn validate_properties(name: &str, dictionaries: &[PropertyDictionary]) -> Check
             return Err("duplicate property dictionary".into());
         }
     }
-    if name == "ferrum" {
-        if by_name.keys().copied().collect::<BTreeSet<_>>()
-            != BTreeSet::from(["transportProperties"])
-        {
-            return Err("Ferrum property dictionary set mismatch".into());
-        }
-        let entries = entry_map(by_name["transportProperties"])?;
-        if entries.keys().copied().collect::<BTreeSet<_>>()
-            != BTreeSet::from(["Cp", "Pr", "k", "mu", "nu", "rho", "transportModel"])
-            || entries["transportModel"].value != ["Newtonian"]
-        {
-            return Err("Ferrum property semantics mismatch".into());
-        }
-        assert_dimensioned(entries["rho"], [1, -3, 0, 0, 0, 0, 0], RHO, EPS)?;
-        assert_dimensioned(entries["mu"], [1, -1, -1, 0, 0, 0, 0], MU, EPS)?;
-        assert_dimensioned(entries["nu"], [0, 2, -1, 0, 0, 0, 0], FERRUM_NU, EPS)?;
-        assert_dimensioned(entries["Cp"], [0, 2, -2, -1, 0, 0, 0], 4182.0, EPS)?;
-        assert_dimensioned(entries["k"], [1, 1, -3, -1, 0, 0, 0], 0.598, EPS)?;
-        assert_dimensioned(entries["Pr"], [0, 0, 0, 0, 0, 0, 0], 7.01, EPS)
-    } else {
-        if by_name.keys().copied().collect::<BTreeSet<_>>()
-            != BTreeSet::from(["momentumTransport", "physicalProperties"])
-        {
-            return Err("OpenFOAM property dictionary set mismatch".into());
-        }
-        let momentum = entry_map(by_name["momentumTransport"])?;
-        if momentum.keys().copied().collect::<BTreeSet<_>>() != BTreeSet::from(["simulationType"])
-            || momentum["simulationType"].value != ["laminar"]
-        {
-            return Err("momentum transport mismatch".into());
-        }
-        let physical = entry_map(by_name["physicalProperties"])?;
-        if physical.keys().copied().collect::<BTreeSet<_>>()
-            != BTreeSet::from(["nu", "viscosityModel"])
-            || physical["viscosityModel"].value != ["constant"]
-        {
-            return Err("physical properties mismatch".into());
-        }
-        assert_dimensioned(physical["nu"], [0, 2, -1, 0, 0, 0, 0], EXACT_NU, EPS)
+    if by_name.keys().copied().collect::<BTreeSet<_>>() != BTreeSet::from(["transportProperties"]) {
+        return Err("Ferrum property dictionary set mismatch".into());
     }
+    let entries = entry_map(by_name["transportProperties"])?;
+    if entries.keys().copied().collect::<BTreeSet<_>>()
+        != BTreeSet::from(["Cp", "Pr", "k", "mu", "nu", "rho", "transportModel"])
+        || entries["transportModel"].value != ["Newtonian"]
+    {
+        return Err("Ferrum property semantics mismatch".into());
+    }
+    assert_dimensioned(entries["rho"], [1, -3, 0, 0, 0, 0, 0], RHO, EPS)?;
+    assert_dimensioned(entries["mu"], [1, -1, -1, 0, 0, 0, 0], MU, EPS)?;
+    assert_dimensioned(entries["nu"], [0, 2, -1, 0, 0, 0, 0], FERRUM_NU, EPS)?;
+    assert_dimensioned(entries["Cp"], [0, 2, -2, -1, 0, 0, 0], 4182.0, EPS)?;
+    assert_dimensioned(entries["k"], [1, 1, -3, -1, 0, 0, 0], 0.598, EPS)?;
+    assert_dimensioned(entries["Pr"], [0, 0, 0, 0, 0, 0, 0], 7.01, EPS)
 }
 
 fn field<'a>(fields: &'a [FieldFile], name: &str) -> CheckResult<&'a FieldFile> {
@@ -524,12 +498,9 @@ fn read_dimensionless_foam_scalar(cursor: &mut TokenCursor, key: &str) -> CheckR
     Ok(parsed)
 }
 
-fn validate_case(name: &str, openfoam: bool) -> CheckResult {
-    let case = case(name);
-    validate_properties(
-        name,
-        &read_case_properties(&case).map_err(|error| error.to_string())?,
-    )?;
+fn validate_case() -> CheckResult {
+    let case = case("ferrum");
+    validate_properties(&read_case_properties(&case).map_err(|error| error.to_string())?)?;
     let mesh =
         PolyMesh::read(&case.join("constant/polyMesh")).map_err(|error| error.to_string())?;
     if mesh.points.len() != 4_825
@@ -577,11 +548,7 @@ fn validate_case(name: &str, openfoam: bool) -> CheckResult {
     {
         return Err("field identity mismatch".into());
     }
-    let expected_p = if openfoam {
-        ["0", "2", "-2", "0", "0", "0", "0"]
-    } else {
-        ["1", "-1", "-2", "0", "0", "0", "0"]
-    };
+    let expected_p = ["1", "-1", "-2", "0", "0", "0", "0"];
     if dimensions(pressure)? != expected_p {
         return Err("pressure dimensions mismatch".into());
     }
@@ -666,9 +633,8 @@ fn laminar_pipe_metadata_is_single_source_and_physically_consistent() {
 }
 
 #[test]
-fn laminar_pipe_cases_preserve_the_shared_contract() {
-    validate_case("ferrum", false).unwrap();
-    validate_case("openfoam-v13", true).unwrap();
+fn laminar_pipe_case_preserves_the_shared_contract() {
+    validate_case().unwrap();
 }
 
 #[test]

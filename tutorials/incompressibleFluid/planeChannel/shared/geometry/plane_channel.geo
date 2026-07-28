@@ -1,4 +1,4 @@
-// Thin 3D extrusion for an OpenFOAM-style 2D plane-channel case.
+// Thin 3D extrusion for a FerrumCFD 2D plane-channel case.
 // All dimensions are SI metres. front/back become empty patches after import.
 L = 1.0;
 H = 0.02;
