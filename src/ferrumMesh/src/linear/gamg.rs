@@ -1801,14 +1801,12 @@ fn pair_map_from_edges(
         cell_neighbours[edge.lower].insert(edge.upper);
         cell_neighbours[edge.upper].insert(edge.lower);
     }
-    let external_neighbour_counts = edges
+    // Use the sum of the endpoint stencil sizes as a bounded-cost compactness
+    // tie-breaker. Computing the exact union for every edge makes a high-degree
+    // star quadratic in its edge count.
+    let external_neighbour_degrees = edges
         .iter()
-        .map(|edge| {
-            cell_neighbours[edge.lower]
-                .union(&cell_neighbours[edge.upper])
-                .filter(|&&cell| cell != edge.lower && cell != edge.upper)
-                .count()
-        })
+        .map(|edge| cell_neighbours[edge.lower].len() + cell_neighbours[edge.upper].len() - 2)
         .collect::<Vec<_>>();
 
     let mut coarse_map = vec![usize::MAX; n_cells];
@@ -1833,7 +1831,7 @@ fn pair_map_from_edges(
                         edge_index,
                         current,
                         edges,
-                        &external_neighbour_counts,
+                        &external_neighbour_degrees,
                         forward,
                     )
                 })
@@ -1897,15 +1895,15 @@ fn pair_edge_is_preferred(
     candidate: usize,
     current: usize,
     edges: &[PairEdge],
-    external_neighbour_counts: &[usize],
+    external_neighbour_degrees: &[usize],
     forward: bool,
 ) -> bool {
     let candidate_edge = edges[candidate];
     let current_edge = edges[current];
     candidate_edge.weight > current_edge.weight
         || (candidate_edge.weight == current_edge.weight
-            && (external_neighbour_counts[candidate] < external_neighbour_counts[current]
-                || (external_neighbour_counts[candidate] == external_neighbour_counts[current]
+            && (external_neighbour_degrees[candidate] < external_neighbour_degrees[current]
+                || (external_neighbour_degrees[candidate] == external_neighbour_degrees[current]
                     && pair_endpoints_are_preferred(candidate_edge, current_edge, forward))))
 }
 
