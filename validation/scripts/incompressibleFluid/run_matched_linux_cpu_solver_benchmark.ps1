@@ -31,7 +31,7 @@ if ($CpuSet -notmatch "^[0-9]+([,-][0-9]+)*$") { throw "CpuSet is invalid: $CpuS
 if ($null -eq (Get-Command wsl -ErrorAction SilentlyContinue)) { throw "wsl.exe was not found" }
 
 $workerWslPath = ConvertTo-MatchedWslPath $WorkerPath $Distro
-$workerBootstrap = 'set -o pipefail; tr -d ''\r'' < "\$1" | bash -s -- "\${@:2}"'
+$workerBootstrap = 'set -o pipefail; tr -d ''\r'' < "$1" | bash -s -- "${@:2}"'
 $preflightArguments = @(
     "-d", $Distro, "--", "bash", "-c", $workerBootstrap, "ferrum-linux-worker", $workerWslPath,
     "--preflight-only",
