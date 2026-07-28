@@ -543,6 +543,61 @@ Each contains 26 raw reports bound by the exact worker proof. The result archive
 SHA-256 values are `455baf4e236cc3f9b031d5527c58d69b31891bbc22303810c8294d1967bfe9ef`
 and `52f032742844d8c5ba43f216ce66dd963c7de11368e9694ab74a52833accb0ac`.
 
+## SIMPLEC Linux Time-To-Accuracy (2026-07-28)
+
+SIMPLEC was evaluated as an explicit same-binary mode, not as a new default.
+Candidate `4be55c69943bc0ffca034071bec98bc4a5cbbff8` (tree
+`daa29fbcdd8eefdcdab3bc5d10fc239a520a9030`) applies `adjustPhi` before the
+consistent `rAtU` flux/HbyA correction. The experiment used one executable,
+p/U `relTol` of zero, two warmups, ten balanced alternating measured pairs,
+and an exact direct top-level `SIMPLE.consistent false -> true` case mutation.
+No magnitude cap or case-specific solver shortcut was added.
+
+The mandatory all-case gate rejected Pipe before any timing classification:
+
+| Check | Baseline SIMPLE | Candidate SIMPLEC | Result |
+| --- | ---: | ---: | --- |
+| SIMPLE iterations | `207` | `206` | pass |
+| U relative L2 / Linf | n/a | `4.976e-5 / 1.091e-4` | fail (`1e-5 / 5e-5` limits) |
+| Gauge p relative L2 / Linf | n/a | `1.308e-4 / 1.562e-4` | L2 fail |
+| Pressure-drop relative difference | n/a | `1.158e-4` | fail (`1e-4` limit) |
+| Momentum work | `10,343` | `10,282` | `0.59%` lower |
+| Pressure work | `27,625` | `43,468` | `57.35%` higher |
+| Total linear work | `37,968` | `53,750` | `41.57%` higher |
+
+Channel passed every accuracy, work, convergence, and timing gate in a separate
+case-only proof:
+
+| Check | Baseline SIMPLE | Candidate SIMPLEC | Result |
+| --- | ---: | ---: | --- |
+| SIMPLE iterations | `545` | `441` | `19.08%` fewer |
+| U relative L2 / Linf | n/a | `7.756e-6 / 8.160e-6` | pass |
+| Gauge p relative L2 / Linf | n/a | `3.504e-7 / 4.053e-7` | pass |
+| Total linear work | `23,442` | `18,417` | `21.44%` lower |
+| Process median | `6.67 s` | `5.89 s` | `11.69%` lower |
+| Paired wins | n/a | `8/10` | pass |
+| Paired median ratio (MAD) | n/a | `0.8701 (0.0524)` | pass |
+| Candidate-first / candidate-second ratio | n/a | `0.8574 / 0.8828` | both faster |
+
+The all-case archive SHA-256 is
+`1767a0bf8da378999e571325eb4c4aa7285087b8556eb20c575864ba486651e3`;
+the accepted Channel archive SHA-256 is
+`c0d167c2aff04267d33814ba2b8267856c77794581b2ee6c8e4a92c00c2b1138`.
+The manifests and proofs bind both modes to the recorded shared binary SHA-256
+`569e1cfaa7dc354f427588adb4d20e6e3addf0d3d831011b934d8e48e96898c2`;
+the executable itself was not retained in the result archive, so that binary
+hash is recorded evidence rather than a subsequently re-hashed artifact.
+The initial Channel summary also wrote `maxResidentSetKiB=0` because its host
+summarizer read the wrong parser property; the raw GNU-time records contain
+`8,936-9,664 KiB`. This PR corrects and regression-tests that reporting field,
+but the archived run supports no RSS claim. Elapsed-time calculations and all
+declared acceptance gates are independent of RSS and were unaffected.
+Artifacts are under
+`target/benchmarks/ferrum_linux_tta_ab/gamg-native-simplec-4be55c6` and
+`target/benchmarks/ferrum_linux_tta_ab/gamg-native-simplec-channel-4be55c6`.
+The evidence accepts SIMPLEC for the frozen Channel configuration only. It
+rejects a global-default change and supports no general SIMPLEC speed claim.
+
 ## External Accuracy Check
 
 Analytic and OpenFOAM processing remained outside the solver and its cases.

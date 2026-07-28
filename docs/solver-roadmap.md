@@ -189,10 +189,13 @@ laminar cases with exactly one SIMPLE section and no PISO/PIMPLE section.
 Explicit `momentumTransport`/`turbulenceProperties` input must select
 `simulationType laminar`; RAS/LES is not dispatched to the laminar kernel.
 No public algorithm-specific executable or `--solveLaminarSimple` selector is
-retained. Currently only steady laminar SIMPLE executes through
-`ferrumRun -solver incompressibleFluid`. SIMPLEC and future PISO/PIMPLE remain
-case-selected modes behind that same public command; they are not implemented
-yet. The implementation reads
+retained. Steady laminar SIMPLE and the explicit `SIMPLE.consistent` SIMPLEC
+mode execute through `ferrumRun -solver incompressibleFluid`; future
+PISO/PIMPLE modes remain case-selected behind that same public command and are
+not implemented yet. SIMPLEC applies `adjustPhi` before the consistent
+`rAtU`-based flux and HbyA correction, matching the OpenFOAM Foundation 13
+operation order while deliberately retaining Ferrum's uncapped denominator
+semantics. The implementation reads
 OpenFOAM-like `U`, `p`,
 `transportProperties`, `fvSchemes`, and `fvSolution`, uses the runtime
 `constant/polyMesh` geometry, runs an uncapped SIMPLE correction path, and
@@ -604,9 +607,12 @@ The first optimization sequence is tracked as follows:
     versus iterative coarse solve, deterministic aggregation/coarsening,
     sweep placement, weighted prolongation, and later GAMG as a PCG/FCG
     preconditioner. Larger gains require fewer V-cycles or less weighted work;
-23. gate the completed static user-bounded `relTol` implementation with Linux
-    time-to-accuracy evidence, then treat any autonomous runtime tolerance
-    controller and SIMPLEC as separate later leaves;
+23. completed: gate the static user-bounded `relTol` implementation with Linux
+    time-to-accuracy evidence and evaluate SIMPLEC as a separate same-binary
+    leaf. SIMPLEC passed the frozen Channel gate but failed the frozen Pipe
+    accuracy and linear-work gates, so it remains an explicit case control and
+    is not a generic default. Any autonomous runtime tolerance controller is a
+    separate future user-bounded experiment;
 24. accept portable and native scalar profiles, then proceed through SIMD,
     shared-memory threading, and GPU as separate reviewed leaves.
 
@@ -647,8 +653,11 @@ Next performance targets:
   accounting, and time-to-accuracy evidence. Persistence is not a prerequisite
   for this static case control;
 - keep a genuinely autonomous runtime tolerance controller separate and
-  user-bounded. Implement SIMPLEC as its own leaf and accept it on the same
-  frozen Pipe/Channel observables before expanding case coverage;
+  user-bounded. SIMPLEC is implemented and evaluated as its own explicit leaf:
+  Channel passed the frozen accuracy, work, and timing gates, while Pipe failed
+  accuracy and pressure-work gates before timing classification. Do not enable
+  it automatically or select it through a hidden case heuristic; any expanded
+  acceptance must be user-visible and evidence-backed on the selected case;
 - define a portable release profile for reproducible comparison and correctness
   and a native release profile that is explicitly hardware-specific. Never mix
   timing claims between these lanes;
@@ -1029,9 +1038,21 @@ The immediate sequence is:
    The feature is therefore publishable as a correctness, compatibility, and
    work-reduction package, but the performance leaf remains unaccepted and no
    stable end-to-end speedup is claimed.
-10. **F-D1-SIMPLEC:** Implement SIMPLEC as an isolated leaf on the frozen
-    Pipe/Channel observables before expanding coverage. A future autonomous
-    tolerance controller remains a separate user-bounded experiment.
+10. **F-D1-SIMPLEC (implemented; case-dependent acceptance):** The correction
+    now follows the OpenFOAM Foundation 13 order (`adjustPhi` before the
+    consistent `rAtU` flux/HbyA correction) without importing OpenFOAM's
+    artificial denominator cap. A same-binary Native Linux `2+10` A/B changed
+    only the direct top-level `SIMPLE.consistent false -> true` token and kept
+    p/U `relTol` at zero. Pipe was rejected before timing classification: its
+    velocity relative L2/Linf were `4.976e-5 / 1.091e-4`, gauge-pressure L2 was
+    `1.308e-4`, pressure-drop difference was `1.158e-4`, and total linear work
+    increased `41.57%` (`37,968 -> 53,750`) because pressure work increased
+    `57.35%`. Channel passed separately: SIMPLE iterations fell `545 -> 441`,
+    total linear work fell `21.44%` (`23,442 -> 18,417`), and the process-time
+    median fell `6.67 -> 5.89 s` (`11.69%`) with `8/10` paired wins and both
+    order cohorts faster. SIMPLEC therefore remains an explicit opt-in with no
+    general speed claim or global-default change. A future autonomous tolerance
+    controller remains a separate user-bounded experiment.
 11. **F-PERF-PORTABLE-NATIVE:** A/B-test Thin/Fat LTO, `codegen-units=1`, a
     separate `target-cpu=native` build, and then PGO. Keep the portable release
     as the reproducible distribution profile and never mix timing lanes.

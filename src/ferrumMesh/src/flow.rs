@@ -936,6 +936,13 @@ fn solve_laminar_simple_driven(
         let mut hby_a = hby_a_from_predicted_velocity(&predicted_velocity, &grad_p, &r_au)?;
         let mut phi_hby_a = compute_phi_hby_a(&runtime.mesh, &hby_a, &velocity_boundary)?;
         let phi_hby_a_before_adjust_summary = summarize_face_fluxes(&runtime.mesh, &phi_hby_a);
+        let adjust_phi_summary = adjust_phi_hby_a(
+            &runtime.mesh,
+            &velocity_boundary,
+            &pressure_boundary,
+            &mut phi_hby_a,
+        )?;
+        let phi_hby_a_after_adjust_summary = summarize_face_fluxes(&runtime.mesh, &phi_hby_a);
         if options.simple_consistent {
             let consistent_phi_correction = consistent_phi_hby_a_pressure_correction(
                 &runtime.mesh,
@@ -947,13 +954,6 @@ fn solve_laminar_simple_driven(
             phi_hby_a = add_face_fluxes(&phi_hby_a, &consistent_phi_correction)?;
             hby_a = consistent_hby_a_from_base(&hby_a, &grad_p, &r_au, &r_at_u)?;
         }
-        let adjust_phi_summary = adjust_phi_hby_a(
-            &runtime.mesh,
-            &velocity_boundary,
-            &pressure_boundary,
-            &mut phi_hby_a,
-        )?;
-        let phi_hby_a_after_adjust_summary = summarize_face_fluxes(&runtime.mesh, &phi_hby_a);
         let net_flux_star = net_cell_flux(&runtime.mesh, &phi_hby_a)?;
         let continuity_star = summarize_continuity(&net_flux_star);
         if !is_finite_continuity(continuity_star) {
@@ -7391,6 +7391,164 @@ mod tests {
                 if message
                     == "runtime field 'U' initial payload was already consumed or not loaded"
         ));
+    }
+
+    #[test]
+    fn consistent_simple_runs_through_public_entrypoint_and_reports_r_at_u() {
+        fn assert_face_flux_bits(
+            actual: super::FaceFluxDiagnosticSummary,
+            expected: super::FaceFluxDiagnosticSummary,
+        ) {
+            assert_eq!(actual.min.to_bits(), expected.min.to_bits());
+            assert_eq!(actual.max.to_bits(), expected.max.to_bits());
+            assert_eq!(actual.l2_norm.to_bits(), expected.l2_norm.to_bits());
+            assert_eq!(actual.sum.to_bits(), expected.sum.to_bits());
+            assert_eq!(actual.sum_abs.to_bits(), expected.sum_abs.to_bits());
+            assert_eq!(
+                actual.internal_sum_abs.to_bits(),
+                expected.internal_sum_abs.to_bits()
+            );
+            assert_eq!(
+                actual.boundary_sum.to_bits(),
+                expected.boundary_sum.to_bits()
+            );
+            assert_eq!(
+                actual.boundary_sum_abs.to_bits(),
+                expected.boundary_sum_abs.to_bits()
+            );
+        }
+
+        let fields = two_cell_fields();
+        let mut options = minimal_laminar_options();
+        options.max_simple_iterations = 1;
+        options.momentum_linear_tolerance = 1.0e-3;
+        let mut baseline_runtime = two_cell_runtime();
+        let baseline = solve_laminar_simple(&mut baseline_runtime, &fields, &options)
+            .expect("baseline SIMPLE report");
+
+        let mut consistent_runtime = two_cell_runtime();
+        let mut consistent_options = options;
+        consistent_options.simple_consistent = true;
+        let consistent =
+            solve_laminar_simple(&mut consistent_runtime, &fields, &consistent_options)
+                .expect("consistent SIMPLE report");
+
+        let baseline_assembly = baseline
+            .pressure_assembly
+            .expect("baseline pressure assembly");
+        let consistent_assembly = consistent
+            .pressure_assembly
+            .expect("consistent pressure assembly");
+
+        assert_eq!(
+            baseline_assembly.r_au.l2_norm.to_bits(),
+            baseline_assembly.r_at_u.l2_norm.to_bits()
+        );
+        assert_eq!(
+            baseline_assembly.r_au.min.to_bits(),
+            baseline_assembly.r_at_u.min.to_bits()
+        );
+        assert_eq!(
+            baseline_assembly.r_au.max.to_bits(),
+            baseline_assembly.r_at_u.max.to_bits()
+        );
+        assert_ne!(
+            consistent_assembly.r_au.l2_norm.to_bits(),
+            consistent_assembly.r_at_u.l2_norm.to_bits()
+        );
+        assert!(consistent_assembly.r_at_u.min > consistent_assembly.r_au.min);
+        assert!(consistent_assembly.r_at_u.max > consistent_assembly.r_au.max);
+        assert_face_flux_bits(
+            consistent_assembly.phi_hby_a_before_adjust,
+            baseline_assembly.phi_hby_a_before_adjust,
+        );
+        assert_face_flux_bits(
+            consistent_assembly.phi_hby_a_after_adjust,
+            baseline_assembly.phi_hby_a_after_adjust,
+        );
+        assert_ne!(
+            consistent_assembly.hby_a.l2_norm.to_bits(),
+            baseline_assembly.hby_a.l2_norm.to_bits()
+        );
+        assert_ne!(
+            consistent_assembly.pressure_source.l2_norm.to_bits(),
+            baseline_assembly.pressure_source.l2_norm.to_bits()
+        );
+        assert_ne!(
+            consistent_assembly
+                .pressure_matrix
+                .diagonal_sum_abs
+                .to_bits(),
+            baseline_assembly.pressure_matrix.diagonal_sum_abs.to_bits()
+        );
+        assert!(
+            consistent
+                .final_velocity
+                .iter()
+                .zip(&baseline.final_velocity)
+                .any(|(actual, expected)| {
+                    actual.x.to_bits() != expected.x.to_bits()
+                        || actual.y.to_bits() != expected.y.to_bits()
+                        || actual.z.to_bits() != expected.z.to_bits()
+                })
+        );
+
+        assert_eq!(consistent.history.len(), consistent.simple_iterations);
+        assert!(consistent.simple_iterations > 0);
+        assert!(
+            consistent.history.iter().all(|iteration| {
+                iteration.pressure_correction_accepted
+                    && iteration.momentum_linear_converged
+                    && iteration.pressure_linear_converged
+                    && iteration.pressure_linear_solves > 0
+                    && iteration
+                        .momentum_component_linear_solves
+                        .iter()
+                        .all(|solve| {
+                            solve.stop_reason != super::LinearSolveStopReason::NotRun
+                                && solve.effective_normalized_tolerance.is_finite()
+                        })
+                    && iteration.pressure_correction_linear_solves
+                        [..iteration.pressure_linear_solves]
+                        .iter()
+                        .all(|solve| {
+                            solve.stop_reason != super::LinearSolveStopReason::NotRun
+                                && solve.effective_normalized_tolerance.is_finite()
+                        })
+            }),
+            "{:#?}",
+            consistent.history
+        );
+        assert_eq!(
+            consistent.stop_reason,
+            LaminarSimpleStopReason::ConvergenceCriteriaNotConfigured
+        );
+        assert_eq!(
+            consistent
+                .linear_solve_summary
+                .momentum_component_non_converged_solves,
+            0
+        );
+        assert_eq!(
+            consistent
+                .linear_solve_summary
+                .pressure_correction_non_converged_solves,
+            0
+        );
+        assert!(
+            consistent
+                .final_velocity
+                .iter()
+                .all(|value| { value.x.is_finite() && value.y.is_finite() && value.z.is_finite() })
+        );
+        assert!(
+            consistent
+                .final_pressure
+                .iter()
+                .all(|value| value.is_finite())
+        );
+        assert!(consistent.final_phi.iter().all(|value| value.is_finite()));
+        assert!(consistent.final_continuity.l2_norm.is_finite());
     }
 
     #[test]
