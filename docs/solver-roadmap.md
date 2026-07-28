@@ -1030,12 +1030,12 @@ The immediate sequence is:
    pressure medians improved by about `13.33%` and `11.94%`. Channel levels
    fell `8 -> 5`, but V-cycles rose `7021 -> 18776`, sparse work rose
    `1071131186 -> 1654088736` (`+54.42%`), and process and internal pressure
-   medians regressed by about `19.55%` and `37.95%`. All sampled final linear
-   solves converged and final continuity remained near `1e-18`, but the
-   predeclared both-case work gate failed, so the expensive `2+10` and
-   converged runs were not started. The implementation remains unmerged,
-   `mergeLevels 1` remains the default, and no speedup is claimed. Focused
-   Fable review remains deferred.
+   medians regressed by about `19.55%` and `37.95%`. All fixed-work,
+   convergence, determinism, and field-parity gates passed, and final
+   continuity remained below `3e-17`, but the predeclared both-case work gate
+   failed, so the expensive `2+10` and converged runs were not started. The
+   implementation remains unmerged, `mergeLevels 1` remains the default, and
+   no speedup is claimed. Focused Fable review remains deferred.
 9. **F-PERF-ADAPTIVE-LINEAR (semantics/work accepted; timing not accepted):**
    Commit `206f7ee` implements static, user-bounded OpenFOAM-style `relTol` for
    all current scalar linear solvers while preserving final outer acceptance.
