@@ -66,6 +66,34 @@ Assert-ControlSourcesUnchanged "before helper load"
 . $CommonHelperPath
 Assert-ControlSourcesUnchanged "while loading the common helper"
 
+function Get-TtaPositiveMaxResidentSetKiB($Timing, [string]$Description) {
+    if ($null -eq $Timing -or $Timing -isnot [pscustomobject]) {
+        throw "$Description GNU time record must be an object"
+    }
+    $property = $Timing.PSObject.Properties["maxResidentSetKiB"]
+    if ($null -eq $property -or $null -eq $property.Value) {
+        throw "$Description GNU time record is missing maxResidentSetKiB"
+    }
+    $value = [long]$property.Value
+    if ($value -le 0) { throw "$Description GNU time maxResidentSetKiB must be positive" }
+    return $value
+}
+
+$gnuTimeSelfTestPath = [System.IO.Path]::GetTempFileName()
+try {
+    [System.IO.File]::WriteAllText(
+        $gnuTimeSelfTestPath,
+        "elapsed_s=1.25`nuser_s=1.00`nsystem_s=0.25`nmax_rss_kb=9876`nexit=0`n",
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    $gnuTimeSelfTest = Read-MatchedGnuTime $gnuTimeSelfTestPath
+    if ((Get-TtaPositiveMaxResidentSetKiB $gnuTimeSelfTest "GNU time parser self-test") -ne 9876) {
+        throw "GNU time maxResidentSetKiB parser self-test failed"
+    }
+} finally {
+    Remove-Item -LiteralPath $gnuTimeSelfTestPath -Force -ErrorAction SilentlyContinue
+}
+
 $RepoRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
 $TargetRoot = Join-Path $RepoRoot "target"
 $Experiment = $Experiment.ToLowerInvariant()
@@ -812,6 +840,7 @@ if ($PreflightOnly) {
     Write-Output "host_profile_block_self_test=pass"
     Write-Output "host_simple_consistent_token_mutation_self_test=pass"
     Write-Output "host_reltol_boundary_self_test=pass"
+    Write-Output "host_gnu_time_rss_parser_self_test=pass"
     $preflightOutput | Write-Output
     return
 }
@@ -1487,6 +1516,7 @@ try {
         }
         $timing = Read-MatchedGnuTime (Join-Path $runRoot "process-time.env")
         if ($timing.exitCode -ne 0 -or $timing.elapsedSeconds -le 0.0) { throw "$($Case.name) $RefName GNU time contract failed" }
+        $maxResidentSetKiB = Get-TtaPositiveMaxResidentSetKiB $timing "$($Case.name) $RefName"
         $reportRelative = Get-TtaExpectedValidatedReportRelativePath $Case.name $Kind $Ordinal $RefName
         $report = Read-ValidatedTtaReport $reportRelative "$($Case.name) $Kind $Ordinal $RefName"
         Assert-ReportContract $report "$($Case.name) $Kind $Ordinal $RefName"
@@ -1504,7 +1534,7 @@ try {
             commonProcessElapsedSeconds = [double]$timing.elapsedSeconds
             processUserSeconds = [double]$timing.userSeconds
             processSystemSeconds = [double]$timing.systemSeconds
-            maxResidentSetKiB = [double]$timing.maxRssKiB
+            maxResidentSetKiB = $maxResidentSetKiB
             canonicalReportSha256 = $canonicalHash
             fvSolutionSha256 = $fvSolutionSha256
             fvSolutionArtifact = Get-ArtifactRelativePath $fvSolutionPath
