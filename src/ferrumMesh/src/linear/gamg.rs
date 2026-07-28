@@ -5,8 +5,9 @@ use std::time::Instant;
 use super::{
     CgPreconditioner, CsrMatrix, CsrSparsityPattern, IterativeSolveReport,
     IterativeSolveTermination, PreconditionedConjugateGradientOptions,
-    PreconditionedConjugateGradientWorkspace, dot, gauss_seidel_sweep_with_cached_diagonal,
-    invalid_input, l2_norm, validate_iterative_solve_input,
+    PreconditionedConjugateGradientWorkspace, dot, dot_product_is_singular,
+    gauss_seidel_sweep_with_cached_diagonal, invalid_input, l2_norm,
+    validate_iterative_solve_input,
 };
 use crate::Result;
 
@@ -29,6 +30,12 @@ pub enum GamgSmoother {
     SymGaussSeidel,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GamgOuterSolver {
+    Standalone,
+    FlexibleCg,
+}
+
 impl std::fmt::Display for GamgAgglomerator {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -47,6 +54,15 @@ impl std::fmt::Display for GamgSmoother {
     }
 }
 
+impl std::fmt::Display for GamgOuterSolver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Standalone => formatter.write_str("standalone"),
+            Self::FlexibleCg => formatter.write_str("FCG"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct GamgOptions {
     pub max_iterations: usize,
@@ -58,6 +74,7 @@ pub struct GamgOptions {
     pub merge_levels: usize,
     pub agglomerator: GamgAgglomerator,
     pub smoother: GamgSmoother,
+    pub outer_solver: GamgOuterSolver,
     pub n_pre_sweeps: usize,
     pub pre_sweeps_level_multiplier: usize,
     pub max_pre_sweeps: usize,
@@ -76,6 +93,18 @@ pub struct GamgSolveControls {
     pub min_iterations: usize,
     pub tolerance: f64,
     pub relative_tolerance: f64,
+}
+
+#[derive(Clone, Copy)]
+struct FcgLinearSystem<'a> {
+    matrix: &'a CsrMatrix,
+    rhs: &'a [f64],
+}
+
+#[derive(Clone, Copy)]
+struct FcgInitialNorms {
+    l1: f64,
+    l2: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -175,6 +204,11 @@ pub struct GamgKernelTiming {
     pub finest_residual_evaluations: usize,
     pub solves: usize,
     pub v_cycles: usize,
+    /// Matrix-vector products performed by the opt-in FCG outer iteration.
+    pub outer_matrix_vector_products: usize,
+    /// Logical vector reductions performed by FCG iterations. This excludes
+    /// initial residual normalization and reductions inside a GAMG V-cycle.
+    pub outer_reductions: usize,
     pub levels: Vec<GamgLevelTiming>,
 }
 
@@ -276,6 +310,8 @@ impl GamgKernelTiming {
         self.finest_residual_evaluations += other.finest_residual_evaluations;
         self.solves += other.solves;
         self.v_cycles += other.v_cycles;
+        self.outer_matrix_vector_products += other.outer_matrix_vector_products;
+        self.outer_reductions += other.outer_reductions;
         Ok(())
     }
 }
@@ -346,6 +382,7 @@ impl Default for GamgOptions {
             // default selects algebraicPair explicitly.
             agglomerator: GamgAgglomerator::AlgebraicPair,
             smoother: GamgSmoother::GaussSeidel,
+            outer_solver: GamgOuterSolver::Standalone,
             n_pre_sweeps: 0,
             pre_sweeps_level_multiplier: 1,
             max_pre_sweeps: 4,
@@ -376,6 +413,58 @@ struct GamgInterpolationScratch<'a> {
     fine: &'a mut [f64],
     coarse_correction: &'a mut [f64],
     coarse_diagonal: &'a mut [f64],
+}
+
+fn fcg_mmax_one_direction(
+    preconditioned_residual: &[f64],
+    previous: Option<(&[f64], &[f64])>,
+    direction: &mut [f64],
+) -> Result<Option<f64>> {
+    if direction.len() != preconditioned_residual.len() {
+        return Err(invalid_input(format!(
+            "GAMG FCG direction length mismatch: expected {}, got {}",
+            preconditioned_residual.len(),
+            direction.len()
+        )));
+    }
+    if let Some((previous_direction, previous_normalized_matrix_direction)) = previous {
+        if previous_direction.len() != direction.len()
+            || previous_normalized_matrix_direction.len() != direction.len()
+        {
+            return Err(invalid_input(format!(
+                "GAMG FCG previous-direction length mismatch: expected {}, got direction={} normalizedMatrixDirection={}",
+                direction.len(),
+                previous_direction.len(),
+                previous_normalized_matrix_direction.len()
+            )));
+        }
+        let orthogonalisation = dot(
+            preconditioned_residual,
+            previous_normalized_matrix_direction,
+        );
+        if !orthogonalisation.is_finite() {
+            return Err(invalid_input(
+                "GAMG FCG orthogonalisation product is not finite".to_string(),
+            ));
+        }
+        for row in 0..direction.len() {
+            direction[row] =
+                preconditioned_residual[row] + (-orthogonalisation) * previous_direction[row];
+        }
+        Ok(Some(orthogonalisation))
+    } else {
+        direction.copy_from_slice(preconditioned_residual);
+        Ok(None)
+    }
+}
+
+fn validate_fcg_preconditioner_output(values: &[f64]) -> Result<()> {
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err(invalid_input(
+            "GAMG FCG preconditioner output is not finite".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 impl GamgTransfer {
@@ -581,6 +670,12 @@ pub struct GamgWorkspace {
     residuals: Vec<Vec<f64>>,
     products: Vec<Vec<f64>>,
     pre_smoothed: Vec<Vec<f64>>,
+    fcg_residual: Vec<f64>,
+    fcg_preconditioned_residual: Vec<f64>,
+    fcg_direction: Vec<f64>,
+    fcg_matrix_direction: Vec<f64>,
+    fcg_previous_direction: Vec<f64>,
+    fcg_previous_matrix_direction: Vec<f64>,
     coarsest_pcg: Option<PreconditionedConjugateGradientWorkspace>,
     has_solved: bool,
 }
@@ -705,6 +800,19 @@ impl GamgWorkspace {
         let residuals = level_vectors(&level_sizes);
         let products = level_vectors(&level_sizes);
         let pre_smoothed = level_vectors(&level_sizes);
+        // Standalone GAMG is the default and must not pay the per-cell memory
+        // cost of the opt-in FCG outer iteration.
+        let fcg_rows = if options.outer_solver == GamgOuterSolver::FlexibleCg {
+            matrix.rows()
+        } else {
+            0
+        };
+        let fcg_residual = vec![0.0; fcg_rows];
+        let fcg_preconditioned_residual = vec![0.0; fcg_rows];
+        let fcg_direction = vec![0.0; fcg_rows];
+        let fcg_matrix_direction = vec![0.0; fcg_rows];
+        let fcg_previous_direction = vec![0.0; fcg_rows];
+        let fcg_previous_matrix_direction = vec![0.0; fcg_rows];
         let coarsest_pcg = if options.direct_solve_coarsest {
             None
         } else {
@@ -727,6 +835,12 @@ impl GamgWorkspace {
             residuals,
             products,
             pre_smoothed,
+            fcg_residual,
+            fcg_preconditioned_residual,
+            fcg_direction,
+            fcg_matrix_direction,
+            fcg_previous_direction,
+            fcg_previous_matrix_direction,
             coarsest_pcg,
             has_solved: false,
         })
@@ -900,6 +1014,22 @@ impl GamgWorkspace {
             });
         }
 
+        if self.options.outer_solver == GamgOuterSolver::FlexibleCg {
+            return self.solve_flexible_cg_with_controls_internal::<PROFILE, SCANNED_DIAGONAL, _>(
+                FcgLinearSystem { matrix, rhs },
+                solution,
+                FcgInitialNorms {
+                    l1: initial_l1,
+                    l2: residual_norm,
+                },
+                controls.l2_controls,
+                timing,
+                |current_l1, _current_l2| {
+                    normalized_l1_has_converged(current_l1, initial_l1, controls)
+                },
+            );
+        }
+
         let iteration_limit = controls
             .l2_controls
             .max_iterations
@@ -936,6 +1066,200 @@ impl GamgWorkspace {
                     converged: true,
                     termination: IterativeSolveTermination::Converged,
                 });
+            }
+        }
+
+        self.has_solved = true;
+        Ok(IterativeSolveReport {
+            solution,
+            iterations: iteration_limit,
+            residual_norm,
+            converged: false,
+            termination: IterativeSolveTermination::MaxIterations,
+        })
+    }
+
+    fn solve_flexible_cg_with_controls_internal<
+        const PROFILE: bool,
+        const SCANNED_DIAGONAL: bool,
+        F,
+    >(
+        &mut self,
+        system: FcgLinearSystem<'_>,
+        mut solution: Vec<f64>,
+        initial_norms: FcgInitialNorms,
+        controls: GamgSolveControls,
+        timing: &mut GamgKernelTiming,
+        mut has_converged: F,
+    ) -> Result<IterativeSolveReport>
+    where
+        F: FnMut(f64, f64) -> bool,
+    {
+        self.fcg_residual.copy_from_slice(&self.residuals[0]);
+        let mut current_l1 = initial_norms.l1;
+        let mut residual_norm = initial_norms.l2;
+        let iteration_limit = controls.max_iterations.max(controls.min_iterations).max(1);
+
+        for iteration in 1..=iteration_limit {
+            let residual = std::mem::take(&mut self.fcg_residual);
+            let mut preconditioned = std::mem::take(&mut self.fcg_preconditioned_residual);
+            preconditioned.fill(0.0);
+            self.residuals[0].copy_from_slice(&residual);
+            let cycle_started = profile_started::<PROFILE>();
+            let cycle_result = self.v_cycle::<PROFILE, SCANNED_DIAGONAL>(
+                &mut preconditioned,
+                &residual,
+                controls,
+                timing,
+            );
+            self.fcg_residual = residual;
+            self.fcg_preconditioned_residual = preconditioned;
+            cycle_result?;
+            add_profile_elapsed::<PROFILE>(&mut timing.v_cycle_seconds, cycle_started);
+            if PROFILE {
+                timing.v_cycles += 1;
+            }
+
+            validate_fcg_preconditioner_output(&self.fcg_preconditioned_residual)?;
+
+            // Preserve GAMG minIter semantics for an exact-zero residual. The
+            // standalone path executes no-op V-cycles until minIter is met;
+            // FCG cannot form a non-zero Krylov direction in that state.
+            if current_l1 == 0.0 {
+                let residual_started = profile_started::<PROFILE>();
+                let (raw_l1, squared_l2) =
+                    self.update_finest_residual_with_norms(&solution, system.rhs)?;
+                add_profile_elapsed::<PROFILE>(
+                    &mut timing.finest_residual_seconds,
+                    residual_started,
+                );
+                if PROFILE {
+                    timing.finest_residual_evaluations += 1;
+                    timing.outer_reductions += 2;
+                }
+                self.fcg_residual.copy_from_slice(&self.residuals[0]);
+                current_l1 = raw_l1;
+                residual_norm = squared_l2.sqrt();
+                if iteration >= controls.min_iterations && has_converged(current_l1, residual_norm)
+                {
+                    self.has_solved = true;
+                    return Ok(IterativeSolveReport {
+                        solution,
+                        iterations: iteration,
+                        residual_norm,
+                        converged: true,
+                        termination: IterativeSolveTermination::Converged,
+                    });
+                }
+                continue;
+            }
+
+            let previous = (iteration > 1).then_some((
+                self.fcg_previous_direction.as_slice(),
+                self.fcg_previous_matrix_direction.as_slice(),
+            ));
+            if fcg_mmax_one_direction(
+                &self.fcg_preconditioned_residual,
+                previous,
+                &mut self.fcg_direction,
+            )?
+            .is_some()
+                && PROFILE
+            {
+                timing.outer_reductions += 1;
+            }
+
+            system
+                .matrix
+                .matvec_into(&self.fcg_direction, &mut self.fcg_matrix_direction)?;
+            if PROFILE {
+                timing.outer_matrix_vector_products += 1;
+            }
+            let step_numerator = dot(&self.fcg_direction, &self.fcg_residual);
+            let curvature = dot(&self.fcg_direction, &self.fcg_matrix_direction);
+            if PROFILE {
+                // Two explicit dot products and four L2 norms in the two
+                // scaled singularity checks below.
+                timing.outer_reductions += 6;
+            }
+            if !step_numerator.is_finite() {
+                return Err(invalid_input(
+                    "GAMG FCG step numerator is not finite".to_string(),
+                ));
+            }
+            if !curvature.is_finite() {
+                return Err(invalid_input(
+                    "GAMG FCG curvature is not finite; matrix is likely not SPD".to_string(),
+                ));
+            }
+            let numerator_is_singular =
+                dot_product_is_singular(step_numerator, &self.fcg_direction, &self.fcg_residual);
+            let curvature_is_singular =
+                dot_product_is_singular(curvature, &self.fcg_direction, &self.fcg_matrix_direction);
+            if step_numerator <= 0.0
+                || numerator_is_singular
+                || curvature <= 0.0
+                || curvature_is_singular
+            {
+                self.has_solved = true;
+                return Ok(IterativeSolveReport {
+                    solution,
+                    iterations: iteration,
+                    residual_norm,
+                    converged: false,
+                    termination: IterativeSolveTermination::Breakdown,
+                });
+            }
+
+            let alpha = step_numerator / curvature;
+            if !alpha.is_finite() {
+                return Err(invalid_input(
+                    "GAMG FCG step length is not finite".to_string(),
+                ));
+            }
+            for (value, direction) in solution.iter_mut().zip(&self.fcg_direction) {
+                *value += alpha * direction;
+                if !value.is_finite() {
+                    return Err(invalid_input("GAMG FCG solution is not finite".to_string()));
+                }
+            }
+            let residual_started = profile_started::<PROFILE>();
+            let (raw_l1, squared_l2) =
+                self.update_finest_residual_with_norms(&solution, system.rhs)?;
+            add_profile_elapsed::<PROFILE>(&mut timing.finest_residual_seconds, residual_started);
+            if PROFILE {
+                timing.finest_residual_evaluations += 1;
+                timing.outer_reductions += 2;
+            }
+            self.fcg_residual.copy_from_slice(&self.residuals[0]);
+            current_l1 = raw_l1;
+            residual_norm = squared_l2.sqrt();
+            if !current_l1.is_finite() || !residual_norm.is_finite() {
+                return Err(invalid_input(
+                    "GAMG FCG residual norm is not finite".to_string(),
+                ));
+            }
+            if iteration >= controls.min_iterations && has_converged(current_l1, residual_norm) {
+                self.has_solved = true;
+                return Ok(IterativeSolveReport {
+                    solution,
+                    iterations: iteration,
+                    residual_norm,
+                    converged: true,
+                    termination: IterativeSolveTermination::Converged,
+                });
+            }
+
+            self.fcg_previous_direction
+                .copy_from_slice(&self.fcg_direction);
+            for row in 0..self.fcg_previous_matrix_direction.len() {
+                self.fcg_previous_matrix_direction[row] =
+                    self.fcg_matrix_direction[row] / curvature;
+                if !self.fcg_previous_matrix_direction[row].is_finite() {
+                    return Err(invalid_input(
+                        "GAMG FCG normalized matrix direction is not finite".to_string(),
+                    ));
+                }
             }
         }
 
@@ -1007,6 +1331,26 @@ impl GamgWorkspace {
                 converged: true,
                 termination: IterativeSolveTermination::Converged,
             });
+        }
+
+        if self.options.outer_solver == GamgOuterSolver::FlexibleCg {
+            let initial_l1 = self.residuals[0]
+                .iter()
+                .map(|value| value.abs())
+                .sum::<f64>();
+            return self.solve_flexible_cg_with_controls_internal::<PROFILE, SCANNED_DIAGONAL, _>(
+                FcgLinearSystem { matrix, rhs },
+                solution,
+                FcgInitialNorms {
+                    l1: initial_l1,
+                    l2: residual_norm,
+                },
+                controls,
+                timing,
+                |_current_l1, current_l2| {
+                    has_converged(current_l2, initial_residual_norm, controls)
+                },
+            );
         }
 
         let iteration_limit = controls.max_iterations.max(controls.min_iterations).max(1);
@@ -2220,9 +2564,10 @@ fn checked_dense_storage_len(n: usize) -> Result<usize> {
 mod tests {
     use super::{
         GamgAgglomerator, GamgFacePairWeight, GamgInterpolationScratch, GamgKernelTiming,
-        GamgOptions, GamgSmoother, GamgSolveControls, GamgTransfer, GamgWorkspace,
+        GamgOptions, GamgOuterSolver, GamgSmoother, GamgSolveControls, GamgTransfer, GamgWorkspace,
         MAX_DENSE_COARSEST_CELLS, NormalizedL1GamgSolveControls, PairEdge, algebraic_pair_map,
-        checked_dense_storage_len, dense_lu_solve, gamg_solve, pair_map_from_edges,
+        checked_dense_storage_len, dense_lu_solve, fcg_mmax_one_direction, gamg_solve,
+        pair_map_from_edges, validate_fcg_preconditioner_output,
     };
     use crate::linear::{
         CgPreconditioner, CsrMatrix, PreconditionedConjugateGradientOptions,
@@ -2246,6 +2591,7 @@ mod tests {
         assert!(!options.interpolate_correction);
         assert!(options.scale_correction);
         assert!(!options.direct_solve_coarsest);
+        assert_eq!(options.outer_solver, GamgOuterSolver::Standalone);
         assert_eq!(options.agglomerator, GamgAgglomerator::AlgebraicPair);
         assert_eq!(options.smoother, GamgSmoother::GaussSeidel);
     }
@@ -3329,6 +3675,7 @@ mod tests {
         struct WorkspaceValueSnap {
             option_iterations: (usize, usize, u64, u64),
             option_hierarchy: (bool, usize, usize, GamgAgglomerator),
+            option_outer_solver: GamgOuterSolver,
             option_smoothing: (GamgSmoother, usize, usize, usize, usize, usize, usize),
             option_correction: (usize, bool, bool, bool),
             agglomeration: AgglomerationValueSnap,
@@ -3340,11 +3687,18 @@ mod tests {
             transfers_capacity: usize,
             transfers: Vec<(usize, TransferValueSnap)>,
             diagonal_slots: NestedUsizeSnap,
+            diagonal_values: NestedBitsSnap,
             corrections: NestedBitsSnap,
             sources: NestedBitsSnap,
             residuals: NestedBitsSnap,
             products: NestedBitsSnap,
             pre_smoothed: NestedBitsSnap,
+            fcg_residual: BitsVecSnap,
+            fcg_preconditioned_residual: BitsVecSnap,
+            fcg_direction: BitsVecSnap,
+            fcg_matrix_direction: BitsVecSnap,
+            fcg_previous_direction: BitsVecSnap,
+            fcg_previous_matrix_direction: BitsVecSnap,
             coarsest_pcg: Option<PcgValueSnap>,
             has_solved: bool,
         }
@@ -3359,7 +3713,7 @@ mod tests {
         #[derive(Clone, Debug, PartialEq, Eq)]
         struct TimingValueSnap {
             seconds_bits: [u64; 7],
-            counters: [usize; 6],
+            counters: [usize; 8],
             levels_len: usize,
             levels_capacity: usize,
             levels: Vec<(usize, LevelTimingValueSnap)>,
@@ -3448,6 +3802,8 @@ mod tests {
                 timing.finest_residual_evaluations,
                 timing.solves,
                 timing.v_cycles,
+                timing.outer_matrix_vector_products,
+                timing.outer_reductions,
             ],
             levels_len: timing.levels.len(),
             levels_capacity: timing.levels.capacity(),
@@ -3606,6 +3962,7 @@ mod tests {
                         workspace.options.merge_levels,
                         workspace.options.agglomerator,
                     ),
+                    option_outer_solver: workspace.options.outer_solver,
                     option_smoothing: (
                         workspace.options.smoother,
                         workspace.options.n_pre_sweeps,
@@ -3630,11 +3987,22 @@ mod tests {
                     transfers_capacity: workspace.transfers.capacity(),
                     transfers,
                     diagonal_slots: nested_usize_snap(&workspace.diagonal_slots),
+                    diagonal_values: nested_bits_snap(&workspace.diagonal_values),
                     corrections: nested_bits_snap(&workspace.corrections),
                     sources: nested_bits_snap(&workspace.sources),
                     residuals: nested_bits_snap(&workspace.residuals),
                     products: nested_bits_snap(&workspace.products),
                     pre_smoothed: nested_bits_snap(&workspace.pre_smoothed),
+                    fcg_residual: bits_vec_snap(&workspace.fcg_residual),
+                    fcg_preconditioned_residual: bits_vec_snap(
+                        &workspace.fcg_preconditioned_residual,
+                    ),
+                    fcg_direction: bits_vec_snap(&workspace.fcg_direction),
+                    fcg_matrix_direction: bits_vec_snap(&workspace.fcg_matrix_direction),
+                    fcg_previous_direction: bits_vec_snap(&workspace.fcg_previous_direction),
+                    fcg_previous_matrix_direction: bits_vec_snap(
+                        &workspace.fcg_previous_matrix_direction,
+                    ),
                     coarsest_pcg,
                     has_solved: workspace.has_solved,
                 },
@@ -3730,6 +4098,8 @@ mod tests {
             finest_residual_evaluations: 14,
             solves: 15,
             v_cycles: 16,
+            outer_matrix_vector_products: 17,
+            outer_reductions: 18,
             levels: vec![
                 super::GamgLevelTiming {
                     level: 0,
@@ -4268,6 +4638,7 @@ mod tests {
             merge_levels: 1,
             agglomerator: GamgAgglomerator::AlgebraicPair,
             smoother: GamgSmoother::GaussSeidel,
+            outer_solver: GamgOuterSolver::Standalone,
             n_pre_sweeps: 0,
             pre_sweeps_level_multiplier: 1,
             max_pre_sweeps: 0,
@@ -8428,6 +8799,487 @@ mod tests {
                     rhs_copies: 1,
                     rows: 0
                 }
+            );
+        }
+    }
+
+    #[test]
+    fn flexible_cg_profiled_and_plain_solve_match_pcg_on_spd_grid() {
+        let matrix = poisson_grid(3, 3, 1.0);
+        let rhs = vec![1.0; matrix.rows()];
+        let options = GamgOptions {
+            outer_solver: GamgOuterSolver::FlexibleCg,
+            max_iterations: 40,
+            tolerance: 1.0e-12,
+            n_cells_in_coarsest_level: 2,
+            smoother: GamgSmoother::SymGaussSeidel,
+            direct_solve_coarsest: true,
+            ..GamgOptions::default()
+        };
+        let controls = NormalizedL1GamgSolveControls {
+            normalization_factor: 1.0,
+            tolerance: 1.0e-12,
+            relative_tolerance: 0.0,
+            l2_controls: options.into(),
+        };
+        let mut plain_workspace =
+            GamgWorkspace::new(&matrix, options).expect("plain FCG workspace");
+        let plain = plain_workspace
+            .solve_normalized_l1_with_controls(&matrix, &rhs, None, controls)
+            .expect("plain FCG solve");
+        let mut profiled_workspace =
+            GamgWorkspace::new(&matrix, options).expect("profiled FCG workspace");
+        let profiled = profiled_workspace
+            .solve_normalized_l1_with_controls_profiled(&matrix, &rhs, None, controls)
+            .expect("profiled FCG solve");
+        let pcg = preconditioned_conjugate_gradient_solve(
+            &matrix,
+            &rhs,
+            None,
+            PreconditionedConjugateGradientOptions {
+                max_iterations: 40,
+                tolerance: 1.0e-12,
+                preconditioner: CgPreconditioner::IncompleteCholesky,
+            },
+        )
+        .expect("PCG oracle");
+
+        assert!(plain.converged, "{plain:?}");
+        assert_eq!(plain.iterations, profiled.report.iterations);
+        assert_eq!(
+            plain.residual_norm.to_bits(),
+            profiled.report.residual_norm.to_bits()
+        );
+        assert_eq!(plain.solution.len(), profiled.report.solution.len());
+        for (plain_value, profiled_value) in plain.solution.iter().zip(&profiled.report.solution) {
+            assert_eq!(plain_value.to_bits(), profiled_value.to_bits());
+        }
+        assert_eq!(profiled.timing.v_cycles, profiled.report.iterations);
+        assert_eq!(
+            profiled.timing.outer_matrix_vector_products,
+            profiled.report.iterations
+        );
+        assert_eq!(
+            profiled.timing.finest_residual_evaluations,
+            profiled.report.iterations + 1
+        );
+        assert_eq!(
+            profiled.timing.outer_reductions,
+            9 * profiled.report.iterations - 1
+        );
+        assert_close(&plain.solution, &pcg.solution, 1.0e-10);
+    }
+
+    #[test]
+    fn flexible_cg_mmax_one_direction_matches_two_step_nonlinear_oracle() {
+        let matrix = poisson_grid(3, 3, 1.0);
+        let rhs = (0..matrix.rows())
+            .map(|row| 1.0 + row as f64 / 8.0)
+            .collect::<Vec<_>>();
+        let options = GamgOptions {
+            outer_solver: GamgOuterSolver::FlexibleCg,
+            max_iterations: 2,
+            min_iterations: 2,
+            tolerance: 0.0,
+            relative_tolerance: 0.0,
+            n_cells_in_coarsest_level: 2,
+            smoother: GamgSmoother::SymGaussSeidel,
+            direct_solve_coarsest: true,
+            ..GamgOptions::default()
+        };
+        let controls = options.into();
+
+        // Build the expected two-step result independently around the same
+        // nonlinear GAMG V-cycle that the public FCG solve uses as M^-1.
+        // The outer recurrence below deliberately does not call the production
+        // direction helper, so numerator/history/true-residual wiring remains
+        // independently checked.
+        let oracle_options = GamgOptions {
+            outer_solver: GamgOuterSolver::Standalone,
+            ..options
+        };
+        let mut oracle_workspace =
+            GamgWorkspace::new(&matrix, oracle_options).expect("oracle GAMG workspace");
+        let mut timing = GamgKernelTiming::default();
+        let mut solution = vec![0.0; matrix.rows()];
+        let mut residual = rhs.clone();
+        let mut previous_direction = vec![0.0; matrix.rows()];
+        let mut previous_normalized_matrix_direction = vec![0.0; matrix.rows()];
+        let mut product = vec![0.0; matrix.rows()];
+        let mut observed_nonzero_truncation = false;
+
+        for iteration in 0..2 {
+            let mut preconditioned = vec![0.0; matrix.rows()];
+            oracle_workspace.residuals[0].copy_from_slice(&residual);
+            oracle_workspace
+                .v_cycle::<false, false>(&mut preconditioned, &residual, controls, &mut timing)
+                .expect("oracle GAMG V-cycle");
+            validate_fcg_preconditioner_output(&preconditioned)
+                .expect("finite oracle preconditioner output");
+
+            let mut direction = preconditioned.clone();
+            if iteration > 0 {
+                let truncation = super::dot(&preconditioned, &previous_normalized_matrix_direction);
+                observed_nonzero_truncation |= truncation != 0.0;
+                for row in 0..direction.len() {
+                    direction[row] -= truncation * previous_direction[row];
+                }
+            }
+            matrix
+                .matvec_into(&direction, &mut product)
+                .expect("oracle direction matvec");
+            let numerator = super::dot(&direction, &residual);
+            let curvature = super::dot(&direction, &product);
+            assert!(numerator > 0.0 && curvature > 0.0);
+            let alpha = numerator / curvature;
+            for (value, direction) in solution.iter_mut().zip(&direction) {
+                *value += alpha * direction;
+            }
+
+            previous_direction.copy_from_slice(&direction);
+            for (value, matrix_direction) in previous_normalized_matrix_direction
+                .iter_mut()
+                .zip(&product)
+            {
+                *value = matrix_direction / curvature;
+            }
+            matrix
+                .matvec_into(&solution, &mut product)
+                .expect("oracle true-residual matvec");
+            for ((value, source), matrix_value) in residual.iter_mut().zip(&rhs).zip(&product) {
+                *value = source - matrix_value;
+            }
+        }
+        assert!(
+            observed_nonzero_truncation,
+            "oracle must exercise the mmax=1 history term"
+        );
+
+        let mut production_workspace =
+            GamgWorkspace::new(&matrix, options).expect("production FCG workspace");
+        let report = production_workspace
+            .solve(&matrix, &rhs, None)
+            .expect("production two-step FCG solve");
+        let mut profiled_workspace =
+            GamgWorkspace::new(&matrix, options).expect("profiled production FCG workspace");
+        let profiled = profiled_workspace
+            .solve_with_controls_profiled(&matrix, &rhs, None, controls)
+            .expect("profiled production two-step FCG solve");
+
+        assert_eq!(report.iterations, 2);
+        assert_eq!(profiled.report.iterations, 2);
+        assert_eq!(report.solution.len(), solution.len());
+        for ((actual, profiled), expected) in report
+            .solution
+            .iter()
+            .zip(&profiled.report.solution)
+            .zip(solution)
+        {
+            assert_eq!(actual.to_bits(), expected.to_bits());
+            assert_eq!(profiled.to_bits(), expected.to_bits());
+        }
+        assert_eq!(
+            report.residual_norm.to_bits(),
+            super::l2_norm(&residual).to_bits()
+        );
+        assert_eq!(
+            profiled.report.residual_norm.to_bits(),
+            report.residual_norm.to_bits()
+        );
+    }
+
+    #[test]
+    fn flexible_cg_exact_zero_honours_minimum_cycles_and_profile_counts() {
+        let matrix = poisson_grid(2, 2, 1.0);
+        let rhs = vec![0.0; matrix.rows()];
+        let options = GamgOptions {
+            outer_solver: GamgOuterSolver::FlexibleCg,
+            max_iterations: 2,
+            min_iterations: 2,
+            tolerance: 1.0e-12,
+            n_cells_in_coarsest_level: 2,
+            smoother: GamgSmoother::SymGaussSeidel,
+            direct_solve_coarsest: true,
+            ..GamgOptions::default()
+        };
+        let controls = NormalizedL1GamgSolveControls {
+            normalization_factor: 1.0,
+            tolerance: 1.0e-12,
+            relative_tolerance: 0.0,
+            l2_controls: options.into(),
+        };
+        let mut workspace = GamgWorkspace::new(&matrix, options).expect("zero FCG workspace");
+        let profiled = workspace
+            .solve_normalized_l1_with_controls_profiled(&matrix, &rhs, None, controls)
+            .expect("zero FCG solve");
+
+        assert!(profiled.report.converged);
+        assert_eq!(profiled.report.iterations, 2);
+        assert_eq!(profiled.report.residual_norm.to_bits(), 0.0f64.to_bits());
+        assert_eq!(profiled.timing.v_cycles, 2);
+        assert_eq!(profiled.timing.outer_matrix_vector_products, 0);
+        assert_eq!(profiled.timing.outer_reductions, 4);
+        assert_eq!(profiled.timing.finest_residual_evaluations, 3);
+    }
+
+    #[test]
+    fn flexible_cg_normalized_l1_keeps_strict_equality_boundary() {
+        let matrix = poisson_grid(3, 3, 1.0);
+        let mut rhs = vec![0.0; matrix.rows()];
+        rhs[0] = 1.0;
+        let options = GamgOptions {
+            outer_solver: GamgOuterSolver::FlexibleCg,
+            max_iterations: 1,
+            min_iterations: 1,
+            tolerance: 0.0,
+            n_cells_in_coarsest_level: 2,
+            smoother: GamgSmoother::SymGaussSeidel,
+            direct_solve_coarsest: true,
+            ..GamgOptions::default()
+        };
+        let controls = |tolerance| NormalizedL1GamgSolveControls {
+            normalization_factor: 1.0,
+            tolerance,
+            relative_tolerance: 0.0,
+            l2_controls: options.into(),
+        };
+        let mut probe_workspace = GamgWorkspace::new(&matrix, options).expect("probe workspace");
+        let probe = probe_workspace
+            .solve_normalized_l1_with_controls(&matrix, &rhs, None, controls(0.0))
+            .expect("one-step FCG probe");
+        let product = matrix
+            .matvec(&probe.solution)
+            .expect("probe residual matvec");
+        let exact_l1 = rhs
+            .iter()
+            .zip(product)
+            .map(|(source, product)| (source - product).abs())
+            .sum::<f64>();
+        assert!(exact_l1 > 0.0 && exact_l1.is_finite());
+
+        let mut equal_workspace = GamgWorkspace::new(&matrix, options).expect("equal workspace");
+        let equal = equal_workspace
+            .solve_normalized_l1_with_controls(&matrix, &rhs, None, controls(exact_l1))
+            .expect("equality-boundary FCG solve");
+        let mut next_workspace = GamgWorkspace::new(&matrix, options).expect("next workspace");
+        let next = next_workspace
+            .solve_normalized_l1_with_controls(&matrix, &rhs, None, controls(exact_l1.next_up()))
+            .expect("next-up FCG solve");
+
+        assert!(
+            !equal.converged,
+            "equality must not satisfy strict normalized L1"
+        );
+        assert!(next.converged, "next_up must satisfy strict normalized L1");
+        assert_eq!(equal.iterations, 1);
+        assert_eq!(next.iterations, 1);
+        for (equal_value, next_value) in equal.solution.iter().zip(next.solution) {
+            assert_eq!(equal_value.to_bits(), next_value.to_bits());
+        }
+    }
+
+    #[test]
+    fn flexible_cg_reports_nonpositive_spd_products_as_breakdown() {
+        for (rows, rhs, expected_numerator_positive, expected_curvature_positive) in [
+            (
+                vec![vec![(0, -4.0), (1, -4.0)], vec![(0, -4.0), (1, -3.0)]],
+                vec![-2.0, 0.5],
+                false,
+                true,
+            ),
+            (
+                vec![vec![(0, -4.0), (1, -4.0)], vec![(0, -4.0), (1, 0.5)]],
+                vec![-2.0, 0.5],
+                true,
+                false,
+            ),
+        ] {
+            let matrix = CsrMatrix::from_rows(rows, 2).expect("symmetric breakdown matrix");
+            let options = GamgOptions {
+                outer_solver: GamgOuterSolver::FlexibleCg,
+                max_iterations: 1,
+                tolerance: 0.0,
+                relative_tolerance: 0.0,
+                n_cells_in_coarsest_level: 1,
+                smoother: GamgSmoother::GaussSeidel,
+                n_finest_sweeps: 1,
+                scale_correction: false,
+                direct_solve_coarsest: true,
+                ..GamgOptions::default()
+            };
+            let controls = options.into();
+            let mut probe = GamgWorkspace::new(
+                &matrix,
+                GamgOptions {
+                    outer_solver: GamgOuterSolver::Standalone,
+                    ..options
+                },
+            )
+            .expect("breakdown probe workspace");
+            probe.residuals[0].copy_from_slice(&rhs);
+            let mut direction = vec![0.0; matrix.rows()];
+            probe
+                .v_cycle::<false, false>(
+                    &mut direction,
+                    &rhs,
+                    controls,
+                    &mut GamgKernelTiming::default(),
+                )
+                .expect("breakdown probe V-cycle");
+            let matrix_direction = matrix.matvec(&direction).expect("breakdown probe matvec");
+            let numerator = super::dot(&direction, &rhs);
+            let curvature = super::dot(&direction, &matrix_direction);
+            assert_eq!(numerator > 0.0, expected_numerator_positive);
+            assert_eq!(curvature > 0.0, expected_curvature_positive);
+
+            let mut workspace = GamgWorkspace::new(&matrix, options).expect("indefinite workspace");
+            let report = workspace
+                .solve(&matrix, &rhs, None)
+                .expect("indefinite FCG returns a breakdown report");
+
+            assert!(!report.converged);
+            assert_eq!(report.iterations, 1);
+            assert_eq!(
+                report.termination,
+                super::IterativeSolveTermination::Breakdown
+            );
+            assert!(report.solution.iter().all(|value| value.to_bits() == 0));
+        }
+
+        let matrix = CsrMatrix::from_rows(
+            vec![vec![(0, 2.0), (1, -1.0)], vec![(0, -1.0), (1, 2.0)]],
+            2,
+        )
+        .expect("finite overflow matrix");
+        let rhs = vec![1.0e308, 0.0];
+        let initial = vec![0.0, 0.0];
+        let options = GamgOptions {
+            outer_solver: GamgOuterSolver::FlexibleCg,
+            max_iterations: 1,
+            tolerance: 0.0,
+            relative_tolerance: 0.0,
+            n_cells_in_coarsest_level: 1,
+            n_finest_sweeps: 0,
+            scale_correction: false,
+            direct_solve_coarsest: true,
+            ..GamgOptions::default()
+        };
+        let mut workspace = GamgWorkspace::new(&matrix, options).expect("overflow workspace");
+        let error = workspace
+            .solve(&matrix, &rhs, Some(&initial))
+            .expect_err("non-finite FCG numerator must fail closed");
+        assert_eq!(error.to_string(), "GAMG FCG step numerator is not finite");
+        assert_eq!(rhs, vec![1.0e308, 0.0]);
+        assert_eq!(initial, vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn flexible_cg_validation_is_fail_closed_and_non_mutating() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let values = [1.0, bad];
+            let error = validate_fcg_preconditioner_output(&values)
+                .expect_err("non-finite FCG preconditioner output must fail");
+            assert_eq!(
+                error.to_string(),
+                "GAMG FCG preconditioner output is not finite"
+            );
+            assert_eq!(values[0].to_bits(), 1.0f64.to_bits());
+            assert_eq!(values[1].to_bits(), bad.to_bits());
+        }
+
+        let mut direction = [3.0, 4.0];
+        let before = direction.map(f64::to_bits);
+        let error = fcg_mmax_one_direction(&[1.0], None, &mut direction)
+            .expect_err("length mismatch must fail before direction mutation");
+        assert!(error.to_string().contains("direction length mismatch"));
+        assert_eq!(direction.map(f64::to_bits), before);
+
+        let error =
+            fcg_mmax_one_direction(&[1.0, 2.0], Some((&[1.0], &[1.0, 2.0])), &mut direction)
+                .expect_err("history length mismatch must fail before direction mutation");
+        assert!(
+            error
+                .to_string()
+                .contains("previous-direction length mismatch")
+        );
+        assert_eq!(direction.map(f64::to_bits), before);
+    }
+
+    #[test]
+    fn flexible_cg_workspace_reuses_buffers_and_resets_history_across_coefficients() {
+        let first_matrix = poisson_grid(3, 3, 1.0);
+        let rhs = (0..first_matrix.rows())
+            .map(|row| 1.0 + row as f64 / 8.0)
+            .collect::<Vec<_>>();
+        let standalone = GamgWorkspace::new(
+            &first_matrix,
+            GamgOptions {
+                n_cells_in_coarsest_level: 2,
+                ..GamgOptions::default()
+            },
+        )
+        .expect("standalone GAMG workspace");
+        for buffer in [
+            &standalone.fcg_residual,
+            &standalone.fcg_preconditioned_residual,
+            &standalone.fcg_direction,
+            &standalone.fcg_matrix_direction,
+            &standalone.fcg_previous_direction,
+            &standalone.fcg_previous_matrix_direction,
+        ] {
+            assert!(buffer.is_empty());
+            assert_eq!(buffer.capacity(), 0);
+        }
+        let options = GamgOptions {
+            outer_solver: GamgOuterSolver::FlexibleCg,
+            max_iterations: 40,
+            tolerance: 1.0e-11,
+            n_cells_in_coarsest_level: 2,
+            smoother: GamgSmoother::SymGaussSeidel,
+            direct_solve_coarsest: true,
+            ..GamgOptions::default()
+        };
+        let mut workspace =
+            GamgWorkspace::new(&first_matrix, options).expect("reused FCG workspace");
+        let pointers = [
+            workspace.fcg_residual.as_ptr(),
+            workspace.fcg_preconditioned_residual.as_ptr(),
+            workspace.fcg_direction.as_ptr(),
+            workspace.fcg_matrix_direction.as_ptr(),
+            workspace.fcg_previous_direction.as_ptr(),
+            workspace.fcg_previous_matrix_direction.as_ptr(),
+        ];
+
+        for lifecycle in 0..10 {
+            let matrix = poisson_grid(3, 3, 1.0 + lifecycle as f64 / 16.0);
+            let reused = workspace
+                .solve(&matrix, &rhs, None)
+                .expect("reused FCG coefficient lifecycle");
+            let mut fresh_workspace =
+                GamgWorkspace::new(&matrix, options).expect("fresh FCG workspace");
+            let fresh = fresh_workspace
+                .solve(&matrix, &rhs, None)
+                .expect("fresh FCG coefficient lifecycle");
+
+            assert!(reused.converged && fresh.converged);
+            assert_eq!(reused.iterations, fresh.iterations);
+            assert_eq!(
+                reused.residual_norm.to_bits(),
+                fresh.residual_norm.to_bits()
+            );
+            for (reused_value, fresh_value) in reused.solution.iter().zip(fresh.solution) {
+                assert_eq!(reused_value.to_bits(), fresh_value.to_bits());
+            }
+            assert_eq!(
+                [
+                    workspace.fcg_residual.as_ptr(),
+                    workspace.fcg_preconditioned_residual.as_ptr(),
+                    workspace.fcg_direction.as_ptr(),
+                    workspace.fcg_matrix_direction.as_ptr(),
+                    workspace.fcg_previous_direction.as_ptr(),
+                    workspace.fcg_previous_matrix_direction.as_ptr(),
+                ],
+                pointers
             );
         }
     }

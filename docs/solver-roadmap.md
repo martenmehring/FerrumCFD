@@ -1074,30 +1074,93 @@ The immediate sequence is:
     work and timing regressions in both cases stopped the expensive `2+10`
     decision run. Keep the option explicit and default-off for compatibility;
     do not use it as a performance default or claim a speedup from it.
-13. **F-PERF-SIMD-THREAD-GPU:** After scalar acceptance, proceed through SIMD,
-    shared-memory threading, and GPU as separate leaves. Apply fixed-work plus
-    time-to-accuracy evidence to every leaf.
-14. **F-D1-CYLINDER-LIMITED-SCHEMES / F-D1-CASE-CYLINDER:** Only after all
+13. **F-PERF-GAMG-STATIC-LEAF-CLOSURE (generic defaults rejected):** Five
+    Native Linux CPU2 `0+2` BCCB smokes on exact main `504f4a49` closed the
+    selected small static leaves without a decision-eligible speed claim.
+    The bit-exact residual/matrix-vector fusion candidate `a9da122` changed
+    Pipe process/pressure medians by `-3.65%/+10.58%` and Channel by
+    `+18.96%/+28.05%`; reports and final fields were bit-exact, but the Channel
+    regression rejected the unmerged leaf. Switching the coarsest solve from
+    iterative to direct changed Pipe process/pressure medians by
+    `+7.45%/+12.54%` and Channel by `+1.26%/-2.72%`; Pipe pressure iterations
+    changed only from `1687` to `1668`, so direct solve is not a generic
+    default. Increasing the coarsest-cell target from `10` to `20` reduced
+    Pipe process/pressure medians by `47.36%/56.92%`, pressure iterations from
+    `1687` to `830`, and weighted smoothing visits from `43,727,040` to
+    `21,274,560`; Channel instead regressed by `8.15%/12.95%`, with iterations
+    rising from `10,654` to `12,282` and visits from `118,461,826` to
+    `133,517,622`. Reducing `maxPostSweeps` from `4` to `3` improved Pipe
+    process/pressure medians by `5.08%/2.15%`, with iterations `1687 -> 1660`
+    and visits `43,727,040 -> 41,174,640`, but regressed Channel by
+    `2.00%/11.12%`, with iterations `10,654 -> 11,489` and visits
+    `118,461,826 -> 122,369,339`. Setting
+    `postSweepsLevelMultiplier 1 -> 0` regressed Pipe process/pressure medians
+    by `3.55%/1.37%`, with iterations `1687 -> 1966` and visits
+    `43,727,040 -> 44,305,776`; it improved Channel medians by
+    `15.15%/9.20%` despite iterations rising `10,654 -> 11,931`, while visits
+    fell `118,461,826 -> 115,527,873`. The option-only leaves are therefore
+    case-dependent controls, not global defaults. No general speedup is
+    claimed from these smoke runs.
+14. **F-PERF-GAMG-FCG (accepted opt-in scalar path; default unchanged):** The
+    existing GAMG V-cycle is now available as the explicit preconditioner for
+    an `outerSolver FCG` pressure path. Seven focused proofs cover the real
+    plain/profiled two-step recurrence, normalized-L1 strict boundaries,
+    exact-zero minimum iterations and counters, both independent breakdown
+    products, integrated non-finite failure, non-mutation, and ten coefficient
+    lifecycles with stable scratch allocations. Standalone GAMG remains the
+    default and allocates no per-cell FCG scratch. A same-binary Native Linux
+    CPU2 `1+5` fixed-work comparison on base `504f4a49` reduced Pipe pressure
+    time by `49.39%` and process time by `38.13%`, with pressure V-cycles
+    `1687 -> 745`. Channel pressure time fell `23.14%` and process time fell
+    `20.41%`, with V-cycles `10654 -> 7021`. All measured momentum and pressure
+    solves converged; the worst relative final-field summary differences were
+    `3.30e-9` for Pipe and `7.52e-9` for Channel, and final continuity L2 stayed
+    below `3e-17`. Accept FCG as an explicit opt-in path only. These two
+    fixed-work cases do not justify a general speed claim or a default change;
+    time-to-accuracy evidence and deferred focused Fable review still follow.
+15. **F-PERF-ADAPTIVE-POLICY (telemetry first):** After the FCG experiment,
+    record per-solve normalized-L1 reduction, iterations, V-cycles, weighted
+    work, and convergence-rate history before changing any tolerance or sweep
+    schedule. Any later adaptive controller must be explicit, user-bounded,
+    deterministic, and opt-in. It must not add finite-magnitude caps, hidden
+    rollbacks, or case-name heuristics, and must preserve the final outer
+    acceptance contract from the static `relTol` implementation.
+16. **F-PERF-SIMD-RUST (planned separate leaf):** Evaluate portable scalar
+    kernel layout and compiler vectorization as a Rust/Cargo-only product path.
+    No `llvm-tools-preview`, external profiler, or system package may become a
+    user build or runtime prerequisite; maintainer-only diagnostics remain
+    outside the product contract. Apply numerical-parity, fixed-work, and
+    time-to-accuracy gates independently from threading.
+17. **F-PERF-THREAD-MOMENTUM (planned separate leaf):** Use the independent
+    momentum components as the first bounded shared-memory threading candidate
+    before parallelizing coupled pressure reductions. Preserve deterministic
+    assembly, convergence reporting, and serial fallback. Keep the product
+    build Rust/Cargo-only with no external system dependency, and require
+    both-case scaling evidence before changing defaults.
+18. **F-PERF-GPU (planned later leaf):** Start GPU work only after the scalar,
+    SIMD, and shared-memory contracts above are measured. Keep it isolated from
+    CPU acceptance and apply the same fixed-work plus time-to-accuracy evidence.
+19. **F-D1-CYLINDER-LIMITED-SCHEMES / F-D1-CASE-CYLINDER:** Only after all
    correctness and scalar-performance gates above are accepted, implement the
    required limited schemes and then the Cylinder case. Validation order
    remains Pipe, Channel, then Cylinder.
-15. **F-AUTO-1 (accepted external dependency):** Keep the accepted isolated n8n
+20. **F-AUTO-1 (accepted external dependency):** Keep the accepted isolated n8n
    coding workflow in the AI Dev Orchestrator repository and preserve the
    existing analysis workflow as a separate read-only path.
-16. **F-REF-1:** Keep focused, documentation-only external version, result, and
+21. **F-REF-1:** Keep focused, documentation-only external version, result, and
    protocol provenance for each newly selected physics area. Do not bundle
    external solver cases or sources.
-17. **F-ARCH-1:** Extract the `incompressibleFluid` module registry and common solver
+22. **F-ARCH-1:** Extract the `incompressibleFluid` module registry and common solver
    lifecycle from the transitional combined crates with parity tests.
-18. **F-IO-1:** Specify and implement `FerrumFile v1`; isolate independently
+23. **F-IO-1:** Specify and implement `FerrumFile v1`; isolate independently
    authored external-format compatibility behind the `ferrumIO` adapter
    boundary.
-19. **F-D1D2-1:** Complete Driver 1 SIMPLE/SIMPLEC and Driver 2 PISO/PIMPLE on the scalar CPU
+24. **F-D1D2-1:** Complete Driver 1 SIMPLE/SIMPLEC and Driver 2 PISO/PIMPLE on the scalar CPU
    reference backend for the frozen selected-case inventory.
-20. **F-BACKEND-1:** After the Driver 1/2 inventory gate, accept `ferrumRun`
+25. **F-BACKEND-1:** After the Driver 1/2 inventory gate, accept `ferrumRun`
    successively on partitioned multi-process CPU, multi-node CPU, multi-GPU,
    and multi-node CPU/GPU integration without changing case numerics, reusing
    the earlier accepted shared-memory and single-GPU leaves.
-21. **F-D3D7-1:** Implement Drivers 3 through 7 in the fixed order above, applying the common
+26. **F-D3D7-1:** Implement Drivers 3 through 7 in the fixed order above, applying the common
    readiness gate and completing coupled `ferrumMultiRun` before Driver 6.
-22. **F-POROUS-1:** Begin porous-media and packed-bed work only after Driver 7 is complete.
+27. **F-POROUS-1:** Begin porous-media and packed-bed work only after Driver 7 is complete.

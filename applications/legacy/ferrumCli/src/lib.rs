@@ -38,8 +38,9 @@ use ferrum_mesh::geometry::{GeometrySummary, summarize_case_geometry};
 use ferrum_mesh::gmsh::read_msh22_ascii;
 use ferrum_mesh::interfaces::{read_interface_config, validate_interface_config};
 use ferrum_mesh::linear::{
-    ConjugateGradientOptions, GamgAgglomerator, GamgKernelTiming, GamgOptions, GamgSmoother,
-    JacobiOptions, conjugate_gradient_solve, jacobi_solve, linear_solver_capabilities,
+    ConjugateGradientOptions, GamgAgglomerator, GamgKernelTiming, GamgOptions, GamgOuterSolver,
+    GamgSmoother, JacobiOptions, conjugate_gradient_solve, jacobi_solve,
+    linear_solver_capabilities,
 };
 use ferrum_mesh::patches::{PatchValidationSummary, validate_case_patches};
 use ferrum_mesh::regions::{
@@ -794,24 +795,7 @@ fn run_laminar_simple_solve(
         wall_clock_seconds
     );
     if let Some(gamg) = options.pressure_gamg_options {
-        println!(
-            "incompressibleFluid pressureGAMG: agglomerator={} smoother={} cacheAgglomeration={} nCellsInCoarsestLevel={} mergeLevels={} minIter={} maxIter={} tolerance={} relTol={} nPreSweeps={} nPostSweeps={} nFinestSweeps={} interpolateCorrection={} scaleCorrection={} directSolveCoarsest={}",
-            gamg.agglomerator,
-            gamg.smoother,
-            yes_no(gamg.cache_agglomeration),
-            gamg.n_cells_in_coarsest_level,
-            gamg.merge_levels,
-            gamg.min_iterations,
-            gamg.max_iterations,
-            format_scientific(gamg.tolerance),
-            format_scientific(gamg.relative_tolerance),
-            gamg.n_pre_sweeps,
-            gamg.n_post_sweeps,
-            gamg.n_finest_sweeps,
-            yes_no(gamg.interpolate_correction),
-            yes_no(gamg.scale_correction),
-            yes_no(gamg.direct_solve_coarsest),
-        );
+        println!("{}", format_pressure_gamg_console(&gamg));
     }
     println!(
         "incompressibleFluid residualControl: state={} checked={} satisfied={} U(tolerance={},initial={},satisfied={}) p(tolerance={},initial={},satisfied={})",
@@ -899,7 +883,7 @@ fn run_laminar_simple_solve(
     }
     if let Some(profile) = &report.timing.pressure_gamg_profile {
         println!(
-            "incompressibleFluid pressureGamgProfile: totalSeconds={:.6} hierarchyBuildSeconds={:.6} hierarchyRebuildSeconds={:.6} matrixRefreshSeconds={:.6} finestResidualSeconds={:.6} vCycleSeconds={:.6} restrictionSeconds={:.6} prolongationSeconds={:.6} smoothingSeconds={:.6} scalingSeconds={:.6} coarseResidualSeconds={:.6} correctionSeconds={:.6} coarsestSolveSeconds={:.6} vCycleOtherSeconds={:.6} otherSeconds={:.6} solves={} vCycles={} levels={}",
+            "incompressibleFluid pressureGamgProfile: totalSeconds={:.6} hierarchyBuildSeconds={:.6} hierarchyRebuildSeconds={:.6} matrixRefreshSeconds={:.6} finestResidualSeconds={:.6} vCycleSeconds={:.6} restrictionSeconds={:.6} prolongationSeconds={:.6} smoothingSeconds={:.6} scalingSeconds={:.6} coarseResidualSeconds={:.6} correctionSeconds={:.6} coarsestSolveSeconds={:.6} vCycleOtherSeconds={:.6} otherSeconds={:.6} solves={} vCycles={} levels={} {}",
             profile.total_seconds,
             profile.hierarchy_build_seconds,
             profile.hierarchy_rebuild_seconds,
@@ -918,6 +902,7 @@ fn run_laminar_simple_solve(
             profile.solves,
             profile.v_cycles,
             profile.levels.len(),
+            gamg_outer_profile_counters(profile),
         );
         for level in &profile.levels {
             println!(
@@ -2349,10 +2334,27 @@ fn openfoam_gamg_options(plan: &SolverCasePlan, section: &str) -> Result<GamgOpt
             ));
         }
     };
+    let outer_solver = match numerics_dictionary_value(
+        &plan.numerics.fv_solution,
+        section,
+        "outerSolver",
+    )
+    .map(|value| value.trim().trim_end_matches(';'))
+    .unwrap_or("standalone")
+    {
+        "standalone" => GamgOuterSolver::Standalone,
+        "FCG" => GamgOuterSolver::FlexibleCg,
+        other => {
+            return Err(format!(
+                "unsupported fvSolution {section} GAMG outerSolver '{other}'; Ferrum supports exactly standalone and FCG"
+            ));
+        }
+    };
 
     let mut options = GamgOptions {
         agglomerator,
         smoother,
+        outer_solver,
         ..GamgOptions::default()
     };
     options.max_iterations =
@@ -2402,6 +2404,42 @@ fn openfoam_gamg_options(plan: &SolverCasePlan, section: &str) -> Result<GamgOpt
         return Err(format!("fvSolution {section}.mergeLevels must be positive"));
     }
     Ok(options)
+}
+
+fn gamg_outer_solver_name(solver: &GamgOuterSolver) -> &'static str {
+    match solver {
+        GamgOuterSolver::Standalone => "standalone",
+        GamgOuterSolver::FlexibleCg => "FCG",
+    }
+}
+
+fn format_pressure_gamg_console(gamg: &GamgOptions) -> String {
+    format!(
+        "incompressibleFluid pressureGAMG: agglomerator={} smoother={} cacheAgglomeration={} nCellsInCoarsestLevel={} mergeLevels={} minIter={} maxIter={} tolerance={} relTol={} nPreSweeps={} nPostSweeps={} nFinestSweeps={} interpolateCorrection={} scaleCorrection={} directSolveCoarsest={} outerSolver={}",
+        gamg.agglomerator,
+        gamg.smoother,
+        yes_no(gamg.cache_agglomeration),
+        gamg.n_cells_in_coarsest_level,
+        gamg.merge_levels,
+        gamg.min_iterations,
+        gamg.max_iterations,
+        format_scientific(gamg.tolerance),
+        format_scientific(gamg.relative_tolerance),
+        gamg.n_pre_sweeps,
+        gamg.n_post_sweeps,
+        gamg.n_finest_sweeps,
+        yes_no(gamg.interpolate_correction),
+        yes_no(gamg.scale_correction),
+        yes_no(gamg.direct_solve_coarsest),
+        gamg_outer_solver_name(&gamg.outer_solver),
+    )
+}
+
+fn gamg_outer_profile_counters(profile: &GamgKernelTiming) -> String {
+    format!(
+        "outerMatrixVectorProducts={} outerReductions={}",
+        profile.outer_matrix_vector_products, profile.outer_reductions
+    )
 }
 
 fn resolve_laminar_preconditioner(
@@ -3623,6 +3661,11 @@ fn write_json_gamg_profile(
             "finestResidualEvaluations",
             profile.finest_residual_evaluations,
         ),
+        (
+            "outerMatrixVectorProducts",
+            profile.outer_matrix_vector_products,
+        ),
+        ("outerReductions", profile.outer_reductions),
         ("solves", profile.solves),
         ("vCycles", profile.v_cycles),
     ];
@@ -3882,6 +3925,13 @@ fn write_json_pressure_gamg_options(
     };
     writeln!(writer, "{{")?;
     let nested = indent + 2;
+    write_json_string_field(
+        writer,
+        nested,
+        "outerSolver",
+        gamg_outer_solver_name(&options.outer_solver),
+    )?;
+    writeln!(writer, ",")?;
     write_json_string_field(
         writer,
         nested,
@@ -4705,6 +4755,16 @@ fn write_markdown_gamg_profile(
     }
     writeln!(writer, "| Pressure solves | {} |", profile.solves)?;
     writeln!(writer, "| V-cycles | {} |", profile.v_cycles)?;
+    writeln!(
+        writer,
+        "| Outer matrix-vector products | {} |",
+        profile.outer_matrix_vector_products
+    )?;
+    writeln!(
+        writer,
+        "| Outer reductions | {} |",
+        profile.outer_reductions
+    )?;
     writeln!(writer, "| Levels | {} |", profile.levels.len())?;
     writeln!(writer)?;
     writeln!(
@@ -4822,6 +4882,11 @@ fn write_laminar_simple_report_markdown(
         options.pressure_max_linear_iterations
     )?;
     if let Some(gamg) = options.pressure_gamg_options {
+        writeln!(
+            writer,
+            "| GAMG outer solver | {} |",
+            gamg_outer_solver_name(&gamg.outer_solver)
+        )?;
         writeln!(writer, "| GAMG agglomerator | {} |", gamg.agglomerator)?;
         writeln!(writer, "| GAMG smoother | {} |", gamg.smoother)?;
         writeln!(
@@ -7991,20 +8056,20 @@ mod tests {
         LaminarSimpleOptions, LaminarSimpleResidualControlSummary, LaminarSimpleSchemes,
         MAX_RUNNER_DRY_RUN_STEPS, SafeOutputRoot, ScalarDiffusionLinearSolver,
         SolverNumericsDictionaryPlan, SolverSelectionSource, estimate_iterations_to_convergence,
-        estimate_simple_iterations_to_convergence, numerics_dictionary_number,
-        numerics_dictionary_usize, numerics_dictionary_value, openfoam_gamg_options,
-        outer_convergence_status_for_reason, parse_ferrum_run_args,
-        parse_incompressible_fluid_args, parse_incompressible_fluid_plan_args,
-        parse_laminar_simple_convection_scheme, parse_laminar_simple_gradient_scheme,
-        parse_laminar_simple_laplacian_scheme, parse_laminar_simple_sn_grad_scheme,
-        parse_openfoam_laminar_preconditioner, parse_openfoam_laminar_solver, parse_solver_args,
-        resolve_laminar_simple_convection_scheme, resolve_laminar_simple_options,
-        resolve_solver_dispatch, resolved_gradient_scheme_value, run_ferrum_subcommand,
-        validate_laminar_residual_control_dictionary, validate_module_execution_contract,
-        write_json_solver_state, write_json_string, write_laminar_simple_fields,
-        write_laminar_simple_report_json, write_laminar_simple_report_markdown,
-        write_laminar_simple_residual_csv, write_laminar_simple_residual_plot,
-        write_solver_plan_json_in_root,
+        estimate_simple_iterations_to_convergence, format_pressure_gamg_console,
+        gamg_outer_profile_counters, numerics_dictionary_number, numerics_dictionary_usize,
+        numerics_dictionary_value, openfoam_gamg_options, outer_convergence_status_for_reason,
+        parse_ferrum_run_args, parse_incompressible_fluid_args,
+        parse_incompressible_fluid_plan_args, parse_laminar_simple_convection_scheme,
+        parse_laminar_simple_gradient_scheme, parse_laminar_simple_laplacian_scheme,
+        parse_laminar_simple_sn_grad_scheme, parse_openfoam_laminar_preconditioner,
+        parse_openfoam_laminar_solver, parse_solver_args, resolve_laminar_simple_convection_scheme,
+        resolve_laminar_simple_options, resolve_solver_dispatch, resolved_gradient_scheme_value,
+        run_ferrum_subcommand, validate_laminar_residual_control_dictionary,
+        validate_module_execution_contract, write_json_solver_state, write_json_string,
+        write_laminar_simple_fields, write_laminar_simple_report_json,
+        write_laminar_simple_report_markdown, write_laminar_simple_residual_csv,
+        write_laminar_simple_residual_plot, write_solver_plan_json_in_root,
     };
     use ferrum_mesh::backends::BackendChoice;
     use ferrum_mesh::control::ControlDict;
@@ -8013,7 +8078,9 @@ mod tests {
         LaminarSimpleLinearSolver, LaminarSimplePreconditioner, LaminarSimpleSnGradScheme,
         LaminarSimpleStopReason, LinearSolveConvergenceSummary, LinearSolveStopReason,
     };
-    use ferrum_mesh::linear::{GamgAgglomerator, GamgSmoother};
+    use ferrum_mesh::linear::{
+        GamgAgglomerator, GamgKernelTiming, GamgOptions, GamgOuterSolver, GamgSmoother,
+    };
     use ferrum_mesh::runtime::{SolverRuntimeData, SolverRuntimeMeshData};
     use ferrum_mesh::solver_plan::{
         SolverBackendPlan, SolverCasePlan, SolverCpuResourcePlan, SolverDimensionality,
@@ -8612,6 +8679,68 @@ mod tests {
         assert!(csv_row.contains(
             "2:iter=2/ok=true/initial=2.500000e-1/residual=1.000000e-3/final=1.000000e-2/effectiveTol=2.000000e-2/reason=AbsoluteTolerance"
         ));
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn gamg_reports_expose_resolved_outer_solver() {
+        let base = output_test_dir("gamg-outer-solver-reporting");
+        std::fs::create_dir_all(&base).expect("output root should be created");
+        let output_root = SafeOutputRoot::open_existing(&base).expect("output root should open");
+        let plan = laminar_simple_test_plan(1000.0, 0.001);
+        let mut options = minimal_laminar_simple_options_for_estimate();
+        options.pressure_linear_solver = LaminarSimpleLinearSolver::Gamg;
+        options.pressure_gamg_options = Some(GamgOptions {
+            outer_solver: GamgOuterSolver::FlexibleCg,
+            ..GamgOptions::default()
+        });
+        let mut report = output_test_report();
+        report.timing.pressure_gamg_profile = Some(GamgKernelTiming {
+            outer_matrix_vector_products: 17,
+            outer_reductions: 23,
+            ..GamgKernelTiming::default()
+        });
+
+        write_laminar_simple_report_json(
+            &plan,
+            &options,
+            &report,
+            0.0,
+            &output_root,
+            Path::new("report.json"),
+        )
+        .expect("JSON report should be written");
+        write_laminar_simple_report_markdown(
+            &plan,
+            &options,
+            &report,
+            0.0,
+            &output_root,
+            Path::new("report.md"),
+        )
+        .expect("Markdown report should be written");
+
+        let json = std::fs::read_to_string(base.join("report.json"))
+            .expect("JSON report should be readable");
+        let markdown = std::fs::read_to_string(base.join("report.md"))
+            .expect("Markdown report should be readable");
+        assert!(json.contains("\"outerSolver\": \"FCG\""));
+        assert!(json.contains("\"outerMatrixVectorProducts\": 17"));
+        assert!(json.contains("\"outerReductions\": 23"));
+        assert!(markdown.contains("| GAMG outer solver | FCG |"));
+        assert!(markdown.contains("| Outer matrix-vector products | 17 |"));
+        assert!(markdown.contains("| Outer reductions | 23 |"));
+        assert_eq!(
+            gamg_outer_profile_counters(
+                report
+                    .timing
+                    .pressure_gamg_profile
+                    .as_ref()
+                    .expect("profile should remain available")
+            ),
+            "outerMatrixVectorProducts=17 outerReductions=23"
+        );
 
         let _ = std::fs::remove_dir_all(base);
     }
@@ -9570,6 +9699,7 @@ mod tests {
             ("solver", "GAMG"),
             ("smoother", "symGaussSeidel"),
             ("agglomerator", "algebraicPair"),
+            ("outerSolver", "FCG"),
             ("maxIter", "73"),
             ("minIter", "2"),
             ("tolerance", "2e-9"),
@@ -9602,6 +9732,7 @@ mod tests {
 
         assert_eq!(options.agglomerator, GamgAgglomerator::AlgebraicPair);
         assert_eq!(options.smoother, GamgSmoother::SymGaussSeidel);
+        assert_eq!(options.outer_solver, GamgOuterSolver::FlexibleCg);
         assert_eq!(options.max_iterations, 73);
         assert_eq!(options.min_iterations, 2);
         assert_eq!(options.tolerance, 2.0e-9);
@@ -9632,6 +9763,7 @@ mod tests {
             ("solver", "GAMG"),
             ("smoother", "symGaussSeidel"),
             ("agglomerator", "faceAreaPair"),
+            ("outerSolver", "FCG"),
             ("maxIter", "73"),
             ("minIter", "2"),
             ("tolerance", "2e-9"),
@@ -9685,6 +9817,7 @@ mod tests {
         assert!(options.profile_gamg);
         assert_eq!(gamg.agglomerator, GamgAgglomerator::FaceAreaPair);
         assert_eq!(gamg.smoother, GamgSmoother::SymGaussSeidel);
+        assert_eq!(gamg.outer_solver, GamgOuterSolver::FlexibleCg);
         assert_eq!(gamg.tolerance, 5.0e-9);
         assert_eq!(gamg.max_iterations, 41);
         assert_eq!(gamg.min_iterations, 2);
@@ -9774,6 +9907,65 @@ mod tests {
         let unknown_agglomerator = openfoam_gamg_options(&plan, "solvers.p")
             .expect_err("unknown GAMG agglomerator must fail");
         assert!(unknown_agglomerator.contains("no agglomerator fallback was applied"));
+    }
+
+    #[test]
+    fn gamg_outer_solver_defaults_to_standalone_and_rejects_unknown_values() {
+        let mut plan = laminar_simple_test_plan(998.2, 1.002e-3);
+        plan.numerics
+            .fv_solution
+            .entries
+            .retain(|entry| entry.section != "solvers.p");
+        for (key, value) in [("solver", "GAMG"), ("smoother", "GaussSeidel")] {
+            plan.numerics
+                .fv_solution
+                .entries
+                .push(SolverNumericsEntryPlan {
+                    section: "solvers.p".to_string(),
+                    key: key.to_string(),
+                    value: value.to_string(),
+                });
+        }
+
+        let defaults = openfoam_gamg_options(&plan, "solvers.p")
+            .expect("omitted outerSolver should use the standalone GAMG solve");
+        assert_eq!(defaults.outer_solver, GamgOuterSolver::Standalone);
+
+        plan.numerics
+            .fv_solution
+            .entries
+            .push(SolverNumericsEntryPlan {
+                section: "solvers.p".to_string(),
+                key: "outerSolver".to_string(),
+                value: "standalone".to_string(),
+            });
+        let explicit = openfoam_gamg_options(&plan, "solvers.p")
+            .expect("the exact standalone outerSolver value should be accepted");
+        assert_eq!(explicit.outer_solver, GamgOuterSolver::Standalone);
+
+        plan.numerics
+            .fv_solution
+            .entries
+            .last_mut()
+            .expect("outerSolver entry")
+            .value = "fcg".to_string();
+        let error = openfoam_gamg_options(&plan, "solvers.p")
+            .expect_err("outerSolver values are case-sensitive and must not fall back");
+        assert!(error.contains("outerSolver 'fcg'"));
+        assert!(error.contains("exactly standalone and FCG"));
+    }
+
+    #[test]
+    fn pressure_gamg_console_keeps_legacy_prefix_and_appends_outer_solver() {
+        let options = GamgOptions {
+            outer_solver: GamgOuterSolver::FlexibleCg,
+            ..GamgOptions::default()
+        };
+
+        let line = format_pressure_gamg_console(&options);
+
+        assert!(line.starts_with("incompressibleFluid pressureGAMG: agglomerator="));
+        assert!(line.ends_with(" outerSolver=FCG"));
     }
 
     #[test]
