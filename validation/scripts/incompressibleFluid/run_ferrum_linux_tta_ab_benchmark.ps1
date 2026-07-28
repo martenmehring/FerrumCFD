@@ -809,7 +809,7 @@ try {
 $pressureRelTolText = Format-Invariant $CandidatePressureRelTol
 $momentumRelTolText = Format-Invariant $CandidateMomentumRelTol
 $workerWslPath = ConvertTo-MatchedWslPath $WorkerPath $Distro
-$workerBootstrap = 'set -o pipefail; tr -d ''\r'' < "\$1" | bash -s -- "\${@:2}"'
+$workerBootstrap = 'set -o pipefail; tr -d ''\r'' < "$1" | bash -s -- "${@:2}"'
 $preflightArguments = @(
     "-d", $Distro, "--", "bash", "-c", $workerBootstrap, "ferrum-linux-tta-ab-worker", $workerWslPath,
     "--preflight-only", "--rust-toolchain", $RustToolchain, "--cpu-set", $CpuSet,
