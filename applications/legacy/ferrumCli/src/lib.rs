@@ -187,7 +187,7 @@ fn gmsh_to_ferrum(args: Vec<String>) -> Result<(), String> {
         mesh.boundary_faces.len()
     );
 
-    println!("Writing OpenFOAM-like case: {}", import.case_dir.display());
+    println!("Writing Ferrum case: {}", import.case_dir.display());
     let summary = write_openfoam_case_with_options(
         &mesh,
         &import.case_dir,
@@ -1714,7 +1714,7 @@ fn resolve_laminar_simple_options(
     solve: &LaminarSimpleSolveArgs,
 ) -> Result<LaminarSimpleOptions, String> {
     if !plan.numerics.fv_solution.present {
-        return Err("Laminar SIMPLE solve requires OpenFOAM-style system/fvSolution".to_string());
+        return Err("Laminar SIMPLE solve requires FOAM dictionary system/fvSolution".to_string());
     }
     let density = solve
         .density
@@ -1896,7 +1896,7 @@ fn resolve_laminar_simple_options(
 
 fn resolve_laminar_simple_schemes(plan: &SolverCasePlan) -> Result<LaminarSimpleSchemes, String> {
     if !plan.numerics.fv_schemes.present {
-        return Err("Laminar SIMPLE solve requires OpenFOAM-style system/fvSchemes".to_string());
+        return Err("Laminar SIMPLE solve requires FOAM dictionary system/fvSchemes".to_string());
     }
 
     let sn_grad = parse_laminar_simple_sn_grad_scheme(required_fv_scheme(
@@ -2267,7 +2267,7 @@ fn validate_laminar_residual_control_dictionary(
         .find(|section| section.path.starts_with(&format!("{SECTION}.")))
     {
         return Err(format!(
-            "fvSolution {SECTION} entries must be single scalar values for steady SIMPLE convergence; nested dictionary '{}' is not valid OpenFOAM Foundation syntax here",
+            "fvSolution {SECTION} entries must be single scalar values for steady SIMPLE convergence; nested dictionary '{}' is not valid FOAM dictionary syntax here",
             nested.path
         ));
     }
@@ -2455,7 +2455,7 @@ fn validate_openfoam_linear_controls(
         && sweeps != 1
     {
         return Err(format!(
-            "fvSolution {section}.nSweeps={sweeps} is not implemented yet; Ferrum currently matches the OpenFOAM default nSweeps=1"
+            "fvSolution {section}.nSweeps={sweeps} is not implemented yet; Ferrum currently supports nSweeps=1"
         ));
     }
     Ok(())
@@ -2559,7 +2559,7 @@ fn parse_openfoam_laminar_solver(value: &str) -> Result<LaminarSimpleLinearSolve
         }
         "symGaussSeidel" | "sym-gauss-seidel" => Ok(LaminarSimpleLinearSolver::SymGaussSeidel),
         "smoothSolver" => Err(
-            "OpenFOAM smoothSolver requires a smoother entry in fvSolution; use GaussSeidel or symGaussSeidel for a direct CLI override"
+            "smoothSolver requires a smoother entry in fvSolution; use GaussSeidel or symGaussSeidel for a direct CLI override"
                 .to_string(),
         ),
         "PCG" | "pcg" => Ok(LaminarSimpleLinearSolver::Pcg),
@@ -2567,7 +2567,7 @@ fn parse_openfoam_laminar_solver(value: &str) -> Result<LaminarSimpleLinearSolve
         "CG" | "cg" => Ok(LaminarSimpleLinearSolver::Cg),
         "Jacobi" | "jacobi" => Ok(LaminarSimpleLinearSolver::Jacobi),
         other => Err(format!(
-            "unsupported OpenFOAM linear solver '{other}'; no fallback was applied"
+            "unsupported fvSolution linear solver '{other}'; no fallback was applied"
         )),
     }
 }
@@ -2582,11 +2582,11 @@ fn parse_openfoam_laminar_preconditioner(
         }
         "diagonal" | "Diagonal" => Ok(LaminarSimplePreconditioner::Diagonal),
         "DILU" => Err(
-            "OpenFOAM DILU is not implemented yet; refusing to substitute a diagonal preconditioner"
+            "DILU is not implemented yet; refusing to substitute a diagonal preconditioner"
                 .to_string(),
         ),
         other => Err(format!(
-            "unsupported OpenFOAM preconditioner '{other}'; no fallback was applied"
+            "unsupported fvSolution preconditioner '{other}'; no fallback was applied"
         )),
     }
 }
@@ -2843,20 +2843,20 @@ fn print_solver_case_plan(plan: &SolverCasePlan, dispatch: Option<&SolverDispatc
 fn print_openfoam_case_compatibility_warnings(warnings: &[String]) {
     let compatibility_count = warnings
         .iter()
-        .filter(|warning| warning.starts_with("OpenFOAM compatibility: "))
+        .filter(|warning| warning.starts_with("Ferrum case compatibility: "))
         .count();
     if compatibility_count == 0 {
-        println!("OpenFOAM compatibility: case layout and required fields look present");
+        println!("Ferrum case compatibility: case layout and required fields look present");
         return;
     }
 
     println!(
-        "OpenFOAM compatibility: {} item(s) to check",
+        "Ferrum case compatibility: {} item(s) to check",
         compatibility_count
     );
     for message in warnings
         .iter()
-        .filter_map(|warning| warning.strip_prefix("OpenFOAM compatibility: "))
+        .filter_map(|warning| warning.strip_prefix("Ferrum case compatibility: "))
     {
         println!("  {}", message);
     }
@@ -7839,7 +7839,7 @@ fn set_validated_patch_type(
         return Err("patch name must not be empty".to_string());
     }
     if !is_openfoam_word(patch_type) {
-        return Err(format!("invalid OpenFOAM patch type '{patch_type}'"));
+        return Err(format!("invalid supported patch type '{patch_type}'"));
     }
     options.set_patch_type(patch, patch_type);
     Ok(())
@@ -7932,7 +7932,7 @@ fn print_ferrum_run_usage() {
 fn print_init_case_usage() {
     println!("usage: initFerrumCase <caseDir> [--region <name> ...] [--regions a,b] [--force]");
     println!();
-    println!("creates an OpenFOAM-like FerrumCFD case skeleton:");
+    println!("creates a FerrumCFD case skeleton:");
     println!("  0/");
     println!("  constant/");
     println!("  constant/polyMesh/");
@@ -7976,7 +7976,7 @@ fn print_patch_type_options() {
         "  -wedgePatch <patch>          write patch type 'wedge' for axisymmetric wedge patches"
     );
     println!("  -symmetryPatch <patch>       write patch type 'symmetryPlane'");
-    println!("  -patchType <patch>=<type>    write any OpenFOAM-compatible patch type");
+    println!("  -patchType <patch>=<type>    write any supported patch type");
 }
 
 #[allow(dead_code)]

@@ -40,7 +40,7 @@ Status meanings:
 | 23 | Malformed Gmsh element tag count can panic parser | Fixed | Signed values use checked conversions and checked index arithmetic; a negative-tag-count test returns a parse error. |
 | 24 | Diffusion assembly permits non-finite CSR/RHS values | Fixed | Source, coefficient, matrix, and RHS operations reject non-finite results; overflow regression coverage is present. |
 | 25 | CG breakdown can be used as a SIMPLE solve result | Fixed | Linear convergence state is preserved through `ScalarSolveReport`; failed momentum or pressure solves prevent SIMPLE convergence and set an invalid-state stop reason. |
-| 26 | WSL benchmark script allows shell injection via WorkDir | Fixed | Work directories are constrained below the repository target directory and WSL paths are single-quote escaped before `bash -lc`. |
+| 26 | Historical external benchmark launcher allowed shell injection via its work directory | Removed | The complete launcher surface was removed from the product repository in July 2026. |
 | 27 | Unchecked run-time write estimate can saturate | Fixed | Write estimates reject non-finite or out-of-range values before integer conversion. |
 | 28 | Backend wrapper accepts missing closing brace | Fixed | EOF before the outer closing brace is an error; regression coverage verifies it. |
 
@@ -59,7 +59,8 @@ nonempty. This rollback never applies to strict case roots.
 
 - `cargo test --workspace --all-targets`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- PowerShell AST parsing for every script below `validation/scripts/incompressibleFluid/`
+- the then-current local benchmark-launcher syntax gate (the launchers were
+  removed from the product repository in July 2026)
 - One real `tutorials/incompressibleFluid/laminarPipe/ferrum/case` SIMPLE iteration using the case's
   `fvSchemes`, `fvSolution`, fields, properties, and `constant/polyMesh`
 

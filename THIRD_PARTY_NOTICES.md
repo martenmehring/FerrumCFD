@@ -1,25 +1,31 @@
 # Third-party notices
 
-FerrumCFD is an independent project. Its Rust source code is distributed under
-the repository's [MIT License](LICENSE).
+FerrumCFD is an independent project. Its source code is distributed under the
+repository's [GNU General Public License v3.0 or later](LICENSE).
 
 ## OpenFOAM Foundation 13
 
-OpenFOAM Foundation 13 is an external, optional validation and interoperability
-tool. It is not included in FerrumCFD and is not a FerrumCFD runtime dependency.
-The independently runnable sibling cases under `tutorials/**/openfoam-v13/`
-use OpenFOAM dictionary names, format identifiers, and generated file headers
-where those names are required by the external OpenFOAM program or file format.
+OpenFOAM Foundation 13 was used as a separately installed external reference
+for recorded interoperability, numerical-validation, and performance results.
+It is not a FerrumCFD runtime dependency. FerrumCFD does not bundle OpenFOAM
+source code, binaries, tutorial cases, or other artifacts obtained from an
+OpenFOAM distribution.
 
-OpenFOAM is distributed separately under the GNU General Public License v3.0:
+The benchmark documents under `docs/benchmarks/` retain only the external
+implementation and version, measurement protocol, and recorded results needed
+to interpret the comparison. Reproduction requires users to obtain OpenFOAM
+and any corresponding reference inputs independently from its distributor.
+
+OpenFOAM is distributed separately under the GNU General Public License
+version 3 or later:
 
 - <https://github.com/OpenFOAM/OpenFOAM-13>
 - <https://github.com/OpenFOAM/OpenFOAM-13/blob/master/COPYING>
 
 FerrumCFD is not affiliated with or endorsed by the OpenFOAM Foundation or CFD
 Direct Ltd. OpenFOAM is a registered trademark of OpenCFD Limited, a producer
-of OpenFOAM software. Use of the name in this repository identifies external
-compatibility cases and validation evidence only.
+of OpenFOAM software. Use of the name in this repository identifies the
+external compatibility target and recorded validation evidence only.
 
 ## Gmsh
 

@@ -4,10 +4,10 @@ These files are validation-only overlays for versioned Ferrum tutorial cases.
 They keep benchmark stopping criteria and iteration budgets outside the generic
 `incompressibleFluid` solver and outside the source tutorial defaults.
 
-Each profile mirrors the OpenFOAM case layout. A validation runner copies the
-tutorial case into `target/`, then overlays the profile's `system` directory.
-The resulting working case is disposable and must not be used as a solver
-fallback or a hidden case-specific default.
+Each profile contains only Ferrum-owned configuration data. A maintainer may
+copy a tutorial case into an untracked directory and overlay the profile's
+`system` directory. The resulting working case is disposable and must not be
+used as a solver fallback or a hidden case-specific default.
 
 Profiles:
 
@@ -21,5 +21,5 @@ Profiles:
   same outer convergence criteria with pressure `GAMG`, `faceAreaPair`, and
   `symGaussSeidel`.
 
-The CPU performance runner selects these overlays explicitly with
-`-PressureSolver pcg` or `-PressureSolver gamg`. PCG remains the default.
+These profiles document accepted validation controls; they are not executable
+launchers and add no user dependency. PCG remains the default.

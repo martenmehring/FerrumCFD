@@ -166,8 +166,8 @@ fn write_case_readme(
     writeln!(writer)?;
     writeln!(writer, "Typical workflow:")?;
     writeln!(writer)?;
-    writeln!(writer, "```powershell")?;
-    writeln!(writer, "gmshToFerrum path\\to\\mesh.msh -case .")?;
+    writeln!(writer, "```console")?;
+    writeln!(writer, "gmshToFerrum path/to/mesh.msh -case .")?;
     writeln!(writer, "checkFerrumMesh -case .")?;
     writeln!(writer, "splitFerrumMeshRegions -case . -cellZones")?;
     writeln!(

@@ -34,7 +34,7 @@ and curated reference environments.
 
 Install Rust 1.94.0 with the `rustfmt` and `clippy` components, then run:
 
-```powershell
+```console
 rustup toolchain install 1.94.0 --profile minimal --component rustfmt --component clippy
 cargo +1.94.0 fmt --all -- --check
 cargo +1.94.0 fetch --locked

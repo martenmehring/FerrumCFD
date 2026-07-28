@@ -563,7 +563,8 @@ fn validate_openfoam_case_structure(
     warnings: &mut Vec<String>,
 ) {
     if !case_dir.join("system").join("controlDict").exists() {
-        warnings.push("OpenFOAM compatibility: missing mandatory system/controlDict".to_string());
+        warnings
+            .push("Ferrum case compatibility: missing mandatory system/controlDict".to_string());
     }
     if !case_dir
         .join("constant")
@@ -571,12 +572,12 @@ fn validate_openfoam_case_structure(
         .exists()
     {
         warnings.push(
-            "OpenFOAM compatibility: missing mandatory constant/transportProperties".to_string(),
+            "Ferrum case compatibility: missing mandatory constant/transportProperties".to_string(),
         );
     }
     if !case_dir.join("0").exists() {
         warnings.push(
-            "OpenFOAM compatibility: missing mandatory time directory 0 (initial field files)"
+            "Ferrum case compatibility: missing mandatory time directory 0 (initial field files)"
                 .to_string(),
         );
     }
@@ -588,9 +589,10 @@ fn validate_openfoam_case_structure(
     match velocity {
         Some(field) if field.class_name.as_deref() == Some("volVectorField") => {}
         Some(_) => warnings.push(
-            "OpenFOAM compatibility: field 0/U exists but class is not volVectorField".to_string(),
+            "Ferrum case compatibility: field 0/U exists but class is not volVectorField"
+                .to_string(),
         ),
-        None => warnings.push("OpenFOAM compatibility: missing mandatory field 0/U".to_string()),
+        None => warnings.push("Ferrum case compatibility: missing mandatory field 0/U".to_string()),
     }
 
     let pressure = fields
@@ -600,19 +602,20 @@ fn validate_openfoam_case_structure(
     match pressure {
         Some(field) if field.class_name.as_deref() == Some("volScalarField") => {}
         Some(_) => warnings.push(
-            "OpenFOAM compatibility: field 0/p exists but class is not volScalarField".to_string(),
+            "Ferrum case compatibility: field 0/p exists but class is not volScalarField"
+                .to_string(),
         ),
-        None => warnings.push("OpenFOAM compatibility: missing mandatory field 0/p".to_string()),
+        None => warnings.push("Ferrum case compatibility: missing mandatory field 0/p".to_string()),
     }
 
     if !case_dir.join("system").join("fvSchemes").exists() {
         warnings.push(
-            "OpenFOAM compatibility: mandatory system/fvSchemes is missing; laminar SIMPLE execution will reject the case".to_string(),
+            "Ferrum case compatibility: mandatory system/fvSchemes is missing; laminar SIMPLE execution will reject the case".to_string(),
         );
     }
     if !case_dir.join("system").join("fvSolution").exists() {
         warnings.push(
-            "OpenFOAM compatibility: mandatory system/fvSolution is missing; laminar SIMPLE execution will reject the case".to_string(),
+            "Ferrum case compatibility: mandatory system/fvSolution is missing; laminar SIMPLE execution will reject the case".to_string(),
         );
     }
     // OpenFOAM-compatible boundary and geometry files are validated by mesh and patch readers elsewhere.
@@ -634,7 +637,7 @@ fn validate_openfoam_case_structure(
             .exists()
     {
         warnings.push(
-            "OpenFOAM compatibility: incomplete constant/polyMesh (faces/owner/neighbour)"
+            "Ferrum case compatibility: incomplete constant/polyMesh (faces/owner/neighbour)"
                 .to_string(),
         );
     }
@@ -2189,7 +2192,7 @@ mod tests {
         let compatibility = extract_openfoam_warnings(&warnings);
         assert!(
             compatibility.is_empty(),
-            "expected no OpenFOAM compatibility warnings, got {:?}",
+            "expected no Ferrum case compatibility warnings, got {:?}",
             compatibility
         );
 
@@ -2559,7 +2562,7 @@ mod tests {
             .iter()
             .filter_map(|warning| {
                 warning
-                    .strip_prefix("OpenFOAM compatibility: ")
+                    .strip_prefix("Ferrum case compatibility: ")
                     .map(str::to_string)
             })
             .collect()

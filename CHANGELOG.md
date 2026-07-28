@@ -6,6 +6,18 @@ are distinguished explicitly.
 
 ## Unreleased
 
+### GPL-3.0-or-later And External Reference Cleanup - 2026-07-28
+
+- Relicensed FerrumCFD-owned source code and documentation from the former MIT
+  terms to the GNU General Public License version 3 or later
+  (`GPL-3.0-or-later`). Previously published MIT-licensed revisions retain
+  their historical license grant.
+- Removed bundled OpenFOAM reference artifacts from the current project tree;
+  documentation retains only the external implementation and version,
+  measurement protocol, and recorded comparison results.
+- Replaced the user-facing quick start with platform-neutral Cargo commands
+  that require only a current Rust toolchain.
+
 ### Native Rust Residual Plots - 2026-07-18
 
 - Replaced the optional Python/Matplotlib residual-plot subprocess with the
@@ -22,7 +34,7 @@ are distinguished explicitly.
 - Simplified the user-facing tutorial contract to an independently runnable
   Ferrum compatibility case, a native OpenFOAM 13 case, an analytical reference
   when useful, concise English documentation, and optional recorded results.
-- Kept existing benchmark scripts and contract tests as maintainer tools while
+- Kept the then-current benchmark tooling and contract tests as maintainer aids while
   removing mandatory master-runner, same-mesh, parameter-hash, and follow-up
   hardening requirements from the physics roadmap.
 - Marked `laminarPipe` and `planeChannel` as established cases and selected the
@@ -63,15 +75,17 @@ are distinguished explicitly.
 - Defined `ferrumMultiRun` as a coupled multi-region runner, not a parameter
   sweep, with a shared CPU/GPU lifecycle, per-region/stage placement, explicit
   interface barriers, mixed-backend operation, and a multi-GPU path.
-- Moved PowerShell orchestration from the root `scripts/` directory to
-  `validation/scripts/incompressibleFluid/` and documented retention/removal
-  criteria so reproducible comparisons are not deleted prematurely.
+- Consolidated the then-current local benchmark orchestration and documented
+  retention/removal criteria for reproducible comparisons. This tooling was
+  later removed from the product repository.
 - Documented `FerrumFile v1` as a target contract while keeping
   the current OpenFOAM-like Ferrum input as an explicit compatibility bridge.
 
-### Command Naming And Licensing - 2026-07-10
+### Command Naming And Former MIT Licensing - 2026-07-10
 
-- Added the repository-level MIT license.
+- Added the repository-level MIT license at that historical milestone
+  (superseded for subsequent revisions on 2026-07-28 by
+  `GPL-3.0-or-later`).
 - Renamed the Gmsh importer from `gmshToFerrumFoam` to `gmshToFerrum`.
 - Removed the unbranded Ferrum aliases for the upstream-style `gmshToFoam`,
   `checkMesh`, and `splitMeshRegions` names. Use `gmshToFerrum`,
@@ -113,7 +127,7 @@ Added:
   `symmetryPlane` paths;
 - external pipe and plane-channel benchmark binaries, with analytic acceptance
   data kept outside generic solver cases;
-- reproducible Gmsh import and Ferrum/OpenFOAM benchmark scripts.
+- reproducible Gmsh import and recorded Ferrum/external benchmark evidence.
 
 Validated:
 
@@ -123,8 +137,8 @@ Validated:
 - the shared 2D plane-channel Gmsh mesh produced a Ferrum mean velocity error
   of 0.1646% relative to plane-Poiseuille flow; OpenFOAM produced 0.4992% in
   the recorded fixed-budget comparison;
-- 160 Rust tests, strict Clippy, Rust formatting, PowerShell syntax checks, and
-  an end-to-end Gmsh import pass.
+- 160 Rust tests, strict Clippy, Rust formatting, benchmark-launcher syntax
+  checks, and an end-to-end Gmsh import pass.
 
 Still planned before calling the solver a production `simpleFoam` replacement:
 
