@@ -997,19 +997,21 @@ try {
     for ($index = 0; $index -lt $proofReports.Count; $index++) {
         $entry = $proofReports[$index]; $entryPath = "$.exactReportProof.reports[$index]"
         Assert-TtaExactJsonProperties $entry @("case", "kind", "ordinal", "ref", "relativePath", "sha256") $entryPath
-        $caseName = Get-TtaRequiredJsonString $entry "case" $entryPath
+        # PowerShell variable names are case-insensitive. Keep this distinct from
+        # the validated top-level -CaseName parameter.
+        $proofCaseName = Get-TtaRequiredJsonString $entry "case" $entryPath
         $kind = Get-TtaRequiredJsonString $entry "kind" $entryPath
         $ordinal = Get-TtaRequiredJsonInteger $entry "ordinal" $entryPath
         $refName = Get-TtaRequiredJsonString $entry "ref" $entryPath
         $relative = Get-TtaRequiredJsonString $entry "relativePath" $entryPath
         $sha256 = Get-TtaRequiredJsonString $entry "sha256" $entryPath
         if ($sha256 -notmatch '^[0-9a-f]{64}$' -or
-            $relative -cne (Get-TtaExpectedValidatedReportRelativePath $caseName $kind $ordinal $refName) -or
+            $relative -cne (Get-TtaExpectedValidatedReportRelativePath $proofCaseName $kind $ordinal $refName) -or
             !$expectedProofReports.ContainsKey($relative)) {
             throw "$entryPath identity, path, or SHA-256 is invalid"
         }
         $expectedIdentity = $expectedProofReports[$relative]
-        if ($caseName -cne $expectedIdentity.case -or $kind -cne $expectedIdentity.kind -or
+        if ($proofCaseName -cne $expectedIdentity.case -or $kind -cne $expectedIdentity.kind -or
             $ordinal -ne $expectedIdentity.ordinal -or $refName -cne $expectedIdentity.ref -or
             $provenProofReports.ContainsKey($relative)) {
             throw "$entryPath differs from the unique expected run identity"
