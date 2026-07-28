@@ -6,9 +6,10 @@ use crate::{MeshError, Result};
 
 pub mod gamg;
 pub use gamg::{
-    GamgAgglomerator, GamgFacePairWeight, GamgKernelTiming, GamgLevelTiming, GamgOptions,
-    GamgOuterSolver, GamgSmoother, GamgSolveControls, GamgWorkspace, ProfiledGamgSolveReport,
-    gamg_solve,
+    GamgAgglomerator, GamgAggregateSizeBin, GamgFacePairWeight, GamgHierarchyDiagnostics,
+    GamgHierarchyLevelDiagnostics, GamgKernelTiming, GamgLevelTiming, GamgOptions, GamgOuterSolver,
+    GamgSmoother, GamgSolveControls, GamgTransferDiagnostics, GamgWorkspace,
+    ProfiledGamgSolveReport, gamg_solve,
 };
 
 #[derive(Clone, Debug)]
