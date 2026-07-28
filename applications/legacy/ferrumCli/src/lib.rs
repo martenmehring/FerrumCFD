@@ -883,10 +883,11 @@ fn run_laminar_simple_solve(
     }
     if let Some(profile) = &report.timing.pressure_gamg_profile {
         println!(
-            "incompressibleFluid pressureGamgProfile: totalSeconds={:.6} hierarchyBuildSeconds={:.6} hierarchyRebuildSeconds={:.6} matrixRefreshSeconds={:.6} finestResidualSeconds={:.6} vCycleSeconds={:.6} restrictionSeconds={:.6} prolongationSeconds={:.6} smoothingSeconds={:.6} scalingSeconds={:.6} coarseResidualSeconds={:.6} correctionSeconds={:.6} coarsestSolveSeconds={:.6} vCycleOtherSeconds={:.6} otherSeconds={:.6} solves={} vCycles={} levels={} {}",
+            "incompressibleFluid pressureGamgProfile: totalSeconds={:.6} hierarchyBuildSeconds={:.6} hierarchyRebuildSeconds={:.6} hierarchyDiagnosticSeconds={:.6} matrixRefreshSeconds={:.6} finestResidualSeconds={:.6} vCycleSeconds={:.6} restrictionSeconds={:.6} prolongationSeconds={:.6} smoothingSeconds={:.6} scalingSeconds={:.6} coarseResidualSeconds={:.6} correctionSeconds={:.6} coarsestSolveSeconds={:.6} vCycleOtherSeconds={:.6} otherSeconds={:.6} solves={} vCycles={} levels={} {}",
             profile.total_seconds,
             profile.hierarchy_build_seconds,
             profile.hierarchy_rebuild_seconds,
+            profile.hierarchy_diagnostic_seconds,
             profile.matrix_refresh_seconds,
             profile.finest_residual_seconds,
             profile.v_cycle_seconds,
@@ -906,7 +907,7 @@ fn run_laminar_simple_solve(
         );
         for level in &profile.levels {
             println!(
-                "incompressibleFluid pressureGamgLevel: level={} cells={} nonzeros={} matrixRefreshSeconds={:.6} restrictionSeconds={:.6} prolongationSeconds={:.6} smoothingSeconds={:.6} scalingSeconds={:.6} residualSeconds={:.6} correctionSeconds={:.6} coarsestSolveSeconds={:.6} restrictionCalls={} prolongationCalls={} smoothingCalls={} smoothingSweeps={} scalingCalls={} residualEvaluations={} correctionUpdates={} coarsestSolves={}",
+                "incompressibleFluid pressureGamgLevel: level={} cells={} nonzeros={} matrixRefreshSeconds={:.6} restrictionSeconds={:.6} prolongationSeconds={:.6} smoothingSeconds={:.6} scalingSeconds={:.6} residualSeconds={:.6} correctionSeconds={:.6} coarsestSolveSeconds={:.6} restrictionCalls={} prolongationCalls={} smoothingCalls={} smoothingSweeps={} scalingCalls={} residualEvaluations={} correctionUpdates={} coarsestSolves={} coarsestIterations={}",
                 level.level,
                 level.cells,
                 level.nonzeros,
@@ -926,7 +927,49 @@ fn run_laminar_simple_solve(
                 level.residual_evaluations,
                 level.correction_updates,
                 level.coarsest_solves,
+                level.coarsest_iterations,
             );
+        }
+        if let Some(hierarchy) = &profile.hierarchy {
+            let grid_complexity = hierarchy.grid_complexity_terms();
+            let operator_complexity = hierarchy.operator_complexity_terms();
+            println!(
+                "incompressibleFluid pressureGamgHierarchy: smootherPassesPerSweep={} directSolveCoarsest={} gridComplexityNumeratorDecimal={} gridComplexityDenominatorDecimal={} operatorComplexityNumeratorDecimal={} operatorComplexityDenominatorDecimal={} nnzWeightedSmoothingWorkDecimal={} nnzWeightedSparseWorkDecimal={} levels={} transfers={}",
+                hierarchy.smoother_passes_per_sweep,
+                yes_no(hierarchy.direct_solve_coarsest),
+                format_optional_u128(grid_complexity.map(|terms| terms.0)),
+                format_optional_u128(grid_complexity.map(|terms| terms.1)),
+                format_optional_u128(operator_complexity.map(|terms| terms.0)),
+                format_optional_u128(operator_complexity.map(|terms| terms.1)),
+                format_optional_u128(profile.nnz_weighted_smoothing_work()),
+                format_optional_u128(profile.nnz_weighted_sparse_work()),
+                hierarchy.levels.len(),
+                hierarchy.transfers.len(),
+            );
+            for transfer in &hierarchy.transfers {
+                println!(
+                    "incompressibleFluid pressureGamgTransfer: fineLevel={} coarseLevel={} fineCells={} coarseCells={} singletonFineCells={} unmatchedFineCells={} minAggregateSize={} maxAggregateSize={}",
+                    transfer.fine_level,
+                    transfer.coarse_level,
+                    transfer.fine_cells,
+                    transfer.coarse_cells,
+                    transfer.singleton_fine_cells,
+                    transfer.unmatched_fine_cells,
+                    transfer.min_aggregate_size,
+                    transfer.max_aggregate_size,
+                );
+                for bin in &transfer.aggregate_size_histogram {
+                    println!(
+                        "incompressibleFluid pressureGamgAggregateSize: fineLevel={} coarseLevel={} aggregateSize={} aggregateCount={}",
+                        transfer.fine_level,
+                        transfer.coarse_level,
+                        bin.aggregate_size,
+                        bin.aggregate_count,
+                    );
+                }
+            }
+        } else {
+            println!("incompressibleFluid pressureGamgHierarchy: available=no");
         }
     }
     println!(
@@ -3635,6 +3678,10 @@ fn write_json_gamg_profile(
         ("totalSeconds", profile.total_seconds),
         ("hierarchyBuildSeconds", profile.hierarchy_build_seconds),
         ("hierarchyRebuildSeconds", profile.hierarchy_rebuild_seconds),
+        (
+            "hierarchyDiagnosticSeconds",
+            profile.hierarchy_diagnostic_seconds,
+        ),
         ("matrixRefreshSeconds", profile.matrix_refresh_seconds),
         ("finestResidualSeconds", profile.finest_residual_seconds),
         ("vCycleSeconds", profile.v_cycle_seconds),
@@ -3673,6 +3720,8 @@ fn write_json_gamg_profile(
         write_json_number_field(writer, nested, name, value)?;
         writeln!(writer, ",")?;
     }
+    write_json_gamg_hierarchy(writer, nested, profile)?;
+    writeln!(writer, ",")?;
     write_json_key(writer, nested, "levels")?;
     writeln!(writer, "[")?;
     for (index, level) in profile.levels.iter().enumerate() {
@@ -3710,6 +3759,7 @@ fn write_json_gamg_profile(
             ("residualEvaluations", level.residual_evaluations),
             ("correctionUpdates", level.correction_updates),
             ("coarsestSolves", level.coarsest_solves),
+            ("coarsestIterations", level.coarsest_iterations),
         ];
         for (counter_index, (name, value)) in level_counters.iter().enumerate() {
             write_json_number_field(writer, level_indent + 2, name, *value)?;
@@ -3721,6 +3771,144 @@ fn write_json_gamg_profile(
         }
         write_indent(writer, level_indent)?;
         if index + 1 < profile.levels.len() {
+            writeln!(writer, "}},")?;
+        } else {
+            writeln!(writer, "}}")?;
+        }
+    }
+    write_indent(writer, nested)?;
+    writeln!(writer, "]")?;
+    write_indent(writer, indent)?;
+    write!(writer, "}}")
+}
+
+fn write_json_gamg_hierarchy(
+    writer: &mut impl Write,
+    indent: usize,
+    profile: &GamgKernelTiming,
+) -> std::io::Result<()> {
+    write_json_key(writer, indent, "hierarchy")?;
+    let Some(hierarchy) = profile.hierarchy.as_ref() else {
+        return write!(writer, "null");
+    };
+
+    writeln!(writer, "{{")?;
+    let nested = indent + 2;
+    write_json_number_field(
+        writer,
+        nested,
+        "smootherPassesPerSweep",
+        hierarchy.smoother_passes_per_sweep,
+    )?;
+    writeln!(writer, ",")?;
+    write_json_bool_field(
+        writer,
+        nested,
+        "directSolveCoarsest",
+        hierarchy.direct_solve_coarsest,
+    )?;
+    writeln!(writer, ",")?;
+
+    let grid_complexity = hierarchy.grid_complexity_terms();
+    let operator_complexity = hierarchy.operator_complexity_terms();
+    for (name, value) in [
+        (
+            "gridComplexityNumeratorDecimal",
+            grid_complexity.map(|terms| terms.0),
+        ),
+        (
+            "gridComplexityDenominatorDecimal",
+            grid_complexity.map(|terms| terms.1),
+        ),
+        (
+            "operatorComplexityNumeratorDecimal",
+            operator_complexity.map(|terms| terms.0),
+        ),
+        (
+            "operatorComplexityDenominatorDecimal",
+            operator_complexity.map(|terms| terms.1),
+        ),
+        (
+            "nnzWeightedSmoothingWorkDecimal",
+            profile.nnz_weighted_smoothing_work(),
+        ),
+        (
+            "nnzWeightedSparseWorkDecimal",
+            profile.nnz_weighted_sparse_work(),
+        ),
+    ] {
+        write_json_key(writer, nested, name)?;
+        write_json_optional_u128_decimal(writer, value)?;
+        writeln!(writer, ",")?;
+    }
+
+    write_json_key(writer, nested, "levels")?;
+    writeln!(writer, "[")?;
+    for (index, level) in hierarchy.levels.iter().enumerate() {
+        let item_indent = nested + 2;
+        write_indent(writer, item_indent)?;
+        writeln!(writer, "{{")?;
+        write_json_number_field(writer, item_indent + 2, "level", level.level)?;
+        writeln!(writer, ",")?;
+        write_json_number_field(writer, item_indent + 2, "cells", level.cells)?;
+        writeln!(writer, ",")?;
+        write_json_number_field(writer, item_indent + 2, "nonzeros", level.nonzeros)?;
+        writeln!(writer)?;
+        write_indent(writer, item_indent)?;
+        if index + 1 < hierarchy.levels.len() {
+            writeln!(writer, "}},")?;
+        } else {
+            writeln!(writer, "}}")?;
+        }
+    }
+    write_indent(writer, nested)?;
+    writeln!(writer, "],")?;
+
+    write_json_key(writer, nested, "transfers")?;
+    writeln!(writer, "[")?;
+    for (index, transfer) in hierarchy.transfers.iter().enumerate() {
+        let item_indent = nested + 2;
+        write_indent(writer, item_indent)?;
+        writeln!(writer, "{{")?;
+        for (name, value) in [
+            ("fineLevel", transfer.fine_level),
+            ("coarseLevel", transfer.coarse_level),
+            ("fineCells", transfer.fine_cells),
+            ("coarseCells", transfer.coarse_cells),
+            ("singletonFineCells", transfer.singleton_fine_cells),
+            ("unmatchedFineCells", transfer.unmatched_fine_cells),
+            ("minAggregateSize", transfer.min_aggregate_size),
+            ("maxAggregateSize", transfer.max_aggregate_size),
+        ] {
+            write_json_number_field(writer, item_indent + 2, name, value)?;
+            writeln!(writer, ",")?;
+        }
+        write_json_key(writer, item_indent + 2, "aggregateSizeHistogram")?;
+        writeln!(writer, "[")?;
+        for (bin_index, bin) in transfer.aggregate_size_histogram.iter().enumerate() {
+            let bin_indent = item_indent + 4;
+            write_indent(writer, bin_indent)?;
+            writeln!(writer, "{{")?;
+            write_json_number_field(writer, bin_indent + 2, "aggregateSize", bin.aggregate_size)?;
+            writeln!(writer, ",")?;
+            write_json_number_field(
+                writer,
+                bin_indent + 2,
+                "aggregateCount",
+                bin.aggregate_count,
+            )?;
+            writeln!(writer)?;
+            write_indent(writer, bin_indent)?;
+            if bin_index + 1 < transfer.aggregate_size_histogram.len() {
+                writeln!(writer, "}},")?;
+            } else {
+                writeln!(writer, "}}")?;
+            }
+        }
+        write_indent(writer, item_indent + 2)?;
+        writeln!(writer, "]")?;
+        write_indent(writer, item_indent)?;
+        if index + 1 < hierarchy.transfers.len() {
             writeln!(writer, "}},")?;
         } else {
             writeln!(writer, "}}")?;
@@ -4737,6 +4925,10 @@ fn write_markdown_gamg_profile(
         ("Profiled GAMG total [s]", profile.total_seconds),
         ("Hierarchy build [s]", profile.hierarchy_build_seconds),
         ("Hierarchy rebuild [s]", profile.hierarchy_rebuild_seconds),
+        (
+            "Hierarchy diagnostics [s]",
+            profile.hierarchy_diagnostic_seconds,
+        ),
         ("Matrix refresh [s]", profile.matrix_refresh_seconds),
         ("Finest residual [s]", profile.finest_residual_seconds),
         ("V-cycles [s]", profile.v_cycle_seconds),
@@ -4769,16 +4961,16 @@ fn write_markdown_gamg_profile(
     writeln!(writer)?;
     writeln!(
         writer,
-        "| Level | Cells | NNZ | Refresh [s] | Restrict [s] | Prolong [s] | Smooth [s] | Scale [s] | Residual [s] | Correction [s] | Coarsest [s] | Smooth sweeps |"
+        "| Level | Cells | NNZ | Refresh [s] | Restrict [s] | Prolong [s] | Smooth [s] | Scale [s] | Residual [s] | Correction [s] | Coarsest [s] | Smooth sweeps | Coarsest iterations |"
     )?;
     writeln!(
         writer,
-        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
     )?;
     for level in &profile.levels {
         writeln!(
             writer,
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             level.level,
             level.cells,
             level.nonzeros,
@@ -4791,7 +4983,99 @@ fn write_markdown_gamg_profile(
             format_scientific(level.correction_seconds),
             format_scientific(level.coarsest_solve_seconds),
             level.smoothing_sweeps,
+            level.coarsest_iterations,
         )?;
+    }
+    write_markdown_gamg_hierarchy(writer, profile)?;
+    Ok(())
+}
+
+fn write_markdown_gamg_hierarchy(
+    writer: &mut impl Write,
+    profile: &GamgKernelTiming,
+) -> std::io::Result<()> {
+    writeln!(writer)?;
+    writeln!(writer, "## Pressure GAMG Hierarchy Diagnostics")?;
+    writeln!(writer)?;
+    let Some(hierarchy) = profile.hierarchy.as_ref() else {
+        return writeln!(writer, "Static hierarchy diagnostics were not recorded.");
+    };
+
+    let grid_complexity = hierarchy.grid_complexity_terms();
+    let operator_complexity = hierarchy.operator_complexity_terms();
+    writeln!(writer, "| Quantity | Exact value |")?;
+    writeln!(writer, "| --- | ---: |")?;
+    writeln!(
+        writer,
+        "| Smoother passes per sweep | {} |",
+        hierarchy.smoother_passes_per_sweep
+    )?;
+    writeln!(
+        writer,
+        "| Direct coarsest solve | {} |",
+        yes_no(hierarchy.direct_solve_coarsest)
+    )?;
+    writeln!(
+        writer,
+        "| Grid complexity terms | {} / {} |",
+        format_optional_u128(grid_complexity.map(|terms| terms.0)),
+        format_optional_u128(grid_complexity.map(|terms| terms.1)),
+    )?;
+    writeln!(
+        writer,
+        "| Operator complexity terms | {} / {} |",
+        format_optional_u128(operator_complexity.map(|terms| terms.0)),
+        format_optional_u128(operator_complexity.map(|terms| terms.1)),
+    )?;
+    writeln!(
+        writer,
+        "| NNZ-weighted smoothing work | {} |",
+        format_optional_u128(profile.nnz_weighted_smoothing_work()),
+    )?;
+    writeln!(
+        writer,
+        "| NNZ-weighted sparse work | {} |",
+        format_optional_u128(profile.nnz_weighted_sparse_work()),
+    )?;
+
+    writeln!(writer)?;
+    writeln!(
+        writer,
+        "| Fine level | Coarse level | Fine cells | Coarse cells | Singleton fine cells | Unmatched fine cells | Min aggregate size | Max aggregate size |"
+    )?;
+    writeln!(
+        writer,
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+    )?;
+    for transfer in &hierarchy.transfers {
+        writeln!(
+            writer,
+            "| {} | {} | {} | {} | {} | {} | {} | {} |",
+            transfer.fine_level,
+            transfer.coarse_level,
+            transfer.fine_cells,
+            transfer.coarse_cells,
+            transfer.singleton_fine_cells,
+            transfer.unmatched_fine_cells,
+            transfer.min_aggregate_size,
+            transfer.max_aggregate_size,
+        )?;
+    }
+
+    writeln!(writer)?;
+    writeln!(
+        writer,
+        "| Fine level | Coarse level | Aggregate size | Aggregate count |"
+    )?;
+    writeln!(writer, "| ---: | ---: | ---: | ---: |")?;
+    for transfer in &hierarchy.transfers {
+        for bin in &transfer.aggregate_size_histogram {
+            writeln!(
+                writer,
+                "| {} | {} | {} | {} |",
+                transfer.fine_level, transfer.coarse_level, bin.aggregate_size, bin.aggregate_count,
+            )?;
+        }
     }
     Ok(())
 }
@@ -6522,6 +6806,16 @@ fn write_json_number_field(
     write!(writer, "{value}")
 }
 
+fn write_json_optional_u128_decimal(
+    writer: &mut impl Write,
+    value: Option<u128>,
+) -> std::io::Result<()> {
+    match value {
+        Some(value) => write_json_string(writer, &value.to_string()),
+        None => write!(writer, "null"),
+    }
+}
+
 fn write_json_bool_field(
     writer: &mut impl Write,
     indent: usize,
@@ -6790,6 +7084,12 @@ fn format_optional_usize(value: Option<usize>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "missing".to_string())
+}
+
+fn format_optional_u128(value: Option<u128>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "n/a".to_string())
 }
 
 fn format_optional_bool(value: Option<bool>) -> &'static str {
@@ -8056,18 +8356,19 @@ mod tests {
         LaminarSimpleOptions, LaminarSimpleResidualControlSummary, LaminarSimpleSchemes,
         MAX_RUNNER_DRY_RUN_STEPS, SafeOutputRoot, ScalarDiffusionLinearSolver,
         SolverNumericsDictionaryPlan, SolverSelectionSource, estimate_iterations_to_convergence,
-        estimate_simple_iterations_to_convergence, format_pressure_gamg_console,
-        gamg_outer_profile_counters, numerics_dictionary_number, numerics_dictionary_usize,
-        numerics_dictionary_value, openfoam_gamg_options, outer_convergence_status_for_reason,
-        parse_ferrum_run_args, parse_incompressible_fluid_args,
-        parse_incompressible_fluid_plan_args, parse_laminar_simple_convection_scheme,
-        parse_laminar_simple_gradient_scheme, parse_laminar_simple_laplacian_scheme,
-        parse_laminar_simple_sn_grad_scheme, parse_openfoam_laminar_preconditioner,
-        parse_openfoam_laminar_solver, parse_solver_args, resolve_laminar_simple_convection_scheme,
-        resolve_laminar_simple_options, resolve_solver_dispatch, resolved_gradient_scheme_value,
-        run_ferrum_subcommand, validate_laminar_residual_control_dictionary,
-        validate_module_execution_contract, write_json_solver_state, write_json_string,
-        write_laminar_simple_fields, write_laminar_simple_report_json,
+        estimate_simple_iterations_to_convergence, format_optional_u128,
+        format_pressure_gamg_console, gamg_outer_profile_counters, numerics_dictionary_number,
+        numerics_dictionary_usize, numerics_dictionary_value, openfoam_gamg_options,
+        outer_convergence_status_for_reason, parse_ferrum_run_args,
+        parse_incompressible_fluid_args, parse_incompressible_fluid_plan_args,
+        parse_laminar_simple_convection_scheme, parse_laminar_simple_gradient_scheme,
+        parse_laminar_simple_laplacian_scheme, parse_laminar_simple_sn_grad_scheme,
+        parse_openfoam_laminar_preconditioner, parse_openfoam_laminar_solver, parse_solver_args,
+        resolve_laminar_simple_convection_scheme, resolve_laminar_simple_options,
+        resolve_solver_dispatch, resolved_gradient_scheme_value, run_ferrum_subcommand,
+        validate_laminar_residual_control_dictionary, validate_module_execution_contract,
+        write_json_gamg_hierarchy, write_json_optional_u128_decimal, write_json_solver_state,
+        write_json_string, write_laminar_simple_fields, write_laminar_simple_report_json,
         write_laminar_simple_report_markdown, write_laminar_simple_residual_csv,
         write_laminar_simple_residual_plot, write_solver_plan_json_in_root,
     };
@@ -8079,7 +8380,9 @@ mod tests {
         LaminarSimpleStopReason, LinearSolveConvergenceSummary, LinearSolveStopReason,
     };
     use ferrum_mesh::linear::{
-        GamgAgglomerator, GamgKernelTiming, GamgOptions, GamgOuterSolver, GamgSmoother,
+        GamgAgglomerator, GamgAggregateSizeBin, GamgHierarchyDiagnostics,
+        GamgHierarchyLevelDiagnostics, GamgKernelTiming, GamgLevelTiming, GamgOptions,
+        GamgOuterSolver, GamgSmoother, GamgTransferDiagnostics,
     };
     use ferrum_mesh::runtime::{SolverRuntimeData, SolverRuntimeMeshData};
     use ferrum_mesh::solver_plan::{
@@ -8684,6 +8987,157 @@ mod tests {
     }
 
     #[test]
+    fn gamg_hierarchy_json_contract_is_exact_ordered_and_decimal_encoded() {
+        let profile = hierarchy_profile_fixture();
+        let mut bytes = Vec::new();
+        write_json_gamg_hierarchy(&mut bytes, 0, &profile)
+            .expect("hierarchy JSON should be written");
+        let json = String::from_utf8(bytes).expect("hierarchy JSON should be UTF-8");
+
+        assert_eq!(
+            json,
+            concat!(
+                "\"hierarchy\": {\n",
+                "  \"smootherPassesPerSweep\": 2,\n",
+                "  \"directSolveCoarsest\": true,\n",
+                "  \"gridComplexityNumeratorDecimal\": \"14\",\n",
+                "  \"gridComplexityDenominatorDecimal\": \"8\",\n",
+                "  \"operatorComplexityNumeratorDecimal\": \"38\",\n",
+                "  \"operatorComplexityDenominatorDecimal\": \"24\",\n",
+                "  \"nnzWeightedSmoothingWorkDecimal\": \"224\",\n",
+                "  \"nnzWeightedSparseWorkDecimal\": \"878\",\n",
+                "  \"levels\": [\n",
+                "    {\n",
+                "      \"level\": 0,\n",
+                "      \"cells\": 8,\n",
+                "      \"nonzeros\": 24\n",
+                "    },\n",
+                "    {\n",
+                "      \"level\": 1,\n",
+                "      \"cells\": 4,\n",
+                "      \"nonzeros\": 10\n",
+                "    },\n",
+                "    {\n",
+                "      \"level\": 2,\n",
+                "      \"cells\": 2,\n",
+                "      \"nonzeros\": 4\n",
+                "    }\n",
+                "  ],\n",
+                "  \"transfers\": [\n",
+                "    {\n",
+                "      \"fineLevel\": 0,\n",
+                "      \"coarseLevel\": 1,\n",
+                "      \"fineCells\": 8,\n",
+                "      \"coarseCells\": 4,\n",
+                "      \"singletonFineCells\": 0,\n",
+                "      \"unmatchedFineCells\": 0,\n",
+                "      \"minAggregateSize\": 2,\n",
+                "      \"maxAggregateSize\": 2,\n",
+                "      \"aggregateSizeHistogram\": [\n",
+                "        {\n",
+                "          \"aggregateSize\": 2,\n",
+                "          \"aggregateCount\": 4\n",
+                "        }\n",
+                "      ]\n",
+                "    },\n",
+                "    {\n",
+                "      \"fineLevel\": 1,\n",
+                "      \"coarseLevel\": 2,\n",
+                "      \"fineCells\": 4,\n",
+                "      \"coarseCells\": 2,\n",
+                "      \"singletonFineCells\": 1,\n",
+                "      \"unmatchedFineCells\": 1,\n",
+                "      \"minAggregateSize\": 1,\n",
+                "      \"maxAggregateSize\": 3,\n",
+                "      \"aggregateSizeHistogram\": [\n",
+                "        {\n",
+                "          \"aggregateSize\": 1,\n",
+                "          \"aggregateCount\": 1\n",
+                "        },\n",
+                "        {\n",
+                "          \"aggregateSize\": 3,\n",
+                "          \"aggregateCount\": 1\n",
+                "        }\n",
+                "      ]\n",
+                "    }\n",
+                "  ]\n",
+                "}"
+            )
+        );
+    }
+
+    #[test]
+    fn gamg_hierarchy_json_uses_null_for_unavailable_exact_counts() {
+        let profile = GamgKernelTiming {
+            hierarchy: Some(std::sync::Arc::new(GamgHierarchyDiagnostics {
+                levels: vec![GamgHierarchyLevelDiagnostics {
+                    level: 0,
+                    cells: 0,
+                    nonzeros: 0,
+                }],
+                transfers: Vec::new(),
+                smoother_passes_per_sweep: 1,
+                direct_solve_coarsest: false,
+            })),
+            ..GamgKernelTiming::default()
+        };
+        let mut bytes = Vec::new();
+        write_json_gamg_hierarchy(&mut bytes, 0, &profile)
+            .expect("unavailable hierarchy counts should still serialize");
+        let json = String::from_utf8(bytes).expect("hierarchy JSON should be UTF-8");
+
+        assert_eq!(
+            json,
+            concat!(
+                "\"hierarchy\": {\n",
+                "  \"smootherPassesPerSweep\": 1,\n",
+                "  \"directSolveCoarsest\": false,\n",
+                "  \"gridComplexityNumeratorDecimal\": null,\n",
+                "  \"gridComplexityDenominatorDecimal\": null,\n",
+                "  \"operatorComplexityNumeratorDecimal\": null,\n",
+                "  \"operatorComplexityDenominatorDecimal\": null,\n",
+                "  \"nnzWeightedSmoothingWorkDecimal\": null,\n",
+                "  \"nnzWeightedSparseWorkDecimal\": null,\n",
+                "  \"levels\": [\n",
+                "    {\n",
+                "      \"level\": 0,\n",
+                "      \"cells\": 0,\n",
+                "      \"nonzeros\": 0\n",
+                "    }\n",
+                "  ],\n",
+                "  \"transfers\": [\n",
+                "  ]\n",
+                "}"
+            )
+        );
+        assert_eq!(json.matches(": null").count(), 6);
+    }
+
+    #[test]
+    fn gamg_exact_count_formatting_is_lossless_at_u128_max_and_explicit_when_unavailable() {
+        let mut bytes = Vec::new();
+        write_json_optional_u128_decimal(&mut bytes, Some(u128::MAX))
+            .expect("u128 max should serialize as a decimal JSON string");
+        assert_eq!(
+            String::from_utf8(bytes).expect("decimal JSON should be UTF-8"),
+            "\"340282366920938463463374607431768211455\""
+        );
+
+        let mut bytes = Vec::new();
+        write_json_optional_u128_decimal(&mut bytes, None)
+            .expect("unavailable count should serialize as null");
+        assert_eq!(
+            String::from_utf8(bytes).expect("null JSON should be UTF-8"),
+            "null"
+        );
+        assert_eq!(
+            format_optional_u128(Some(u128::MAX)),
+            "340282366920938463463374607431768211455"
+        );
+        assert_eq!(format_optional_u128(None), "n/a");
+    }
+
+    #[test]
     fn gamg_reports_expose_resolved_outer_solver() {
         let base = output_test_dir("gamg-outer-solver-reporting");
         std::fs::create_dir_all(&base).expect("output root should be created");
@@ -8696,11 +9150,7 @@ mod tests {
             ..GamgOptions::default()
         });
         let mut report = output_test_report();
-        report.timing.pressure_gamg_profile = Some(GamgKernelTiming {
-            outer_matrix_vector_products: 17,
-            outer_reductions: 23,
-            ..GamgKernelTiming::default()
-        });
+        report.timing.pressure_gamg_profile = Some(hierarchy_profile_fixture());
 
         write_laminar_simple_report_json(
             &plan,
@@ -8728,9 +9178,21 @@ mod tests {
         assert!(json.contains("\"outerSolver\": \"FCG\""));
         assert!(json.contains("\"outerMatrixVectorProducts\": 17"));
         assert!(json.contains("\"outerReductions\": 23"));
+        assert!(json.contains("\"hierarchyDiagnosticSeconds\": 0.125"));
+        assert!(json.contains("\"nnzWeightedSmoothingWorkDecimal\": \"224\""));
+        assert!(json.contains("\"nnzWeightedSparseWorkDecimal\": \"878\""));
+        assert!(json.contains("\"coarsestIterations\": 7"));
         assert!(markdown.contains("| GAMG outer solver | FCG |"));
         assert!(markdown.contains("| Outer matrix-vector products | 17 |"));
         assert!(markdown.contains("| Outer reductions | 23 |"));
+        assert!(markdown.contains("| Hierarchy diagnostics [s] | 1.250000e-1 |"));
+        assert!(markdown.contains("| Coarsest iterations |"));
+        assert!(markdown.contains("| Grid complexity terms | 14 / 8 |"));
+        assert!(markdown.contains("| Operator complexity terms | 38 / 24 |"));
+        assert!(markdown.contains("| NNZ-weighted smoothing work | 224 |"));
+        assert!(markdown.contains("| NNZ-weighted sparse work | 878 |"));
+        assert!(markdown.contains("| 1 | 2 | 4 | 2 | 1 | 1 | 1 | 3 |"));
+        assert!(markdown.contains("| 1 | 2 | 3 | 1 |"));
         assert_eq!(
             gamg_outer_profile_counters(
                 report
@@ -9095,6 +9557,102 @@ mod tests {
             }],
             final_pressure: vec![1.0],
             history: Vec::new(),
+        }
+    }
+
+    fn hierarchy_profile_fixture() -> GamgKernelTiming {
+        GamgKernelTiming {
+            hierarchy_diagnostic_seconds: 0.125,
+            finest_residual_evaluations: 5,
+            outer_matrix_vector_products: 17,
+            outer_reductions: 23,
+            levels: vec![
+                GamgLevelTiming {
+                    level: 0,
+                    cells: 8,
+                    nonzeros: 24,
+                    smoothing_sweeps: 3,
+                    scaling_calls: 1,
+                    residual_evaluations: 2,
+                    ..GamgLevelTiming::default()
+                },
+                GamgLevelTiming {
+                    level: 1,
+                    cells: 4,
+                    nonzeros: 10,
+                    smoothing_sweeps: 4,
+                    scaling_calls: 2,
+                    residual_evaluations: 3,
+                    ..GamgLevelTiming::default()
+                },
+                GamgLevelTiming {
+                    level: 2,
+                    cells: 2,
+                    nonzeros: 4,
+                    residual_evaluations: 1,
+                    coarsest_solves: 1,
+                    coarsest_iterations: 7,
+                    ..GamgLevelTiming::default()
+                },
+            ],
+            hierarchy: Some(std::sync::Arc::new(GamgHierarchyDiagnostics {
+                levels: vec![
+                    GamgHierarchyLevelDiagnostics {
+                        level: 0,
+                        cells: 8,
+                        nonzeros: 24,
+                    },
+                    GamgHierarchyLevelDiagnostics {
+                        level: 1,
+                        cells: 4,
+                        nonzeros: 10,
+                    },
+                    GamgHierarchyLevelDiagnostics {
+                        level: 2,
+                        cells: 2,
+                        nonzeros: 4,
+                    },
+                ],
+                transfers: vec![
+                    GamgTransferDiagnostics {
+                        fine_level: 0,
+                        coarse_level: 1,
+                        fine_cells: 8,
+                        coarse_cells: 4,
+                        singleton_fine_cells: 0,
+                        unmatched_fine_cells: 0,
+                        min_aggregate_size: 2,
+                        max_aggregate_size: 2,
+                        aggregate_size_histogram: vec![GamgAggregateSizeBin {
+                            aggregate_size: 2,
+                            aggregate_count: 4,
+                        }],
+                    },
+                    GamgTransferDiagnostics {
+                        fine_level: 1,
+                        coarse_level: 2,
+                        fine_cells: 4,
+                        coarse_cells: 2,
+                        singleton_fine_cells: 1,
+                        unmatched_fine_cells: 1,
+                        min_aggregate_size: 1,
+                        max_aggregate_size: 3,
+                        aggregate_size_histogram: vec![
+                            GamgAggregateSizeBin {
+                                aggregate_size: 1,
+                                aggregate_count: 1,
+                            },
+                            GamgAggregateSizeBin {
+                                aggregate_size: 3,
+                                aggregate_count: 1,
+                            },
+                        ],
+                    },
+                ],
+                smoother_passes_per_sweep: 2,
+                direct_solve_coarsest: true,
+            })),
+            ..GamgKernelTiming::default()
         }
     }
 

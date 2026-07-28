@@ -138,6 +138,7 @@ pub struct GamgLevelTiming {
     pub residual_evaluations: usize,
     pub correction_updates: usize,
     pub coarsest_solves: usize,
+    pub coarsest_iterations: usize,
 }
 
 impl GamgLevelTiming {
@@ -160,7 +161,7 @@ impl GamgLevelTiming {
             + self.coarsest_solve_seconds
     }
 
-    fn accumulate(&mut self, other: Self) -> Result<()> {
+    fn validate_metadata(&self, other: Self) -> Result<()> {
         if self.level != other.level || self.cells != other.cells || self.nonzeros != other.nonzeros
         {
             return Err(invalid_input(format!(
@@ -168,6 +169,10 @@ impl GamgLevelTiming {
                 self.level, self.cells, self.nonzeros, other.level, other.cells, other.nonzeros
             )));
         }
+        Ok(())
+    }
+
+    fn accumulate_unchecked(&mut self, other: Self) {
         self.restriction_seconds += other.restriction_seconds;
         self.matrix_refresh_seconds += other.matrix_refresh_seconds;
         self.prolongation_seconds += other.prolongation_seconds;
@@ -185,7 +190,76 @@ impl GamgLevelTiming {
         self.residual_evaluations += other.residual_evaluations;
         self.correction_updates += other.correction_updates;
         self.coarsest_solves += other.coarsest_solves;
-        Ok(())
+        self.coarsest_iterations += other.coarsest_iterations;
+    }
+}
+
+/// One sorted aggregate-size histogram bin in a profiled GAMG hierarchy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GamgAggregateSizeBin {
+    pub aggregate_size: usize,
+    pub aggregate_count: usize,
+}
+
+/// Static diagnostics for one fine-to-coarse transfer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GamgTransferDiagnostics {
+    pub fine_level: usize,
+    pub coarse_level: usize,
+    pub fine_cells: usize,
+    pub coarse_cells: usize,
+    pub singleton_fine_cells: usize,
+    pub unmatched_fine_cells: usize,
+    pub min_aggregate_size: usize,
+    pub max_aggregate_size: usize,
+    pub aggregate_size_histogram: Vec<GamgAggregateSizeBin>,
+}
+
+/// Static matrix shape for one GAMG hierarchy level.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GamgHierarchyLevelDiagnostics {
+    pub level: usize,
+    pub cells: usize,
+    pub nonzeros: usize,
+}
+
+/// Static hierarchy data collected only by profiled solves.
+///
+/// Integer counts are authoritative. Complexity helpers return exact
+/// numerator and denominator terms without floating-point division.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GamgHierarchyDiagnostics {
+    pub levels: Vec<GamgHierarchyLevelDiagnostics>,
+    pub transfers: Vec<GamgTransferDiagnostics>,
+    pub smoother_passes_per_sweep: usize,
+    pub direct_solve_coarsest: bool,
+}
+
+impl GamgHierarchyDiagnostics {
+    /// Returns `(sum(level cells), finest cells)` for grid complexity.
+    pub fn grid_complexity_terms(&self) -> Option<(u128, u128)> {
+        let finest = self.levels.first()?.cells as u128;
+        if finest == 0 {
+            return None;
+        }
+        let numerator = self
+            .levels
+            .iter()
+            .try_fold(0u128, |sum, level| sum.checked_add(level.cells as u128))?;
+        Some((numerator, finest))
+    }
+
+    /// Returns `(sum(level nonzeros), finest nonzeros)` for operator complexity.
+    pub fn operator_complexity_terms(&self) -> Option<(u128, u128)> {
+        let finest = self.levels.first()?.nonzeros as u128;
+        if finest == 0 {
+            return None;
+        }
+        let numerator = self
+            .levels
+            .iter()
+            .try_fold(0u128, |sum, level| sum.checked_add(level.nonzeros as u128))?;
+        Some((numerator, finest))
     }
 }
 
@@ -194,6 +268,7 @@ pub struct GamgKernelTiming {
     pub total_seconds: f64,
     pub hierarchy_build_seconds: f64,
     pub hierarchy_rebuild_seconds: f64,
+    pub hierarchy_diagnostic_seconds: f64,
     pub matrix_refresh_seconds: f64,
     pub finest_residual_seconds: f64,
     pub v_cycle_seconds: f64,
@@ -210,6 +285,7 @@ pub struct GamgKernelTiming {
     /// initial residual normalization and reductions inside a GAMG V-cycle.
     pub outer_reductions: usize,
     pub levels: Vec<GamgLevelTiming>,
+    pub hierarchy: Option<Arc<GamgHierarchyDiagnostics>>,
 }
 
 impl GamgKernelTiming {
@@ -222,6 +298,12 @@ impl GamgKernelTiming {
                 .collect(),
             ..Self::default()
         }
+    }
+
+    fn from_hierarchy(matrices: &[CsrMatrix], hierarchy: Arc<GamgHierarchyDiagnostics>) -> Self {
+        let mut timing = Self::from_matrices(matrices);
+        timing.hierarchy = Some(hierarchy);
+        timing
     }
 
     pub fn add_hierarchy_build(&mut self, seconds: f64) {
@@ -283,9 +365,78 @@ impl GamgKernelTiming {
         (self.v_cycle_seconds - accounted).max(0.0)
     }
 
+    /// Returns an NNZ-weighted smoothing-work proxy.
+    ///
+    /// This deliberately weights every logical smoother pass by the complete
+    /// level NNZ. It is a stable hierarchy/work comparison unit, not a claim
+    /// that the cached-diagonal kernel physically reloads the diagonal entry.
+    pub fn nnz_weighted_smoothing_work(&self) -> Option<u128> {
+        let hierarchy = self.hierarchy.as_ref()?;
+        if hierarchy.levels.len() != self.levels.len() {
+            return None;
+        }
+        self.levels
+            .iter()
+            .zip(&hierarchy.levels)
+            .try_fold(0u128, |sum, (timing, level)| {
+                if timing.level != level.level
+                    || timing.cells != level.cells
+                    || timing.nonzeros != level.nonzeros
+                {
+                    return None;
+                }
+                let visits = (timing.smoothing_sweeps as u128)
+                    .checked_mul(hierarchy.smoother_passes_per_sweep as u128)?
+                    .checked_mul(level.nonzeros as u128)?;
+                sum.checked_add(visits)
+            })
+    }
+
+    /// Returns an NNZ-weighted sparse-work proxy for profiled solver work.
+    ///
+    /// The sum includes smoothing, level/finest residual products, correction
+    /// scaling products, and FCG outer matrix-vector products. Transfer maps,
+    /// coefficient refresh, and vector-only reductions remain separate.
+    pub fn nnz_weighted_sparse_work(&self) -> Option<u128> {
+        let hierarchy = self.hierarchy.as_ref()?;
+        if hierarchy.levels.len() != self.levels.len() {
+            return None;
+        }
+        let level_visits =
+            self.levels
+                .iter()
+                .zip(&hierarchy.levels)
+                .try_fold(0u128, |sum, (timing, level)| {
+                    if timing.level != level.level
+                        || timing.cells != level.cells
+                        || timing.nonzeros != level.nonzeros
+                    {
+                        return None;
+                    }
+                    let smoothing_passes = (timing.smoothing_sweeps as u128)
+                        .checked_mul(hierarchy.smoother_passes_per_sweep as u128)?;
+                    let sparse_passes = smoothing_passes
+                        .checked_add(timing.residual_evaluations as u128)?
+                        .checked_add(timing.scaling_calls as u128)?;
+                    let visits = sparse_passes.checked_mul(level.nonzeros as u128)?;
+                    sum.checked_add(visits)
+                })?;
+        let finest_matrix_products = (self.finest_residual_evaluations as u128)
+            .checked_add(self.outer_matrix_vector_products as u128)?;
+        let finest_residual_work =
+            finest_matrix_products.checked_mul(hierarchy.levels.first()?.nonzeros as u128)?;
+        level_visits.checked_add(finest_residual_work)
+    }
+
     pub fn accumulate(&mut self, other: &Self) -> Result<()> {
-        if self.levels.is_empty() {
-            self.levels = other.levels.clone();
+        let initialize_levels = self.levels.is_empty();
+        if initialize_levels {
+            if self.hierarchy.is_some() && self.hierarchy != other.hierarchy {
+                return Err(invalid_input(
+                    "GAMG profile static hierarchy diagnostics changed during accumulation"
+                        .to_string(),
+                ));
+            }
         } else if self.levels.len() != other.levels.len() {
             return Err(invalid_input(format!(
                 "GAMG profile hierarchy changed from {} to {} levels",
@@ -293,13 +444,29 @@ impl GamgKernelTiming {
                 other.levels.len()
             )));
         } else {
+            if self.hierarchy != other.hierarchy {
+                return Err(invalid_input(
+                    "GAMG profile static hierarchy diagnostics changed during accumulation"
+                        .to_string(),
+                ));
+            }
+            for (level, other_level) in self.levels.iter().zip(&other.levels) {
+                level.validate_metadata(*other_level)?;
+            }
+        }
+
+        if initialize_levels {
+            self.levels = other.levels.clone();
+            self.hierarchy = other.hierarchy.clone();
+        } else {
             for (level, other_level) in self.levels.iter_mut().zip(&other.levels) {
-                level.accumulate(*other_level)?;
+                level.accumulate_unchecked(*other_level);
             }
         }
         self.total_seconds += other.total_seconds;
         self.hierarchy_build_seconds += other.hierarchy_build_seconds;
         self.hierarchy_rebuild_seconds += other.hierarchy_rebuild_seconds;
+        self.hierarchy_diagnostic_seconds += other.hierarchy_diagnostic_seconds;
         self.matrix_refresh_seconds += other.matrix_refresh_seconds;
         self.finest_residual_seconds += other.finest_residual_seconds;
         self.v_cycle_seconds += other.v_cycle_seconds;
@@ -657,6 +824,116 @@ impl GamgTransfer {
     }
 }
 
+fn build_hierarchy_diagnostics(
+    matrices: &[CsrMatrix],
+    transfers: &[GamgTransfer],
+    options: GamgOptions,
+) -> Result<GamgHierarchyDiagnostics> {
+    if matrices.len() != transfers.len() + 1 {
+        return Err(invalid_input(format!(
+            "GAMG profile hierarchy expected one fewer transfers than levels, got {} levels and {} transfers",
+            matrices.len(),
+            transfers.len()
+        )));
+    }
+
+    let levels = matrices
+        .iter()
+        .enumerate()
+        .map(|(level, matrix)| GamgHierarchyLevelDiagnostics {
+            level,
+            cells: matrix.rows(),
+            nonzeros: matrix.nnz(),
+        })
+        .collect();
+    let mut transfer_diagnostics = Vec::with_capacity(transfers.len());
+    for (fine_level, transfer) in transfers.iter().enumerate() {
+        let coarse_level = fine_level + 1;
+        let fine_cells = matrices[fine_level].rows();
+        let coarse_cells = matrices[coarse_level].rows();
+        if transfer.fine_to_coarse.len() != fine_cells {
+            return Err(invalid_input(format!(
+                "GAMG profile transfer {fine_level}->{coarse_level} expected {fine_cells} fine cells, got {}",
+                transfer.fine_to_coarse.len()
+            )));
+        }
+
+        let mut aggregate_sizes = vec![0usize; coarse_cells];
+        for (fine_cell, &coarse_cell) in transfer.fine_to_coarse.iter().enumerate() {
+            let aggregate_size = aggregate_sizes.get_mut(coarse_cell).ok_or_else(|| {
+                invalid_input(format!(
+                    "GAMG profile transfer {fine_level}->{coarse_level} maps fine cell {fine_cell} to out-of-range coarse cell {coarse_cell} of {coarse_cells}"
+                ))
+            })?;
+            *aggregate_size = aggregate_size.checked_add(1).ok_or_else(|| {
+                invalid_input(format!(
+                    "GAMG profile transfer {fine_level}->{coarse_level} aggregate {coarse_cell} size overflow"
+                ))
+            })?;
+        }
+        if aggregate_sizes.contains(&0) {
+            return Err(invalid_input(format!(
+                "GAMG profile transfer {fine_level}->{coarse_level} contains an empty aggregate"
+            )));
+        }
+
+        let singleton_fine_cells = aggregate_sizes.iter().filter(|&&size| size == 1).count();
+        // Pair agglomeration seeds every non-singleton aggregate with one
+        // matched pair. Remaining members were unmatched by the greedy pass
+        // and subsequently attached to an existing aggregate.
+        let unmatched_fine_cells = aggregate_sizes
+            .iter()
+            .try_fold(0usize, |sum, &size| {
+                sum.checked_add(if size == 1 { 1 } else { size - 2 })
+            })
+            .ok_or_else(|| {
+                invalid_input(format!(
+                    "GAMG profile transfer {fine_level}->{coarse_level} unmatched-cell count overflow"
+                ))
+            })?;
+        let min_aggregate_size = aggregate_sizes.iter().copied().min().unwrap_or(0);
+        let max_aggregate_size = aggregate_sizes.iter().copied().max().unwrap_or(0);
+        let mut histogram = BTreeMap::<usize, usize>::new();
+        for aggregate_size in aggregate_sizes {
+            let count = histogram.entry(aggregate_size).or_default();
+            *count = count.checked_add(1).ok_or_else(|| {
+                invalid_input(format!(
+                    "GAMG profile transfer {fine_level}->{coarse_level} aggregate histogram overflow"
+                ))
+            })?;
+        }
+        let aggregate_size_histogram = histogram
+            .into_iter()
+            .map(|(aggregate_size, aggregate_count)| GamgAggregateSizeBin {
+                aggregate_size,
+                aggregate_count,
+            })
+            .collect();
+
+        transfer_diagnostics.push(GamgTransferDiagnostics {
+            fine_level,
+            coarse_level,
+            fine_cells,
+            coarse_cells,
+            singleton_fine_cells,
+            unmatched_fine_cells,
+            min_aggregate_size,
+            max_aggregate_size,
+            aggregate_size_histogram,
+        });
+    }
+
+    Ok(GamgHierarchyDiagnostics {
+        levels,
+        transfers: transfer_diagnostics,
+        smoother_passes_per_sweep: match options.smoother {
+            GamgSmoother::GaussSeidel => 1,
+            GamgSmoother::SymGaussSeidel => 2,
+        },
+        direct_solve_coarsest: options.direct_solve_coarsest,
+    })
+}
+
 pub struct GamgWorkspace {
     options: GamgOptions,
     agglomeration_source: GamgAgglomerationSource,
@@ -677,6 +954,7 @@ pub struct GamgWorkspace {
     fcg_previous_direction: Vec<f64>,
     fcg_previous_matrix_direction: Vec<f64>,
     coarsest_pcg: Option<PreconditionedConjugateGradientWorkspace>,
+    profiled_hierarchy: Option<Arc<GamgHierarchyDiagnostics>>,
     has_solved: bool,
 }
 
@@ -842,6 +1120,7 @@ impl GamgWorkspace {
             fcg_previous_direction,
             fcg_previous_matrix_direction,
             coarsest_pcg,
+            profiled_hierarchy: None,
             has_solved: false,
         })
     }
@@ -896,8 +1175,12 @@ impl GamgWorkspace {
             controls,
             &mut timing,
         )?;
+        if self.profiled_hierarchy.is_none() {
+            self.profiled_hierarchy = timing.hierarchy.clone();
+        }
         timing.total_seconds = started.elapsed().as_secs_f64();
         let accounted_seconds = timing.hierarchy_rebuild_seconds
+            + timing.hierarchy_diagnostic_seconds
             + timing.matrix_refresh_seconds
             + timing.finest_residual_seconds
             + timing.v_cycle_seconds;
@@ -940,8 +1223,12 @@ impl GamgWorkspace {
             controls,
             &mut timing,
         )?;
+        if self.profiled_hierarchy.is_none() {
+            self.profiled_hierarchy = timing.hierarchy.clone();
+        }
         timing.total_seconds = started.elapsed().as_secs_f64();
         let accounted_seconds = timing.hierarchy_rebuild_seconds
+            + timing.hierarchy_diagnostic_seconds
             + timing.matrix_refresh_seconds
             + timing.finest_residual_seconds
             + timing.v_cycle_seconds;
@@ -979,7 +1266,20 @@ impl GamgWorkspace {
         if PROFILE {
             let hierarchy_rebuild_seconds = timing.hierarchy_rebuild_seconds;
             let hierarchy_rebuilds = timing.hierarchy_rebuilds;
-            *timing = GamgKernelTiming::from_matrices(&self.matrices);
+            let (hierarchy, hierarchy_diagnostic_seconds) = match &self.profiled_hierarchy {
+                Some(hierarchy) => (Arc::clone(hierarchy), 0.0),
+                None => {
+                    let diagnostic_started = profile_started::<PROFILE>();
+                    let hierarchy = Arc::new(build_hierarchy_diagnostics(
+                        &self.matrices,
+                        &self.transfers,
+                        self.options,
+                    )?);
+                    (hierarchy, profile_elapsed(diagnostic_started))
+                }
+            };
+            *timing = GamgKernelTiming::from_hierarchy(&self.matrices, hierarchy);
+            timing.hierarchy_diagnostic_seconds = hierarchy_diagnostic_seconds;
             timing.hierarchy_rebuild_seconds = hierarchy_rebuild_seconds;
             timing.hierarchy_rebuilds = hierarchy_rebuilds;
             timing.solves = 1;
@@ -1296,7 +1596,20 @@ impl GamgWorkspace {
         if PROFILE {
             let hierarchy_rebuild_seconds = timing.hierarchy_rebuild_seconds;
             let hierarchy_rebuilds = timing.hierarchy_rebuilds;
-            *timing = GamgKernelTiming::from_matrices(&self.matrices);
+            let (hierarchy, hierarchy_diagnostic_seconds) = match &self.profiled_hierarchy {
+                Some(hierarchy) => (Arc::clone(hierarchy), 0.0),
+                None => {
+                    let diagnostic_started = profile_started::<PROFILE>();
+                    let hierarchy = Arc::new(build_hierarchy_diagnostics(
+                        &self.matrices,
+                        &self.transfers,
+                        self.options,
+                    )?);
+                    (hierarchy, profile_elapsed(diagnostic_started))
+                }
+            };
+            *timing = GamgKernelTiming::from_hierarchy(&self.matrices, hierarchy);
+            timing.hierarchy_diagnostic_seconds = hierarchy_diagnostic_seconds;
             timing.hierarchy_rebuild_seconds = hierarchy_rebuild_seconds;
             timing.hierarchy_rebuilds = hierarchy_rebuilds;
             timing.solves = 1;
@@ -1560,10 +1873,11 @@ impl GamgWorkspace {
         }
 
         let coarsest_started = profile_started::<PROFILE>();
-        self.solve_coarsest_level(coarsest, controls)?;
+        let coarsest_iterations = self.solve_coarsest_level(coarsest, controls)?;
         if PROFILE {
             timing.levels[coarsest].coarsest_solve_seconds += profile_elapsed(coarsest_started);
             timing.levels[coarsest].coarsest_solves += 1;
+            timing.levels[coarsest].coarsest_iterations += coarsest_iterations;
         }
 
         for level in (1..coarsest).rev() {
@@ -1713,13 +2027,18 @@ impl GamgWorkspace {
         result
     }
 
-    fn solve_coarsest_level(&mut self, coarsest: usize, controls: GamgSolveControls) -> Result<()> {
+    fn solve_coarsest_level(
+        &mut self,
+        coarsest: usize,
+        controls: GamgSolveControls,
+    ) -> Result<usize> {
         if self.options.direct_solve_coarsest {
             dense_lu_solve(
                 &self.matrices[coarsest],
                 &self.sources[coarsest],
                 &mut self.corrections[coarsest],
-            )
+            )?;
+            Ok(0)
         } else {
             let initial_norm = l2_norm(&self.sources[coarsest]);
             let tolerance = controls
@@ -1739,8 +2058,9 @@ impl GamgWorkspace {
                         preconditioner: CgPreconditioner::IncompleteCholesky,
                     },
                 )?;
+            let iterations = report.iterations;
             self.corrections[coarsest].copy_from_slice(&report.solution);
-            Ok(())
+            Ok(iterations)
         }
     }
 }
@@ -3700,6 +4020,7 @@ mod tests {
             fcg_previous_direction: BitsVecSnap,
             fcg_previous_matrix_direction: BitsVecSnap,
             coarsest_pcg: Option<PcgValueSnap>,
+            profiled_hierarchy: Option<super::GamgHierarchyDiagnostics>,
             has_solved: bool,
         }
 
@@ -3707,16 +4028,17 @@ mod tests {
         struct LevelTimingValueSnap {
             metadata: (usize, usize, usize),
             seconds_bits: [u64; 8],
-            counters: [usize; 9],
+            counters: [usize; 10],
         }
 
         #[derive(Clone, Debug, PartialEq, Eq)]
         struct TimingValueSnap {
-            seconds_bits: [u64; 7],
+            seconds_bits: [u64; 8],
             counters: [usize; 8],
             levels_len: usize,
             levels_capacity: usize,
             levels: Vec<(usize, LevelTimingValueSnap)>,
+            hierarchy: Option<(usize, super::GamgHierarchyDiagnostics)>,
         }
 
         #[derive(Clone, Debug)]
@@ -3726,6 +4048,7 @@ mod tests {
             initial: BitsVecSnap,
             usize_arcs: Vec<(String, std::sync::Arc<[usize]>)>,
             face_arcs: Vec<std::sync::Arc<[GamgFacePairWeight]>>,
+            profiled_hierarchy: Option<std::sync::Arc<super::GamgHierarchyDiagnostics>>,
         }
 
         let usize_vec_snap = |values: &Vec<usize>| UsizeVecSnap {
@@ -3790,6 +4113,7 @@ mod tests {
                 timing.total_seconds.to_bits(),
                 timing.hierarchy_build_seconds.to_bits(),
                 timing.hierarchy_rebuild_seconds.to_bits(),
+                timing.hierarchy_diagnostic_seconds.to_bits(),
                 timing.matrix_refresh_seconds.to_bits(),
                 timing.finest_residual_seconds.to_bits(),
                 timing.v_cycle_seconds.to_bits(),
@@ -3836,11 +4160,18 @@ mod tests {
                                 level.residual_evaluations,
                                 level.correction_updates,
                                 level.coarsest_solves,
+                                level.coarsest_iterations,
                             ],
                         },
                     )
                 })
                 .collect(),
+            hierarchy: timing.hierarchy.as_ref().map(|hierarchy| {
+                (
+                    std::sync::Arc::as_ptr(hierarchy) as usize,
+                    (**hierarchy).clone(),
+                )
+            }),
         };
         let snapshot = |workspace: &GamgWorkspace,
                         timing: &super::GamgKernelTiming,
@@ -4004,12 +4335,14 @@ mod tests {
                         &workspace.fcg_previous_matrix_direction,
                     ),
                     coarsest_pcg,
+                    profiled_hierarchy: workspace.profiled_hierarchy.as_deref().cloned(),
                     has_solved: workspace.has_solved,
                 },
                 timing: timing_snap(timing),
                 initial: bits_vec_snap(initial),
                 usize_arcs,
                 face_arcs,
+                profiled_hierarchy: workspace.profiled_hierarchy.clone(),
             }
         };
 
@@ -4047,6 +4380,11 @@ mod tests {
             assert_eq!(after.face_arcs.len(), before.face_arcs.len());
             for (before_arc, after_arc) in before.face_arcs.iter().zip(&after.face_arcs) {
                 assert!(std::sync::Arc::ptr_eq(before_arc, after_arc));
+            }
+            match (&before.profiled_hierarchy, &after.profiled_hierarchy) {
+                (Some(before), Some(after)) => assert!(std::sync::Arc::ptr_eq(before, after)),
+                (None, None) => {}
+                _ => panic!("profiled hierarchy cache presence changed"),
             }
         };
 
@@ -4088,6 +4426,7 @@ mod tests {
             total_seconds: 1.0,
             hierarchy_build_seconds: 2.0,
             hierarchy_rebuild_seconds: 3.0,
+            hierarchy_diagnostic_seconds: 3.5,
             matrix_refresh_seconds: 4.0,
             finest_residual_seconds: 5.0,
             v_cycle_seconds: 6.0,
@@ -4122,6 +4461,7 @@ mod tests {
                     residual_evaluations: 37,
                     correction_updates: 38,
                     coarsest_solves: 39,
+                    coarsest_iterations: 40,
                 },
                 super::GamgLevelTiming {
                     level: 1,
@@ -4144,8 +4484,10 @@ mod tests {
                     residual_evaluations: 57,
                     correction_updates: 58,
                     coarsest_solves: 59,
+                    coarsest_iterations: 60,
                 },
             ],
+            hierarchy: None,
         };
 
         let ic_variant = snapshot(&workspace, &seeded_timing(), &initial);
@@ -4508,27 +4850,31 @@ mod tests {
                     timing.finest_residual_evaluations,
                     timing.solves,
                     timing.v_cycles,
+                    timing.outer_matrix_vector_products,
+                    timing.outer_reductions,
                 ],
                 timing
                     .levels
                     .iter()
                     .map(|level| {
                         (
-                            level.level,
-                            level.cells,
-                            level.nonzeros,
-                            level.matrix_refreshes,
-                            level.restriction_calls,
-                            level.prolongation_calls,
-                            level.smoothing_calls,
-                            level.smoothing_sweeps,
-                            level.scaling_calls,
-                            level.residual_evaluations,
-                            level.correction_updates,
-                            level.coarsest_solves,
+                            [level.level, level.cells, level.nonzeros],
+                            [
+                                level.matrix_refreshes,
+                                level.restriction_calls,
+                                level.prolongation_calls,
+                                level.smoothing_calls,
+                                level.smoothing_sweeps,
+                                level.scaling_calls,
+                                level.residual_evaluations,
+                                level.correction_updates,
+                                level.coarsest_solves,
+                                level.coarsest_iterations,
+                            ],
                         )
                     })
                     .collect::<Vec<_>>(),
+                timing.hierarchy.as_deref().cloned(),
             )
         };
         let assert_finite_timing = |timing: &super::GamgKernelTiming| {
@@ -4536,6 +4882,7 @@ mod tests {
                 timing.total_seconds,
                 timing.hierarchy_build_seconds,
                 timing.hierarchy_rebuild_seconds,
+                timing.hierarchy_diagnostic_seconds,
                 timing.matrix_refresh_seconds,
                 timing.finest_residual_seconds,
                 timing.v_cycle_seconds,
@@ -4599,21 +4946,21 @@ mod tests {
             );
 
             if live_timing.is_some() {
+                let logical = logical_timing(live_timing_ref);
+                assert_eq!(logical.0, [0, 1, 1, 3, 1, 2, 0, 0]);
                 assert_eq!(
-                    logical_timing(live_timing_ref),
-                    (
-                        [0, 1, 1, 3, 1, 2],
-                        vec![
-                            (0, 4, 10, 1, 2, 2, 2, 4, 2, 0, 2, 0),
-                            (1, 2, 4, 1, 0, 0, 0, 0, 0, 0, 0, 2),
-                        ],
-                    )
+                    logical.1,
+                    vec![
+                        ([0, 4, 10], [1, 2, 2, 2, 4, 2, 0, 2, 0, 0]),
+                        ([1, 2, 4], [1, 0, 0, 0, 0, 0, 0, 0, 2, 13]),
+                    ]
                 );
+                assert!(logical.2.is_some());
                 assert_finite_timing(live_timing_ref);
                 assert_finite_timing(clean_timing_ref);
                 assert_finite_timing(repeated_timing_ref);
             } else {
-                assert_eq!(logical_timing(live_timing_ref), ([0; 6], vec![]));
+                assert_eq!(logical_timing(live_timing_ref), ([0; 8], vec![], None));
             }
         }
     }
@@ -9282,6 +9629,684 @@ mod tests {
                 pointers
             );
         }
+    }
+
+    #[test]
+    fn hierarchy_diagnostics_report_exact_shapes_histograms_and_complexity_terms() {
+        let matrices = vec![
+            tridiagonal_matrix(8),
+            tridiagonal_matrix(4),
+            tridiagonal_matrix(2),
+        ];
+        let transfers = vec![
+            GamgTransfer {
+                fine_to_coarse: vec![0, 0, 1, 1, 2, 2, 3, 3],
+                fine_entry_to_coarse_entry: Vec::new(),
+            },
+            GamgTransfer {
+                fine_to_coarse: vec![0, 0, 1, 1],
+                fine_entry_to_coarse_entry: Vec::new(),
+            },
+        ];
+        let options = GamgOptions {
+            smoother: GamgSmoother::SymGaussSeidel,
+            direct_solve_coarsest: true,
+            ..GamgOptions::default()
+        };
+
+        let diagnostics = super::build_hierarchy_diagnostics(&matrices, &transfers, options)
+            .expect("exact hierarchy diagnostics");
+
+        assert_eq!(
+            diagnostics.levels,
+            vec![
+                super::GamgHierarchyLevelDiagnostics {
+                    level: 0,
+                    cells: 8,
+                    nonzeros: 22,
+                },
+                super::GamgHierarchyLevelDiagnostics {
+                    level: 1,
+                    cells: 4,
+                    nonzeros: 10,
+                },
+                super::GamgHierarchyLevelDiagnostics {
+                    level: 2,
+                    cells: 2,
+                    nonzeros: 4,
+                },
+            ]
+        );
+        assert_eq!(
+            diagnostics.transfers,
+            vec![
+                super::GamgTransferDiagnostics {
+                    fine_level: 0,
+                    coarse_level: 1,
+                    fine_cells: 8,
+                    coarse_cells: 4,
+                    singleton_fine_cells: 0,
+                    unmatched_fine_cells: 0,
+                    min_aggregate_size: 2,
+                    max_aggregate_size: 2,
+                    aggregate_size_histogram: vec![super::GamgAggregateSizeBin {
+                        aggregate_size: 2,
+                        aggregate_count: 4,
+                    }],
+                },
+                super::GamgTransferDiagnostics {
+                    fine_level: 1,
+                    coarse_level: 2,
+                    fine_cells: 4,
+                    coarse_cells: 2,
+                    singleton_fine_cells: 0,
+                    unmatched_fine_cells: 0,
+                    min_aggregate_size: 2,
+                    max_aggregate_size: 2,
+                    aggregate_size_histogram: vec![super::GamgAggregateSizeBin {
+                        aggregate_size: 2,
+                        aggregate_count: 2,
+                    }],
+                },
+            ]
+        );
+        assert_eq!(diagnostics.grid_complexity_terms(), Some((14, 8)));
+        assert_eq!(diagnostics.operator_complexity_terms(), Some((36, 22)));
+        assert_eq!(diagnostics.smoother_passes_per_sweep, 2);
+        assert!(diagnostics.direct_solve_coarsest);
+    }
+
+    #[test]
+    fn hierarchy_diagnostics_reject_structural_mismatches_without_mutating_inputs() {
+        let matrix_snapshot = |matrices: &[CsrMatrix]| {
+            matrices
+                .iter()
+                .map(|matrix| {
+                    (
+                        matrix.rows(),
+                        matrix.cols(),
+                        matrix.row_offsets().to_vec(),
+                        matrix.col_indices().to_vec(),
+                        matrix
+                            .values()
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let transfer_snapshot = |transfers: &[GamgTransfer]| {
+            transfers
+                .iter()
+                .map(|transfer| {
+                    (
+                        transfer.fine_to_coarse.clone(),
+                        transfer.fine_entry_to_coarse_entry.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let assert_rejected = |matrices: Vec<CsrMatrix>,
+                               transfers: Vec<GamgTransfer>,
+                               expected: &str| {
+            let matrices_before = matrix_snapshot(&matrices);
+            let transfers_before = transfer_snapshot(&transfers);
+            let error =
+                super::build_hierarchy_diagnostics(&matrices, &transfers, GamgOptions::default())
+                    .expect_err("invalid hierarchy diagnostics must fail closed");
+            assert_eq!(error.to_string(), expected);
+            assert_eq!(matrix_snapshot(&matrices), matrices_before);
+            assert_eq!(transfer_snapshot(&transfers), transfers_before);
+        };
+
+        assert_rejected(
+            vec![tridiagonal_matrix(4), tridiagonal_matrix(2)],
+            Vec::new(),
+            "GAMG profile hierarchy expected one fewer transfers than levels, got 2 levels and 0 transfers",
+        );
+        assert_rejected(
+            vec![tridiagonal_matrix(4), tridiagonal_matrix(2)],
+            vec![GamgTransfer {
+                fine_to_coarse: vec![0, 0, 1],
+                fine_entry_to_coarse_entry: vec![17, 19],
+            }],
+            "GAMG profile transfer 0->1 expected 4 fine cells, got 3",
+        );
+        assert_rejected(
+            vec![tridiagonal_matrix(4), tridiagonal_matrix(2)],
+            vec![GamgTransfer {
+                fine_to_coarse: vec![0, 0, 1, 2],
+                fine_entry_to_coarse_entry: vec![23],
+            }],
+            "GAMG profile transfer 0->1 maps fine cell 3 to out-of-range coarse cell 2 of 2",
+        );
+        assert_rejected(
+            vec![tridiagonal_matrix(4), tridiagonal_matrix(3)],
+            vec![GamgTransfer {
+                fine_to_coarse: vec![0, 0, 1, 1],
+                fine_entry_to_coarse_entry: vec![29, 31, 37],
+            }],
+            "GAMG profile transfer 0->1 contains an empty aggregate",
+        );
+    }
+
+    #[test]
+    fn hierarchy_diagnostics_distinguish_odd_attached_and_singleton_cells() {
+        let attached = super::build_hierarchy_diagnostics(
+            &[tridiagonal_matrix(5), tridiagonal_matrix(2)],
+            &[GamgTransfer {
+                fine_to_coarse: vec![0, 0, 0, 1, 1],
+                fine_entry_to_coarse_entry: Vec::new(),
+            }],
+            GamgOptions::default(),
+        )
+        .expect("odd attached aggregate diagnostics");
+        let attached_transfer = &attached.transfers[0];
+        assert_eq!(attached_transfer.singleton_fine_cells, 0);
+        assert_eq!(attached_transfer.unmatched_fine_cells, 1);
+        assert_eq!(attached_transfer.min_aggregate_size, 2);
+        assert_eq!(attached_transfer.max_aggregate_size, 3);
+        assert_eq!(
+            attached_transfer.aggregate_size_histogram,
+            vec![
+                super::GamgAggregateSizeBin {
+                    aggregate_size: 2,
+                    aggregate_count: 1,
+                },
+                super::GamgAggregateSizeBin {
+                    aggregate_size: 3,
+                    aggregate_count: 1,
+                },
+            ]
+        );
+
+        let singleton = super::build_hierarchy_diagnostics(
+            &[tridiagonal_matrix(5), tridiagonal_matrix(3)],
+            &[GamgTransfer {
+                fine_to_coarse: vec![0, 0, 1, 1, 2],
+                fine_entry_to_coarse_entry: Vec::new(),
+            }],
+            GamgOptions::default(),
+        )
+        .expect("odd singleton aggregate diagnostics");
+        let singleton_transfer = &singleton.transfers[0];
+        assert_eq!(singleton_transfer.singleton_fine_cells, 1);
+        assert_eq!(singleton_transfer.unmatched_fine_cells, 1);
+        assert_eq!(singleton_transfer.min_aggregate_size, 1);
+        assert_eq!(singleton_transfer.max_aggregate_size, 2);
+        assert_eq!(
+            singleton_transfer.aggregate_size_histogram,
+            vec![
+                super::GamgAggregateSizeBin {
+                    aggregate_size: 1,
+                    aggregate_count: 1,
+                },
+                super::GamgAggregateSizeBin {
+                    aggregate_size: 2,
+                    aggregate_count: 2,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn hierarchy_weighted_work_applies_smoother_and_fcg_matrix_product_factors() {
+        let matrices = vec![tridiagonal_matrix(8), tridiagonal_matrix(4)];
+        let transfers = vec![GamgTransfer {
+            fine_to_coarse: vec![0, 0, 1, 1, 2, 2, 3, 3],
+            fine_entry_to_coarse_entry: Vec::new(),
+        }];
+        let mut gauss_seidel = timing_with_hierarchy(
+            &matrices,
+            &transfers,
+            GamgOptions {
+                smoother: GamgSmoother::GaussSeidel,
+                ..GamgOptions::default()
+            },
+        );
+        gauss_seidel.levels[0].smoothing_sweeps = 2;
+        gauss_seidel.levels[0].residual_evaluations = 1;
+        gauss_seidel.levels[0].scaling_calls = 1;
+        gauss_seidel.levels[1].smoothing_sweeps = 3;
+        gauss_seidel.levels[1].residual_evaluations = 2;
+        gauss_seidel.levels[1].scaling_calls = 1;
+        gauss_seidel.finest_residual_evaluations = 2;
+        gauss_seidel.outer_matrix_vector_products = 3;
+
+        let mut symmetric = timing_with_hierarchy(
+            &matrices,
+            &transfers,
+            GamgOptions {
+                smoother: GamgSmoother::SymGaussSeidel,
+                ..GamgOptions::default()
+            },
+        );
+        symmetric.levels.clone_from(&gauss_seidel.levels);
+        symmetric.finest_residual_evaluations = gauss_seidel.finest_residual_evaluations;
+        symmetric.outer_matrix_vector_products = gauss_seidel.outer_matrix_vector_products;
+
+        assert_eq!(gauss_seidel.nnz_weighted_smoothing_work(), Some(74));
+        assert_eq!(symmetric.nnz_weighted_smoothing_work(), Some(148));
+        assert_eq!(gauss_seidel.nnz_weighted_sparse_work(), Some(258));
+        assert_eq!(symmetric.nnz_weighted_sparse_work(), Some(332));
+    }
+
+    #[test]
+    fn hierarchy_profile_is_observational_and_records_coarsest_iterations() {
+        let matrix = poisson_grid(4, 4, 1.0);
+        let rhs = (0..matrix.rows())
+            .map(|row| 1.0 + row as f64 / matrix.rows() as f64)
+            .collect::<Vec<_>>();
+        let base_options = GamgOptions {
+            max_iterations: 2,
+            min_iterations: 2,
+            tolerance: 0.0,
+            relative_tolerance: 0.0,
+            n_cells_in_coarsest_level: 2,
+            direct_solve_coarsest: false,
+            ..GamgOptions::default()
+        };
+        let mut plain_workspace =
+            GamgWorkspace::new(&matrix, base_options).expect("plain hierarchy workspace");
+        let mut plain_timing = GamgKernelTiming::default();
+        let plain = plain_workspace
+            .solve_with_controls_internal::<false, false>(
+                &matrix,
+                &rhs,
+                None,
+                base_options.into(),
+                &mut plain_timing,
+            )
+            .expect("plain hierarchy solve");
+        assert!(plain_timing.hierarchy.is_none());
+        assert!(plain_timing.levels.is_empty());
+        assert_eq!(plain_timing.solves, 0);
+
+        let mut iterative_workspace =
+            GamgWorkspace::new(&matrix, base_options).expect("profiled iterative workspace");
+        let iterative = iterative_workspace
+            .solve_with_controls_profiled(&matrix, &rhs, None, base_options.into())
+            .expect("profiled iterative solve");
+        assert_eq!(plain.iterations, iterative.report.iterations);
+        assert_eq!(plain.converged, iterative.report.converged);
+        assert_eq!(plain.termination, iterative.report.termination);
+        assert_eq!(
+            plain.residual_norm.to_bits(),
+            iterative.report.residual_norm.to_bits()
+        );
+        assert_eq!(
+            plain
+                .solution
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            iterative
+                .report
+                .solution
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        let iterative_hierarchy = iterative
+            .timing
+            .hierarchy
+            .as_ref()
+            .expect("profiled solve must report its static hierarchy");
+        assert!(!iterative_hierarchy.direct_solve_coarsest);
+        let iterative_coarsest = iterative
+            .timing
+            .levels
+            .last()
+            .expect("iterative coarsest level");
+        assert_eq!(
+            iterative_coarsest.coarsest_solves,
+            iterative.report.iterations
+        );
+        assert!(iterative_coarsest.coarsest_iterations >= iterative_coarsest.coarsest_solves);
+        assert!(
+            iterative.timing.levels[..iterative.timing.levels.len() - 1]
+                .iter()
+                .all(|level| level.coarsest_iterations == 0)
+        );
+
+        let direct_options = GamgOptions {
+            direct_solve_coarsest: true,
+            ..base_options
+        };
+        let mut direct_workspace =
+            GamgWorkspace::new(&matrix, direct_options).expect("profiled direct workspace");
+        let direct = direct_workspace
+            .solve_with_controls_profiled(&matrix, &rhs, None, direct_options.into())
+            .expect("profiled direct solve");
+        assert!(
+            direct
+                .timing
+                .hierarchy
+                .as_ref()
+                .expect("direct hierarchy diagnostics")
+                .direct_solve_coarsest
+        );
+        let direct_coarsest = direct.timing.levels.last().expect("direct coarsest level");
+        assert_eq!(direct_coarsest.coarsest_solves, direct.report.iterations);
+        assert_eq!(direct_coarsest.coarsest_iterations, 0);
+    }
+
+    #[test]
+    fn profiled_hierarchy_cache_is_success_bound_and_reused_across_ten_coefficients() {
+        let matrix = poisson_grid(4, 4, 1.0);
+        let rhs = (0..matrix.rows())
+            .map(|row| 1.0 + row as f64 / matrix.rows() as f64)
+            .collect::<Vec<_>>();
+        let options = GamgOptions {
+            max_iterations: 2,
+            min_iterations: 2,
+            tolerance: 0.0,
+            relative_tolerance: 0.0,
+            cache_agglomeration: true,
+            n_cells_in_coarsest_level: 2,
+            ..GamgOptions::default()
+        };
+
+        let mut failed_workspace =
+            GamgWorkspace::new(&matrix, options).expect("failed-profile workspace");
+        let error = failed_workspace
+            .solve_with_controls_profiled(&matrix, &rhs[..rhs.len() - 1], None, options.into())
+            .expect_err("invalid profiled solve must fail before caching diagnostics");
+        assert_eq!(
+            error.to_string(),
+            "iterative solve expected rhs with 16 entries, got 15"
+        );
+        assert!(failed_workspace.profiled_hierarchy.is_none());
+
+        let mut plain_workspace =
+            GamgWorkspace::new(&matrix, options).expect("unprofiled hierarchy workspace");
+        plain_workspace
+            .solve_with_controls(&matrix, &rhs, None, options.into())
+            .expect("unprofiled hierarchy solve");
+        assert!(plain_workspace.profiled_hierarchy.is_none());
+
+        let mut workspace =
+            GamgWorkspace::new(&matrix, options).expect("profiled hierarchy workspace");
+        let first = workspace
+            .solve_with_controls_profiled(&matrix, &rhs, None, options.into())
+            .expect("first profiled hierarchy solve");
+        let cached = workspace
+            .profiled_hierarchy
+            .as_ref()
+            .expect("successful profiled solve caches diagnostics")
+            .clone();
+        assert!(std::sync::Arc::ptr_eq(
+            first
+                .timing
+                .hierarchy
+                .as_ref()
+                .expect("first timing hierarchy"),
+            &cached,
+        ));
+        assert!(first.timing.hierarchy_diagnostic_seconds.is_finite());
+        assert!(first.timing.hierarchy_diagnostic_seconds >= 0.0);
+
+        for lifecycle in 1..10 {
+            let matrix = poisson_grid(4, 4, 1.0 + lifecycle as f64 / 32.0);
+            let profiled = workspace
+                .solve_with_controls_profiled(&matrix, &rhs, None, options.into())
+                .expect("cached profiled coefficient lifecycle");
+            assert!(std::sync::Arc::ptr_eq(
+                workspace
+                    .profiled_hierarchy
+                    .as_ref()
+                    .expect("workspace hierarchy cache"),
+                &cached,
+            ));
+            assert!(std::sync::Arc::ptr_eq(
+                profiled
+                    .timing
+                    .hierarchy
+                    .as_ref()
+                    .expect("profile timing hierarchy"),
+                &cached,
+            ));
+            assert_eq!(
+                profiled.timing.hierarchy_diagnostic_seconds.to_bits(),
+                0.0f64.to_bits(),
+            );
+        }
+
+        let cached_before_failure = workspace
+            .profiled_hierarchy
+            .as_ref()
+            .expect("cache before failed retry")
+            .clone();
+        workspace
+            .solve_with_controls_profiled(&matrix, &rhs[..rhs.len() - 1], None, options.into())
+            .expect_err("invalid retry must not replace cached diagnostics");
+        assert!(std::sync::Arc::ptr_eq(
+            workspace
+                .profiled_hierarchy
+                .as_ref()
+                .expect("cache after failed retry"),
+            &cached_before_failure,
+        ));
+
+        let uncached_options = GamgOptions {
+            cache_agglomeration: false,
+            ..options
+        };
+        let mut uncached_workspace = GamgWorkspace::new(&matrix, uncached_options)
+            .expect("uncached profiled hierarchy workspace");
+        let uncached_first = uncached_workspace
+            .solve_with_controls_profiled(&matrix, &rhs, None, uncached_options.into())
+            .expect("first uncached profiled solve");
+        let uncached_first_hierarchy = uncached_first
+            .timing
+            .hierarchy
+            .as_ref()
+            .expect("first uncached timing hierarchy")
+            .clone();
+        assert!(std::sync::Arc::ptr_eq(
+            uncached_workspace
+                .profiled_hierarchy
+                .as_ref()
+                .expect("first uncached workspace hierarchy"),
+            &uncached_first_hierarchy,
+        ));
+        let second_matrix = poisson_grid(4, 4, 1.25);
+        let uncached_second = uncached_workspace
+            .solve_with_controls_profiled(&second_matrix, &rhs, None, uncached_options.into())
+            .expect("second uncached profiled solve");
+        let uncached_second_hierarchy = uncached_second
+            .timing
+            .hierarchy
+            .as_ref()
+            .expect("second uncached timing hierarchy");
+        assert!(!std::sync::Arc::ptr_eq(
+            &uncached_first_hierarchy,
+            uncached_second_hierarchy,
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            uncached_workspace
+                .profiled_hierarchy
+                .as_ref()
+                .expect("second uncached workspace hierarchy"),
+            uncached_second_hierarchy,
+        ));
+        assert_eq!(uncached_second.timing.hierarchy_rebuilds, 1);
+        assert!(
+            uncached_second
+                .timing
+                .hierarchy_diagnostic_seconds
+                .is_finite()
+        );
+        assert!(uncached_second.timing.hierarchy_diagnostic_seconds >= 0.0);
+    }
+
+    #[test]
+    fn hierarchy_timing_accumulation_rejects_static_mismatch_before_mutation() {
+        let matrices = vec![tridiagonal_matrix(4), tridiagonal_matrix(2)];
+        let transfers = vec![GamgTransfer {
+            fine_to_coarse: vec![0, 0, 1, 1],
+            fine_entry_to_coarse_entry: Vec::new(),
+        }];
+        let mut accumulated = timing_with_hierarchy(
+            &matrices,
+            &transfers,
+            GamgOptions {
+                smoother: GamgSmoother::GaussSeidel,
+                ..GamgOptions::default()
+            },
+        );
+        accumulated.total_seconds = 11.0;
+        accumulated.levels[1].coarsest_iterations = 7;
+        let mut compatible = timing_with_hierarchy(
+            &matrices,
+            &transfers,
+            GamgOptions {
+                smoother: GamgSmoother::GaussSeidel,
+                ..GamgOptions::default()
+            },
+        );
+        compatible.total_seconds = 2.0;
+        compatible.levels[1].coarsest_iterations = 5;
+        accumulated
+            .accumulate(&compatible)
+            .expect("matching hierarchy must accumulate");
+        assert_eq!(accumulated.total_seconds.to_bits(), 13.0f64.to_bits());
+        assert_eq!(accumulated.levels[1].coarsest_iterations, 12);
+
+        let mismatched = timing_with_hierarchy(
+            &matrices,
+            &transfers,
+            GamgOptions {
+                smoother: GamgSmoother::SymGaussSeidel,
+                ..GamgOptions::default()
+            },
+        );
+        let before_hierarchy = accumulated.hierarchy.clone();
+        let before_total = accumulated.total_seconds;
+        let before_coarsest_iterations = accumulated.levels[1].coarsest_iterations;
+
+        let error = accumulated
+            .accumulate(&mismatched)
+            .expect_err("static hierarchy mismatch must fail closed");
+
+        assert_eq!(
+            error.to_string(),
+            "GAMG profile static hierarchy diagnostics changed during accumulation"
+        );
+        assert_eq!(accumulated.hierarchy, before_hierarchy);
+        assert_eq!(accumulated.total_seconds.to_bits(), before_total.to_bits());
+        assert_eq!(
+            accumulated.levels[1].coarsest_iterations,
+            before_coarsest_iterations
+        );
+
+        let mut late_level_mismatch = compatible.clone();
+        late_level_mismatch.hierarchy = accumulated.hierarchy.clone();
+        late_level_mismatch.levels[0].smoothing_calls = 99;
+        late_level_mismatch.levels[1].cells += 1;
+        let before_debug = format!("{accumulated:?}");
+        let before_levels_pointer = accumulated.levels.as_ptr();
+        let before_hierarchy_pointer = accumulated.hierarchy.as_ref().map(std::sync::Arc::as_ptr);
+
+        let error = accumulated
+            .accumulate(&late_level_mismatch)
+            .expect_err("later-level metadata mismatch must fail before any accumulation");
+
+        assert_eq!(
+            error.to_string(),
+            "GAMG profile hierarchy changed at level 1: expected cells=2 nonzeros=4, got level=1 cells=3 nonzeros=4"
+        );
+        assert_eq!(format!("{accumulated:?}"), before_debug);
+        assert_eq!(accumulated.levels.as_ptr(), before_levels_pointer);
+        assert_eq!(
+            accumulated.hierarchy.as_ref().map(std::sync::Arc::as_ptr),
+            before_hierarchy_pointer,
+        );
+    }
+
+    #[test]
+    fn hierarchy_complexity_and_weighted_visit_helpers_fail_closed() {
+        let empty = super::GamgHierarchyDiagnostics {
+            levels: Vec::new(),
+            transfers: Vec::new(),
+            smoother_passes_per_sweep: 1,
+            direct_solve_coarsest: false,
+        };
+        assert_eq!(empty.grid_complexity_terms(), None);
+        assert_eq!(empty.operator_complexity_terms(), None);
+
+        let zero_finest = super::GamgHierarchyDiagnostics {
+            levels: vec![super::GamgHierarchyLevelDiagnostics {
+                level: 0,
+                cells: 0,
+                nonzeros: 0,
+            }],
+            transfers: Vec::new(),
+            smoother_passes_per_sweep: 1,
+            direct_solve_coarsest: false,
+        };
+        assert_eq!(zero_finest.grid_complexity_terms(), None);
+        assert_eq!(zero_finest.operator_complexity_terms(), None);
+
+        let mut mismatched = GamgKernelTiming {
+            levels: vec![super::GamgLevelTiming {
+                level: 0,
+                cells: 1,
+                nonzeros: 1,
+                smoothing_sweeps: 1,
+                ..super::GamgLevelTiming::default()
+            }],
+            hierarchy: Some(std::sync::Arc::new(super::GamgHierarchyDiagnostics {
+                levels: Vec::new(),
+                transfers: Vec::new(),
+                smoother_passes_per_sweep: 1,
+                direct_solve_coarsest: false,
+            })),
+            ..GamgKernelTiming::default()
+        };
+        assert_eq!(mismatched.nnz_weighted_smoothing_work(), None);
+        assert_eq!(mismatched.nnz_weighted_sparse_work(), None);
+
+        mismatched.hierarchy = Some(std::sync::Arc::new(super::GamgHierarchyDiagnostics {
+            levels: vec![super::GamgHierarchyLevelDiagnostics {
+                level: 0,
+                cells: 2,
+                nonzeros: 1,
+            }],
+            transfers: Vec::new(),
+            smoother_passes_per_sweep: 1,
+            direct_solve_coarsest: false,
+        }));
+        assert_eq!(mismatched.nnz_weighted_smoothing_work(), None);
+        assert_eq!(mismatched.nnz_weighted_sparse_work(), None);
+
+        mismatched.hierarchy = Some(std::sync::Arc::new(super::GamgHierarchyDiagnostics {
+            levels: vec![super::GamgHierarchyLevelDiagnostics {
+                level: 0,
+                cells: 1,
+                nonzeros: usize::MAX,
+            }],
+            transfers: Vec::new(),
+            smoother_passes_per_sweep: 2,
+            direct_solve_coarsest: false,
+        }));
+        mismatched.levels[0].nonzeros = usize::MAX;
+        mismatched.levels[0].smoothing_sweeps = usize::MAX;
+        assert_eq!(mismatched.nnz_weighted_smoothing_work(), None);
+        assert_eq!(mismatched.nnz_weighted_sparse_work(), None);
+    }
+
+    fn timing_with_hierarchy(
+        matrices: &[CsrMatrix],
+        transfers: &[GamgTransfer],
+        options: GamgOptions,
+    ) -> GamgKernelTiming {
+        let hierarchy = std::sync::Arc::new(
+            super::build_hierarchy_diagnostics(matrices, transfers, options)
+                .expect("test hierarchy diagnostics"),
+        );
+        GamgKernelTiming::from_hierarchy(matrices, hierarchy)
     }
 
     fn poisson_grid(nx: usize, ny: usize, scale: f64) -> CsrMatrix {
