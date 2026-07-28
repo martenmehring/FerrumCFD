@@ -591,11 +591,14 @@ The first optimization sequence is tracked as follows:
     and all solver controls remain unchanged;
 22. continue testing hierarchy leaves one at a time. The isolated
     `mergeLevels 2` experiment failed the frozen two-case work gate and remains
-    unmerged; production keeps requiring `mergeLevels 1`. Evaluate cached
-    direct coarse factorization next as a separate package. Keep coarsest-level
-    target, deterministic aggregation/coarsening, sweep placement, and weighted
-    prolongation isolated. Larger gains require fewer V-cycles or less weighted
-    work in both frozen cases;
+    unmerged; production keeps requiring `mergeLevels 1`. Cached direct coarse
+    factorization also passed its semantic gates but failed the frozen two-case
+    total-time gate and remains unmerged; production keeps
+    `directSolveCoarsest false`. Inspect reusable work in that active iterative
+    coarse path next. Keep coarsest-level target, deterministic
+    aggregation/coarsening, sweep placement, and weighted prolongation
+    isolated. Larger gains require fewer V-cycles or less weighted work in both
+    frozen cases;
 23. completed: gate the static user-bounded `relTol` implementation with Linux
     time-to-accuracy evidence and evaluate SIMPLEC as a separate same-binary
     leaf. SIMPLEC passed the frozen Channel gate but failed the frozen Pipe
@@ -965,7 +968,9 @@ The immediate sequence is:
    `266304720/381274010` and `736011430/1071131186`; iterative coarsest work is
    `2137/6771` iterations. These profiled oracles prove observational parity,
    not a speedup. Focused Fable review remains explicitly deferred.
-8. **F-PERF-GAMG-HIERARCHY-LEAVES (equal-weight pairing accepted; `mergeLevels 2` rejected):** Test one predeclared variable per A/B:
+8. **F-PERF-GAMG-HIERARCHY-LEAVES (equal-weight pairing accepted;
+   `mergeLevels 2` and cached direct factorization rejected):** Test one
+   predeclared variable per A/B:
    coarsest-level target; cached direct versus iterative coarse solve;
    deterministic pairing/coarsening; pre/post/finest sweep placement; weighted
    prolongation; and, later, GAMG as a PCG/FCG preconditioner. Invalidate and
@@ -1036,6 +1041,24 @@ The immediate sequence is:
    failed, so the expensive `2+10` and converged runs were not started. The
    implementation remains unmerged, `mergeLevels 1` remains the default, and
    no speedup is claimed. Focused Fable review remains deferred.
+   The following one-file clean-base experiment on `44946ce` cached the dense
+   direct coarsest-level factorization within one coarse-coefficient lifecycle.
+   It preserved lazy construction, invalidation before coefficient mutation,
+   stable allocations across ten lifecycles, failure and retry behavior, and
+   exact legacy arithmetic. Its 56 focused GAMG tests, full workspace,
+   formatting, Rust 1.94 locked/offline Clippy, and two independent reviews
+   passed. A fresh Native Linux CPU2 `A-B-B-A` Stage A compared the old and
+   cached implementations with `directSolveCoarsest true` on both sides. All
+   12 reports, final `U` and `p` fields, convergence counts, and numerical
+   semantics were exact. Pipe total internal and pressure medians improved by
+   `27.01%` and `29.51%`, while its profiled coarse phase improved by `80.87%`.
+   Channel's coarse phase also improved by `68.50%`, but its total internal and
+   pressure medians regressed by `8.27%` and `9.95%`. The predeclared both-case
+   total-time gate therefore stopped before `2+10` and Stage B. The cache stays
+   local and unmerged, production retains `directSolveCoarsest false`, and no
+   general speedup is claimed. Evidence manifest SHA256 is
+   `241d6d9e722382af268b9dcb4560ef9607187407f41b74187d6573bb0c249b3f`.
+   Focused Fable review remains deferred.
 9. **F-PERF-ADAPTIVE-LINEAR (semantics/work accepted; timing not accepted):**
    Commit `206f7ee` implements static, user-bounded OpenFOAM-style `relTol` for
    all current scalar linear solvers while preserving final outer acceptance.
