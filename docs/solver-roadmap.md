@@ -200,10 +200,13 @@ writes JSON/Markdown reports including pressure-assembly diagnostics for
 `rAU/rAtU`, `HbyA`, `phiHbyA`, pressure source, pressure flux, and corrected
 `phi`. Reports also contain a `linearSolves` profile so medium/fine runs expose
 whether the bottleneck is the non-symmetric momentum predictor or the pressure
-PCG/IC(0) correction. OpenFOAM Foundation-style outer `residualControl` and
-linear-solver convergence are reported separately. `converged=true` means the
-configured outer field criteria were checked and satisfied; each linear solve
-still exposes its own initial/final residual, iterations, and convergence flag.
+PCG/IC(0) correction. Resolved `solvers.U.relTol` and `solvers.p.relTol` use a
+strict normalized-L1 target for every linear solve. OpenFOAM Foundation-style
+outer `residualControl` and linear-solver convergence are reported separately.
+`converged=true` means the configured outer field criteria were checked and
+satisfied; every momentum-component and pressure-correction solve exposes its
+initial/final residuals, effective target, stop reason, iterations, and
+convergence flag.
 
 The 2026-07-10 residual-control validation used a maximum budget of `250` with
 `U 1e-3` and `p 1e-2`. The release solver stopped early at SIMPLE iteration
@@ -285,9 +288,10 @@ criteria, not only by benchmark agreement.
 - Keep the implemented OpenFOAM-normalized initial/final residual reporting for
   vector momentum, component momentum, pressure correction, continuity, and
   field changes under regression test.
-- Implement OpenFOAM `relTol`, `minIter`, and configurable `smoothSolver`
-  `nSweeps`; until then, reject non-default values instead of silently changing
-  their meaning.
+- Keep the implemented OpenFOAM `relTol` contract under regression test.
+  Implement non-GAMG `minIter` and configurable `smoothSolver` `nSweeps` in
+  separate leaves; until then, reject non-default values instead of silently
+  changing their meaning.
 - Use the new `linearSolves` profile to compare the OpenFOAM-like
   symmetric Gauss-Seidel momentum smoother against explicit BiCGStab experiments, then
   add an ILU/DILU preconditioner before moving the same contract to GPU.
@@ -566,8 +570,10 @@ The first optimization sequence is tracked as follows:
 13. completed: profile GAMG hierarchy refresh and every V-cycle phase, identify
     smoothing as the dominant phase, and reuse cached diagonal slots in the
     Gauss-Seidel smoother while preserving floating-point operation order;
-14. establish strict absolute and relative normalized-L1 stopping as the first
-    post-flow correctness gate, retaining L2 telemetry wherever it is exposed;
+14. completed: establish strict absolute and relative normalized-L1 stopping
+    as the first post-flow correctness gate, retaining L2 telemetry wherever it
+    is exposed, and extend the static user `relTol` contract to every current
+    scalar linear solver;
 15. freeze `laminarPipe` and `planeChannel` as the A/B corpus after an accepted
     post-flow clean baseline;
 16. completed and accepted: retain allocation-free cached-diagonal CSR
@@ -598,7 +604,9 @@ The first optimization sequence is tracked as follows:
     versus iterative coarse solve, deterministic aggregation/coarsening,
     sweep placement, weighted prolongation, and later GAMG as a PCG/FCG
     preconditioner. Larger gains require fewer V-cycles or less weighted work;
-23. gate adaptive linear tolerances, then SIMPLEC;
+23. gate the completed static user-bounded `relTol` implementation with Linux
+    time-to-accuracy evidence, then treat any autonomous runtime tolerance
+    controller and SIMPLEC as separate later leaves;
 24. accept portable and native scalar profiles, then proceed through SIMD,
     shared-memory threading, and GPU as separate reviewed leaves.
 
@@ -609,10 +617,10 @@ its own before/after evidence.
 
 Next performance targets:
 
-- first make normalized L1 the post-flow correctness gate. Stopping requires
-  strict absolute and relative normalized-L1 criteria; preserve L2 telemetry
-  where already exposed. Do not tune tolerances or iteration budgets to
-  manufacture parity;
+- retain normalized L1 as the completed post-flow correctness gate. Stopping
+  requires strict absolute and relative normalized-L1 criteria; preserve L2
+  telemetry where already exposed. Do not tune tolerances or iteration budgets
+  to manufacture parity;
 - freeze `laminarPipe` and `planeChannel` as the mandatory A/B corpus using
   identical inputs, schemes, controls, hardware lane, process/thread settings,
   and an accepted post-flow clean baseline;
@@ -634,12 +642,13 @@ Next performance targets:
 - next persist SIMPLE and momentum topology, coefficients where valid,
   preconditioner state, histories, and workspaces. Define explicit invalidation
   and preserve equations, boundaries, and convergence semantics;
-- only after persistence parity, add adaptive linear tolerances bounded by user
-  controls. Preserve final outer acceptance criteria and report each effective
-  tolerance and the resulting linear work;
-- only after the persistence and adaptive-tolerance gates pass, implement
-  SIMPLEC and accept it on the same frozen Pipe/Channel observables before
-  expanding case coverage;
+- accept the implemented static OpenFOAM-style `relTol` only with unchanged
+  final outer acceptance, explicit effective-target telemetry, linear-work
+  accounting, and time-to-accuracy evidence. Persistence is not a prerequisite
+  for this static case control;
+- keep a genuinely autonomous runtime tolerance controller separate and
+  user-bounded. Implement SIMPLEC as its own leaf and accept it on the same
+  frozen Pipe/Channel observables before expanding case coverage;
 - define a portable release profile for reproducible comparison and correctness
   and a native release profile that is explicitly hardware-specific. Never mix
   timing claims between these lanes;
@@ -917,7 +926,8 @@ The immediate sequence is:
    the reproducible lane, apply identical CPU affinity and serial environment,
    and record common process plus separate native timers. The same-WSL lane is
    implemented and has accepted portable, Native `1+5`, and Native Pipe `2+9`
-   baseline evidence; the two secondary diagnostic lanes remain optional.
+   baseline evidence. PR `#80` merged this lane as `7f71427`; the two secondary
+   diagnostic lanes remain optional.
 6. **F-PERF-GAMG-SCALING-ROW-KERNELS (first leaf rejected):** Continue with
    isolated CSR residual, scaling, and row-traversal leaves before structural
    hierarchy changes. A bit-exact paired-dot scaling candidate passed the full
@@ -952,7 +962,7 @@ The immediate sequence is:
    `61925/30336` and `19007/9760` for Pipe/Channel respectively. The
    diagnostics remain local and unmerged while the first hierarchy leaves are
    falsified.
-8. **F-PERF-GAMG-HIERARCHY-LEAVES (equal-weight pairing accepted locally):** Test one predeclared variable per A/B:
+8. **F-PERF-GAMG-HIERARCHY-LEAVES (equal-weight pairing accepted):** Test one predeclared variable per A/B:
    coarsest-level target; cached direct versus iterative coarse solve;
    deterministic pairing/coarsening; pre/post/finest sweep placement; weighted
    prolongation; and, later, GAMG as a PCG/FCG preconditioner. Invalidate and
@@ -986,8 +996,8 @@ The immediate sequence is:
    13 measured process medians of `2.24 vs 6.65 s` for Pipe and
    `6.47 vs 10.97 s` for Channel, ratios `0.3368` and `0.5898`. These are
    fixed-work results on the two frozen cases, not a general all-case speed
-   claim. The isolated one-file implementation is published as Draft PR `#79`;
-   CI passed and trusted merge remains pending.
+   claim. PR `#79` merged the isolated one-file implementation as `4a0e2f3`
+   after CI and Trusted Merge passed.
    A direct child experiment (`73e3c5b`) then replaced the local cell-order
    pass with deterministic global heavy-edge matching. Its 37 focused GAMG
    tests, complete workspace, and Rust 1.94 Clippy gates passed after updating
@@ -1007,11 +1017,15 @@ The immediate sequence is:
    Reports and final fields stayed bit-exact. Channel's `0+2` probe was
    inconclusive because its two order cohorts disagreed, so the predeclared
    both-case gate stopped before a stronger Channel run.
-9. **F-PERF-ADAPTIVE-LINEAR:** After persistence parity, add user-bounded
-   adaptive linear tolerances while preserving final outer acceptance and
-   reporting effective tolerances and linear work.
-10. **F-D1-SIMPLEC:** After the persistence and adaptive-linear gates, implement
-    SIMPLEC on the frozen Pipe/Channel observables before expanding coverage.
+9. **F-PERF-ADAPTIVE-LINEAR (implementation and proof candidate):** Local commit
+   `206f7ee` implements static, user-bounded OpenFOAM-style `relTol` for all
+   current scalar linear solvers while preserving final outer acceptance. It
+   reports every effective target, stop reason, and linear-work contribution.
+   This is not an autonomous runtime controller. Publication remains gated on
+   the canonical same-Linux Pipe/Channel time-to-accuracy proof.
+10. **F-D1-SIMPLEC:** Implement SIMPLEC as an isolated leaf on the frozen
+    Pipe/Channel observables before expanding coverage. A future autonomous
+    tolerance controller remains a separate user-bounded experiment.
 11. **F-PERF-PORTABLE-NATIVE:** A/B-test Thin/Fat LTO, `codegen-units=1`, a
     separate `target-cpu=native` build, and then PGO. Keep the portable release
     as the reproducible distribution profile and never mix timing lanes.
