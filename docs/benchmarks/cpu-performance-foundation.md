@@ -641,6 +641,25 @@ Ferrum is faster for every mesh, solver configuration, accuracy target, or
 physics model. OpenFOAM cases, executables, and the external comparison harness
 are not distributed with FerrumCFD.
 
+### Rejected `interpolateCorrection` Performance Leaf
+
+PR `#93` added Foundation-style correction interpolation as an explicit,
+default-off GAMG capability. A same-binary Native Linux `0+2` go/no-go on exact
+merge `be039401` changed only `interpolateCorrection false -> true`, used CPU
+set `2`, and alternated the order of both variants. It produced:
+
+| Case | `false` median [s] | `true` median [s] | `true / false` | pressure iterations `false -> true` |
+| --- | ---: | ---: | ---: | ---: |
+| Laminar pipe | 2.645 | 4.225 | 1.5974 | 1,687 -> 2,448 |
+| Plane channel | 6.815 | 8.125 | 1.1922 | 10,654 -> 11,064 |
+
+Every linear solve completed and the report-level velocity and pressure L2
+differences remained below `4e-11`, but both cases increased pressure work and
+process time. The non-decision smoke therefore rejected this option as a
+performance leaf before the expensive `2+10` run. It remains available only as
+an opt-in compatibility control; `false` remains the default. The external
+harness and generated run artifacts are not distributed with FerrumCFD.
+
 ## Next Performance Target
 
 Pressure linear solves still dominate converged runtime. GAMG integration,
@@ -649,7 +668,8 @@ per-level cycle profiling, and the first measured smoother-layout optimization
 are complete. Smoothing remains `74.53%` to `75.70%` of the current V-cycle,
 while scaling remains about `18%` to `19%`. Any further GAMG performance leaf must first isolate
 the remaining smoother row-kernel cost and preserve the same CSR and sweep
-order; case tolerances or cycle counts are not performance knobs. PCG/IC(0)
+order; case tolerances, cycle counts, and rejected correction interpolation are
+not performance knobs. PCG/IC(0)
 remains the current default and an explicit selectable solver rather than a
 hidden fallback. The next solver-capability task is tracked separately in the
 roadmap.
