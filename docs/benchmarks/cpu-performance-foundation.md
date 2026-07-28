@@ -587,6 +587,11 @@ The manifests and proofs bind both modes to the recorded shared binary SHA-256
 `569e1cfaa7dc354f427588adb4d20e6e3addf0d3d831011b934d8e48e96898c2`;
 the executable itself was not retained in the result archive, so that binary
 hash is recorded evidence rather than a subsequently re-hashed artifact.
+The initial Channel summary also wrote `maxResidentSetKiB=0` because its host
+summarizer read the wrong parser property; the raw GNU-time records contain
+`8,936-9,664 KiB`. This PR corrects and regression-tests that reporting field,
+but the archived run supports no RSS claim. Elapsed-time calculations and all
+declared acceptance gates are independent of RSS and were unaffected.
 Artifacts are under
 `target/benchmarks/ferrum_linux_tta_ab/gamg-native-simplec-4be55c6` and
 `target/benchmarks/ferrum_linux_tta_ab/gamg-native-simplec-channel-4be55c6`.
