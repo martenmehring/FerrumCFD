@@ -499,6 +499,50 @@ byte-identical. Relative to that immediately preceding checkpoint, the pipe
 changed from `16.8136 s` to `15.9451 s` (`1.05x`), while the channel changed
 from `7.3885 s` to `8.1579 s` (`0.91x`) under the variable host load.
 
+## Static `relTol` Linux Time-To-Accuracy (2026-07-28)
+
+The static OpenFOAM-style relative linear tolerance was evaluated as an exact
+same-Linux A/B before publication. Baseline
+`7f71427be8d49c67ec2449b4ab457e4e25d23d32` (tree `7e89f623`) and direct-child
+candidate `206f7ee7c72dee4c8afcf4cb65b09c521bdfabc0` (tree `025ae302`) differ only
+in `applications/legacy/ferrumCli/src/lib.rs` and
+`src/ferrumMesh/src/flow.rs`; the Cargo.lock blob and SHA-256 are identical.
+Both references were built separately on WSL2 ext4 with Rust `1.94.0`, the
+hardware-specific Native profile, Cargo incremental disabled, and CPU `2` on an
+11th-generation Intel Core i7-1165G7. Each case used two warmups and ten
+balanced alternating measured pairs, followed by untimed field oracles.
+
+Accuracy and linear-work gates passed in both cases before process timing was
+classified:
+
+| Case | Candidate p/U `relTol` | SIMPLE base/candidate | U rel L2/Linf | Gauge p rel L2/Linf | Continuity max ratio | Linear work base/candidate | Reduction |
+| --- | --- | ---: | --- | --- | ---: | ---: | ---: |
+| Laminar pipe | `1e-6` / `1e-3` | `207 / 207` | `4.118e-6 / 1.010e-5` | `4.737e-6 / 5.737e-6` | `1.0182` | `37,968 / 29,476` | `22.37%` |
+| Plane channel | `1e-5` / `1e-2` | `545 / 546` | `1.909e-8 / 3.038e-8` | `9.914e-9 / 1.418e-8` | `0.9955` | `23,442 / 14,455` | `38.34%` |
+
+All outer iterations and every linear solve converged. The pressure and
+momentum work components did not increase; Pipe reduced momentum/pressure work
+by `56.58% / 9.56%`, and Channel by `63.50% / 10.89%`. Pressure-drop and flow
+remain report-based indicators rather than patch-area averages.
+
+GNU `time` elapsed seconds are the primary timing metric; solver-internal time
+is secondary. Neither case passed every predeclared stability gate:
+
+| Case | Process median base/candidate [s] | Ratio of medians | Paired median (MAD) | Wins | Order cohorts | Result |
+| --- | ---: | ---: | ---: | ---: | --- | --- |
+| Laminar pipe | `33.055 / 28.645` | `0.8666` | `0.8669 (0.0786)` | `9/10` | `0.9706 / 0.7905` | rejected: gain not greater than `2 x MAD` |
+| Plane channel | `6.930 / 6.615` | `0.9545` | `0.8932 (0.1008)` | `6/10` | `0.8539 / 1.0735` | rejected: cohort, MAD, and win-count gates |
+
+The evidence therefore accepts the numerical semantics and reduced linear work,
+but it does **not** establish a stable end-to-end speedup and supports no general
+performance claim. The exact artifacts are under
+`target/benchmarks/ferrum_linux_tta_ab/gamg-native-pipe-206f7ee-p1e-6-u1e-3-proof-v1`
+and
+`target/benchmarks/ferrum_linux_tta_ab/gamg-native-channel-206f7ee-p1e-5-u1e-2-proof-v2`.
+Each contains 26 raw reports bound by the exact worker proof. The result archive
+SHA-256 values are `455baf4e236cc3f9b031d5527c58d69b31891bbc22303810c8294d1967bfe9ef`
+and `52f032742844d8c5ba43f216ce66dd963c7de11368e9694ab74a52833accb0ac`.
+
 ## External Accuracy Check
 
 Analytic and OpenFOAM processing remained outside the solver and its cases.

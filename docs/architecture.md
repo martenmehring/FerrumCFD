@@ -493,9 +493,10 @@ explicit `algebraicPair` or mesh-geometric `faceAreaPair`. The latter derives
 its initial weights from runtime face-area vectors and sums weights while
 coarsening. One hierarchy is retained per pressure topology; matrix values are
 refreshed for each pressure equation. Case-level `tolerance` and `relTol`
-retain OpenFOAM's normalized LDU L1-residual meaning: the GAMG core receives a
-conservative absolute L2 limit, and the reporting layer checks the strict L1
-criteria before it marks the linear solve converged. GAMG remains invalid for the
+retain OpenFOAM's normalized LDU L1-residual meaning. The GAMG core receives
+independent conservative L2 controls derived from the absolute and relative
+normalized-L1 limits, while the strict normalized-L1 post-check and reporting
+remain authoritative. GAMG remains invalid for the
 nonsymmetric momentum equation, and unsupported controls fail without
 substituting PCG or another agglomerator.
 
@@ -554,6 +555,7 @@ entries are the default source for pressure and velocity under-relaxation and
 for per-equation linear
 tolerances: `relaxationFactors.equations.U`,
 `relaxationFactors.fields.p`, `solvers.U.tolerance`, `solvers.p.tolerance`,
+`solvers.U.relTol`, `solvers.p.relTol`,
 `solvers.p.solver PCG`, `solvers.p.preconditioner DIC`,
 `SIMPLE.nNonOrthogonalCorrectors`, `SIMPLE.pRefCell`, `SIMPLE.pRefValue`, and
 `SIMPLE.consistent`, and optional `maxIter` values. OpenFOAM-style
@@ -563,7 +565,9 @@ criterion is one absolute scalar. Ferrum evaluates the initial residual from
 the first equation solve in the SIMPLE iteration; `U` uses the maximum vector
 component and `p` uses the first pressure solve before any further
 non-orthogonal corrector solves. Linear-solver initial/final residuals,
-iteration counts, and convergence flags remain a separate reporting layer.
+iteration counts, convergence flags, effective targets, and stop reasons remain
+a separate reporting layer, with complete telemetry for every momentum
+component and pressure-correction solve.
 Continuity is diagnostic and is not an extra hidden convergence gate.
 Ferrum-specific SIMPLE entries can additionally set `minSimpleIterations`.
 Only OpenFOAM-style residual controls can mark the generic solver converged.
@@ -595,10 +599,14 @@ error, not a fallback. CLI flags remain explicit experiment overrides. Solver
 execution also requires `system/fvSchemes` and
 `system/fvSolution` instead of inventing a missing case configuration.
 Absent `tolerance` and `maxIter` entries use the OpenFOAM 13
-`lduMatrix::solver` defaults (`1e-6` and `1000`). Ferrum currently supports the
-OpenFOAM defaults `relTol=0`, `minIter=0`, and `smoothSolver nSweeps=1`; a
-different configured value is rejected explicitly until its stopping semantics
-are implemented.
+`lduMatrix::solver` defaults (`1e-6` and `1000`). All current scalar linear
+solvers accept a finite, non-negative `relTol` and use the strict normalized-L1
+target `max(tolerance, relTol * initialNormalizedResidual)`. Non-GAMG solvers
+activate the relative criterion only above OpenFOAM's `SMALL` boundary
+(`1e-15`); the established GAMG compatibility contract uses every positive
+`relTol`. This is a static user control whose effective target is recomputed
+per solve, not an autonomous adaptive controller. A non-zero `minIter` outside
+GAMG and `smoothSolver nSweeps` other than `1` remain explicitly unsupported.
 The pressure bridge now follows the OpenFOAM shape more closely: it applies
 equation relaxation through an internal momentum-equation object, builds
 cell-wise `rAU` from the original momentum diagonal, exposes per-component
