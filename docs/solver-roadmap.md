@@ -1207,6 +1207,26 @@ The immediate sequence is:
     no speedup or publication claim is made. The 546-entry evidence manifest
     SHA256 is
     `31a155c59a2b70700cfe2c498439090eefb6cbb7e63b1608a20f992e5807c86a`.
+    A subsequent same-binary Native Linux CPU2 hierarchy leaf changed only
+    `nPostSweeps 2 -> 1` in external copies of the frozen FCG Pipe and Channel
+    cases. The initial unprofiled/profiled `0+2` smoke passed every numerical
+    and structural gate. Weighted sparse work fell by `6.88%` for Pipe and
+    `5.26%` for Channel, while V-cycles rose by `4.03%` and `6.20%`, remaining
+    below the predeclared work break-even limits. All linear solves completed,
+    final continuity stayed below `3e-17`, and final velocity, gauge-pressure,
+    boundaries, hierarchy, and all options except `nPostSweeps` remained within
+    the frozen contract.
+
+    The strict same-binary `2+10` decision run did not establish a robust
+    two-case time win. Pipe's raw and paired pressure medians improved by
+    `0.88%` and `3.22%`, but only `6/10` pairs won and the paired improvement
+    `0.03224` was below `2 * MAD = 0.22043`. Channel's raw median improved by
+    `4.23%`, while its paired median regressed by `0.45%`; only `5/10` pairs
+    won and the order cohorts disagreed (`+0.96%` versus `-13.96%`). The leaf
+    is therefore rejected as a generic default. No converged or
+    time-to-accuracy runs followed, no source default changed, and no speedup
+    is claimed. The 1,575-entry evidence manifest SHA256 is
+    `ca7700052f30a37b24448f19a27a38065ce9f41949eda488ceeaa44f8dd638b0`.
 14. **F-PERF-GAMG-FCG (accepted opt-in scalar path; default unchanged):** The
     existing GAMG V-cycle is now available as the explicit preconditioner for
     an `outerSolver FCG` pressure path. Seven focused proofs cover the real
