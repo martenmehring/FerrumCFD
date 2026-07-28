@@ -7704,7 +7704,8 @@ mod tests {
 
     #[test]
     fn runs_minimal_simple_pressure_correction_with_face_area_gamg() {
-        let mut runtime = two_cell_runtime();
+        let mut plain_runtime = two_cell_runtime();
+        let mut profiled_runtime = two_cell_runtime();
         let fields = two_cell_fields();
         let mut options = minimal_laminar_options();
         options.pressure_linear_solver = LaminarSimpleLinearSolver::Gamg;
@@ -7713,13 +7714,17 @@ mod tests {
             tolerance: options.pressure_linear_tolerance,
             n_cells_in_coarsest_level: 1,
             agglomerator: GamgAgglomerator::FaceAreaPair,
-            direct_solve_coarsest: true,
+            n_pre_sweeps: 1,
+            interpolate_correction: true,
+            direct_solve_coarsest: false,
             ..GamgOptions::default()
         });
-        options.profile_gamg = true;
+        let plain = solve_laminar_simple(&mut plain_runtime, &fields, &options)
+            .expect("plain faceAreaPair interpolation SIMPLE report");
 
-        let report = solve_laminar_simple(&mut runtime, &fields, &options)
-            .expect("faceAreaPair GAMG SIMPLE report");
+        options.profile_gamg = true;
+        let report = solve_laminar_simple(&mut profiled_runtime, &fields, &options)
+            .expect("profiled faceAreaPair interpolation SIMPLE report");
 
         assert!(report.simple_iterations > 0);
         assert!(report.total_pressure_linear_iterations > 0);
@@ -7742,6 +7747,23 @@ mod tests {
         );
         assert_eq!(profile.v_cycles, report.total_pressure_linear_iterations);
         assert_eq!(profile.hierarchy_builds, 1);
+        assert_eq!(plain.simple_iterations, report.simple_iterations);
+        assert_eq!(plain.stop_reason, report.stop_reason);
+        assert_eq!(
+            plain.total_pressure_linear_iterations,
+            report.total_pressure_linear_iterations
+        );
+        for (plain, profiled) in plain.final_pressure.iter().zip(&report.final_pressure) {
+            assert_eq!(plain.to_bits(), profiled.to_bits());
+        }
+        for (plain, profiled) in plain.final_velocity.iter().zip(&report.final_velocity) {
+            assert_eq!(plain.x.to_bits(), profiled.x.to_bits());
+            assert_eq!(plain.y.to_bits(), profiled.y.to_bits());
+            assert_eq!(plain.z.to_bits(), profiled.z.to_bits());
+        }
+        for (plain, profiled) in plain.final_phi.iter().zip(&report.final_phi) {
+            assert_eq!(plain.to_bits(), profiled.to_bits());
+        }
     }
 
     #[test]

@@ -372,6 +372,12 @@ struct GamgTransfer {
     fine_entry_to_coarse_entry: Vec<usize>,
 }
 
+struct GamgInterpolationScratch<'a> {
+    fine: &'a mut [f64],
+    coarse_correction: &'a mut [f64],
+    coarse_diagonal: &'a mut [f64],
+}
+
 impl GamgTransfer {
     fn restrict_sum(&self, fine: &[f64], coarse: &mut [f64]) -> Result<()> {
         if fine.len() != self.fine_to_coarse.len() {
@@ -410,6 +416,133 @@ impl GamgTransfer {
                 ))
             })?;
         }
+        Ok(())
+    }
+
+    fn interpolate_correction(
+        &self,
+        matrix: &CsrMatrix,
+        diagonal_values: &[f64],
+        coarse: &[f64],
+        fine: &mut [f64],
+        scratch: GamgInterpolationScratch<'_>,
+    ) -> Result<()> {
+        let GamgInterpolationScratch {
+            fine: fine_scratch,
+            coarse_correction: coarse_correction_scratch,
+            coarse_diagonal: coarse_diagonal_scratch,
+        } = scratch;
+        let rows = matrix.rows();
+        if fine.len() != rows
+            || fine_scratch.len() != rows
+            || diagonal_values.len() != rows
+            || self.fine_to_coarse.len() != rows
+        {
+            return Err(invalid_input(format!(
+                "GAMG correction interpolation fine shape mismatch: matrix={rows} mapping={} diagonal={} correction={} scratch={}",
+                self.fine_to_coarse.len(),
+                diagonal_values.len(),
+                fine.len(),
+                fine_scratch.len()
+            )));
+        }
+        if coarse_correction_scratch.len() != coarse.len()
+            || coarse_diagonal_scratch.len() != coarse.len()
+        {
+            return Err(invalid_input(format!(
+                "GAMG correction interpolation coarse shape mismatch: correction={} correctionScratch={} diagonalScratch={}",
+                coarse.len(),
+                coarse_correction_scratch.len(),
+                coarse_diagonal_scratch.len()
+            )));
+        }
+        for (row, &coarse_index) in self.fine_to_coarse.iter().enumerate() {
+            if coarse_index >= coarse.len() {
+                return Err(invalid_input(format!(
+                    "GAMG correction interpolation coarse index {coarse_index} for fine row {row} is out of range {}",
+                    coarse.len()
+                )));
+            }
+        }
+
+        // Match the Foundation GAMG interpolation order: form the complete
+        // off-diagonal product from the injected field before replacing any
+        // fine value with its diagonal interpolation.
+        for row in 0..rows {
+            let mut off_diagonal = 0.0;
+            for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                let column = matrix.col_indices()[entry];
+                if column != row {
+                    off_diagonal += matrix.values()[entry] * fine[column];
+                }
+            }
+            if !off_diagonal.is_finite() {
+                return Err(invalid_input(format!(
+                    "GAMG correction interpolation off-diagonal product at row {row} is not finite"
+                )));
+            }
+            let diagonal = diagonal_values[row];
+            if !diagonal.is_finite() || diagonal == 0.0 {
+                return Err(invalid_input(format!(
+                    "GAMG correction interpolation diagonal at row {row} is invalid: {diagonal}"
+                )));
+            }
+            let interpolated = -off_diagonal / diagonal;
+            if !interpolated.is_finite() {
+                return Err(invalid_input(format!(
+                    "GAMG correction interpolation value at row {row} is not finite"
+                )));
+            }
+            fine_scratch[row] = interpolated;
+        }
+
+        coarse_correction_scratch.fill(0.0);
+        coarse_diagonal_scratch.fill(0.0);
+        for row in 0..rows {
+            let coarse_index = self.fine_to_coarse[row];
+            let diagonal = diagonal_values[row];
+            let weighted = diagonal * fine_scratch[row];
+            if !weighted.is_finite() {
+                return Err(invalid_input(format!(
+                    "GAMG correction interpolation weighted value at row {row} is not finite"
+                )));
+            }
+            coarse_correction_scratch[coarse_index] += weighted;
+            coarse_diagonal_scratch[coarse_index] += diagonal;
+            if !coarse_correction_scratch[coarse_index].is_finite()
+                || !coarse_diagonal_scratch[coarse_index].is_finite()
+            {
+                return Err(invalid_input(format!(
+                    "GAMG correction interpolation aggregate {coarse_index} is not finite"
+                )));
+            }
+        }
+        for coarse_index in 0..coarse.len() {
+            let diagonal = coarse_diagonal_scratch[coarse_index];
+            if !diagonal.is_finite() || diagonal == 0.0 {
+                return Err(invalid_input(format!(
+                    "GAMG correction interpolation aggregate diagonal {coarse_index} is invalid: {diagonal}"
+                )));
+            }
+            let correction =
+                coarse[coarse_index] - coarse_correction_scratch[coarse_index] / diagonal;
+            if !correction.is_finite() {
+                return Err(invalid_input(format!(
+                    "GAMG correction interpolation aggregate correction {coarse_index} is not finite"
+                )));
+            }
+            coarse_correction_scratch[coarse_index] = correction;
+        }
+        for row in 0..rows {
+            let corrected = fine_scratch[row] + coarse_correction_scratch[self.fine_to_coarse[row]];
+            if !corrected.is_finite() {
+                return Err(invalid_input(format!(
+                    "GAMG correction interpolation corrected value at row {row} is not finite"
+                )));
+            }
+            fine_scratch[row] = corrected;
+        }
+        fine.copy_from_slice(fine_scratch);
         Ok(())
     }
 
@@ -493,12 +626,6 @@ impl GamgWorkspace {
                 "GAMG mergeLevels={} is not implemented by the matrix foundation; no level-combination fallback was applied",
                 options.merge_levels
             )));
-        }
-        if options.interpolate_correction {
-            return Err(invalid_input(
-                "GAMG interpolateCorrection=true is not implemented by the matrix foundation; no injection fallback was applied"
-                    .to_string(),
-            ));
         }
         Self::build_validated(matrix, options, agglomeration_source)
     }
@@ -1109,11 +1236,28 @@ impl GamgWorkspace {
             let (fine_corrections, coarse_corrections) = self.corrections.split_at_mut(level + 1);
             self.transfers[level]
                 .prolong_injection(&coarse_corrections[0], &mut fine_corrections[level])?;
+            if self.options.interpolate_correction {
+                let (fine_products, coarse_products) = self.products.split_at_mut(level + 1);
+                let (_, coarse_residuals) = self.residuals.split_at_mut(level + 1);
+                self.transfers[level].interpolate_correction(
+                    &self.matrices[level],
+                    &self.diagonal_values[level],
+                    &coarse_corrections[0],
+                    &mut fine_corrections[level],
+                    GamgInterpolationScratch {
+                        fine: &mut fine_products[level],
+                        coarse_correction: &mut coarse_residuals[0],
+                        coarse_diagonal: &mut coarse_products[0],
+                    },
+                )?;
+            }
             if PROFILE {
                 timing.levels[level].prolongation_seconds += profile_elapsed(prolongation_started);
                 timing.levels[level].prolongation_calls += 1;
             }
-            if self.options.scale_correction && level < coarsest - 1 {
+            if self.options.scale_correction
+                && (self.options.interpolate_correction || level < coarsest - 1)
+            {
                 let scaling_started = profile_started::<PROFILE>();
                 scale_correction(
                     &self.matrices[level],
@@ -1166,6 +1310,21 @@ impl GamgWorkspace {
         let prolongation_started = profile_started::<PROFILE>();
         let (finest_correction, coarse_corrections) = self.corrections.split_at_mut(1);
         self.transfers[0].prolong_injection(&coarse_corrections[0], &mut finest_correction[0])?;
+        if self.options.interpolate_correction {
+            let (finest_products, coarse_products) = self.products.split_at_mut(1);
+            let (_, coarse_residuals) = self.residuals.split_at_mut(1);
+            self.transfers[0].interpolate_correction(
+                &self.matrices[0],
+                &self.diagonal_values[0],
+                &coarse_corrections[0],
+                &mut finest_correction[0],
+                GamgInterpolationScratch {
+                    fine: &mut finest_products[0],
+                    coarse_correction: &mut coarse_residuals[0],
+                    coarse_diagonal: &mut coarse_products[0],
+                },
+            )?;
+        }
         if PROFILE {
             timing.levels[0].prolongation_seconds += profile_elapsed(prolongation_started);
             timing.levels[0].prolongation_calls += 1;
@@ -2060,10 +2219,10 @@ fn checked_dense_storage_len(n: usize) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        GamgAgglomerator, GamgFacePairWeight, GamgKernelTiming, GamgOptions, GamgSmoother,
-        GamgWorkspace, MAX_DENSE_COARSEST_CELLS, NormalizedL1GamgSolveControls, PairEdge,
-        algebraic_pair_map, checked_dense_storage_len, dense_lu_solve, gamg_solve,
-        pair_map_from_edges,
+        GamgAgglomerator, GamgFacePairWeight, GamgInterpolationScratch, GamgKernelTiming,
+        GamgOptions, GamgSmoother, GamgSolveControls, GamgTransfer, GamgWorkspace,
+        MAX_DENSE_COARSEST_CELLS, NormalizedL1GamgSolveControls, PairEdge, algebraic_pair_map,
+        checked_dense_storage_len, dense_lu_solve, gamg_solve, pair_map_from_edges,
     };
     use crate::linear::{
         CgPreconditioner, CsrMatrix, PreconditionedConjugateGradientOptions,
@@ -2089,6 +2248,658 @@ mod tests {
         assert!(!options.direct_solve_coarsest);
         assert_eq!(options.agglomerator, GamgAgglomerator::AlgebraicPair);
         assert_eq!(options.smoother, GamgSmoother::GaussSeidel);
+    }
+
+    #[test]
+    fn interpolate_correction_matches_foundation_13_ldu_face_order_oracle_and_coarse_means() {
+        let order_sentinel = f64::EPSILON / 2.0;
+        let matrix = CsrMatrix::from_rows(
+            vec![
+                vec![(0, 4.0), (1, 1.0), (2, order_sentinel), (3, -1.0)],
+                vec![(0, 1.0), (1, 5.0)],
+                vec![(0, order_sentinel), (2, 3.0)],
+                vec![(0, -1.0), (3, 6.0)],
+            ],
+            4,
+        )
+        .expect("interpolation oracle matrix");
+        let transfer = GamgTransfer {
+            fine_to_coarse: vec![0, 0, 1, 1],
+            fine_entry_to_coarse_entry: Vec::new(),
+        };
+        let diagonal = [4.0, 5.0, 3.0, 6.0];
+        let coarse = [1.0, 1.0];
+        let mut fine = [1.0; 4];
+        let original = fine;
+        let mut fine_scratch = [0.0; 4];
+        let mut coarse_correction_scratch = [0.0; 2];
+        let mut coarse_diagonal_scratch = [0.0; 2];
+
+        transfer
+            .interpolate_correction(
+                &matrix,
+                &diagonal,
+                &coarse,
+                &mut fine,
+                GamgInterpolationScratch {
+                    fine: &mut fine_scratch,
+                    coarse_correction: &mut coarse_correction_scratch,
+                    coarse_diagonal: &mut coarse_diagonal_scratch,
+                },
+            )
+            .expect("Foundation interpolation");
+
+        // Independent Foundation-13 LDU-face-order oracle. This intentionally
+        // does not reuse the CSR row traversal from interpolate_correction.
+        let faces = [
+            (0_usize, 1_usize, 1.0),
+            (0, 2, order_sentinel),
+            (0, 3, -1.0),
+        ];
+        let mut off_diagonal = [0.0; 4];
+        for (lower, upper, coefficient) in faces {
+            off_diagonal[lower] += coefficient * original[upper];
+            off_diagonal[upper] += coefficient * original[lower];
+        }
+        let mut reordered_off_diagonal = [0.0; 4];
+        for (lower, upper, coefficient) in [faces[0], faces[2], faces[1]] {
+            reordered_off_diagonal[lower] += coefficient * original[upper];
+            reordered_off_diagonal[upper] += coefficient * original[lower];
+        }
+        assert_eq!(off_diagonal[0].to_bits(), 0.0_f64.to_bits());
+        assert_eq!(
+            reordered_off_diagonal[0].to_bits(),
+            order_sentinel.to_bits()
+        );
+        let mut expected = [0.0; 4];
+        for row in 0..4 {
+            expected[row] = -off_diagonal[row] / diagonal[row];
+        }
+        let mut weighted_sum = [0.0; 2];
+        let mut diagonal_sum = [0.0; 2];
+        for row in 0..4 {
+            let aggregate = transfer.fine_to_coarse[row];
+            weighted_sum[aggregate] += diagonal[row] * expected[row];
+            diagonal_sum[aggregate] += diagonal[row];
+        }
+        for aggregate in 0..2 {
+            weighted_sum[aggregate] =
+                coarse[aggregate] - weighted_sum[aggregate] / diagonal_sum[aggregate];
+        }
+        for row in 0..4 {
+            expected[row] += weighted_sum[transfer.fine_to_coarse[row]];
+        }
+
+        let sealed_foundation_bits = [
+            0x3ff1_c71c_71c7_1c72,
+            0x3fed_27d2_7d27_d27e,
+            0x3fec_71c7_1c71_c71c,
+            0x3ff0_e38e_38e3_8e39,
+        ];
+        for ((actual, expected), sealed) in fine.iter().zip(expected).zip(sealed_foundation_bits) {
+            assert_eq!(actual.to_bits(), expected.to_bits());
+            assert_eq!(actual.to_bits(), sealed);
+        }
+        for (aggregate, coarse_value) in coarse.iter().enumerate() {
+            let mut weighted = 0.0;
+            let mut weight = 0.0;
+            for row in 0..4 {
+                if transfer.fine_to_coarse[row] == aggregate {
+                    weighted += diagonal[row] * fine[row];
+                    weight += diagonal[row];
+                }
+            }
+            assert!((weighted / weight - coarse_value).abs() <= 2.0 * f64::EPSILON);
+        }
+    }
+
+    #[test]
+    fn interpolate_correction_failures_do_not_write_the_fine_field() {
+        let matrix = CsrMatrix::from_rows(
+            vec![vec![(0, 1.0), (1, -1.0)], vec![(0, -1.0), (1, -1.0)]],
+            2,
+        )
+        .expect("zero aggregate diagonal matrix");
+        let transfer = GamgTransfer {
+            fine_to_coarse: vec![0, 0],
+            fine_entry_to_coarse_entry: Vec::new(),
+        };
+        let mut fine = [2.0, 2.0];
+        let before = fine;
+        let mut fine_scratch = [0.0; 2];
+        let mut coarse_correction_scratch = [0.0; 1];
+        let mut coarse_diagonal_scratch = [0.0; 1];
+        let error = transfer
+            .interpolate_correction(
+                &matrix,
+                &[1.0, -1.0],
+                &[0.5],
+                &mut fine,
+                GamgInterpolationScratch {
+                    fine: &mut fine_scratch,
+                    coarse_correction: &mut coarse_correction_scratch,
+                    coarse_diagonal: &mut coarse_diagonal_scratch,
+                },
+            )
+            .expect_err("zero aggregate diagonal must fail");
+        assert_eq!(
+            error.to_string(),
+            "GAMG correction interpolation aggregate diagonal 0 is invalid: 0"
+        );
+        assert_eq!(fine, before);
+        assert!(fine_scratch.iter().all(|value| value.is_finite()));
+        assert!(
+            coarse_correction_scratch
+                .iter()
+                .all(|value| value.is_finite())
+        );
+        assert!(
+            coarse_diagonal_scratch
+                .iter()
+                .all(|value| value.is_finite())
+        );
+
+        let mut short_scratch = [0.0; 1];
+        let shape_error = transfer
+            .interpolate_correction(
+                &matrix,
+                &[1.0, -1.0],
+                &[0.5],
+                &mut fine,
+                GamgInterpolationScratch {
+                    fine: &mut short_scratch,
+                    coarse_correction: &mut coarse_correction_scratch,
+                    coarse_diagonal: &mut coarse_diagonal_scratch,
+                },
+            )
+            .expect_err("short scratch must fail");
+        assert_eq!(
+            shape_error.to_string(),
+            "GAMG correction interpolation fine shape mismatch: matrix=2 mapping=2 diagonal=2 correction=2 scratch=1"
+        );
+        assert_eq!(fine, before);
+
+        let bad_mapping = GamgTransfer {
+            fine_to_coarse: vec![0, 1],
+            fine_entry_to_coarse_entry: Vec::new(),
+        };
+        let mapping_error = bad_mapping
+            .interpolate_correction(
+                &matrix,
+                &[1.0, -1.0],
+                &[0.5],
+                &mut fine,
+                GamgInterpolationScratch {
+                    fine: &mut fine_scratch,
+                    coarse_correction: &mut coarse_correction_scratch,
+                    coarse_diagonal: &mut coarse_diagonal_scratch,
+                },
+            )
+            .expect_err("out-of-range aggregate must fail");
+        assert_eq!(
+            mapping_error.to_string(),
+            "GAMG correction interpolation coarse index 1 for fine row 1 is out of range 1"
+        );
+        assert_eq!(fine, before);
+
+        let mut long_coarse_scratch = [0.0; 2];
+        let coarse_shape_error = transfer
+            .interpolate_correction(
+                &matrix,
+                &[1.0, -1.0],
+                &[0.5],
+                &mut fine,
+                GamgInterpolationScratch {
+                    fine: &mut fine_scratch,
+                    coarse_correction: &mut long_coarse_scratch,
+                    coarse_diagonal: &mut coarse_diagonal_scratch,
+                },
+            )
+            .expect_err("coarse scratch mismatch must fail");
+        assert_eq!(
+            coarse_shape_error.to_string(),
+            "GAMG correction interpolation coarse shape mismatch: correction=1 correctionScratch=2 diagonalScratch=1"
+        );
+        assert_eq!(fine, before);
+
+        let overflow_matrix =
+            CsrMatrix::from_rows(vec![vec![(0, 1.0), (1, 0.5)], vec![(0, 0.5), (1, 1.0)]], 2)
+                .expect("late correction overflow matrix");
+        let mut overflow_fine = [f64::MAX, f64::MAX];
+        let overflow_before = overflow_fine;
+        let late_error = transfer
+            .interpolate_correction(
+                &overflow_matrix,
+                &[1.0, 1.0],
+                &[f64::MAX],
+                &mut overflow_fine,
+                GamgInterpolationScratch {
+                    fine: &mut fine_scratch,
+                    coarse_correction: &mut coarse_correction_scratch,
+                    coarse_diagonal: &mut coarse_diagonal_scratch,
+                },
+            )
+            .expect_err("late aggregate correction overflow must fail");
+        assert_eq!(
+            late_error.to_string(),
+            "GAMG correction interpolation aggregate correction 0 is not finite"
+        );
+        assert_eq!(overflow_fine, overflow_before);
+    }
+
+    #[test]
+    fn interpolate_correction_failed_solve_is_externally_atomic_and_retry_safe() {
+        let invalid = CsrMatrix::from_rows(
+            vec![vec![(0, 1.0), (1, -0.125)], vec![(0, -0.125), (1, -1.0)]],
+            2,
+        )
+        .expect("interpolation failure matrix");
+        let valid = CsrMatrix::from_rows(
+            vec![vec![(0, 2.0), (1, -0.125)], vec![(0, -0.125), (1, 2.0)]],
+            2,
+        )
+        .expect("interpolation retry matrix");
+        let rhs = [1.0, -0.5];
+        let initial = [0.25, -0.125];
+        let initial_before = initial;
+        let options = GamgOptions {
+            max_iterations: 1,
+            min_iterations: 1,
+            tolerance: 0.0,
+            relative_tolerance: 0.0,
+            n_cells_in_coarsest_level: 1,
+            interpolate_correction: true,
+            direct_solve_coarsest: true,
+            ..GamgOptions::default()
+        };
+        let controls: GamgSolveControls = options.into();
+        let mut workspace = GamgWorkspace::new(&invalid, options).expect("failure-path workspace");
+
+        let error = workspace
+            .solve_with_controls(&invalid, &rhs, Some(&initial), controls)
+            .expect_err("zero fine-level aggregate diagonal must fail");
+        assert_eq!(
+            error.to_string(),
+            "GAMG correction interpolation aggregate diagonal 0 is invalid: 0"
+        );
+        assert_eq!(initial, initial_before);
+        assert!(!workspace.has_solved);
+
+        let retried = workspace
+            .solve_with_controls(&valid, &rhs, Some(&initial), controls)
+            .expect("failed workspace must remain retry-safe");
+        let mut fresh = GamgWorkspace::new(&valid, options).expect("fresh retry workspace");
+        let expected = fresh
+            .solve_with_controls(&valid, &rhs, Some(&initial), controls)
+            .expect("fresh retry solve");
+        assert_eq!(retried.iterations, expected.iterations);
+        assert_eq!(retried.converged, expected.converged);
+        assert_eq!(retried.termination, expected.termination);
+        assert_eq!(
+            retried.residual_norm.to_bits(),
+            expected.residual_norm.to_bits()
+        );
+        for (actual, expected) in retried.solution.iter().zip(expected.solution) {
+            assert_eq!(actual.to_bits(), expected.to_bits());
+        }
+    }
+
+    #[test]
+    fn interpolate_correction_true_preserves_plain_profiled_and_agglomerator_routes() {
+        let matrix = poisson_grid(4, 4, 1.0);
+        let rhs = (0..matrix.rows())
+            .map(|row| 1.0 + row as f64 * 0.03125)
+            .collect::<Vec<_>>();
+        let options = GamgOptions {
+            max_iterations: 2,
+            min_iterations: 2,
+            tolerance: 0.0,
+            relative_tolerance: 0.0,
+            n_cells_in_coarsest_level: 2,
+            n_pre_sweeps: 1,
+            interpolate_correction: true,
+            direct_solve_coarsest: false,
+            ..GamgOptions::default()
+        };
+        let controls = GamgSolveControls {
+            max_iterations: 2,
+            min_iterations: 2,
+            tolerance: 0.0,
+            relative_tolerance: 0.0,
+        };
+
+        let mut plain_workspace =
+            GamgWorkspace::new(&matrix, options).expect("plain interpolation workspace");
+        let plain = plain_workspace
+            .solve_with_controls(&matrix, &rhs, None, controls)
+            .expect("plain interpolation solve");
+        let mut profiled_workspace =
+            GamgWorkspace::new(&matrix, options).expect("profiled interpolation workspace");
+        let profiled = profiled_workspace
+            .solve_with_controls_profiled(&matrix, &rhs, None, controls)
+            .expect("profiled interpolation solve");
+        assert_eq!(plain.iterations, 2);
+        assert_eq!(profiled.report.iterations, 2);
+        assert_eq!(plain.converged, profiled.report.converged);
+        assert_eq!(plain.termination, profiled.report.termination);
+        assert_eq!(
+            plain.residual_norm.to_bits(),
+            profiled.report.residual_norm.to_bits()
+        );
+        for (plain, profiled) in plain.solution.iter().zip(&profiled.report.solution) {
+            assert_eq!(plain.to_bits(), profiled.to_bits());
+        }
+        assert_eq!(profiled.timing.v_cycles, 2);
+        assert_eq!(profiled.timing.solves, 1);
+        let coarsest = profiled_workspace.level_count() - 1;
+        for (level, timing) in profiled.timing.levels.iter().enumerate() {
+            assert_eq!(
+                timing.prolongation_calls,
+                if level < coarsest { 2 } else { 0 }
+            );
+        }
+        assert!(
+            profiled_workspace.pre_smoothed[1..coarsest]
+                .iter()
+                .flatten()
+                .any(|value| *value != 0.0)
+        );
+        assert_eq!(profiled.timing.levels[1].smoothing_calls, 4);
+        assert_eq!(profiled.timing.levels[1].smoothing_sweeps, 6);
+
+        let normalized = NormalizedL1GamgSolveControls {
+            normalization_factor: 1.0,
+            tolerance: 0.0,
+            relative_tolerance: 0.0,
+            l2_controls: controls,
+        };
+        let mut normalized_plain_workspace =
+            GamgWorkspace::new(&matrix, options).expect("normalized plain workspace");
+        let normalized_plain = normalized_plain_workspace
+            .solve_normalized_l1_with_controls(&matrix, &rhs, None, normalized)
+            .expect("normalized plain interpolation solve");
+        let mut normalized_profiled_workspace =
+            GamgWorkspace::new(&matrix, options).expect("normalized profiled workspace");
+        let normalized_profiled = normalized_profiled_workspace
+            .solve_normalized_l1_with_controls_profiled(&matrix, &rhs, None, normalized)
+            .expect("normalized profiled interpolation solve");
+        assert_eq!(normalized_plain.iterations, 2);
+        assert_eq!(normalized_profiled.report.iterations, 2);
+        assert_eq!(
+            normalized_plain.residual_norm.to_bits(),
+            normalized_profiled.report.residual_norm.to_bits()
+        );
+        for (plain, profiled) in normalized_plain
+            .solution
+            .iter()
+            .zip(&normalized_profiled.report.solution)
+        {
+            assert_eq!(plain.to_bits(), profiled.to_bits());
+        }
+        assert_eq!(normalized_profiled.timing.v_cycles, 2);
+        for (level, timing) in normalized_profiled.timing.levels.iter().enumerate() {
+            assert_eq!(
+                timing.prolongation_calls,
+                if level < coarsest { 2 } else { 0 }
+            );
+        }
+
+        let face_options = GamgOptions {
+            agglomerator: GamgAgglomerator::FaceAreaPair,
+            max_iterations: 1,
+            min_iterations: 1,
+            ..options
+        };
+        let mut face_workspace = GamgWorkspace::new_with_face_area_weights(
+            &matrix,
+            face_options,
+            &grid_face_weights(4, 4),
+        )
+        .expect("face-area interpolation workspace");
+        let face_report = face_workspace
+            .solve(&matrix, &rhs, None)
+            .expect("face-area interpolation solve");
+        assert_eq!(face_report.iterations, 1);
+        assert!(face_report.solution.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn interpolate_correction_entrypoints_have_sealed_one_cycle_sentinels() {
+        let matrix = poisson_grid(4, 4, 1.0);
+        let rhs = (0..matrix.rows())
+            .map(|row| 1.0 + row as f64 * 0.03125)
+            .collect::<Vec<_>>();
+        let true_options = GamgOptions {
+            max_iterations: 1,
+            min_iterations: 1,
+            tolerance: 0.0,
+            relative_tolerance: 0.0,
+            n_cells_in_coarsest_level: 2,
+            n_pre_sweeps: 1,
+            interpolate_correction: true,
+            direct_solve_coarsest: false,
+            ..GamgOptions::default()
+        };
+        let false_options = GamgOptions {
+            interpolate_correction: false,
+            ..true_options
+        };
+        let controls: GamgSolveControls = true_options.into();
+        let normalized = NormalizedL1GamgSolveControls {
+            normalization_factor: 1.0,
+            tolerance: 0.0,
+            relative_tolerance: 0.0,
+            l2_controls: controls,
+        };
+
+        let mut true_l2_workspace =
+            GamgWorkspace::new(&matrix, true_options).expect("true L2 sentinel workspace");
+        let true_l2 = true_l2_workspace
+            .solve_with_controls(&matrix, &rhs, None, controls)
+            .expect("true L2 sentinel");
+        let mut true_l1_workspace =
+            GamgWorkspace::new(&matrix, true_options).expect("true L1 sentinel workspace");
+        let true_l1 = true_l1_workspace
+            .solve_normalized_l1_with_controls(&matrix, &rhs, None, normalized)
+            .expect("true normalized-L1 sentinel");
+        let mut false_l2_workspace =
+            GamgWorkspace::new(&matrix, false_options).expect("false L2 sentinel workspace");
+        let false_l2 = false_l2_workspace
+            .solve_with_controls(&matrix, &rhs, None, controls)
+            .expect("false L2 sentinel");
+        let mut false_l1_workspace =
+            GamgWorkspace::new(&matrix, false_options).expect("false L1 sentinel workspace");
+        let false_l1 = false_l1_workspace
+            .solve_normalized_l1_with_controls(&matrix, &rhs, None, normalized)
+            .expect("false normalized-L1 sentinel");
+
+        let true_solution_bits = [
+            0x3fed_65c3_64a4_ed0c,
+            0x3ff4_ffcb_6f65_2de2,
+            0x3ff5_3eaa_ab73_5ff8,
+            0x3fee_aac9_af10_98b4,
+            0x3ff5_e5ca_324e_c053,
+            0x3fff_a791_ad90_f3e2,
+            0x4000_0834_913f_7538,
+            0x3ff6_b883_80c0_e5e9,
+            0x3ff7_3848_3e91_daec,
+            0x4000_b82a_2e4f_89a9,
+            0x4000_eb58_2ccd_e933,
+            0x3ff8_096d_350c_42d2,
+            0x3ff1_7550_11a8_753d,
+            0x3ff8_90da_1327_1ce4,
+            0x3ff8_df82_d9a5_d090,
+            0x3ff2_1a3c_03ac_84d8,
+        ];
+        let false_solution_bits = [
+            0x3feb_c563_3c8a_b6e4,
+            0x3ff3_cb12_87a8_b142,
+            0x3ff4_5986_8679_2184,
+            0x3fed_ca7a_9e49_9b93,
+            0x3ff4_d8d2_b729_8c92,
+            0x3ffe_4f65_290f_b100,
+            0x3fff_07aa_f463_a1d7,
+            0x3ff6_3cc6_1dcf_394f,
+            0x3ff6_8502_494b_a76a,
+            0x4000_4797_e759_b324,
+            0x4000_93fc_2283_62ca,
+            0x3ff7_b1bf_fdc5_c09c,
+            0x3ff1_2cc2_2974_923a,
+            0x3ff8_2fb2_055d_e446,
+            0x3ff8_8e7a_f7a9_6b5a,
+            0x3ff1_f00e_bd5b_cafe,
+        ];
+        for ((true_l2, true_l1), expected) in true_l2
+            .solution
+            .iter()
+            .zip(&true_l1.solution)
+            .zip(true_solution_bits)
+        {
+            assert_eq!(true_l2.to_bits(), expected);
+            assert_eq!(true_l1.to_bits(), expected);
+        }
+        for ((false_l2, false_l1), expected) in false_l2
+            .solution
+            .iter()
+            .zip(&false_l1.solution)
+            .zip(false_solution_bits)
+        {
+            assert_eq!(false_l2.to_bits(), expected);
+            assert_eq!(false_l1.to_bits(), expected);
+        }
+        assert_eq!(true_l2.residual_norm.to_bits(), 0x3fa2_e97e_52b5_abb0);
+        assert_eq!(true_l1.residual_norm.to_bits(), 0x3fa2_e97e_52b5_abb0);
+        assert_eq!(false_l2.residual_norm.to_bits(), 0x3fcb_cf71_dd54_76ae);
+        assert_eq!(false_l1.residual_norm.to_bits(), 0x3fcb_cf71_dd54_76ae);
+        assert_ne!(true_solution_bits, false_solution_bits);
+    }
+
+    #[test]
+    fn interpolate_correction_scales_coarsest_child_and_reuses_scratch() {
+        let matrix = poisson_grid(8, 8, 1.0);
+        let rhs = vec![1.0; matrix.rows()];
+        let options = GamgOptions {
+            max_iterations: 1,
+            min_iterations: 1,
+            tolerance: 0.0,
+            relative_tolerance: 0.0,
+            n_cells_in_coarsest_level: 2,
+            interpolate_correction: true,
+            scale_correction: true,
+            direct_solve_coarsest: true,
+            ..GamgOptions::default()
+        };
+        let controls: GamgSolveControls = options.into();
+        let mut workspace =
+            GamgWorkspace::new(&matrix, options).expect("interpolation lifecycle workspace");
+        assert!(workspace.level_count() >= 3);
+        let product_allocations = workspace
+            .products
+            .iter()
+            .map(|values| (values.as_ptr(), values.len(), values.capacity()))
+            .collect::<Vec<_>>();
+        let residual_allocations = workspace
+            .residuals
+            .iter()
+            .map(|values| (values.as_ptr(), values.len(), values.capacity()))
+            .collect::<Vec<_>>();
+
+        for lifecycle in 0..10 {
+            let scaled = poisson_grid(8, 8, 1.0 + lifecycle as f64 * 0.015625);
+            let report = workspace
+                .solve_with_controls(&scaled, &rhs, None, controls)
+                .expect("reused interpolation solve");
+            let mut fresh =
+                GamgWorkspace::new(&scaled, options).expect("fresh interpolation workspace");
+            let expected = fresh
+                .solve_with_controls(&scaled, &rhs, None, controls)
+                .expect("fresh interpolation solve");
+            assert_eq!(report.iterations, expected.iterations);
+            assert_eq!(
+                report.residual_norm.to_bits(),
+                expected.residual_norm.to_bits()
+            );
+            for (actual, expected) in report.solution.iter().zip(expected.solution) {
+                assert_eq!(actual.to_bits(), expected.to_bits());
+            }
+            assert_eq!(
+                workspace
+                    .products
+                    .iter()
+                    .map(|values| (values.as_ptr(), values.len(), values.capacity()))
+                    .collect::<Vec<_>>(),
+                product_allocations
+            );
+            assert_eq!(
+                workspace
+                    .residuals
+                    .iter()
+                    .map(|values| (values.as_ptr(), values.len(), values.capacity()))
+                    .collect::<Vec<_>>(),
+                residual_allocations
+            );
+        }
+
+        let mut profiled_workspace =
+            GamgWorkspace::new(&matrix, options).expect("profiled scaling workspace");
+        let profiled = profiled_workspace
+            .solve_with_controls_profiled(&matrix, &rhs, None, controls)
+            .expect("profiled scaling solve");
+        let coarsest = profiled_workspace.level_count() - 1;
+        assert_eq!(profiled.timing.levels[coarsest - 1].scaling_calls, 1);
+
+        let injection_options = GamgOptions {
+            interpolate_correction: false,
+            ..options
+        };
+        let mut injection_workspace =
+            GamgWorkspace::new(&matrix, injection_options).expect("injection workspace");
+        let injection_profiled = injection_workspace
+            .solve_with_controls_profiled(&matrix, &rhs, None, injection_options.into())
+            .expect("profiled injection solve");
+        let injection_coarsest = injection_workspace.level_count() - 1;
+        assert_eq!(
+            injection_profiled.timing.levels[injection_coarsest - 1].scaling_calls,
+            0
+        );
+
+        let unscaled_options = GamgOptions {
+            scale_correction: false,
+            ..options
+        };
+        let mut unscaled_workspace =
+            GamgWorkspace::new(&matrix, unscaled_options).expect("unscaled workspace");
+        let unscaled_profiled = unscaled_workspace
+            .solve_with_controls_profiled(&matrix, &rhs, None, unscaled_options.into())
+            .expect("unscaled interpolation solve");
+        assert!(
+            unscaled_profiled
+                .timing
+                .levels
+                .iter()
+                .all(|level| level.scaling_calls == 0)
+        );
+
+        let rebuild_options = GamgOptions {
+            cache_agglomeration: false,
+            ..options
+        };
+        let mut rebuild_workspace =
+            GamgWorkspace::new(&matrix, rebuild_options).expect("rebuild workspace");
+        rebuild_workspace
+            .solve(&matrix, &rhs, None)
+            .expect("initial rebuild solve");
+        let rebuilt = rebuild_workspace
+            .solve_with_controls_profiled(&matrix, &rhs, None, rebuild_options.into())
+            .expect("second rebuild solve");
+        assert_eq!(rebuilt.timing.hierarchy_rebuilds, 1);
+        assert!(
+            rebuilt
+                .report
+                .solution
+                .iter()
+                .all(|value| value.is_finite())
+        );
     }
 
     #[test]
