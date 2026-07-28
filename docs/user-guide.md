@@ -700,6 +700,11 @@ overrides for experiments. It also reads `solvers.U.tolerance`,
 `solvers.p.solver PCG`, `solvers.p.preconditioner DIC`,
 `SIMPLE.nNonOrthogonalCorrectors`, `SIMPLE.pRefCell`, `SIMPLE.pRefValue`, and
 `SIMPLE.consistent`, and optional `maxIter` values from `system/fvSolution`.
+`SIMPLE.consistent true` is an explicit SIMPLEC choice, not an automatic
+performance default. The frozen Linux acceptance gate found a robust benefit
+for the current Plane Channel configuration but rejected the current Pipe
+configuration on accuracy and pressure-work limits; select it deliberately and
+validate the chosen case rather than assuming a universal speedup.
 For pressure PCG, OpenFOAM `DIC`/`FDIC` maps to Ferrum's CPU IC(0)
 incomplete-Cholesky preconditioner. `DILU` is rejected until a true
 nonsymmetric ILU/DILU preconditioner exists; no diagonal fallback is applied.
