@@ -725,7 +725,7 @@ tutorial matrix. The status column is the audited repository state on
 | 1 | `laminarPipe` | 3D internal flow and pressure loss | Runnable case, analytical checks, convergence profiles, and performance evidence present | Hagen-Poiseuille analytical solution |
 | 2 | `planeChannel` | true 2D `empty` handling | Runnable case, analytical checks, executable `empty` coverage, convergence profiles, and performance evidence present | Plane-Poiseuille analytical solution |
 | 3 | `cylinder` | steady laminar external flow at `Re = 1` and corrected non-orthogonal pressure coupling | Independently authored 48-cell case plus preflight and two-SIMPLE-iteration smoke present; automated force/continuity comparison and production-quality acceptance remain open | Documented OpenFOAM Foundation 13 observables selected by the focused case task |
-| 4 | `lidDrivenCavity` | recirculation and closed-pressure reference | Not implemented as an executable Ferrum tutorial | Published benchmark |
+| 4 | `lidDrivenCavity` | recirculation and closed-pressure reference | Independently authored 4-cell case plus preflight and two-SIMPLE-iteration E2E smoke present; the nonzero `pRefValue` is verified in the written field and all eight fixed-velocity faces exercise the pressure constraint; refined centerline/vortex acceptance remains open | Ghia, Ghia, and Shin Re=100 published benchmark |
 | 5 | `backwardFacingStep` | separation, reattachment, outlet robustness, and actual reverse-flow switching | Not implemented as an executable Ferrum tutorial | Published benchmark |
 | 6 | `axisymmetricPipe` | executable `wedge` handling | Not implemented as an executable Ferrum tutorial | Hagen-Poiseuille analytical solution |
 
@@ -740,12 +740,14 @@ optional and case-specific. No combined runner is required.
 The next quality jump is the correctness matrix and ownership split, not
 another unbounded sequence of GAMG micro-optimizations:
 
-1. add end-to-end open- and closed-pressure cases that jointly exercise
-   `pRefCell`/`pRefValue`, `constrainPressure`, `adjustPhi`, pressure flux, and
-   a deliberately skewed corrected non-orthogonal mesh;
-2. complete the Cylinder force/continuity acceptance, then add
-   `lidDrivenCavity`, `backwardFacingStep`, and `axisymmetricPipe` in matrix
-   order;
+1. retain the new Lid Cavity closed-pressure E2E smoke for
+   `pRefCell`/`pRefValue` and `constrainPressure`, then complete the remaining
+   deliberately skewed corrected non-orthogonal E2E mesh and physical cavity
+   acceptance; open-pressure `adjustPhi` and pressure-flux coverage remains
+   part of the combined gate;
+2. complete the Cylinder force/continuity acceptance, refine the
+   `lidDrivenCavity` physical acceptance, then add `backwardFacingStep` and
+   `axisymmetricPipe` in matrix order;
 3. add executable direction-changing backflow coverage and executable
    `wedge` and `symmetryPlane` solver cases. Existing unit coverage and the
    Plane Channel/Cylinder `empty` runs remain necessary but are not the full
