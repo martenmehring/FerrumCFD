@@ -1381,6 +1381,42 @@ The immediate sequence is:
     `8aede4d77678e66191ff4507d620ab4a89bc6302f849ee2d3ab6c955401adb98`;
     its manifest-seal SHA256 is
     `ce5daefe6004b2a10a102545a278601accf0e458207a2f92f58f6c395f0fcdec`.
+    A subsequent two-file clean-base research leaf on `951aa7f` retained the
+    exact public PCG path while allowing GAMG's iterative coarsest solve to
+    reuse one numerical IC(0) factorization per matrix-coefficient lifecycle.
+    Every finest and coarse coefficient refresh invalidates the cache before
+    mutation; failed refactorization stays invalid, and a repaired retry is
+    bit-exact with a fresh workspace. Sixteen route combinations covered
+    standalone and FCG, L2 and normalized-L1, profiled and unprofiled, and
+    cached and fresh execution across ten non-proportional SPD lifecycles.
+    Additional proofs covered wrong sparsity, zero V-cycles, an indefinite
+    coarse failure, exact reports and factors, and stable PCG/IC(0)
+    allocations. All 54 release GAMG tests, the full workspace gate plus one
+    intentional performance ignore, the release pressure-matrix gate, Rust
+    1.94 locked/offline Clippy, formatting, and independent source and proof
+    reviews passed. No tolerance, hierarchy, sweep, arithmetic, traversal,
+    reciprocal, reordering, public API, or artificial magnitude cap changed.
+
+    The native Linux WSL2/ext4 CPU2 pre-gate passed all 16 jobs with exact
+    reports, fields, work, hierarchy, options, and lifecycle counters. Stage A
+    then completed all 132 prescribed jobs: three warmup pairs and 30 measured
+    ABBA pairs per case. Pipe's primary internal-time raw candidate/base ratio
+    was `1.00299`; the paired ratio was `0.96900`, but the A-leading and
+    B-leading cohorts split to `1.08886` and `0.83418`, only `17/30` pairs won,
+    and the one-sided 97.5% bootstrap upper log-ratio was `0.09023`. Its solver
+    guard also failed the A-leading cohort. Channel's raw and paired primary
+    ratios were `1.00295` and `1.00151`, the cohorts were `0.99732` and
+    `1.00570`, only `15/30` pairs won, and the bootstrap upper log-ratio was
+    `0.04888`; its solver guard failed as well. Both process-time guards passed,
+    all 148 executed processes retained exact semantics, and no wall-clock
+    anomaly occurred. Because both case gates failed, the decision is
+    `NO-GO`; confirmation was neither authorized nor created. The source
+    remains local, uncommitted, unpushed, and without a pull request. No Fable
+    review or speedup is claimed. The sealed 3,856-entry final evidence manifest
+    SHA256 is
+    `6d0422f6f4bb49b0a8b0f0ebe61ade9718637ca215b6fa433895d1c80c8fe9a7`;
+    its final manifest-seal SHA256 is
+    `8a5c2a8adde7554fa295841ea9bba72e0c33a95ec67f69a9d844f49017eb37f0`.
 14. **F-PERF-GAMG-FCG (accepted opt-in scalar path; default unchanged):** The
     existing GAMG V-cycle is now available as the explicit preconditioner for
     an `outerSolver FCG` pressure path. Seven focused proofs cover the real
