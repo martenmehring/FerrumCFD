@@ -1,0 +1,74 @@
+FoamFile
+{
+    version 2.0;
+    format ascii;
+    class faceZoneMesh;
+    location "constant/polyMesh";
+    object faceZones;
+}
+
+3
+(
+    walls
+    {
+        type faceZone;
+        faceLabels 6
+        (
+            4
+            6
+            5
+            8
+            7
+            9
+        );
+        flipMap 6
+        (
+            false
+            false
+            false
+            false
+            false
+            false
+        );
+    }
+    lid
+    {
+        type faceZone;
+        faceLabels 2
+        (
+            10
+            11
+        );
+        flipMap 2
+        (
+            false
+            false
+        );
+    }
+    frontAndBack
+    {
+        type faceZone;
+        faceLabels 8
+        (
+            12
+            14
+            16
+            18
+            13
+            15
+            17
+            19
+        );
+        flipMap 8
+        (
+            false
+            false
+            false
+            false
+            false
+            false
+            false
+            false
+        );
+    }
+)
