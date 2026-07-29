@@ -1461,12 +1461,39 @@ The immediate sequence is:
     deterministic, and opt-in. It must not add finite-magnitude caps, hidden
     rollbacks, or case-name heuristics, and must preserve the final outer
     acceptance contract from the static `relTol` implementation.
-16. **F-PERF-SIMD-RUST (planned separate leaf):** Evaluate portable scalar
-    kernel layout and compiler vectorization as a Rust/Cargo-only product path.
+16. **F-PERF-SIMD-RUST (first AVX2 leaf rejected; portable contract retained):**
+    Evaluate portable scalar kernel layout and compiler vectorization as a
+    Rust/Cargo-only product path.
     No `llvm-tools-preview`, external profiler, or system package may become a
     user build or runtime prerequisite; maintainer-only diagnostics remain
     outside the product contract. Apply numerical-parity, fixed-work, and
     time-to-accuracy gates independently from threading.
+    A subsequent one-file clean-base AVX2 row-4 leaf on `5d47281` vectorized
+    only the final correction-scaling row update, with runtime dispatch on
+    `x86_64` and the exact scalar path as the portable fallback. It preserved
+    CSR row and diagonal traversal, multiplication/subtraction/division/addition
+    order, error and partial-mutation semantics, allocation behavior, hierarchy,
+    sweeps, tolerances, counters, reports, and public APIs. The focused
+    bit-parity, failure, malformed-structure, and ten-coefficient-lifecycle
+    proofs, release validation, assembly checks, and Rust 1.94 locked/offline
+    Clippy gates passed without adding a dependency or user prerequisite.
+
+    Native Linux WSL2/ext4 pre-gates and Stage A executed exactly 280 processes:
+    16 semantic pre-gates plus 264 paired `A-B-B-A` jobs across profiled and
+    unprofiled Pipe/Channel lanes. All retained exact numerical semantics, but
+    the frozen robustness gate rejected the leaf. Pipe's primary paired ratio
+    was `0.930576`, but only `20/30` pairs won and the 98.75% bootstrap upper
+    ratio was `1.028686`; its scaling-mechanism ratio was `0.947121`, with
+    `19/30` wins and upper ratio `1.039300`. Channel's primary paired ratio was
+    `0.962118`, with `20/30` wins and upper ratio `1.007354`; only Channel's
+    scaling mechanism passed (`0.946624`, `22/30` wins, upper ratio `0.990073`).
+    Profiled Channel solver and process guards also failed. Confirmation was
+    not authorized, the source remains local, uncommitted, unpushed, and
+    without a pull request, and no speedup, SIMD-default, or Fable-review claim
+    is made. The independently verified 6,950-entry evidence manifest SHA256 is
+    `ca9af93032cdaa06e110672b71b45783ca95c0a61fbc514578245aca04ed0c6b`;
+    its final manifest-seal SHA256 is
+    `78b0f4dbd2938fe524e27739682b1f30813ef5d35828d76215ffd3c943e09fbb`.
 17. **F-PERF-THREAD-MOMENTUM (planned separate leaf):** Use the independent
     momentum components as the first bounded shared-memory threading candidate
     before parallelizing coupled pressure reductions. Preserve deterministic
