@@ -717,22 +717,50 @@ resident across iterations and reports every unavoidable host transfer.
 ## Milestone 6: Driver 1 Laminar Validation Matrix
 
 Before Driver 2 starts, steady incompressible SIMPLE/SIMPLEC must pass this
-tutorial matrix:
+tutorial matrix. The status column is the audited repository state on
+2026-07-29; a smoke run is not the same as full physical acceptance.
 
-| Order | Case | Primary coverage | Reference |
-| ---: | --- | --- | --- |
-| 1 | `laminarPipe` | 3D internal flow and pressure loss | Hagen-Poiseuille analytical solution |
-| 2 | `planeChannel` | true 2D `empty` handling | Plane-Poiseuille analytical solution |
-| 3 | `cylinder` | official OpenFOAM 13 steady laminar external flow at `Re = 1`; deferred until the correctness and scalar-performance gates above are accepted | Official-case observables selected during the focused case task |
-| 4 | `lidDrivenCavity` | recirculation and closed-pressure reference | Published benchmark |
-| 5 | `backwardFacingStep` | separation, reattachment, and outlet robustness | Published benchmark |
-| 6 | `axisymmetricPipe` | `wedge` handling | Hagen-Poiseuille analytical solution |
+| Order | Case | Primary coverage | Current status | Reference |
+| ---: | --- | --- | --- | --- |
+| 1 | `laminarPipe` | 3D internal flow and pressure loss | Runnable case, analytical checks, convergence profiles, and performance evidence present | Hagen-Poiseuille analytical solution |
+| 2 | `planeChannel` | true 2D `empty` handling | Runnable case, analytical checks, executable `empty` coverage, convergence profiles, and performance evidence present | Plane-Poiseuille analytical solution |
+| 3 | `cylinder` | steady laminar external flow at `Re = 1` and corrected non-orthogonal pressure coupling | Independently authored 48-cell case plus preflight and two-SIMPLE-iteration smoke present; automated force/continuity comparison and production-quality acceptance remain open | Documented OpenFOAM Foundation 13 observables selected by the focused case task |
+| 4 | `lidDrivenCavity` | recirculation and closed-pressure reference | Not implemented as an executable Ferrum tutorial | Published benchmark |
+| 5 | `backwardFacingStep` | separation, reattachment, outlet robustness, and actual reverse-flow switching | Not implemented as an executable Ferrum tutorial | Published benchmark |
+| 6 | `axisymmetricPipe` | executable `wedge` handling | Not implemented as an executable Ferrum tutorial | Hagen-Poiseuille analytical solution |
 
-Every case contains an independently runnable `ferrum/case` directory, an
-English README, and an analytical reference when one is useful. Otherwise the
-README points to a documented external benchmark.
+For acceptance, every case must contain an independently runnable `ferrum/case`
+directory, an English README, and an analytical reference when one is useful.
+Otherwise the README points to a documented external benchmark.
 Shared inputs, comparison metadata, recorded results, and mesh variants are
 optional and case-specific. No combined runner is required.
+
+### Audited Driver 1 priority gate (2026-07-29)
+
+The next quality jump is the correctness matrix and ownership split, not
+another unbounded sequence of GAMG micro-optimizations:
+
+1. add end-to-end open- and closed-pressure cases that jointly exercise
+   `pRefCell`/`pRefValue`, `constrainPressure`, `adjustPhi`, pressure flux, and
+   a deliberately skewed corrected non-orthogonal mesh;
+2. complete the Cylinder force/continuity acceptance, then add
+   `lidDrivenCavity`, `backwardFacingStep`, and `axisymmetricPipe` in matrix
+   order;
+3. add executable direction-changing backflow coverage and executable
+   `wedge` and `symmetryPlane` solver cases. Existing unit coverage and the
+   Plane Channel/Cylinder `empty` runs remain necessary but are not the full
+   boundary-condition matrix;
+4. split the transitional 10,018-line `flow.rs` and 10,390-line
+   `linear/gamg.rs` behind parity-tested crate and module APIs before adding
+   PISO/PIMPLE, thermal physics, or GPU kernels;
+5. resume acceleration only as separately reviewed leaves in the order SIMD,
+   deterministic shared-memory momentum threading, then GPU. The first AVX2
+   leaf was rejected; threading and executable GPU kernels are still planned,
+   not accepted product capabilities.
+
+A bounded micro-optimization may still be measured when profiling identifies a
+generic cross-case hotspot, but it must not displace these gates and must retain
+the existing two-case numerical and timing acceptance contract.
 
 ## Runner And Multi-Region Milestone
 
@@ -1503,9 +1531,11 @@ The immediate sequence is:
 18. **F-PERF-GPU (planned later leaf):** Start GPU work only after the scalar,
     SIMD, and shared-memory contracts above are measured. Keep it isolated from
     CPU acceptance and apply the same fixed-work plus time-to-accuracy evidence.
-19. **F-D1-CYLINDER-LIMITED-SCHEMES / F-D1-CASE-CYLINDER:** Only after all
-   correctness and scalar-performance gates above are accepted, implement the
-   required limited schemes and then the Cylinder case. Validation order
+19. **F-D1-CYLINDER-LIMITED-SCHEMES / F-D1-CASE-CYLINDER (implementation
+   started, acceptance open):** Limited schemes, the independently authored
+   Cylinder case, preflight, and a two-iteration smoke are present. Add the
+   automated force/continuity comparison and the required mesh-quality and
+   convergence gates before calling the case accepted. Validation order
    remains Pipe, Channel, then Cylinder.
 20. **F-AUTO-1 (accepted external dependency):** Keep the accepted isolated n8n
    coding workflow in the AI Dev Orchestrator repository and preserve the
@@ -1513,8 +1543,22 @@ The immediate sequence is:
 21. **F-REF-1:** Keep focused, documentation-only external version, result, and
    protocol provenance for each newly selected physics area. Do not bundle
    external solver cases or sources.
-22. **F-ARCH-1:** Extract the `incompressibleFluid` module registry and common solver
-   lifecycle from the transitional combined crates with parity tests.
+22. **F-ARCH-1A / F-ARCH-1B / F-ARCH-1C (mandatory before Driver 2, thermal
+   physics, or GPU kernels):** Replace the transitional combined ownership in
+   three independently reviewable, parity-preserving leaves:
+   - **F-ARCH-1A:** move finite-volume geometry, gradients, fluxes, boundary
+     operators, and equation assembly from `ferrumMesh` into
+     `ferrumFiniteVolume`; keep mesh and topology ownership in `ferrumMesh`;
+   - **F-ARCH-1B:** move backend-neutral CSR, PCG/BiCGStab, smoothers, and GAMG
+     kernels behind a narrow reusable linear-algebra API owned under
+     `ferrumCore`, without changing arithmetic order, reports, or solver
+     semantics;
+   - **F-ARCH-1C:** move SIMPLE/SIMPLEC orchestration, the module registry, and
+     the common solver lifecycle into `applications/modules/incompressibleFluid`
+     and leave `ferrumRun` as dispatch only.
+   Each leaf must keep the existing unit, workspace, fixed-work, convergence,
+   and field-parity gates green. Do not combine this migration with new
+   numerics or performance claims.
 23. **F-IO-1:** Specify and implement `FerrumFile v1`; isolate independently
    authored external-format compatibility behind the `ferrumIO` adapter
    boundary.
