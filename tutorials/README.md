@@ -34,7 +34,10 @@ Current Driver 1 bundles:
 - `incompressibleFluid/planeChannel`: true 2D plane-Poiseuille flow with
   `empty` front/back patches and an analytical reference;
 - `incompressibleFluid/cylinder`: steady Re=1 flow around a cylinder, with an
-  OpenFOAM Foundation 13 documented numerical benchmark.
+  OpenFOAM Foundation 13 documented numerical benchmark;
+- `incompressibleFluid/lidDrivenCavity`: a closed-pressure Re=100 wiring smoke
+  with an explicit nonzero pressure reference; refined physical acceptance is
+  still open.
 
 Drivers 1 and 2 both use the `incompressibleFluid` module while validating
 different coupling algorithms. The remaining Driver 1 cases and Drivers 2

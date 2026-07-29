@@ -1,0 +1,30 @@
+schema_version = 2
+case_id = "incompressibleFluid.lidDrivenCavity.re100"
+module = "incompressibleFluid"
+readiness_driver = "steadyIncompressible"
+algorithm = "SIMPLE"
+regime = "laminar"
+title = "Two-dimensional lid-driven cavity at Re=100"
+acceptance_status = "wiring-smoke-only"
+
+[implementations]
+ferrum_case = "ferrum/case"
+mesh_source = "shared/geometry/lid_cavity_2x2x1.msh"
+
+[reference]
+kind = "published-benchmark"
+title = "High-Re solutions for incompressible flow using the Navier-Stokes equations and a multigrid method"
+authors = "U. Ghia, K. N. Ghia, C. T. Shin"
+journal = "Journal of Computational Physics 48 (1982) 387-411"
+doi = "10.1016/0021-9991(82)90058-4"
+
+[physics]
+unit_system = "SI"
+cavity_width_m = 1.0
+lid_speed_m_per_s = 1.0
+kinematic_viscosity_m2_per_s = 0.01
+reynolds_number = 100.0
+
+[planned_observables]
+names = ["horizontal_velocity_on_vertical_centerline", "vertical_velocity_on_horizontal_centerline", "primary_vortex_location"]
+note = "The checked-in 2x2x1 mesh proves executable closed-pressure wiring only; refined grid-independent acceptance remains open."
