@@ -74,6 +74,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrum-finite-volume"
+version = "0.1.0"
+dependencies = [
+ "ferrum-mesh",
+]
+
+[[package]]
 name = "ferrum-mesh"
 version = "0.1.0"
 dependencies = [

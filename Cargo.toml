@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "src/ferrumMesh",
+    "src/ferrumFiniteVolume",
     "applications/legacy/ferrumCli",
     "applications/solvers/ferrumRun",
 ]
