@@ -2605,7 +2605,6 @@ fn pair_map_from_edges(
     forward: bool,
 ) -> Result<(Vec<usize>, usize)> {
     let mut cell_edges = vec![Vec::<usize>::new(); n_cells];
-    let mut cell_neighbours = vec![BTreeSet::<usize>::new(); n_cells];
     for (edge_index, edge) in edges.iter().enumerate() {
         if edge.lower >= n_cells || edge.upper >= n_cells || edge.lower == edge.upper {
             return Err(invalid_input(format!(
@@ -2621,16 +2620,17 @@ fn pair_map_from_edges(
         }
         cell_edges[edge.lower].push(edge_index);
         cell_edges[edge.upper].push(edge_index);
-        cell_neighbours[edge.lower].insert(edge.upper);
-        cell_neighbours[edge.upper].insert(edge.lower);
     }
+    // Use endpoint degrees as a linear-time proxy for the width of the
+    // resulting coarse stencil. Computing the exact neighbour-set union for
+    // every edge is quadratic on sparse high-degree graphs such as a star.
     let external_neighbour_counts = edges
         .iter()
         .map(|edge| {
-            cell_neighbours[edge.lower]
-                .union(&cell_neighbours[edge.upper])
-                .filter(|&&cell| cell != edge.lower && cell != edge.upper)
-                .count()
+            cell_edges[edge.lower]
+                .len()
+                .saturating_add(cell_edges[edge.upper].len())
+                .saturating_sub(2)
         })
         .collect::<Vec<_>>();
 
