@@ -1305,6 +1305,45 @@ The immediate sequence is:
     `77cd6b32859edff70c258b3afbcef37cdfaa7923a7081969655c298567e0945b`;
     its manifest-seal SHA256 is
     `79bfdfada22d0ec6c75035a0a9efaa28b88820656ebc4705bff367744574ab41`.
+    A further two-file clean-base research leaf on `41ed598` retained the
+    public symmetric Gauss-Seidel implementation as the exact legacy oracle
+    while adding an internal caller-owned path for momentum solves. Three old
+    and three solution component vectors were retained across SIMPLE steps,
+    and the existing residual and matrix-product workspace was shared
+    sequentially across the three components. Arithmetic and traversal order,
+    tolerance comparisons, errors, reports, aggregation, non-SymGS behavior,
+    and public APIs remained unchanged. Five focused linear and three momentum
+    proofs passed in both debug and release, including exact and `next_up`
+    stopping boundaries, all failure paths, repaired retries, ten coefficient
+    lifecycles, XYZ aggregation, and stable pointers and capacities. The final
+    496-test workspace gate plus one intentional performance ignore, Rust 1.94
+    locked/offline Clippy, formatting, and an independent source audit passed.
+
+    Native Linux CPU2 pre-gates passed all 16 jobs, and Stage A completed all
+    48 jobs with exact semantic parity. An independent seal audit found one
+    non-decision metadata defect: `stage-a-results.json` retained the stale
+    descriptive string `unprofiled pressureLinearSolveSeconds`, while the
+    frozen protocol, gate calculations, summary, and decision correctly used
+    `unprofiled solverTotalSeconds` as the primary metric. The immutable sealed
+    package records that inconsistency; it does not change the result because
+    all four required metric/case gates failed. The performance evidence was
+    not robust. Pipe solver-total raw medians improved by `6.81%`, but paired
+    medians regressed by `9.66%`, only `2/5` pairs won, and the A-leading and
+    B-leading ratios were `0.9926` and `1.1354`. Pipe momentum-linear raw
+    medians improved by `10.52%`, but paired medians regressed by `12.04%`,
+    only `1/5` pairs won, and both cohort ratios regressed to `1.0299` and
+    `1.2059`. Channel solver-total raw medians regressed by `11.07%`; paired
+    medians improved by `1.65%`, but only `3/5` pairs won and the cohorts split
+    to `1.1766` and `0.7138`. Channel momentum-linear raw medians regressed by
+    `9.00%`; paired medians improved by `7.37%`, but only `3/5` pairs won and
+    the cohorts split to `1.0948` and `0.6903`. The strict gate therefore
+    rejected the leaf before Stage B, with zero additional measurements. The
+    source remains local and unmerged, and no speedup is claimed. A focused
+    Fable review was neither used nor claimed for the rejected source. The
+    1,606-entry evidence manifest SHA256 is
+    `c0c7d75985f98df4a14a173278124de0cf72944bcd22aece165047a4dd87c2ad`;
+    its manifest-seal SHA256 is
+    `5e87e9020d37cd2f1b7455235ba3b94de9f3c800a4d6e15dc4c92b3e28de03ea`.
 14. **F-PERF-GAMG-FCG (accepted opt-in scalar path; default unchanged):** The
     existing GAMG V-cycle is now available as the explicit preconditioner for
     an `outerSolver FCG` pressure path. Seven focused proofs cover the real
