@@ -1,0 +1,13 @@
+[package]
+name = "ferrum-finite-volume"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "ferrum_finite_volume"
+path = "src/lib.rs"
+
+[dependencies]
+ferrum-mesh = { path = "../ferrumMesh" }

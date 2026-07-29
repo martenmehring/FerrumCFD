@@ -724,7 +724,7 @@ tutorial matrix. The status column is the audited repository state on
 | ---: | --- | --- | --- | --- |
 | 1 | `laminarPipe` | 3D internal flow and pressure loss | Runnable case, analytical checks, convergence profiles, and performance evidence present | Hagen-Poiseuille analytical solution |
 | 2 | `planeChannel` | true 2D `empty` handling | Runnable case, analytical checks, executable `empty` coverage, convergence profiles, and performance evidence present | Plane-Poiseuille analytical solution |
-| 3 | `cylinder` | steady laminar external flow at `Re = 1` and corrected non-orthogonal pressure coupling | Independently authored 48-cell case plus preflight and two-SIMPLE-iteration smoke present; automated force/continuity comparison and production-quality acceptance remain open | Documented OpenFOAM Foundation 13 observables selected by the focused case task |
+| 3 | `cylinder` | steady laminar external flow at `Re = 1` and corrected non-orthogonal pressure coupling | Independently authored 48-cell case, preflight, two-SIMPLE-iteration smoke, and generic stationary-wall force/Cd/Cl operator present; deterministic production meshes, executable reporting, force/continuity gates, and production-quality acceptance remain open | Documented OpenFOAM Foundation 13 observables selected by the focused case task |
 | 4 | `lidDrivenCavity` | recirculation and closed-pressure reference | Independently authored 4-cell case plus preflight and two-SIMPLE-iteration E2E smoke present; the nonzero `pRefValue` is verified in the written field and all eight fixed-velocity faces exercise the pressure constraint; refined centerline/vortex acceptance remains open | Ghia, Ghia, and Shin Re=100 published benchmark |
 | 5 | `backwardFacingStep` | separation, reattachment, outlet robustness, and actual reverse-flow switching | Not implemented as an executable Ferrum tutorial | Published benchmark |
 | 6 | `axisymmetricPipe` | executable `wedge` handling | Not implemented as an executable Ferrum tutorial | Hagen-Poiseuille analytical solution |
@@ -1533,12 +1533,17 @@ The immediate sequence is:
 18. **F-PERF-GPU (planned later leaf):** Start GPU work only after the scalar,
     SIMD, and shared-memory contracts above are measured. Keep it isolated from
     CPU acceptance and apply the same fixed-work plus time-to-accuracy evidence.
-19. **F-D1-CYLINDER-LIMITED-SCHEMES / F-D1-CASE-CYLINDER (implementation
-   started, acceptance open):** Limited schemes, the independently authored
-   Cylinder case, preflight, and a two-iteration smoke are present. Add the
-   automated force/continuity comparison and the required mesh-quality and
-   convergence gates before calling the case accepted. Validation order
-   remains Pipe, Channel, then Cylinder.
+19. **F-D1-CYLINDER-LIMITED-SCHEMES / F-D1-CASE-CYLINDER (C1 implemented,
+   physical acceptance open):** Limited schemes, the independently authored
+   Cylinder case, preflight, and a two-iteration smoke are present. The first
+   `ferrumFiniteVolume` leaf now provides generic stationary-no-slip pressure,
+   viscous-force, and Cd/Cl integration for `zeroGradient` wall pressure with
+   explicit pressure-gauge and extruded-2D reference-area handling. Moment/Cm
+   remains gated on area-centroid geometry. C2 must connect that API to a
+   deterministic coarse/fine O-grid family and C3 must add automated
+   force/continuity, mesh-quality, and convergence gates before calling the
+   case accepted. C4 is the external same-Linux comparison against Foundation
+   v13. Validation order remains Pipe, Channel, then Cylinder.
 20. **F-AUTO-1 (accepted external dependency):** Keep the accepted isolated n8n
    coding workflow in the AI Dev Orchestrator repository and preserve the
    existing analysis workflow as a separate read-only path.
@@ -1550,7 +1555,10 @@ The immediate sequence is:
    three independently reviewable, parity-preserving leaves:
    - **F-ARCH-1A:** move finite-volume geometry, gradients, fluxes, boundary
      operators, and equation assembly from `ferrumMesh` into
-     `ferrumFiniteVolume`; keep mesh and topology ownership in `ferrumMesh`;
+     `ferrumFiniteVolume`; keep mesh and topology ownership in `ferrumMesh`.
+     The independent boundary-force/post-processing leaf is the first active
+     crate boundary; the solver operators still require separate parity-only
+     migration packages;
    - **F-ARCH-1B:** move backend-neutral CSR, PCG/BiCGStab, smoothers, and GAMG
      kernels behind a narrow reusable linear-algebra API owned under
      `ferrumCore`, without changing arithmetic order, reports, or solver

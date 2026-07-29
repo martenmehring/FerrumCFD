@@ -54,13 +54,17 @@ identifies an appropriate published benchmark or observable. Empty or invented
 analytical references are forbidden. Stable recorded results belong under
 `docs/benchmarks/`.
 
-The first layout migration places the reusable mesh/finite-volume foundation
-under `src/ferrumMesh` and the still-combined implementation package under
-`applications/legacy/ferrumCli`. The canonical `ferrumRun` executable crate
-already lives at `applications/solvers/ferrumRun` and delegates to that legacy
-library. Solver modules and utilities move behind their permanent boundaries
-only with behavior-parity tests. This staged move preserves a buildable
-workspace throughout the architecture transition.
+The first layout migration placed the reusable mesh and transitional
+finite-volume foundation under `src/ferrumMesh` and the still-combined
+implementation package under `applications/legacy/ferrumCli`. The first active
+ownership split now places solver-independent stationary-wall force and Cd/Cl
+post-processing under `src/ferrumFiniteVolume`; the remaining operators still
+live in the transitional foundation until separate behavior-parity migrations
+are accepted. The canonical `ferrumRun` executable crate already lives at
+`applications/solvers/ferrumRun` and delegates to the legacy library. Solver
+modules and utilities move behind their permanent boundaries only with
+behavior-parity tests. This staged move preserves a buildable workspace
+throughout the architecture transition.
 
 ## Public Runner And Module Naming
 
