@@ -1941,6 +1941,24 @@ boundaryField
     }
 
     #[test]
+    fn field_reader_rejects_bytes_beyond_its_exact_total() {
+        let content = "FoamFile { class volScalarField; object p; } internalField uniform 0; boundaryField {}";
+        let extended = format!("{content} trailingToken;");
+        let error = parse_field_file_reader(
+            BufReader::with_capacity(1, Cursor::new(extended.as_bytes())),
+            content.len(),
+            Path::new("0/p"),
+            None,
+            FieldLoadPolicy::Summary,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "line 1: 0/p: dictionary input exceeds its declared length"
+        );
+    }
+
+    #[test]
     fn nonuniform_values_are_capped_and_fail_closed() {
         let zero = parse_field_file_str(
             "FoamFile { class volScalarField; object p; }\ninternalField nonuniform List<scalar> 0 ();\nboundaryField {}\n",

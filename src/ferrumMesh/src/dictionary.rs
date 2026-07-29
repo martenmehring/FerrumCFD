@@ -918,6 +918,24 @@ pub mod streaming {
         }
 
         fn byte(&mut self) -> std::result::Result<Option<u8>, (usize, &'static str)> {
+            if self.physical == self.declared {
+                let bytes = self
+                    .reader
+                    .fill_buf()
+                    .map_err(|_| (self.line, "dictionary input read failed"))?;
+                return if bytes.is_empty() {
+                    Ok(None)
+                } else {
+                    Err((self.line, "dictionary input exceeds its declared length"))
+                };
+            }
+            let physical = self
+                .physical
+                .checked_add(1)
+                .ok_or((self.line, "dictionary byte counter overflow"))?;
+            if self.physical > self.declared {
+                return Err((self.line, "dictionary input exceeds its declared length"));
+            }
             let bytes = self
                 .reader
                 .fill_buf()
@@ -932,10 +950,6 @@ pub mod streaming {
                 ));
             }
             let value = bytes[0];
-            let physical = self
-                .physical
-                .checked_add(1)
-                .ok_or((self.line, "dictionary byte counter overflow"))?;
             self.reader.consume(1);
             self.physical = physical;
             if physical > self.declared {
@@ -1329,10 +1343,46 @@ pub mod streaming {
         }
 
         #[test]
-        fn physical_count_includes_extra_probe() {
-            let mut lexer = TokenSource::new(Path::new("x"), Cursor::new(b"ab"), 1).unwrap();
-            assert!(lexer.peek().is_err());
-            assert_eq!(lexer.physical_bytes_read(), 2);
+        fn declared_boundary_rejects_extra_probe_without_consuming_it() {
+            let mut reader = BufReader::with_capacity(1, Cursor::new(b"ab"));
+            {
+                let mut lexer = TokenSource::new(Path::new("x"), &mut reader, 1).unwrap();
+                let first = lexer.peek().unwrap_err();
+                assert_parse(&first, 1, "x: dictionary input exceeds its declared length");
+                assert_eq!(
+                    first.to_string(),
+                    "line 1: x: dictionary input exceeds its declared length"
+                );
+                let first = first.to_string();
+                assert_eq!(lexer.next().unwrap_err().to_string(), first);
+                assert_eq!(lexer.next_required().unwrap_err().to_string(), first);
+                assert_eq!(lexer.physical_bytes_read(), 1);
+            }
+            let mut tail = Vec::new();
+            reader.read_to_end(&mut tail).unwrap();
+            assert_eq!(tail, b"b");
+
+            let mut empty_declared = BufReader::with_capacity(1, Cursor::new(b"x"));
+            {
+                let mut lexer =
+                    TokenSource::new(Path::new("zero"), &mut empty_declared, 0).unwrap();
+                assert!(lexer.peek().is_err());
+                assert_eq!(lexer.physical_bytes_read(), 0);
+            }
+            let mut untouched = Vec::new();
+            empty_declared.read_to_end(&mut untouched).unwrap();
+            assert_eq!(untouched, b"x");
+
+            let mut exact = source(b"a");
+            assert_eq!(exact.next().unwrap().unwrap().value, "a");
+            assert!(exact.next().unwrap().is_none());
+            assert!(source(b"").next().unwrap().is_none());
+
+            let mut exact_max =
+                TokenSource::new(Path::new("max"), Cursor::new(b""), usize::MAX).unwrap();
+            exact_max.inject_physical_overflow();
+            assert!(exact_max.peek().unwrap().is_none());
+            assert_eq!(exact_max.physical_bytes_read(), usize::MAX);
 
             for data in [b"( x )".as_slice(), b"(x)".as_slice()] {
                 let mut lexer = source(data);
@@ -1472,13 +1522,17 @@ pub mod streaming {
                 extra.peek().unwrap_err(),
                 MeshError::Parse { line: 1, .. }
             ));
+            assert_eq!(extra.physical_bytes_read(), 1);
 
             let mut early = TokenSource::new(Path::new("length"), Cursor::new(b"a\n"), 3).unwrap();
             early.next().unwrap();
-            assert!(matches!(
-                early.peek().unwrap_err(),
-                MeshError::Parse { line: 2, .. }
-            ));
+            let first = early.peek().unwrap_err();
+            assert_parse(
+                &first,
+                2,
+                "length: dictionary input ended before its declared length",
+            );
+            assert_eq!(early.next().unwrap_err().to_string(), first.to_string());
         }
 
         #[test]
