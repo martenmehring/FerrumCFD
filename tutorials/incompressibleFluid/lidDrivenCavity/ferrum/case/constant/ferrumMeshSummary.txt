@@ -1,0 +1,24 @@
+FerrumCFD mesh summary
+source=tutorials/incompressibleFluid/lidDrivenCavity/shared/geometry/lid_cavity_2x2x1.msh
+case=tutorials/incompressibleFluid/lidDrivenCavity/ferrum/case
+points=18
+cells=4
+faces=20
+internal_faces=4
+boundary_faces=16
+unmatched_boundary_faces=0
+duplicate_boundary_faces=0
+non_manifold_faces=0
+
+[patches]
+walls type=wall tag=1 faces=6 startFace=4
+lid type=wall tag=2 faces=2 startFace=10
+frontAndBack type=empty tag=3 faces=8 startFace=12
+
+[face_zones]
+walls tag=1 faces=6
+lid tag=2 faces=2
+frontAndBack tag=3 faces=8
+
+[cell_zones]
+fluid tag=10 cells=4
