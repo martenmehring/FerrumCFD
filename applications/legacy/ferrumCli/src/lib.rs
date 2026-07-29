@@ -8,6 +8,12 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use case::{InitCaseOptions, init_case};
+use ferrum_finite_volume::boundary_forces::{
+    MAX_RELATIVE_AREA_VECTOR_IMBALANCE_TOLERANCE, NoSlipWallForceOptions, PressureFieldKind,
+    PressureReference, ReferenceArea, WallForceCoefficients,
+    integrate_stationary_no_slip_zero_gradient_pressure_wall_forces,
+};
+use ferrum_finite_volume::continuity::{NormalizedContinuity, normalize_steady_continuity};
 use ferrum_mesh::Point3;
 use ferrum_mesh::backends::{
     read_backend_config, validate_backend_policy, validate_backend_resources,
@@ -713,6 +719,9 @@ fn run_laminar_simple_solve(
     solve: &LaminarSimpleSolveArgs,
 ) -> Result<(), String> {
     let options = resolve_laminar_simple_options(plan, solve)?;
+    if let Some(wall_forces) = &solve.wall_forces {
+        validate_wall_force_boundary_conditions(&plan.initial_fields, &wall_forces.patch_names)?;
+    }
 
     let started = Instant::now();
     let report = if solve.solve_verbose {
@@ -752,6 +761,14 @@ fn run_laminar_simple_solve(
             .map_err(|error| error.to_string())?
     };
     let wall_clock_seconds = started.elapsed().as_secs_f64();
+    let post_processing = build_laminar_simple_post_processing(plan, solve, &options, &report)?;
+
+    if let Some(continuity_errors) = &post_processing.continuity_errors {
+        print_continuity_errors(continuity_errors);
+    }
+    if let Some(wall_forces) = &post_processing.wall_forces {
+        print_wall_force_coefficients(wall_forces);
+    }
 
     println!(
         "incompressibleFluid solve: backend=cpu linearSolver={} momentumLinearSolver={} momentumPreconditioner={} momentumRelTol={} pressureLinearSolver={} pressurePreconditioner={} pressureRelTol={} divPhiU=\"{}\" gradP=\"{}\" gradU=\"{}\" laplacian=\"{}\" snGrad=\"{}\" interpolation=\"{}\" pRefCell={} pRefValue={} nonOrthogonalCorrectors={} consistent={} stopReason={} cells={} faces={} simpleIterations={} minSimpleIterations={} converged={} residualControl={} initialContinuityL2={} finalContinuityL2={} momentumInitialResidual={} momentumFinalResidual={} momentumResidualNorm={} pressureInitialResidual={} pressureFinalResidual={} pressureResidualNorm={} momentumLinearIterations={} pressureLinearIterations={} wallClockSeconds={:.6}",
@@ -1100,6 +1117,7 @@ fn run_laminar_simple_solve(
             plan,
             &options,
             &report,
+            &post_processing,
             wall_clock_seconds,
             output_root.expect("output requested"),
             path,
@@ -1117,6 +1135,7 @@ fn run_laminar_simple_solve(
             plan,
             &options,
             &report,
+            &post_processing,
             wall_clock_seconds,
             output_root.expect("output requested"),
             path,
@@ -1132,6 +1151,208 @@ fn run_laminar_simple_solve(
     print_laminar_simple_convergence_feedback(&report, &options);
 
     Ok(())
+}
+
+fn build_laminar_simple_post_processing(
+    plan: &SolverCasePlan,
+    solve: &LaminarSimpleSolveArgs,
+    options: &LaminarSimpleOptions,
+    report: &LaminarSimpleReport,
+) -> Result<LaminarSimplePostProcessing, String> {
+    let total_volume = plan.runtime_data.mesh.total_cell_volume;
+    let continuity_errors = plan
+        .run
+        .delta_t
+        .map(|delta_t| {
+            let final_error =
+                normalize_steady_continuity(report.final_continuity, total_volume, delta_t)
+                    .map_err(|error| {
+                        format!("could not normalize final continuity errors ({error})")
+                    })?;
+            if report.history.len() != report.simple_iterations {
+                return Err(format!(
+                    "could not normalize cumulative continuity errors: history has {} completed iterations but report records {}",
+                    report.history.len(),
+                    report.simple_iterations
+                ));
+            }
+            let mut cumulative_global = 0.0;
+            for item in &report.history {
+                let normalized =
+                    normalize_steady_continuity(item.continuity_after, total_volume, delta_t)
+                        .map_err(|error| {
+                            format!(
+                                "could not normalize continuity errors after SIMPLE iteration {} ({error})",
+                                item.iteration
+                            )
+                        })?;
+                cumulative_global += normalized.global;
+                if !cumulative_global.is_finite() {
+                    return Err(format!(
+                        "cumulative normalized global continuity error became non-finite after SIMPLE iteration {}",
+                        item.iteration
+                    ));
+                }
+            }
+            Ok(ContinuityErrorsReport {
+                final_error,
+                cumulative_global,
+                delta_t,
+                total_volume,
+            })
+        })
+        .transpose()?;
+
+    let wall_forces = solve
+        .wall_forces
+        .as_ref()
+        .map(|request| {
+            let patch_names = request
+                .patch_names
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            integrate_stationary_no_slip_zero_gradient_pressure_wall_forces(
+                &plan.runtime_data.mesh,
+                &report.final_velocity,
+                &report.final_pressure,
+                &patch_names,
+                NoSlipWallForceOptions {
+                    pressure_kind: PressureFieldKind::Kinematic,
+                    pressure_reference: PressureReference::AreaVectorBalancedMean {
+                        relative_area_vector_imbalance_tolerance:
+                            MAX_RELATIVE_AREA_VECTOR_IMBALANCE_TOLERANCE,
+                    },
+                    density: options.density,
+                    dynamic_viscosity: options.dynamic_viscosity,
+                    reference_speed: request.reference_speed,
+                    reference_area: ReferenceArea::Explicit(request.reference_area),
+                    drag_direction: Point3 {
+                        x: 1.0,
+                        y: 0.0,
+                        z: 0.0,
+                    },
+                    lift_direction: Point3 {
+                        x: 0.0,
+                        y: 1.0,
+                        z: 0.0,
+                    },
+                },
+            )
+            .map(|coefficients| WallForceReport {
+                patch_names: request.patch_names.clone(),
+                reference_speed: request.reference_speed,
+                coefficients,
+            })
+            .map_err(|error| format!("could not integrate selected wall forces ({error})"))
+        })
+        .transpose()?;
+
+    Ok(LaminarSimplePostProcessing {
+        continuity_errors,
+        wall_forces,
+    })
+}
+
+fn validate_wall_force_boundary_conditions(
+    fields: &InitialFieldSet,
+    patch_names: &[String],
+) -> Result<(), String> {
+    let velocity = required_initial_field(fields, "U")?;
+    let pressure = required_initial_field(fields, "p")?;
+    for patch_name in patch_names {
+        validate_wall_force_patch_condition(velocity, patch_name, "noSlip")?;
+        validate_wall_force_patch_condition(pressure, patch_name, "zeroGradient")?;
+    }
+    Ok(())
+}
+
+fn required_initial_field<'a>(
+    fields: &'a InitialFieldSet,
+    field_name: &str,
+) -> Result<&'a FieldFile, String> {
+    let mut matches = fields
+        .fields
+        .iter()
+        .filter(|field| field.region.is_none() && field.name == field_name);
+    let field = matches.next().ok_or_else(|| {
+        format!("wall-force integration requires the initial field 0/{field_name}")
+    })?;
+    if matches.next().is_some() {
+        return Err(format!(
+            "wall-force integration requires exactly one default-region 0/{field_name} field"
+        ));
+    }
+    Ok(field)
+}
+
+fn validate_wall_force_patch_condition(
+    field: &FieldFile,
+    patch_name: &str,
+    required_type: &str,
+) -> Result<(), String> {
+    let mut matches = field
+        .boundary_patches
+        .iter()
+        .filter(|patch| patch.name == patch_name);
+    let patch = matches.next().ok_or_else(|| {
+        format!(
+            "wall-force patch '{patch_name}' is missing from 0/{} boundaryField",
+            field.name
+        )
+    })?;
+    if matches.next().is_some() {
+        return Err(format!(
+            "wall-force patch '{patch_name}' occurs more than once in 0/{} boundaryField",
+            field.name
+        ));
+    }
+    if patch.patch_type.as_deref() != Some(required_type) {
+        return Err(format!(
+            "wall-force patch '{patch_name}' requires 0/{} type {required_type}, found {}",
+            field.name,
+            patch.patch_type.as_deref().unwrap_or("missing")
+        ));
+    }
+    Ok(())
+}
+
+fn print_continuity_errors(summary: &ContinuityErrorsReport) {
+    println!(
+        "incompressibleFluid continuityErrors: local={} global={} cumulativeGlobal={} deltaT={} totalVolume={}",
+        format_scientific(summary.final_error.local),
+        format_scientific(summary.final_error.global),
+        format_scientific(summary.cumulative_global),
+        format_scientific(summary.delta_t),
+        format_scientific(summary.total_volume),
+    );
+}
+
+fn print_wall_force_coefficients(report: &WallForceReport) {
+    let value = &report.coefficients;
+    println!(
+        "incompressibleFluid wallForces: patches={} selectedPatches={} selectedFaces={} pressureFx={} pressureFy={} pressureFz={} viscousFx={} viscousFy={} viscousFz={} totalFx={} totalFy={} totalFz={} dragPressure={} dragViscous={} dragTotal={} liftPressure={} liftViscous={} liftTotal={} referenceArea={} referenceSpeed={}",
+        report.patch_names.join(","),
+        value.selected_patches,
+        value.selected_faces,
+        format_scientific(value.pressure_force.x),
+        format_scientific(value.pressure_force.y),
+        format_scientific(value.pressure_force.z),
+        format_scientific(value.viscous_force.x),
+        format_scientific(value.viscous_force.y),
+        format_scientific(value.viscous_force.z),
+        format_scientific(value.total_force.x),
+        format_scientific(value.total_force.y),
+        format_scientific(value.total_force.z),
+        format_scientific(value.drag.pressure),
+        format_scientific(value.drag.viscous),
+        format_scientific(value.drag.total),
+        format_scientific(value.lift.pressure),
+        format_scientific(value.lift.viscous),
+        format_scientific(value.lift.total),
+        format_scientific(value.resolved_reference_area),
+        format_scientific(report.reference_speed),
+    );
 }
 
 fn write_laminar_simple_residual_csv(
@@ -3384,6 +3605,7 @@ fn write_laminar_simple_report_json(
     plan: &SolverCasePlan,
     options: &LaminarSimpleOptions,
     report: &LaminarSimpleReport,
+    post_processing: &LaminarSimplePostProcessing,
     wall_clock_seconds: f64,
     output_root: &SafeOutputRoot,
     path: &Path,
@@ -3392,7 +3614,7 @@ fn write_laminar_simple_report_json(
     let mut writer = BufWriter::new(file);
 
     writeln!(writer, "{{")?;
-    write_json_number_field(&mut writer, 2, "schemaVersion", 2)?;
+    write_json_number_field(&mut writer, 2, "schemaVersion", 3)?;
     writeln!(writer, ",")?;
     write_json_key(&mut writer, 2, "caseDir")?;
     write_json_string(&mut writer, &plan.case_dir.display().to_string())?;
@@ -3526,6 +3748,10 @@ fn write_laminar_simple_report_json(
     writeln!(writer)?;
     write_indent(&mut writer, 2)?;
     writeln!(writer, "}},")?;
+    write_json_continuity_errors(&mut writer, post_processing.continuity_errors.as_ref())?;
+    writeln!(writer, ",")?;
+    write_json_wall_forces(&mut writer, post_processing.wall_forces.as_ref())?;
+    writeln!(writer, ",")?;
     write_json_operator_summary(&mut writer, &report.operator_summary)?;
     writeln!(writer, ",")?;
     write_json_boundary_summary(&mut writer, &report.boundary_summary)?;
@@ -4254,6 +4480,130 @@ fn write_json_continuity_summary(
     writeln!(writer, ",")?;
     write_json_key(writer, indent + 2, "globalSum")?;
     write_json_optional_number(writer, Some(summary.global_sum))?;
+    writeln!(writer)?;
+    write_indent(writer, indent)?;
+    write!(writer, "}}")
+}
+
+fn write_json_continuity_errors(
+    writer: &mut impl Write,
+    summary: Option<&ContinuityErrorsReport>,
+) -> std::io::Result<()> {
+    write_json_key(writer, 2, "continuityErrors")?;
+    let Some(summary) = summary else {
+        return write!(writer, "null");
+    };
+    writeln!(writer, "{{")?;
+    write_json_key(writer, 4, "local")?;
+    write_json_optional_number(writer, Some(summary.final_error.local))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "global")?;
+    write_json_optional_number(writer, Some(summary.final_error.global))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "cumulativeGlobal")?;
+    write_json_optional_number(writer, Some(summary.cumulative_global))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "deltaT")?;
+    write_json_optional_number(writer, Some(summary.delta_t))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "totalVolume")?;
+    write_json_optional_number(writer, Some(summary.total_volume))?;
+    writeln!(writer)?;
+    write_indent(writer, 2)?;
+    write!(writer, "}}")
+}
+
+fn write_json_wall_forces(
+    writer: &mut impl Write,
+    report: Option<&WallForceReport>,
+) -> std::io::Result<()> {
+    write_json_key(writer, 2, "wallForces")?;
+    let Some(report) = report else {
+        return write!(writer, "null");
+    };
+    let value = &report.coefficients;
+    writeln!(writer, "{{")?;
+    write_json_key(writer, 4, "patches")?;
+    write_json_string_array(writer, &report.patch_names)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(writer, 4, "selectedPatches", value.selected_patches)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(writer, 4, "selectedFaces", value.selected_faces)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "pressureFieldKind")?;
+    write_json_string(writer, "kinematic")?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "pressureReference")?;
+    write_json_string(writer, "areaVectorBalancedMean")?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "resolvedPressureReference")?;
+    write_json_optional_number(writer, Some(value.resolved_pressure_reference))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "referenceSpeed")?;
+    write_json_optional_number(writer, Some(report.reference_speed))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "referenceArea")?;
+    write_json_optional_number(writer, Some(value.resolved_reference_area))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "referenceDynamicPressure")?;
+    write_json_optional_number(writer, Some(value.reference_dynamic_pressure))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "selectedArea")?;
+    write_json_optional_number(writer, Some(value.selected_area))?;
+    writeln!(writer, ",")?;
+    write_json_point(writer, 4, "areaVectorSum", value.area_vector_sum)?;
+    writeln!(writer, ",")?;
+    write_json_point(writer, 4, "pressureForce", value.pressure_force)?;
+    writeln!(writer, ",")?;
+    write_json_point(writer, 4, "viscousForce", value.viscous_force)?;
+    writeln!(writer, ",")?;
+    write_json_point(writer, 4, "totalForce", value.total_force)?;
+    writeln!(writer, ",")?;
+    write_json_directional_coefficient(writer, 4, "drag", value.drag)?;
+    writeln!(writer, ",")?;
+    write_json_directional_coefficient(writer, 4, "lift", value.lift)?;
+    writeln!(writer)?;
+    write_indent(writer, 2)?;
+    write!(writer, "}}")
+}
+
+fn write_json_point(
+    writer: &mut impl Write,
+    indent: usize,
+    key: &str,
+    point: Point3,
+) -> std::io::Result<()> {
+    write_json_key(writer, indent, key)?;
+    writeln!(writer, "{{")?;
+    write_json_key(writer, indent + 2, "x")?;
+    write_json_optional_number(writer, Some(point.x))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "y")?;
+    write_json_optional_number(writer, Some(point.y))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "z")?;
+    write_json_optional_number(writer, Some(point.z))?;
+    writeln!(writer)?;
+    write_indent(writer, indent)?;
+    write!(writer, "}}")
+}
+
+fn write_json_directional_coefficient(
+    writer: &mut impl Write,
+    indent: usize,
+    key: &str,
+    value: ferrum_finite_volume::boundary_forces::DirectionalCoefficient,
+) -> std::io::Result<()> {
+    write_json_key(writer, indent, key)?;
+    writeln!(writer, "{{")?;
+    write_json_key(writer, indent + 2, "pressure")?;
+    write_json_optional_number(writer, Some(value.pressure))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "viscous")?;
+    write_json_optional_number(writer, Some(value.viscous))?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "total")?;
+    write_json_optional_number(writer, Some(value.total))?;
     writeln!(writer)?;
     write_indent(writer, indent)?;
     write!(writer, "}}")
@@ -5084,6 +5434,7 @@ fn write_laminar_simple_report_markdown(
     plan: &SolverCasePlan,
     options: &LaminarSimpleOptions,
     report: &LaminarSimpleReport,
+    post_processing: &LaminarSimplePostProcessing,
     wall_clock_seconds: f64,
     output_root: &SafeOutputRoot,
     path: &Path,
@@ -5095,7 +5446,7 @@ fn write_laminar_simple_report_markdown(
     writeln!(writer)?;
     writeln!(writer, "Case: `{}`", plan.case_dir.display())?;
     writeln!(writer)?;
-    writeln!(writer, "- Schema version: `2`")?;
+    writeln!(writer, "- Schema version: `3`")?;
     writeln!(writer, "- Module: `incompressibleFluid`")?;
     writeln!(writer, "- Algorithm: `SIMPLE`")?;
     writeln!(writer, "- Regime: `laminar`")?;
@@ -5387,6 +5738,115 @@ fn write_laminar_simple_report_markdown(
         "| Pressure L2 norm | {} |",
         format_scientific(report.fields.pressure.l2_norm)
     )?;
+    writeln!(writer)?;
+    writeln!(writer, "## Continuity errors")?;
+    writeln!(writer)?;
+    if let Some(continuity_errors) = &post_processing.continuity_errors {
+        writeln!(writer, "| Quantity | Value |")?;
+        writeln!(writer, "| --- | ---: |")?;
+        writeln!(
+            writer,
+            "| Final local error | {} |",
+            format_scientific(continuity_errors.final_error.local)
+        )?;
+        writeln!(
+            writer,
+            "| Final global error | {} |",
+            format_scientific(continuity_errors.final_error.global)
+        )?;
+        writeln!(
+            writer,
+            "| Cumulative global error | {} |",
+            format_scientific(continuity_errors.cumulative_global)
+        )?;
+        writeln!(
+            writer,
+            "| deltaT | {} |",
+            format_scientific(continuity_errors.delta_t)
+        )?;
+        writeln!(
+            writer,
+            "| Total volume | {} |",
+            format_scientific(continuity_errors.total_volume)
+        )?;
+    } else {
+        writeln!(
+            writer,
+            "Unavailable because `controlDict` does not define `deltaT`."
+        )?;
+    }
+    if let Some(wall_forces) = &post_processing.wall_forces {
+        let value = &wall_forces.coefficients;
+        writeln!(writer)?;
+        writeln!(writer, "## Wall forces")?;
+        writeln!(writer)?;
+        writeln!(writer, "| Quantity | Value |")?;
+        writeln!(writer, "| --- | ---: |")?;
+        writeln!(
+            writer,
+            "| Patches | {} |",
+            wall_forces.patch_names.join(",")
+        )?;
+        writeln!(writer, "| Selected patches | {} |", value.selected_patches)?;
+        writeln!(writer, "| Selected faces | {} |", value.selected_faces)?;
+        writeln!(writer, "| Pressure field kind | kinematic |")?;
+        writeln!(writer, "| Pressure reference | area-vector balanced mean |")?;
+        writeln!(
+            writer,
+            "| Selected area | {} |",
+            format_scientific(value.selected_area)
+        )?;
+        writeln!(
+            writer,
+            "| Reference speed | {} |",
+            format_scientific(wall_forces.reference_speed)
+        )?;
+        writeln!(
+            writer,
+            "| Reference area | {} |",
+            format_scientific(value.resolved_reference_area)
+        )?;
+        writeln!(
+            writer,
+            "| Resolved pressure reference | {} |",
+            format_scientific(value.resolved_pressure_reference)
+        )?;
+        writeln!(
+            writer,
+            "| Pressure force x/y/z | {} / {} / {} |",
+            format_scientific(value.pressure_force.x),
+            format_scientific(value.pressure_force.y),
+            format_scientific(value.pressure_force.z)
+        )?;
+        writeln!(
+            writer,
+            "| Viscous force x/y/z | {} / {} / {} |",
+            format_scientific(value.viscous_force.x),
+            format_scientific(value.viscous_force.y),
+            format_scientific(value.viscous_force.z)
+        )?;
+        writeln!(
+            writer,
+            "| Total force x/y/z | {} / {} / {} |",
+            format_scientific(value.total_force.x),
+            format_scientific(value.total_force.y),
+            format_scientific(value.total_force.z)
+        )?;
+        writeln!(
+            writer,
+            "| Drag pressure/viscous/total | {} / {} / {} |",
+            format_scientific(value.drag.pressure),
+            format_scientific(value.drag.viscous),
+            format_scientific(value.drag.total)
+        )?;
+        writeln!(
+            writer,
+            "| Lift pressure/viscous/total | {} / {} / {} |",
+            format_scientific(value.lift.pressure),
+            format_scientific(value.lift.viscous),
+            format_scientific(value.lift.total)
+        )?;
+    }
     writeln!(writer)?;
     writeln!(writer, "## Timing Profile")?;
     writeln!(writer)?;
@@ -7412,6 +7872,35 @@ struct LaminarSimpleSolveArgs {
     report_json: Option<PathBuf>,
     report_markdown: Option<PathBuf>,
     write_final_fields: Option<PathBuf>,
+    wall_forces: Option<WallForceSolveArgs>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct WallForceSolveArgs {
+    patch_names: Vec<String>,
+    reference_speed: f64,
+    reference_area: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ContinuityErrorsReport {
+    final_error: NormalizedContinuity,
+    cumulative_global: f64,
+    delta_t: f64,
+    total_volume: f64,
+}
+
+#[derive(Clone, Debug)]
+struct WallForceReport {
+    patch_names: Vec<String>,
+    reference_speed: f64,
+    coefficients: WallForceCoefficients,
+}
+
+#[derive(Clone, Debug)]
+struct LaminarSimplePostProcessing {
+    continuity_errors: Option<ContinuityErrorsReport>,
+    wall_forces: Option<WallForceReport>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -7495,6 +7984,9 @@ fn parse_solver_args_for_invocation(
     let mut solve_report_json = None;
     let mut solve_report_markdown = None;
     let mut write_final_fields = None;
+    let mut wall_force_patches = None;
+    let mut force_reference_speed = None;
+    let mut force_reference_area = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -7884,6 +8376,49 @@ fn parse_solver_args_for_invocation(
                 laminar_simple_option_seen = true;
                 index += 2;
             }
+            "-wallForcePatches"
+            | "--wallForcePatches"
+            | "-wall-force-patches"
+            | "--wall-force-patches" => {
+                if wall_force_patches.is_some() {
+                    return Err("--wallForcePatches may be specified only once".to_string());
+                }
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--wallForcePatches requires comma-separated patch names".to_string()
+                })?;
+                wall_force_patches = Some(parse_wall_force_patch_names(value)?);
+                laminar_simple_option_seen = true;
+                index += 2;
+            }
+            "-forceReferenceSpeed"
+            | "--forceReferenceSpeed"
+            | "-force-reference-speed"
+            | "--force-reference-speed" => {
+                if force_reference_speed.is_some() {
+                    return Err("--forceReferenceSpeed may be specified only once".to_string());
+                }
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--forceReferenceSpeed requires a positive finite speed".to_string()
+                })?;
+                force_reference_speed =
+                    Some(parse_positive_f64_arg("--forceReferenceSpeed", value)?);
+                laminar_simple_option_seen = true;
+                index += 2;
+            }
+            "-forceReferenceArea"
+            | "--forceReferenceArea"
+            | "-force-reference-area"
+            | "--force-reference-area" => {
+                if force_reference_area.is_some() {
+                    return Err("--forceReferenceArea may be specified only once".to_string());
+                }
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--forceReferenceArea requires a positive finite area".to_string()
+                })?;
+                force_reference_area = Some(parse_positive_f64_arg("--forceReferenceArea", value)?);
+                laminar_simple_option_seen = true;
+                index += 2;
+            }
             other => return Err(format!("unknown ferrum solve option '{other}'")),
         }
     }
@@ -7900,6 +8435,26 @@ fn parse_solver_args_for_invocation(
             "scalar diffusion solve options require --solveScalarDiffusion <field>".to_string(),
         );
     }
+    let wall_forces = match (
+        wall_force_patches,
+        force_reference_speed,
+        force_reference_area,
+    ) {
+        (None, None, None) => None,
+        (Some(patch_names), Some(reference_speed), Some(reference_area)) => {
+            Some(WallForceSolveArgs {
+                patch_names,
+                reference_speed,
+                reference_area,
+            })
+        }
+        _ => {
+            return Err(
+                "--wallForcePatches, --forceReferenceSpeed, and --forceReferenceArea must be supplied together"
+                    .to_string(),
+            );
+        }
+    };
     let laminar_simple_solve = if invocation == SolverInvocation::IncompressibleFluidExecute {
         Some(LaminarSimpleSolveArgs {
             density,
@@ -7930,6 +8485,7 @@ fn parse_solver_args_for_invocation(
             report_json: solve_report_json,
             report_markdown: solve_report_markdown,
             write_final_fields,
+            wall_forces,
         })
     } else {
         None
@@ -8023,6 +8579,28 @@ fn parse_positive_usize_arg(label: &str, value: &str) -> Result<usize, String> {
         return Err(format!("{label} must be greater than zero"));
     }
     Ok(parsed)
+}
+
+fn parse_wall_force_patch_names(value: &str) -> Result<Vec<String>, String> {
+    if value.is_empty() {
+        return Err("--wallForcePatches requires at least one patch name".to_string());
+    }
+    let mut patch_names = Vec::new();
+    for raw_name in value.split(',') {
+        let name = raw_name.trim();
+        if name.is_empty() {
+            return Err(
+                "--wallForcePatches must not contain empty comma-separated patch names".to_string(),
+            );
+        }
+        if patch_names.iter().any(|existing| existing == name) {
+            return Err(format!(
+                "--wallForcePatches patch '{name}' is selected more than once"
+            ));
+        }
+        patch_names.push(name.to_string());
+    }
+    Ok(patch_names)
 }
 
 fn parse_non_negative_usize_arg(label: &str, value: &str) -> Result<usize, String> {
@@ -8292,6 +8870,10 @@ fn print_ferrum_run_usage() {
     println!("  --solveReportJson <file>         write the solver report as JSON");
     println!("  --solveReportMarkdown <file>     write the solver report as Markdown");
     println!("  --writeFinalFields <dir>         write final U and p fields");
+    println!("  --wallForcePatches <a,b>         integrate selected noSlip wall patches");
+    println!("  --forceReferenceSpeed <m/s>      positive force-coefficient speed");
+    println!("  --forceReferenceArea <m2>        positive force-coefficient area");
+    println!("  wall-force options are opt-in and must be supplied together");
 }
 
 fn print_init_case_usage() {
@@ -8352,14 +8934,15 @@ fn normalize_case_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContinuitySummary, FERRUM_MAX_CASE_SIMPLE_ITERATIONS, LaminarSimpleIterationSummary,
-        LaminarSimpleOptions, LaminarSimpleResidualControlSummary, LaminarSimpleSchemes,
-        MAX_RUNNER_DRY_RUN_STEPS, SafeOutputRoot, ScalarDiffusionLinearSolver,
-        SolverNumericsDictionaryPlan, SolverSelectionSource, estimate_iterations_to_convergence,
-        estimate_simple_iterations_to_convergence, format_optional_u128,
-        format_pressure_gamg_console, gamg_outer_profile_counters, numerics_dictionary_number,
-        numerics_dictionary_usize, numerics_dictionary_value, openfoam_gamg_options,
-        outer_convergence_status_for_reason, parse_ferrum_run_args,
+        ContinuityErrorsReport, ContinuitySummary, FERRUM_MAX_CASE_SIMPLE_ITERATIONS,
+        LaminarSimpleIterationSummary, LaminarSimpleOptions, LaminarSimplePostProcessing,
+        LaminarSimpleResidualControlSummary, LaminarSimpleSchemes, MAX_RUNNER_DRY_RUN_STEPS,
+        SafeOutputRoot, ScalarDiffusionLinearSolver, SolverNumericsDictionaryPlan,
+        SolverSelectionSource, WallForceReport, build_laminar_simple_post_processing,
+        estimate_iterations_to_convergence, estimate_simple_iterations_to_convergence,
+        format_optional_u128, format_pressure_gamg_console, gamg_outer_profile_counters,
+        numerics_dictionary_number, numerics_dictionary_usize, numerics_dictionary_value,
+        openfoam_gamg_options, outer_convergence_status_for_reason, parse_ferrum_run_args,
         parse_incompressible_fluid_args, parse_incompressible_fluid_plan_args,
         parse_laminar_simple_convection_scheme, parse_laminar_simple_gradient_scheme,
         parse_laminar_simple_laplacian_scheme, parse_laminar_simple_sn_grad_scheme,
@@ -8367,8 +8950,9 @@ mod tests {
         resolve_laminar_simple_convection_scheme, resolve_laminar_simple_options,
         resolve_solver_dispatch, resolved_gradient_scheme_value, run_ferrum_subcommand,
         validate_laminar_residual_control_dictionary, validate_module_execution_contract,
-        write_json_gamg_hierarchy, write_json_optional_u128_decimal, write_json_solver_state,
-        write_json_string, write_laminar_simple_fields, write_laminar_simple_report_json,
+        validate_wall_force_boundary_conditions, write_json_gamg_hierarchy,
+        write_json_optional_u128_decimal, write_json_solver_state, write_json_string,
+        write_laminar_simple_fields, write_laminar_simple_report_json,
         write_laminar_simple_report_markdown, write_laminar_simple_residual_csv,
         write_laminar_simple_residual_plot, write_solver_plan_json_in_root,
     };
@@ -8398,6 +8982,8 @@ mod tests {
     };
     use std::io::ErrorKind;
     use std::path::{Path, PathBuf};
+
+    use ferrum_finite_volume::boundary_forces::{DirectionalCoefficient, WallForceCoefficients};
 
     #[test]
     fn outer_convergence_status_distinguishes_missing_and_unmet_criteria() {
@@ -8722,6 +9308,101 @@ mod tests {
     }
 
     #[test]
+    fn parses_atomic_wall_force_options_for_incompressible_execution() {
+        let parsed = parse_incompressible_fluid_args(&[
+            "--wallForcePatches".to_string(),
+            " cylinder, innerWall ".to_string(),
+            "--forceReferenceSpeed".to_string(),
+            "0.015".to_string(),
+            "--forceReferenceArea".to_string(),
+            "1e-6".to_string(),
+        ])
+        .expect("complete wall-force options should parse");
+        let wall_forces = parsed
+            .laminar_simple_solve
+            .expect("incompressible solve")
+            .wall_forces
+            .expect("wall-force request");
+
+        assert_eq!(wall_forces.patch_names, ["cylinder", "innerWall"]);
+        assert_eq!(wall_forces.reference_speed, 0.015);
+        assert_eq!(wall_forces.reference_area, 1.0e-6);
+    }
+
+    #[test]
+    fn wall_force_options_reject_partial_duplicate_empty_and_nonpositive_inputs() {
+        for args in [
+            vec!["--wallForcePatches", "cylinder"],
+            vec!["--forceReferenceSpeed", "1", "--forceReferenceArea", "1"],
+            vec![
+                "--wallForcePatches",
+                "cylinder",
+                "--forceReferenceSpeed",
+                "1",
+            ],
+        ] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            let error = parse_incompressible_fluid_args(&args)
+                .expect_err("partial wall-force options must fail");
+            assert!(error.contains("must be supplied together"));
+        }
+
+        for patches in ["", "cylinder,", "cylinder,,wall", "cylinder,cylinder"] {
+            let error = parse_incompressible_fluid_args(&[
+                "--wallForcePatches".to_string(),
+                patches.to_string(),
+                "--forceReferenceSpeed".to_string(),
+                "1".to_string(),
+                "--forceReferenceArea".to_string(),
+                "1".to_string(),
+            ])
+            .expect_err("invalid patch list must fail");
+            assert!(
+                error.contains("patch") || error.contains("Patch"),
+                "unexpected error: {error}"
+            );
+        }
+
+        for (flag, value) in [
+            ("--forceReferenceSpeed", "0"),
+            ("--forceReferenceSpeed", "NaN"),
+            ("--forceReferenceArea", "-1"),
+            ("--forceReferenceArea", "inf"),
+        ] {
+            let mut args = vec![
+                "--wallForcePatches".to_string(),
+                "cylinder".to_string(),
+                "--forceReferenceSpeed".to_string(),
+                "1".to_string(),
+                "--forceReferenceArea".to_string(),
+                "1".to_string(),
+            ];
+            let position = args
+                .iter()
+                .position(|arg| arg == flag)
+                .expect("fixture flag");
+            args[position + 1] = value.to_string();
+            parse_incompressible_fluid_args(&args)
+                .expect_err("non-positive or non-finite reference value must fail");
+        }
+    }
+
+    #[test]
+    fn wall_force_options_are_execution_only() {
+        let args = [
+            "--wallForcePatches".to_string(),
+            "cylinder".to_string(),
+            "--forceReferenceSpeed".to_string(),
+            "1".to_string(),
+            "--forceReferenceArea".to_string(),
+            "1".to_string(),
+        ];
+
+        assert!(parse_solver_args(&args).is_err());
+        assert!(parse_incompressible_fluid_plan_args(&args).is_err());
+    }
+
+    #[test]
     fn parses_laminar_simple_residual_reporting_options() {
         let args = vec![
             "--solveVerbose".to_string(),
@@ -8929,6 +9610,7 @@ mod tests {
             &plan,
             &options,
             &report,
+            &output_test_post_processing(),
             0.0,
             &output_root,
             Path::new("report.json"),
@@ -8938,6 +9620,7 @@ mod tests {
             &plan,
             &options,
             &report,
+            &output_test_post_processing(),
             0.0,
             &output_root,
             Path::new("report.md"),
@@ -9156,6 +9839,7 @@ mod tests {
             &plan,
             &options,
             &report,
+            &output_test_post_processing(),
             0.0,
             &output_root,
             Path::new("report.json"),
@@ -9165,6 +9849,7 @@ mod tests {
             &plan,
             &options,
             &report,
+            &output_test_post_processing(),
             0.0,
             &output_root,
             Path::new("report.md"),
@@ -9226,6 +9911,7 @@ mod tests {
                 &plan,
                 &options,
                 &report,
+                &output_test_post_processing(),
                 0.0,
                 &output_root,
                 Path::new("overflow.json"),
@@ -9235,6 +9921,7 @@ mod tests {
                 &plan,
                 &options,
                 &report,
+                &output_test_post_processing(),
                 0.0,
                 &output_root,
                 Path::new("overflow.md"),
@@ -9524,6 +10211,69 @@ mod tests {
         }
     }
 
+    fn wall_force_test_fields(
+        velocity_type: Option<&str>,
+        pressure_type: Option<&str>,
+    ) -> ferrum_mesh::fields::InitialFieldSet {
+        ferrum_mesh::fields::InitialFieldSet {
+            case_dir: PathBuf::from("case"),
+            fields: vec![
+                ferrum_mesh::fields::FieldFile {
+                    path: PathBuf::from("case/0/U"),
+                    region: None,
+                    name: "U".to_string(),
+                    class_name: Some("volVectorField".to_string()),
+                    dimensions: None,
+                    internal_field: None,
+                    boundary_patches: vec![ferrum_mesh::fields::FieldBoundaryPatch {
+                        name: "cylinder".to_string(),
+                        patch_type: velocity_type.map(str::to_string),
+                        inlet_value: None,
+                        value: None,
+                    }],
+                },
+                ferrum_mesh::fields::FieldFile {
+                    path: PathBuf::from("case/0/p"),
+                    region: None,
+                    name: "p".to_string(),
+                    class_name: Some("volScalarField".to_string()),
+                    dimensions: None,
+                    internal_field: None,
+                    boundary_patches: vec![ferrum_mesh::fields::FieldBoundaryPatch {
+                        name: "cylinder".to_string(),
+                        patch_type: pressure_type.map(str::to_string),
+                        inlet_value: None,
+                        value: None,
+                    }],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn wall_force_bridge_requires_exact_no_slip_and_zero_gradient_field_conditions() {
+        let selected = ["cylinder".to_string()];
+        validate_wall_force_boundary_conditions(
+            &wall_force_test_fields(Some("noSlip"), Some("zeroGradient")),
+            &selected,
+        )
+        .expect("supported wall-force boundary conditions should pass");
+
+        for (velocity_type, pressure_type, expected) in [
+            (Some("fixedValue"), Some("zeroGradient"), "type noSlip"),
+            (Some("noSlip"), Some("fixedValue"), "type zeroGradient"),
+            (None, Some("zeroGradient"), "type noSlip"),
+            (Some("noSlip"), None, "type zeroGradient"),
+        ] {
+            let error = validate_wall_force_boundary_conditions(
+                &wall_force_test_fields(velocity_type, pressure_type),
+                &selected,
+            )
+            .expect_err("unsupported wall-force boundary condition must fail");
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+    }
+
     fn output_test_report() -> ferrum_mesh::flow::LaminarSimpleReport {
         ferrum_mesh::flow::LaminarSimpleReport {
             cells: 1,
@@ -9558,6 +10308,186 @@ mod tests {
             final_pressure: vec![1.0],
             history: Vec::new(),
         }
+    }
+
+    fn output_test_post_processing() -> LaminarSimplePostProcessing {
+        LaminarSimplePostProcessing {
+            continuity_errors: Some(ContinuityErrorsReport {
+                final_error: Default::default(),
+                cumulative_global: 0.0,
+                delta_t: 1.0,
+                total_volume: 1.0,
+            }),
+            wall_forces: None,
+        }
+    }
+
+    fn output_test_post_processing_with_forces() -> LaminarSimplePostProcessing {
+        LaminarSimplePostProcessing {
+            continuity_errors: Some(ContinuityErrorsReport {
+                final_error: ferrum_finite_volume::continuity::NormalizedContinuity {
+                    local: 1.25e-7,
+                    global: -2.5e-9,
+                },
+                cumulative_global: -3.75e-9,
+                delta_t: 0.5,
+                total_volume: 4.0,
+            }),
+            wall_forces: Some(WallForceReport {
+                patch_names: vec!["cylinder".to_string()],
+                reference_speed: 0.015,
+                coefficients: WallForceCoefficients {
+                    pressure_force: ferrum_mesh::Point3 {
+                        x: 1.0,
+                        y: 2.0,
+                        z: 3.0,
+                    },
+                    viscous_force: ferrum_mesh::Point3 {
+                        x: 0.5,
+                        y: -0.25,
+                        z: 0.0,
+                    },
+                    total_force: ferrum_mesh::Point3 {
+                        x: 1.5,
+                        y: 1.75,
+                        z: 3.0,
+                    },
+                    drag: DirectionalCoefficient {
+                        pressure: 4.0,
+                        viscous: 2.0,
+                        total: 6.0,
+                    },
+                    lift: DirectionalCoefficient {
+                        pressure: 1.0,
+                        viscous: -0.5,
+                        total: 0.5,
+                    },
+                    selected_patches: 1,
+                    selected_faces: 16,
+                    selected_area: 0.25,
+                    area_vector_sum: ferrum_mesh::Point3 {
+                        x: 0.0,
+                        y: 0.0,
+                        z: 0.0,
+                    },
+                    resolved_pressure_reference: 1.25,
+                    resolved_reference_area: 1.0e-6,
+                    reference_dynamic_pressure: 0.1125,
+                },
+            }),
+        }
+    }
+
+    #[test]
+    fn continuity_bridge_uses_final_and_completed_iteration_foundation_semantics() {
+        let mut plan = laminar_simple_test_plan(1000.0, 0.001);
+        plan.run.delta_t = Some(0.5);
+        plan.runtime_data.mesh.total_cell_volume = 2.0;
+        let solve = parse_incompressible_fluid_args(&[])
+            .expect("default incompressible args")
+            .laminar_simple_solve
+            .expect("incompressible solve");
+        let options = minimal_laminar_simple_options_for_estimate();
+        let mut report = output_test_report();
+        report.simple_iterations = 2;
+        report.final_continuity = ContinuitySummary {
+            l2_norm: 1.0,
+            max_abs: 1.0,
+            sum_abs: 4.0,
+            global_sum: -1.0,
+        };
+        let mut first = build_laminar_simple_iteration_summary(1, 0.0, 0.0, 0.0);
+        first.continuity_after = ContinuitySummary {
+            l2_norm: 1.0,
+            max_abs: 1.0,
+            sum_abs: 3.0,
+            global_sum: 2.0,
+        };
+        let mut second = build_laminar_simple_iteration_summary(2, 0.0, 0.0, 0.0);
+        second.continuity_after = report.final_continuity;
+        report.history = vec![first, second];
+
+        let post = build_laminar_simple_post_processing(&plan, &solve, &options, &report)
+            .expect("continuity bridge should normalize valid summaries");
+
+        let continuity = post
+            .continuity_errors
+            .expect("deltaT should enable normalized continuity");
+        assert_eq!(continuity.final_error.local, 1.0);
+        assert_eq!(continuity.final_error.global, -0.25);
+        assert_eq!(continuity.cumulative_global, 0.25);
+        assert_eq!(continuity.delta_t, 0.5);
+        assert_eq!(continuity.total_volume, 2.0);
+    }
+
+    #[test]
+    fn missing_delta_t_keeps_normalized_continuity_optional() {
+        let mut plan = laminar_simple_test_plan(1000.0, 0.001);
+        plan.run.delta_t = None;
+        let solve = parse_incompressible_fluid_args(&[])
+            .expect("default incompressible args")
+            .laminar_simple_solve
+            .expect("incompressible solve");
+        let options = minimal_laminar_simple_options_for_estimate();
+        let report = output_test_report();
+
+        let post = build_laminar_simple_post_processing(&plan, &solve, &options, &report)
+            .expect("missing deltaT must preserve the existing solve contract");
+
+        assert!(post.continuity_errors.is_none());
+    }
+
+    #[test]
+    fn report_schema_three_serializes_continuity_and_optional_wall_forces() {
+        let base = output_test_dir("post-processing-report");
+        std::fs::create_dir_all(&base).expect("output root should be created");
+        let output_root = SafeOutputRoot::open_existing(&base).expect("output root should open");
+        let plan = laminar_simple_test_plan(1000.0, 0.001);
+        let options = minimal_laminar_simple_options_for_estimate();
+        let report = output_test_report();
+        let post = output_test_post_processing_with_forces();
+
+        write_laminar_simple_report_json(
+            &plan,
+            &options,
+            &report,
+            &post,
+            0.0,
+            &output_root,
+            Path::new("report.json"),
+        )
+        .expect("JSON report should be written");
+        write_laminar_simple_report_markdown(
+            &plan,
+            &options,
+            &report,
+            &post,
+            0.0,
+            &output_root,
+            Path::new("report.md"),
+        )
+        .expect("Markdown report should be written");
+
+        let json = std::fs::read_to_string(base.join("report.json"))
+            .expect("JSON report should be readable");
+        let markdown = std::fs::read_to_string(base.join("report.md"))
+            .expect("Markdown report should be readable");
+        assert!(json.contains("\"schemaVersion\": 3"));
+        assert!(json.contains("\"continuityErrors\""));
+        assert!(json.contains("\"cumulativeGlobal\": -0.00000000375"));
+        assert!(json.contains("\"wallForces\""));
+        assert!(json.contains("\"pressureFieldKind\": \"kinematic\""));
+        assert!(json.contains("\"selectedFaces\": 16"));
+        assert!(json.contains("\"total\": 6"));
+        assert!(markdown.contains("- Schema version: `3`"));
+        assert!(markdown.contains("## Continuity errors"));
+        assert!(markdown.contains("## Wall forces"));
+        assert!(
+            markdown
+                .contains("| Drag pressure/viscous/total | 4.000000e0 / 2.000000e0 / 6.000000e0 |")
+        );
+
+        let _ = std::fs::remove_dir_all(base);
     }
 
     fn hierarchy_profile_fixture() -> GamgKernelTiming {

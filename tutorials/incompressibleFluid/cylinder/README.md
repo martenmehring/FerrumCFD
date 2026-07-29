@@ -71,15 +71,61 @@ The accepted Rust readback path records these raw maxima:
 | `Fine` | 44.296535 deg | 0.499926 | 3.477364 |
 
 All applicable C2 tests pass. The larger Legacy aspect value is retained as
-raw evidence rather than hidden by a cap. C3 must still add automated force,
-continuity, and convergence acceptance, and C4 must still perform the
-same-Linux comparison with OpenFOAM Foundation 13.
+raw evidence rather than hidden by a cap. C3 now supplies the automated force,
+continuity, convergence, refinement, and determinism acceptance. C4 must still
+perform the same-Linux comparison with OpenFOAM Foundation 13.
 
 From the repository root, run Ferrum without modifying the source case:
 
 ```console
 cargo run --locked -p ferrum-run --bin ferrumRun -- -solver incompressibleFluid -case tutorials/incompressibleFluid/cylinder/ferrum/case
 ```
+
+## C3 physical-acceptance gate
+
+The solver report can optionally integrate the final stationary no-slip wall
+force without changing the equations or the SIMPLE stopping rules. For the
+Cylinder, select patch `cylinder`, reference speed `0.015 m/s`, and projected
+area `D x depth = 1e-6 m2`. Ferrum reports pressure, viscous, and total force
+components plus `Cd` and `Cl` in the console and optional JSON/Markdown
+reports. The current incompressible solver stores kinematic pressure; density
+and dynamic viscosity therefore come from the resolved case properties.
+
+C3 also reports continuity with the same volume normalization used by the
+documented Foundation reference:
+
+```text
+local  = (sum(abs(netCellFlux)) / totalCellVolume) * deltaT
+global = (sum(netCellFlux)      / totalCellVolume) * deltaT
+```
+
+The existing raw L2, maximum, absolute-sum, and global-sum diagnostics remain
+available and unchanged. They are not substituted for the normalized
+reference quantities.
+
+The complete C3 release gate generates fresh `Coarse` and `Fine` meshes in a
+temporary directory, repeats `Coarse`, applies the C2 quality limits to the
+same meshes that are solved, requires converged outer and linear solves, and
+checks continuity, `Cd`, `Cl`, refinement drift, and deterministic final
+fields. It bundles no external case and invokes no external CFD utility:
+
+```console
+cargo +1.94.0 test --locked --release -p ferrum-run --test cylinder_c3_acceptance -- --ignored --nocapture
+```
+
+This explicit ignored test is a release gate rather than part of the fast
+default test suite. It passed on 2026-07-29 with the following evidence:
+
+| Mesh/run | SIMPLE iterations | Local continuity | Global continuity | Cd | Cl |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `Coarse` A | 1,181 | 7.518411e-13 | -2.859259e-14 | 11.50464804 | 1.074589e-8 |
+| `Coarse` B | 1,181 | bit-identical to A | bit-identical to A | bit-identical to A | bit-identical to A |
+| `Fine` | 3,583 | <= 1e-6 gate passed | <= 1e-6 gate passed | 11.53648 | 9.706568e-9 |
+
+The Coarse/Fine drag drift is `0.275907%`, below the `5%` gate. The two Coarse
+runs also produced bit-identical final `U` and `p`. These are physical and
+deterministic C3 results, not a speed comparison. C4 performs the separate
+same-Linux comparison against Foundation 13.
 
 ## Numerical benchmark
 
@@ -100,6 +146,6 @@ mesh.
 
 There is no useful closed-form solution for this finite-domain viscous cylinder
 problem, so the documented numerical benchmark is used instead. Current
-limitations are the coarse mesh, simplified finite outer boundary, steady
-laminar model, and absence of an automated force-comparison runner. Runtime is
-intentionally not an acceptance value because it depends on hardware.
+limitations are the finite outer boundary and steady laminar model. Runtime is
+intentionally not a C3 acceptance value because it depends on hardware; the
+same-Linux performance comparison belongs to C4.

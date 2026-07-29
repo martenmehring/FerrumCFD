@@ -724,7 +724,7 @@ tutorial matrix. The status column is the audited repository state on
 | ---: | --- | --- | --- | --- |
 | 1 | `laminarPipe` | 3D internal flow and pressure loss | Runnable case, analytical checks, convergence profiles, and performance evidence present | Hagen-Poiseuille analytical solution |
 | 2 | `planeChannel` | true 2D `empty` handling | Runnable case, analytical checks, executable `empty` coverage, convergence profiles, and performance evidence present | Plane-Poiseuille analytical solution |
-| 3 | `cylinder` | steady laminar external flow at `Re = 1` and corrected non-orthogonal pressure coupling | Independently authored 48-cell `LegacySmoke` case, preflight, two-SIMPLE-iteration smoke, generic stationary-wall force/Cd/Cl operator, and accepted C2 deterministic Coarse/Fine O-grids with raw-quality evidence present; C3 reporting/physical gates and C4 same-Linux comparison remain open | Documented OpenFOAM Foundation 13 observables selected by the focused case task |
+| 3 | `cylinder` | steady laminar external flow at `Re = 1` and corrected non-orthogonal pressure coupling | Independently authored 48-cell `LegacySmoke` case, accepted C2 deterministic Coarse/Fine O-grids, generic force/continuity reporting, and the complete C3 Coarse/Coarse/Fine physical gate pass; C4 same-Linux comparison remains open | Documented OpenFOAM Foundation 13 observables selected by the focused case task |
 | 4 | `lidDrivenCavity` | recirculation and closed-pressure reference | Independently authored 4-cell case plus preflight and two-SIMPLE-iteration E2E smoke present; the nonzero `pRefValue` is verified in the written field and all eight fixed-velocity faces exercise the pressure constraint; refined centerline/vortex acceptance remains open | Ghia, Ghia, and Shin Re=100 published benchmark |
 | 5 | `backwardFacingStep` | separation, reattachment, outlet robustness, and actual reverse-flow switching | Not implemented as an executable Ferrum tutorial | Published benchmark |
 | 6 | `axisymmetricPipe` | executable `wedge` handling | Not implemented as an executable Ferrum tutorial | Hagen-Poiseuille analytical solution |
@@ -745,7 +745,7 @@ another unbounded sequence of GAMG micro-optimizations:
    deliberately skewed corrected non-orthogonal E2E mesh and physical cavity
    acceptance; open-pressure `adjustPhi` and pressure-flux coverage remains
    part of the combined gate;
-2. complete the Cylinder force/continuity acceptance, refine the
+2. retain the accepted Cylinder force/continuity gate, refine the
    `lidDrivenCavity` physical acceptance, then add `backwardFacingStep` and
    `axisymmetricPipe` in matrix order;
 3. add executable direction-changing backflow coverage and executable
@@ -1533,8 +1533,8 @@ The immediate sequence is:
 18. **F-PERF-GPU (planned later leaf):** Start GPU work only after the scalar,
     SIMD, and shared-memory contracts above are measured. Keep it isolated from
     CPU acceptance and apply the same fixed-work plus time-to-accuracy evidence.
-19. **F-D1-CYLINDER-LIMITED-SCHEMES / F-D1-CASE-CYLINDER (C1/C2 implemented;
-   C3/C4 open):** Limited schemes, the
+19. **F-D1-CYLINDER-LIMITED-SCHEMES / F-D1-CASE-CYLINDER (C1/C2/C3 accepted;
+   C4 open):** Limited schemes, the
    independently authored Cylinder case, preflight, and a two-iteration smoke
    are present. The first `ferrumFiniteVolume` leaf provides generic
    stationary-no-slip pressure, viscous-force, and Cd/Cl integration for
@@ -1568,10 +1568,34 @@ The immediate sequence is:
    `44.296535 deg / 0.499926 / 3.477364` for `Fine`, in
    non-orthogonality / normalized skewness / active-edge-aspect order.
 
-   C3 must still connect automated force, continuity, mesh-quality, and
-   convergence gates before the Cylinder is physically accepted. C4 remains
-   the external same-Linux comparison against OpenFOAM Foundation v13.
-   Validation order remains Pipe, Channel, then Cylinder.
+   C3 connects the final SIMPLE fields to the existing generic wall-force API
+   through optional `ferrumRun` reporting. It retains the raw continuity
+   summary and adds the Foundation-compatible quantities
+   `(sumAbs(netCellFlux)/totalVolume)*deltaT` and
+   `(globalSum(netCellFlux)/totalVolume)*deltaT`, including cumulative global
+   error. Its explicit release-only Rust gate regenerates and round-trips the
+   `Coarse` and `Fine` meshes, re-applies the C2 quality policy to those exact
+   solve inputs, repeats `Coarse`, and requires outer/linear convergence,
+   finite forces, `|Cl| <= 1e-6`, normalized local/global continuity
+   `<= 1e-6`, `Cd` within 15% of the documented value, and Coarse/Fine `Cd`
+   drift `<= 5%`. No external runtime or case is part of C3.
+
+   The release gate passed on 2026-07-29. Both identical `Coarse` runs stopped
+   after 1,181 SIMPLE iterations with bit-identical final `U` and `p`; the
+   first recorded normalized local/global/cumulative errors were
+   `7.518411e-13 / -2.859259e-14 / -4.148956e-11`, with
+   `Cd=11.50464804` and `Cl=1.074589e-8`. `Fine` stopped after 3,583 SIMPLE
+   iterations with `Cd=11.53648` and `Cl=9.706568e-9`; the Coarse/Fine drag
+   drift was `0.275907%`. Every force, convergence, mesh-quality, continuity,
+   refinement, report, and determinism assertion passed.
+
+   This gate exposed a corrected-non-orthogonal flux inconsistency: final
+   `phi` now subtracts the solved pressure flux from the exact face-flux base
+   used to assemble the final pressure equation. A skewed-mesh regression
+   proves matrix-residual/flux-divergence parity, while the zero-corrector path
+   retains its existing behavior. C4 remains the external same-Linux
+   comparison against OpenFOAM Foundation v13. Validation order remains Pipe,
+   Channel, then Cylinder.
 20. **F-AUTO-1 (accepted external dependency):** Keep the accepted isolated n8n
    coding workflow in the AI Dev Orchestrator repository and preserve the
    existing analysis workflow as a separate read-only path.
