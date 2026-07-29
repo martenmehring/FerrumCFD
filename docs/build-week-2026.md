@@ -82,9 +82,11 @@ gate passes.
 
 ## Publication Record
 
-The optimization candidate is developed on
-`codex/ferrum-optimization-integration-20260718`. Its deterministic commits use
-the `Project Automation <project-automation@users.noreply.github.com>` identity.
-The final pull request, CI result, review outcome, merge commit, and submission
-URL will be added here when those events exist; this record does not pre-claim
-publication or acceptance.
+The optimization candidate was developed on
+`codex/ferrum-optimization-integration-20260718`. Automated publication is a
+tooling step, not a contributor. Publication commits must therefore use the
+verified identity of project owner Marten Mehring and must never invent or
+substitute a person-like automation identity. Correcting already published Git
+metadata is tracked separately because changing an author or committer rewrites
+the affected commit and every descendant. This record does not pre-claim a
+review, merge, or acceptance that is not backed by versioned evidence.
