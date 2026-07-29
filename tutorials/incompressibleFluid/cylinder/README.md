@@ -11,6 +11,70 @@ The independently authored `ferrum/case` contains a complete 48-cell
 body-fitted mesh. It is deliberately small and deterministic for a bounded
 regression, not for production-quality force prediction.
 
+## Deterministic mesh family (C2)
+
+C2 defines a pure-Rust, deterministic O-grid generator. It is a Ferrum mesh
+capability, not a wrapper around an external mesher. The cylinder diameter
+`D` is the geometry scale. Every preset has only the `inlet`, `outlet`,
+`cylinder`, and `frontAndBack` boundary patches plus the `fluid` volume zone;
+there are no separate `top` or `bottom` patches. For `Coarse` and `Fine`, the
+left, upper, and lower outer-boundary segments belong to `inlet`, while only
+the right segment belongs to `outlet`. `LegacySmoke` preserves the existing
+four-face `inlet` and twelve-face `outlet` outer-boundary split.
+
+| Preset | Circumferential sectors | Radial layers | Cells | Intended use |
+| --- | ---: | ---: | ---: | --- |
+| `LegacySmoke` | 16 | 3 | 48 | Preserve the bounded checked-in smoke topology |
+| `Coarse` | 128 | 42 | 5,376 | First production acceptance mesh |
+| `Fine` | 256 | 84 | 21,504 | Refinement and C3 physical-acceptance mesh |
+
+The `Coarse` and `Fine` presets use a `-100D .. +100D` outer domain, an
+extrusion depth of `D`, and deterministic exponential radial grading with the
+continuous endpoint spacing-density parameter `R = 1000` in
+`g(t) = (R^t - 1) / (R - 1)`. This is not a claim that the final discrete cell
+is exactly 1000 times wider than the first. Their generated mesh files belong
+under `target/` and are not tracked. The small `LegacySmoke` case remains the
+fast repository fixture.
+
+The generator also writes neutral Gmsh 2.2 ASCII and reads that output back
+through Ferrum's independently authored importer. Acceptance requires exact
+point, cell, patch, and topology parity after that round trip. Generating or
+running these meshes therefore requires no OpenFOAM runtime, utility, or case
+data.
+
+C2 records raw geometry measurements rather than hiding poor cells behind a
+quality cap. The Rust acceptance tests must demonstrate, for every preset:
+
+- deterministic ordering and repeated-generation hashes, exact cell counts,
+  a closed periodic seam, and the expected patch inventory;
+- zero non-finite geometry, zero non-positive face areas, zero non-positive
+  cell volumes, and no reported problematic face or cell indices; and
+- exact neutral-writer/readback topology and patch parity.
+
+The production `Coarse` and `Fine` presets must additionally demonstrate:
+
+- maximum internal non-orthogonality of at most `50 deg`;
+- maximum normalized internal skewness of at most `0.55`; and
+- maximum active two-dimensional edge aspect ratio of at most `4.0`.
+
+Those production limits do not apply to the intentionally tiny 48-cell
+`LegacySmoke` regression mesh. Its raw values remain observable and its safety,
+topology, and determinism contracts still apply; changing its topology to meet
+production-quality limits would defeat its compatibility purpose.
+
+The accepted Rust readback path records these raw maxima:
+
+| Preset | Non-orthogonality | Normalized skewness | Active edge aspect |
+| --- | ---: | ---: | ---: |
+| `LegacySmoke` | 48.099448 deg | 0.490957 | 13.940787 |
+| `Coarse` | 43.608220 deg | 0.499852 | 3.626150 |
+| `Fine` | 44.296535 deg | 0.499926 | 3.477364 |
+
+All applicable C2 tests pass. The larger Legacy aspect value is retained as
+raw evidence rather than hidden by a cap. C3 must still add automated force,
+continuity, and convergence acceptance, and C4 must still perform the
+same-Linux comparison with OpenFOAM Foundation 13.
+
 From the repository root, run Ferrum without modifying the source case:
 
 ```console
