@@ -1,16 +1,21 @@
 //! Deterministic writer for the supported subset of neutral Gmsh 2.2 ASCII.
 
 use std::collections::HashSet;
-use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
+use crate::safe_output::SafeOutputRoot;
 use crate::{Mesh, MeshError, PhysicalName, Result};
 
 /// Writes a validated mesh as neutral Gmsh 2.2 ASCII.
 pub fn write_msh22_ascii(path: &Path, mesh: &Mesh) -> Result<()> {
     validate_mesh(mesh)?;
-    let mut writer = BufWriter::new(File::create(path)?);
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| invalid("Gmsh output path has no file name"))?;
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let output = SafeOutputRoot::open_existing(parent)?;
+    let mut writer = BufWriter::new(output.open_replace_regular(Path::new(file_name))?);
     write_validated_msh22_ascii(&mut writer, mesh)?;
     writer.flush()?;
     Ok(())

@@ -174,6 +174,48 @@ fn all_presets_are_mesh_and_byte_deterministic_and_roundtrip_exactly() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn gmsh_path_writer_does_not_clobber_link_targets() {
+    use std::os::unix::fs::symlink;
+
+    let directory = temporary_path("gmsh-safe-output", "dir");
+    fs::create_dir(&directory).expect("create temporary output directory");
+    let victim = directory.join("victim.txt");
+    let output = directory.join("mesh.msh");
+    fs::write(&victim, b"preserve me").expect("write victim file");
+    let mesh = generate_cylinder_ogrid(&CylinderOGridPreset::LegacySmoke.config())
+        .expect("generate test mesh");
+
+    symlink(&victim, &output).expect("create output symlink");
+    assert!(write_msh22_ascii(&output, &mesh).is_err());
+    assert_eq!(
+        fs::read(&victim).expect("read symlink target"),
+        b"preserve me"
+    );
+    fs::remove_file(&output).expect("remove output symlink");
+
+    fs::hard_link(&victim, &output).expect("create output hard link");
+    write_msh22_ascii(&output, &mesh).expect("replace hard link safely");
+    assert_eq!(
+        fs::read(&victim).expect("read hard-link target"),
+        b"preserve me"
+    );
+    assert!(
+        fs::read(&output)
+            .expect("read replacement output")
+            .starts_with(b"$MeshFormat\n")
+    );
+
+    let linked_directory = temporary_path("gmsh-linked-output", "dir");
+    symlink(&directory, &linked_directory).expect("create output directory symlink");
+    assert!(write_msh22_ascii(&linked_directory.join("escaped.msh"), &mesh).is_err());
+    assert!(!directory.join("escaped.msh").exists());
+    fs::remove_file(&linked_directory).expect("remove output directory symlink");
+
+    fs::remove_dir_all(&directory).expect("remove temporary output directory");
+}
+
 #[test]
 fn legacy_smoke_roundtrips_with_valid_raw_poly_mesh_quality() {
     assert_preset_roundtrip_quality(CylinderOGridPreset::LegacySmoke, [4, 12, 16, 96], false);
