@@ -1344,6 +1344,43 @@ The immediate sequence is:
     `c0c7d75985f98df4a14a173278124de0cf72944bcd22aece165047a4dd87c2ad`;
     its manifest-seal SHA256 is
     `5e87e9020d37cd2f1b7455235ba3b94de9f3c800a4d6e15dc4c92b3e28de03ea`.
+    A following two-file clean-base research leaf on `40c6a80` replaced only
+    the GAMG cached-diagonal smoother hot loop with a private validated
+    index-elided kernel. Full CSR, diagonal, buffer, and coefficient-refresh
+    invariants precede every call. Row, entry, multiplication, addition, and
+    diagonal-division order; non-finite failure order and partial mutation;
+    sweeps, tolerances, hierarchy, work counters, reports, and public APIs all
+    remained exact. The general checked kernel became a unit-test-only oracle.
+    No reciprocal, packed storage, reordering, reassociation, new allocation,
+    hierarchy change, or artificial magnitude cap was introduced. Two direct
+    debug and release proofs covered diagonal positions, multiple forward and
+    reverse half-sweeps, and exact late-failure mutation. All 54 GAMG tests in
+    debug and release, the 490-test workspace gate plus one intentional
+    performance ignore, the release pressure-matrix gate, Rust 1.94
+    locked/offline Clippy, formatting, and independent unsafe-invariant reviews
+    passed.
+
+    Native Linux CPU2 build and 16/16 semantic pre-gates passed. Stage A then
+    completed exactly 48 jobs with exact fields, reports, hierarchy, options,
+    stop reasons, convergence, and work fingerprints. Its single authoritative
+    gate specification has SHA256
+    `271f84d4327ef29bd40d7576d5fc5ca7238df39dc024f22b848a6d11eaff2cfd`.
+    Channel passed the complete gate: its primary raw and paired candidate/base
+    ratios were `0.82236` and `0.78960`, with both order cohorts below one and
+    `4/5` wins; its profiled smoothing paired ratio was `0.69591` with `5/5`
+    wins. Pipe also showed a strong mechanism signal: the smoothing raw and
+    paired ratios were `0.79037` and `0.82912`, with `5/5` wins. Pipe's primary
+    pressure ratios were `0.82415` raw and `0.92583` paired with `4/5` wins, but
+    the B-leading cohort was `1.00155`, and its `0.07417` paired improvement was
+    not greater than the `0.10900` paired-ratio MAD. Both predeclared criteria
+    therefore failed. All solver/process guards passed, but the strict decision
+    was `NO-GO`; Stage B was neither authorized nor created, and no extra runs
+    occurred. The source remains local and unmerged, and no speedup is claimed.
+    A focused Fable review was neither used nor claimed for the rejected source.
+    The independently verified 1,914-entry evidence manifest SHA256 is
+    `8aede4d77678e66191ff4507d620ab4a89bc6302f849ee2d3ab6c955401adb98`;
+    its manifest-seal SHA256 is
+    `ce5daefe6004b2a10a102545a278601accf0e458207a2f92f58f6c395f0fcdec`.
 14. **F-PERF-GAMG-FCG (accepted opt-in scalar path; default unchanged):** The
     existing GAMG V-cycle is now available as the explicit preconditioner for
     an `outerSolver FCG` pressure path. Seven focused proofs cover the real
