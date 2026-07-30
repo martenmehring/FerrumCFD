@@ -399,6 +399,24 @@ pub fn summarize_poly_mesh_quality(
 }
 
 pub fn compute_poly_mesh_geometry(mesh: &PolyMesh) -> Result<PolyMeshGeometry> {
+    compute_poly_mesh_geometry_with_volume_validation(mesh, |_, _| Ok(()))
+}
+
+pub(crate) fn compute_solver_runtime_geometry(mesh: &PolyMesh) -> Result<PolyMeshGeometry> {
+    compute_poly_mesh_geometry_with_volume_validation(mesh, |cell_index, volume| {
+        if !volume.is_finite() || volume <= 0.0 {
+            return Err(MeshError::InvalidInput(format!(
+                "cell {cell_index} has invalid oriented volume {volume}"
+            )));
+        }
+        Ok(())
+    })
+}
+
+fn compute_poly_mesh_geometry_with_volume_validation(
+    mesh: &PolyMesh,
+    validate_volume: impl Fn(usize, f64) -> Result<()>,
+) -> Result<PolyMeshGeometry> {
     mesh.validate()?;
     let face_geometry = compute_face_geometry(mesh)?;
     let cell_centres = compute_cell_centres(mesh, &face_geometry)?;
@@ -407,6 +425,9 @@ pub fn compute_poly_mesh_geometry(mesh: &PolyMesh) -> Result<PolyMeshGeometry> {
     let cell_volumes =
         compute_signed_cell_volumes(mesh, &face_geometry, &cell_centres, &oriented_area_vectors)?;
 
+    for (cell_index, volume) in cell_volumes.iter().copied().enumerate() {
+        validate_volume(cell_index, volume)?;
+    }
     let non_positive_cell_volumes = cell_volumes.iter().filter(|volume| **volume <= 0.0).count();
 
     Ok(PolyMeshGeometry {
