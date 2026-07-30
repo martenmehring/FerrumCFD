@@ -5828,7 +5828,7 @@ fn write_laminar_simple_report_markdown(
         writeln!(
             writer,
             "| Patches | {} |",
-            wall_forces.patch_names.join(",")
+            escape_markdown_table_cell(&wall_forces.patch_names.join(","))
         )?;
         writeln!(writer, "| Selected patches | {} |", value.selected_patches)?;
         writeln!(writer, "| Selected faces | {} |", value.selected_faces)?;
@@ -6206,6 +6206,25 @@ fn write_laminar_simple_report_markdown(
     }
 
     writer.flush()
+}
+
+fn escape_markdown_table_cell(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            '|' => escaped.push_str("&#124;"),
+            character if character.is_control() => {
+                escaped.push_str(&format!("&#{};", u32::from(character)));
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 fn write_markdown_face_flux_diagnostic(
@@ -8982,10 +9001,11 @@ mod tests {
         LaminarSimpleResidualControlSummary, LaminarSimpleSchemes, MAX_RUNNER_DRY_RUN_STEPS,
         SafeOutputRoot, ScalarDiffusionLinearSolver, SolverNumericsDictionaryPlan,
         SolverSelectionSource, WallForceReport, build_laminar_simple_post_processing,
-        estimate_iterations_to_convergence, estimate_simple_iterations_to_convergence,
-        format_optional_u128, format_pressure_gamg_console, gamg_outer_profile_counters,
-        numerics_dictionary_number, numerics_dictionary_usize, numerics_dictionary_value,
-        openfoam_gamg_options, outer_convergence_status_for_reason, parse_ferrum_run_args,
+        escape_markdown_table_cell, estimate_iterations_to_convergence,
+        estimate_simple_iterations_to_convergence, format_optional_u128,
+        format_pressure_gamg_console, gamg_outer_profile_counters, numerics_dictionary_number,
+        numerics_dictionary_usize, numerics_dictionary_value, openfoam_gamg_options,
+        outer_convergence_status_for_reason, parse_ferrum_run_args,
         parse_incompressible_fluid_args, parse_incompressible_fluid_plan_args,
         parse_laminar_simple_convection_scheme, parse_laminar_simple_gradient_scheme,
         parse_laminar_simple_laplacian_scheme, parse_laminar_simple_sn_grad_scheme,
@@ -10419,6 +10439,43 @@ mod tests {
                 },
             }),
         }
+    }
+
+    #[test]
+    fn markdown_report_escapes_untrusted_wall_force_patch_names() {
+        let base = output_test_dir("wall-force-markdown-escaping");
+        std::fs::create_dir_all(&base).expect("output root should be created");
+        let output_root = SafeOutputRoot::open_existing(&base).expect("output root should open");
+        let mut post_processing = output_test_post_processing_with_forces();
+        post_processing
+            .wall_forces
+            .as_mut()
+            .expect("wall-force fixture should be present")
+            .patch_names = vec!["<script>alert('x')</script>|row\nnext&last".to_string()];
+
+        write_laminar_simple_report_markdown(
+            &laminar_simple_test_plan(1000.0, 0.001),
+            &minimal_laminar_simple_options_for_estimate(),
+            &output_test_report(),
+            &post_processing,
+            0.0,
+            &output_root,
+            Path::new("report.md"),
+        )
+        .expect("Markdown report should be written");
+
+        let markdown = std::fs::read_to_string(base.join("report.md"))
+            .expect("Markdown report should be readable");
+        assert!(markdown.contains(
+            "| Patches | &lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;&#124;row&#10;next&amp;last |"
+        ));
+        assert!(!markdown.contains("<script>"));
+        assert_eq!(
+            escape_markdown_table_cell("quoted \"name\"\t"),
+            "quoted &quot;name&quot;&#9;"
+        );
+
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
