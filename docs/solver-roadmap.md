@@ -196,8 +196,12 @@ writes JSON/Markdown reports including pressure-assembly diagnostics for
 `phi`. Reports also contain a `linearSolves` profile so medium/fine runs expose
 whether the bottleneck is the non-symmetric momentum predictor or the pressure
 PCG/IC(0) correction. Resolved `solvers.U.relTol` and `solvers.p.relTol` use a
-strict normalized-L1 target for every linear solve. OpenFOAM Foundation-style
-outer `residualControl` and linear-solver convergence are reported separately.
+strict normalized-L1 target for every linear solve. Standalone GAMG already
+checks that target directly; the non-GAMG PCG path still uses a conservative
+normalized-L1-to-L2 bridge followed by final normalized-L1 acceptance. A direct
+normalized-L1 PCG loop remains a planned performance leaf and must preserve the
+same strict public stopping contract. OpenFOAM Foundation-style outer
+`residualControl` and linear-solver convergence are reported separately.
 `converged=true` means the configured outer field criteria were checked and
 satisfied; every momentum-component and pressure-correction solve exposes its
 initial/final residuals, effective target, stop reason, iterations, and
@@ -331,8 +335,8 @@ solver instability behind artificial clipping.
 
 Current executable subset:
 
-- `grad(p)`: `Gauss linear`;
-- `grad(U)`: `Gauss linear`;
+- `grad(p)`: `Gauss linear`, `cellLimited Gauss linear k`;
+- `grad(U)`: `Gauss linear`, `cellLimited Gauss linear k`;
 - `div(phi,U)`: `Gauss upwind`, `Gauss linearUpwind grad(U)`;
 - `laplacian`: `Gauss linear corrected`, `orthogonal`, `uncorrected`;
 - `snGrad`: `corrected`, `orthogonal`, `uncorrected`;
@@ -340,13 +344,34 @@ Current executable subset:
 
 Next scheme targets:
 
-- validate corrected `snGrad` and non-orthogonal flux correction on generated
-  skewed meshes;
+- retain the accepted corrected non-orthogonal pressure-flux parity proof and
+  extend it to a generated skewness/corrector matrix rather than treating the
+  corrected path as wholly unimplemented;
 - add bounded/limited convection schemes as explicit schemes, not hidden
   clamps;
 - keep operator assembly independent from CPU/GPU solver backend code;
 - add operator-level tests for face orientation, owner/neighbour signs, and
   boundary-face flux signs.
+
+### Spatial Accuracy Track
+
+Keep spatial accuracy independent from the pressure-kernel timing sequence:
+
+1. add weighted least-squares scalar and vector gradients with exact constant
+   and linear reproduction in an intrinsic active-dimensional basis,
+   deterministic stencils, and fail-closed deficiency handling relative to
+   that active dimension so valid `empty` and `wedge` meshes remain supported;
+2. propagate the selected gradient through momentum assembly, pressure
+   non-orthogonal correction, and explicit `0/1/2` corrector gates on open,
+   closed, orthogonal, non-orthogonal, and deliberately skewed meshes;
+3. replace the current lowest-order wall-force baseline with reconstructed
+   wall-face pressure and full deviatoric viscous traction from reconstructed
+   `grad(U)`, while preserving pressure-gauge, orientation, and area contracts;
+4. run at least three geometrically similar meshes and report observed order,
+   Richardson extrapolation, and GCI for `Cd`, fields, wall pressure, and wall
+   shear, with iterative error demonstrably below spatial error;
+5. only then repeat same-mesh OpenFOAM parity. Cross-engine parity and formal
+   grid convergence remain separate claims.
 
 ## Milestone 4: Benchmark Matrix
 
@@ -396,8 +421,10 @@ Current status:
 - historical OpenFOAM `simpleFoam`: `4.21 s` solver execution and `7.85 s`
   driver wall time in the matched 100-step rerun; do not use this as current
   `foamRun` performance data;
-- CPU pressure PCG now has an IC(0) incomplete-Cholesky path for OpenFOAM
-  `DIC`/`FDIC`, replacing the earlier diagonal-only mapping for pressure;
+- CPU pressure PCG has a full CSR IC(0) incomplete-Cholesky path. The current
+  `DIC` and `FDIC` dictionary names are compatibility aliases to that IC(0)
+  implementation, not exact OpenFOAM DIC/FDIC algorithm parity. A true
+  face-LDU DIC/FDIC leaf is planned below;
 - CG/PCG breakdown tests are scale-relative rather than absolute
   `f64::EPSILON` cutoffs, so valid small SI-scaled pressure systems are not
   terminated prematurely;
@@ -1648,6 +1675,12 @@ The immediate sequence is:
    `<= 1e-6`, `Cd` within 15% of the documented value, and Coarse/Fine `Cd`
    drift `<= 5%`. No external runtime or case is part of C3.
 
+   The accepted force path is intentionally a lowest-order baseline: wall
+   pressure is taken from the owner cell and the viscous term uses a one-sided
+   wall-normal velocity derivative. It is not yet the reconstructed wall-face
+   pressure and full deviatoric traction required by the spatial-accuracy
+   track.
+
    The release gate passed on 2026-07-29. Both identical `Coarse` runs stopped
    after 1,181 SIMPLE iterations with bit-identical final `U` and `p`; the
    first recorded normalized local/global/cumulative errors were
@@ -1655,7 +1688,9 @@ The immediate sequence is:
    `Cd=11.50464804` and `Cl=1.074589e-8`. `Fine` stopped after 3,583 SIMPLE
    iterations with `Cd=11.53648` and `Cl=9.706568e-9`; the Coarse/Fine drag
    drift was `0.275907%`. Every force, convergence, mesh-quality, continuity,
-   refinement, report, and determinism assertion passed.
+   refinement, report, and determinism assertion passed. This two-level drift
+   is a useful regression gate, not a formal observed-order, Richardson, or GCI
+   result.
 
    This gate exposed a corrected-non-orthogonal flux inconsistency: final
    `phi` now subtracts the solved pressure flux from the exact face-flux base
@@ -1677,6 +1712,66 @@ The immediate sequence is:
    [Cylinder same-Linux parity](benchmarks/cylinder-linux-parity.md). No
    OpenFOAM case, source, executable, or comparison launcher is tracked.
    Validation order remains Pipe, Channel, then Cylinder.
+
+   **Post-C4 Cylinder pressure and accuracy sequence (planned):**
+
+   1. **F-CYL-PCG-PROFILE (completed diagnostic; no speed claim):** Exact
+      post-merge commit `966e32ee9508` and tree `caff8b6a6b4f` were archived
+      into a fresh WSL ext4 build with Rust `1.94.0`, `target-cpu=native`, and
+      pinned serial CPU `2`. On the unchanged official 5,388-cell Fixed case,
+      plain and profiled 20-step runs produced identical canonical reports and
+      bit-identical final `U`/`p`. The profiled 200-step run executed 25,323
+      pressure-PCG iterations. Of `9.475771 s` measured PCG time,
+      preconditioner application used `44.967%`, vector operations `26.675%`,
+      matrix-vector products `26.441%`, factor refresh `1.492%`, and other work
+      `0.425%`. This phase ranking selects the preconditioner application path
+      for point 2; it does not establish an end-to-end performance change;
+   2. **F-CYL-DIC-FDIC:** add true symmetric face-LDU `DIC` and `FDIC`
+      preconditioners while preserving the existing full CSR IC(0) path behind
+      `ic0`/`incompleteCholesky`. Match the OpenFOAM Foundation 13 mathematical
+      contract: one owner/neighbour coefficient per internal face, the
+      diagonal DIC recurrence, reciprocal preconditioned diagonal, and
+      deterministic forward/reverse face sweeps. `FDIC` uses the same
+      recurrence with cached face multipliers. Implement this independently in
+      safe Rust with explicit finite, positive-pivot, allocation, ordering, and
+      failure gates. This is not a reopening of the rejected LDU-addressed
+      symmetric Gauss-Seidel experiment;
+   3. **F-CYL-PCG-NL1:** make non-GAMG PCG evaluate the public normalized-L1
+      residual directly on each convergence check and reuse the already
+      written residual. Preserve strict absolute/relative boundaries,
+      zero-iteration initial convergence, exact iteration-count/max-iteration
+      lifecycle, L2 telemetry, breakdown behavior, final acceptance, and
+      existing outer SIMPLE bounds. This is not the rejected C8
+      reduction-only fusion;
+   4. **F-CYL-PRESSURE-GEOMETRY-CACHE:** build immutable mesh-bound pressure
+      geometry once, including face areas, projected owner/neighbour distances,
+      and non-orthogonal area-vector terms. Refresh only when the mesh changes,
+      keep coefficient fields solve-local, and prove exact assembly parity;
+   5. **F-CYL-COMPACT-FACES / F-PERF-THREAD-MOMENTUM:** introduce compact
+      owner/neighbour internal-face arrays as an isolated storage leaf, then
+      benchmark deterministic parallel momentum components as the existing
+      separate threading leaf. Keep a serial fallback and do not combine the
+      storage and threading acceptance decisions;
+   6. **F-CYL-SPATIAL-ACCURACY:** execute the separate Spatial Accuracy Track
+      above: weighted least-squares gradients, the skewness/corrector matrix,
+      reconstructed wall traction, and at least three-mesh observed-order plus
+      GCI evidence before making a higher-accuracy claim.
+
+   Performance leaves 1-4 and the compact-face storage leaf use the same
+   generated official 5,388-cell Cylinder mesh and recorded input hashes,
+   serial Linux CPU lane, separate Fixed-1,000 and time-to-accuracy results,
+   and unchanged schemes, tolerances, iteration budgets, and physical gates.
+   Effects below 5% require at least two warmups and nine alternating measured
+   pairs. The threading leaf instead compares pinned single-thread and
+   multi-thread lanes while retaining an exact serial oracle and reporting
+   scaling efficiency. The accuracy leaf follows its separate multi-mesh
+   protocol above and may change only the explicitly selected discretization or
+   reconstruction scheme.
+
+   Record `U`, `p`, `Cd`, `Cl`, continuity, iterations, preconditioner
+   applications, and relevant work counters in every applicable lane. No
+   case-specific heuristic, hidden fallback, tolerance relaxation, or
+   artificial finite-magnitude cap may manufacture a pass.
 20. **F-AUTO-1 (accepted external dependency):** Keep the accepted isolated n8n
    coding workflow in the AI Dev Orchestrator repository and preserve the
    existing analysis workflow as a separate read-only path.
