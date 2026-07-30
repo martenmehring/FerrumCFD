@@ -94,7 +94,7 @@ fn validate_mesh(mesh: &Mesh) -> Result<()> {
             "cannot write a mesh that contains unsupported-element summaries",
         ));
     }
-    validate_physical_names(&mesh.physical_names)?;
+    let physical_name_keys = validate_physical_names(&mesh.physical_names)?;
     for point in &mesh.points {
         if !point.x.is_finite() || !point.y.is_finite() || !point.z.is_finite() {
             return Err(invalid("cannot write a non-finite Gmsh node"));
@@ -125,6 +125,7 @@ fn validate_mesh(mesh: &Mesh) -> Result<()> {
             2,
             &face.nodes,
             mesh,
+            &physical_name_keys,
             &mut source_ids,
         )?;
     }
@@ -142,14 +143,19 @@ fn validate_mesh(mesh: &Mesh) -> Result<()> {
             3,
             &cell.nodes,
             mesh,
+            &physical_name_keys,
             &mut source_ids,
         )?;
     }
     Ok(())
 }
 
-fn validate_physical_names(names: &[PhysicalName]) -> Result<()> {
-    for (index, physical) in names.iter().enumerate() {
+fn validate_physical_names(names: &[PhysicalName]) -> Result<HashSet<(u8, i32)>> {
+    let mut keys = HashSet::new();
+    keys.try_reserve(names.len())
+        .map_err(|_| MeshError::OutOfMemory)?;
+
+    for physical in names {
         if physical.dim > 3 {
             return Err(invalid(format!(
                 "Gmsh physical dimension {} is outside 0 through 3",
@@ -165,17 +171,14 @@ fn validate_physical_names(names: &[PhysicalName]) -> Result<()> {
                 physical.name
             )));
         }
-        if names[..index]
-            .iter()
-            .any(|other| other.dim == physical.dim && other.tag == physical.tag)
-        {
+        if !keys.insert((physical.dim, physical.tag)) {
             return Err(invalid(format!(
                 "duplicate Gmsh physical name key ({}, {})",
                 physical.dim, physical.tag
             )));
         }
     }
-    Ok(())
+    Ok(keys)
 }
 
 fn validate_element(
@@ -184,6 +187,7 @@ fn validate_element(
     dimension: u8,
     nodes: &[usize],
     mesh: &Mesh,
+    physical_name_keys: &HashSet<(u8, i32)>,
     source_ids: &mut HashSet<usize>,
 ) -> Result<()> {
     if source_id == 0 {
@@ -192,12 +196,7 @@ fn validate_element(
     if !source_ids.insert(source_id) {
         return Err(invalid(format!("duplicate Gmsh element id {source_id}")));
     }
-    if physical_tag <= 0
-        || !mesh
-            .physical_names
-            .iter()
-            .any(|physical| physical.dim == dimension && physical.tag == physical_tag)
-    {
+    if physical_tag <= 0 || !physical_name_keys.contains(&(dimension, physical_tag)) {
         return Err(invalid(format!(
             "Gmsh element {source_id} references unknown {dimension}D physical tag {physical_tag}"
         )));
