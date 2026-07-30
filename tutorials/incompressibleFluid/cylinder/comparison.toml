@@ -25,10 +25,35 @@ reynolds_number = 1.0
 [observables]
 names = ["drag_coefficient", "lift_coefficient", "local_continuity", "global_continuity"]
 reference_values = [10.6558580, 4.6316142e-11, 2.200139e-10, -1.2322084e-11]
+continuity_definition = "deltaT times the volume-weighted average of abs(div(phi)) for local continuity and div(phi) for global continuity"
 
 [tolerances]
 drag_coefficient_relative = 0.15
+coarse_fine_drag_relative = 0.05
 lift_coefficient_absolute = 1.0e-6
 local_continuity_absolute = 1.0e-6
 global_continuity_absolute = 1.0e-6
-justification = "The checked-in 48-cell smoke mesh is intentionally much coarser than the 5388-cell documented reference; drag uses an engineering regression band, while symmetry and continuity use absolute near-zero checks."
+justification = "C3 uses the independently generated 5376-cell Coarse and 21504-cell Fine O-grids. Drag must satisfy both the documented-reference band and a stricter Coarse/Fine drift gate; symmetry and volume-normalized continuity use absolute near-zero checks."
+
+[acceptance]
+mesh_presets = ["Coarse", "Fine"]
+coarse_repetitions = 2
+minimum_simple_iterations = 10
+maximum_simple_iterations = 5000
+profile = "validation/profiles/incompressibleFluid/cylinder/c3"
+external_runtime_required = false
+
+[evidence.c3_2026_07_29]
+status = "passed"
+coarse_simple_iterations = 1181
+coarse_local_continuity = 7.51841103959995e-13
+coarse_global_continuity = -2.859259133542362e-14
+coarse_cumulative_global_continuity = -4.1489559090149705e-11
+coarse_drag_coefficient = 11.504648041960273
+coarse_lift_coefficient = 1.0745888347720425e-8
+coarse_repeat_final_fields_bit_identical = true
+fine_simple_iterations = 3583
+fine_drag_coefficient = 11.53648
+fine_lift_coefficient = 9.706568e-9
+coarse_fine_drag_relative_drift = 0.002759073824944815
+note = "The exact ignored release gate passed all mesh, convergence, linear-solve, force, continuity, refinement, report, and deterministic-repeat assertions. C4 same-Linux timing remains separate."

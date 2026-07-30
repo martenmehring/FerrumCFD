@@ -16,9 +16,10 @@ fn copy_tree(source: &Path, destination: &Path) {
     }
 }
 
-fn run_case(case: &Path, extra: &[&str]) -> Output {
+fn run_case(case: &Path, working_directory: &Path, extra: &[&str]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ferrumRun"));
     command
+        .current_dir(working_directory)
         .arg("-solver")
         .arg("incompressibleFluid")
         .arg("-case")
@@ -45,7 +46,7 @@ fn packaged_cylinder_preflight_and_two_iteration_smoke() {
         std::env::temp_dir().join(format!("ferrum-cylinder-{}-{nonce}", std::process::id()));
     copy_tree(&source, &temporary);
 
-    let preflight = run_case(&source, &["--preflight"]);
+    let preflight = run_case(&source, &temporary, &["--preflight"]);
     assert!(
         preflight.status.success(),
         "preflight failed: {}",
@@ -56,8 +57,24 @@ fn packaged_cylinder_preflight_and_two_iteration_smoke() {
     assert!(preflight_stdout.contains("gradSchemes.grad(U)=$limited"));
     assert!(preflight_stdout.contains("divSchemes.div(phi,U)=bounded Gauss linearUpwind limited"));
 
-    let solve = run_case(&temporary, &["--maxSimpleIterations", "2"]);
-    let _ = fs::remove_dir_all(&temporary);
+    let solve = run_case(
+        &temporary,
+        &temporary,
+        &[
+            "--maxSimpleIterations",
+            "2",
+            "--wallForcePatches",
+            "cylinder",
+            "--forceReferenceSpeed",
+            "0.015",
+            "--forceReferenceArea",
+            "1e-6",
+            "--solveReportJson",
+            "report.json",
+            "--solveReportMarkdown",
+            "report.md",
+        ],
+    );
     assert!(
         solve.status.success(),
         "smoke solve failed: {}",
@@ -78,4 +95,49 @@ fn packaged_cylinder_preflight_and_two_iteration_smoke() {
         .parse::<f64>()
         .expect("final continuity is numeric");
     assert!(continuity.is_finite());
+
+    let normalized = solve_stdout
+        .lines()
+        .find(|line| line.starts_with("incompressibleFluid continuityErrors:"))
+        .expect("missing normalized continuity evidence");
+    assert!(parse_evidence_f64(normalized, "local").is_finite());
+    assert!(parse_evidence_f64(normalized, "global").is_finite());
+    assert!(parse_evidence_f64(normalized, "cumulativeGlobal").is_finite());
+
+    let forces = solve_stdout
+        .lines()
+        .find(|line| line.starts_with("incompressibleFluid wallForces:"))
+        .expect("missing wall-force evidence");
+    assert_eq!(parse_evidence_usize(forces, "selectedPatches"), 1);
+    assert_eq!(parse_evidence_usize(forces, "selectedFaces"), 16);
+    assert!(parse_evidence_f64(forces, "dragTotal").is_finite());
+    assert!(parse_evidence_f64(forces, "liftTotal").is_finite());
+
+    let json = fs::read_to_string(temporary.join("report.json")).expect("read JSON report");
+    let markdown = fs::read_to_string(temporary.join("report.md")).expect("read Markdown report");
+    assert!(json.contains("\"continuityErrors\""));
+    assert!(json.contains("\"wallForces\""));
+    assert!(markdown.contains("Continuity errors"));
+    assert!(markdown.contains("Wall forces"));
+
+    let _ = fs::remove_dir_all(&temporary);
+}
+
+fn evidence_token<'a>(line: &'a str, key: &str) -> &'a str {
+    let prefix = format!("{key}=");
+    line.split_whitespace()
+        .find_map(|part| part.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("missing token {key:?} in {line:?}"))
+}
+
+fn parse_evidence_f64(line: &str, key: &str) -> f64 {
+    evidence_token(line, key)
+        .parse()
+        .unwrap_or_else(|_| panic!("token {key:?} is not numeric in {line:?}"))
+}
+
+fn parse_evidence_usize(line: &str, key: &str) -> usize {
+    evidence_token(line, key)
+        .parse()
+        .unwrap_or_else(|_| panic!("token {key:?} is not usize in {line:?}"))
 }

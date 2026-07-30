@@ -8,6 +8,9 @@ authors.workspace = true
 [dependencies]
 ferrum-cli = { path = "../../legacy/ferrumCli" }
 
+[dev-dependencies]
+ferrum-mesh = { path = "../../../src/ferrumMesh" }
+
 [[bin]]
 name = "ferrumRun"
 path = "src/main.rs"

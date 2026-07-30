@@ -1025,6 +1025,7 @@ fn solve_laminar_simple_driven(
         let mut pressure_source_summary = ScalarDiagnosticSummary::default();
         let mut pressure_equation_flux_summary = FaceFluxDiagnosticSummary::default();
         let mut pressure_matrix_summary = MatrixDiagnosticSummary::default();
+        let mut last_pressure_equation_flux = None;
         let apply_non_orthogonal_correction =
             options.schemes.laplacian.uses_non_orthogonal_correction();
         let pressure_solve_count = if apply_non_orthogonal_correction {
@@ -1225,11 +1226,18 @@ fn solve_laminar_simple_driven(
             pressure_linear_iterations_this_simple += report.iterations;
             final_pressure_correction_residual_norm = report.residual_norm;
             final_pressure_correction_normalized_residual_norm = report.normalized_residual_norm;
+            last_pressure_equation_flux = Some(pressure_equation_flux);
             pressure_report = Some(report);
         }
         let Some(pressure_report) = pressure_report else {
             break;
         };
+        let final_pressure_equation_flux = last_pressure_equation_flux.ok_or_else(|| {
+            invalid_input(
+                "laminar SIMPLE completed a pressure solve without retaining its equation flux"
+                    .to_string(),
+            )
+        })?;
         let field_correction_started = Instant::now();
         let pressure_initial_normalized_residual_norm =
             first_pressure_initial_normalized_residual_norm
@@ -1268,7 +1276,8 @@ fn solve_laminar_simple_driven(
             &r_at_u,
             &constrained_pressure_boundary,
         )?;
-        let corrected_phi = subtract_face_fluxes(&phi_hby_a, &pressure_flux)?;
+        let corrected_phi =
+            corrected_pressure_equation_flux(&final_pressure_equation_flux, &pressure_flux)?;
         let pressure_assembly = PressureAssemblyDiagnostics {
             r_au: summarize_scalars(&r_au),
             r_at_u: summarize_scalars(&r_at_u),
@@ -3632,6 +3641,13 @@ fn subtract_face_fluxes(left: &[f64], right: &[f64]) -> Result<Vec<f64>> {
         .collect())
 }
 
+fn corrected_pressure_equation_flux(
+    pressure_equation_flux: &[f64],
+    pressure_flux: &[f64],
+) -> Result<Vec<f64>> {
+    subtract_face_fluxes(pressure_equation_flux, pressure_flux)
+}
+
 fn scalar_gradient(
     mesh: &SolverRuntimeMeshData,
     values: &[f64],
@@ -5235,55 +5251,41 @@ fn limit_scalar_gradient(
     }
 
     for cell in 0..mesh.cells {
-        let maximum_delta = checked_subtraction(
+        let maximum_delta = limiter_checked_cell_subtraction(
             maxima[cell],
             values[cell],
-            format!("cellLimited cell {cell} maximum extrema delta"),
+            cell,
+            "maximum extrema delta",
         )?;
-        let minimum_delta = checked_subtraction(
+        let minimum_delta = limiter_checked_cell_subtraction(
             minima[cell],
             values[cell],
-            format!("cellLimited cell {cell} minimum extrema delta"),
+            cell,
+            "minimum extrema delta",
         )?;
-        let span = checked_subtraction(
-            maxima[cell],
-            minima[cell],
-            format!("cellLimited cell {cell} extrema span"),
-        )?;
+        let span =
+            limiter_checked_cell_subtraction(maxima[cell], minima[cell], cell, "extrema span")?;
         let widening = if coefficient == 1.0 {
             0.0
         } else {
-            let widening_numerator = checked_product(
-                span,
-                1.0 - coefficient,
-                format!("cellLimited cell {cell} widening numerator"),
-            )?;
-            require_finite(
-                widening_numerator / coefficient,
-                format!("cellLimited cell {cell} widening term"),
-            )?
+            let widening_numerator =
+                limiter_checked_cell_product(span, 1.0 - coefficient, cell, "widening numerator")?;
+            limiter_require_cell_finite(widening_numerator / coefficient, cell, "widening term")?
         };
-        let widened_maximum = require_finite(
-            maximum_delta + widening,
-            format!("cellLimited cell {cell} widened maximum delta"),
-        )?;
-        let widened_minimum = require_finite(
-            minimum_delta - widening,
-            format!("cellLimited cell {cell} widened minimum delta"),
-        )?;
+        let widened_maximum =
+            limiter_require_cell_finite(maximum_delta + widening, cell, "widened maximum delta")?;
+        let widened_minimum =
+            limiter_require_cell_finite(minimum_delta - widening, cell, "widened minimum delta")?;
         let mut limiter: f64 = 1.0;
 
         for &face_index in &cell_faces[cell] {
-            let delta = checked_delta(
+            let delta = limiter_checked_face_delta(
                 mesh.face_centres[face_index],
                 mesh.cell_centres[cell],
-                format!("cellLimited cell {cell} face {face_index} centre delta"),
+                cell,
+                face_index,
             )?;
-            let extrapolation = checked_dot(
-                gradient[cell],
-                delta,
-                format!("cellLimited cell {cell} face {face_index} extrapolation"),
-            )?;
+            let extrapolation = limiter_checked_face_dot(gradient[cell], delta, cell, face_index)?;
             let ratio = if extrapolation > widened_maximum && extrapolation > 0.0 {
                 widened_maximum / extrapolation
             } else if extrapolation < widened_minimum && extrapolation < 0.0 {
@@ -5291,20 +5293,157 @@ fn limit_scalar_gradient(
             } else {
                 1.0
             };
-            let ratio = require_finite(
-                ratio,
-                format!("cellLimited cell {cell} face {face_index} limiter ratio"),
-            )?;
+            let ratio = limiter_require_face_finite(ratio, cell, face_index, "limiter ratio")?;
             limiter = limiter.min(ratio.clamp(0.0, 1.0));
-            require_finite(limiter, format!("cellLimited cell {cell} final limiter"))?;
+            limiter_require_cell_finite(limiter, cell, "final limiter")?;
         }
-        checked_scale(
-            &mut gradient[cell],
-            limiter,
-            format!("cellLimited cell {cell} limited gradient"),
-        )?;
+        limiter_checked_cell_scale(&mut gradient[cell], limiter, cell)?;
     }
     Ok(gradient)
+}
+
+#[inline]
+fn limiter_require_cell_finite(value: f64, cell: usize, context: &'static str) -> Result<f64> {
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(invalid_input(format!(
+            "cellLimited cell {cell} {context} is non-finite ({value})"
+        )))
+    }
+}
+
+#[inline]
+fn limiter_require_face_finite(
+    value: f64,
+    cell: usize,
+    face: usize,
+    context: &'static str,
+) -> Result<f64> {
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(invalid_input(format!(
+            "cellLimited cell {cell} face {face} {context} is non-finite ({value})"
+        )))
+    }
+}
+
+#[inline]
+fn limiter_checked_cell_subtraction(
+    left: f64,
+    right: f64,
+    cell: usize,
+    context: &'static str,
+) -> Result<f64> {
+    if !left.is_finite() {
+        return Err(invalid_input(format!(
+            "cellLimited cell {cell} {context} left operand is non-finite ({left})"
+        )));
+    }
+    if !right.is_finite() {
+        return Err(invalid_input(format!(
+            "cellLimited cell {cell} {context} right operand is non-finite ({right})"
+        )));
+    }
+    limiter_require_cell_finite(left - right, cell, context)
+}
+
+#[inline]
+fn limiter_checked_cell_product(
+    left: f64,
+    right: f64,
+    cell: usize,
+    context: &'static str,
+) -> Result<f64> {
+    if !left.is_finite() {
+        return Err(invalid_input(format!(
+            "cellLimited cell {cell} {context} left operand is non-finite ({left})"
+        )));
+    }
+    if !right.is_finite() {
+        return Err(invalid_input(format!(
+            "cellLimited cell {cell} {context} right operand is non-finite ({right})"
+        )));
+    }
+    limiter_require_cell_finite(left * right, cell, context)
+}
+
+#[inline]
+fn limiter_checked_face_delta(
+    left: Point3,
+    right: Point3,
+    cell: usize,
+    face: usize,
+) -> Result<Point3> {
+    for (component, value) in [("x", left.x), ("y", left.y), ("z", left.z)] {
+        limiter_require_face_finite(
+            value,
+            cell,
+            face,
+            match component {
+                "x" => "centre delta left point x component",
+                "y" => "centre delta left point y component",
+                _ => "centre delta left point z component",
+            },
+        )?;
+    }
+    for (component, value) in [("x", right.x), ("y", right.y), ("z", right.z)] {
+        limiter_require_face_finite(
+            value,
+            cell,
+            face,
+            match component {
+                "x" => "centre delta right point x component",
+                "y" => "centre delta right point y component",
+                _ => "centre delta right point z component",
+            },
+        )?;
+    }
+
+    Ok(Point3 {
+        x: limiter_require_face_finite(left.x - right.x, cell, face, "centre delta x component")?,
+        y: limiter_require_face_finite(left.y - right.y, cell, face, "centre delta y component")?,
+        z: limiter_require_face_finite(left.z - right.z, cell, face, "centre delta z component")?,
+    })
+}
+
+#[inline]
+fn limiter_checked_face_product(
+    left: f64,
+    right: f64,
+    cell: usize,
+    face: usize,
+    context: &'static str,
+) -> Result<f64> {
+    if !left.is_finite() {
+        return Err(invalid_input(format!(
+            "cellLimited cell {cell} face {face} {context} left operand is non-finite ({left})"
+        )));
+    }
+    if !right.is_finite() {
+        return Err(invalid_input(format!(
+            "cellLimited cell {cell} face {face} {context} right operand is non-finite ({right})"
+        )));
+    }
+    limiter_require_face_finite(left * right, cell, face, context)
+}
+
+#[inline]
+fn limiter_checked_face_dot(left: Point3, right: Point3, cell: usize, face: usize) -> Result<f64> {
+    let x = limiter_checked_face_product(left.x, right.x, cell, face, "extrapolation x product")?;
+    let y = limiter_checked_face_product(left.y, right.y, cell, face, "extrapolation y product")?;
+    let z = limiter_checked_face_product(left.z, right.z, cell, face, "extrapolation z product")?;
+    let xy = limiter_require_face_finite(x + y, cell, face, "extrapolation x-y sum")?;
+    limiter_require_face_finite(xy + z, cell, face, "extrapolation")
+}
+
+#[inline]
+fn limiter_checked_cell_scale(value: &mut Point3, factor: f64, cell: usize) -> Result<()> {
+    value.x = limiter_checked_cell_product(value.x, factor, cell, "limited gradient x component")?;
+    value.y = limiter_checked_cell_product(value.y, factor, cell, "limited gradient y component")?;
+    value.z = limiter_checked_cell_product(value.z, factor, cell, "limited gradient z component")?;
+    Ok(())
 }
 
 fn cell_face_adjacency(mesh: &SolverRuntimeMeshData) -> Result<Vec<Vec<usize>>> {
@@ -5396,6 +5535,7 @@ fn checked_magnitude(value: Point3, context: String) -> Result<f64> {
     require_finite(value.x.hypot(value.y).hypot(value.z), context)
 }
 
+#[cfg(test)]
 fn checked_scale(value: &mut Point3, factor: f64, context: String) -> Result<()> {
     value.x = checked_product(value.x, factor, format!("{context} x component"))?;
     value.y = checked_product(value.y, factor, format!("{context} y component"))?;
@@ -6929,6 +7069,80 @@ mod tests {
         {
             assert_close(value, 0.0);
         }
+    }
+
+    #[test]
+    fn non_orthogonal_corrected_flux_matches_final_matrix_residual() {
+        let mut runtime = two_cell_runtime();
+        runtime.mesh.face_area_vectors[0] = point(1.0, 0.5, 0.0);
+        runtime.mesh.cell_volumes = vec![0.4, 0.6];
+        runtime.mesh.min_cell_volume = 0.4;
+        runtime.mesh.max_cell_volume = 0.6;
+        let boundary = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
+        let geometry = ScalarGradientGeometry::from_mesh(&runtime.mesh)
+            .expect("skewed scalar gradient geometry");
+        let r_au = vec![1.0, 2.0];
+        let pressure = vec![1.25, -0.5];
+        let phi_hby_a = vec![0.4, -0.1, 0.2];
+
+        let non_orthogonal_flux = non_orthogonal_pressure_flux_correction(
+            &runtime.mesh,
+            &geometry,
+            &pressure,
+            &r_au,
+            &boundary,
+            LaminarSimpleGradientScheme::GaussLinear,
+        )
+        .expect("skewed non-orthogonal correction flux");
+        assert!(
+            non_orthogonal_flux
+                .iter()
+                .any(|value| value.abs() > 1.0e-12),
+            "skewed regression mesh must exercise a non-zero explicit correction"
+        );
+        let final_equation_flux =
+            super::add_face_fluxes(&phi_hby_a, &non_orthogonal_flux).expect("final equation flux");
+        let source = super::pressure_correction_source(
+            &runtime.mesh,
+            &net_cell_flux(&runtime.mesh, &final_equation_flux).expect("equation net flux"),
+        )
+        .expect("pressure source");
+        let system =
+            assemble_variable_scalar_component_system(&runtime.mesh, &r_au, &source, &boundary)
+                .expect("skewed pressure system");
+        let matrix_balance = system
+            .matrix
+            .matvec(&pressure)
+            .expect("pressure matrix balance");
+        let pressure_flux =
+            super::pressure_equation_flux(&runtime.mesh, &pressure, &r_au, &boundary)
+                .expect("pressure equation flux");
+
+        let corrected =
+            super::corrected_pressure_equation_flux(&final_equation_flux, &pressure_flux)
+                .expect("non-orthogonal corrected flux");
+        let corrected_balance =
+            net_cell_flux(&runtime.mesh, &corrected).expect("corrected flux balance");
+        for ((actual, matrix), rhs) in corrected_balance
+            .iter()
+            .zip(&matrix_balance)
+            .zip(&system.rhs)
+        {
+            assert_close(*actual, matrix - rhs);
+        }
+
+        let omitted_non_orthogonal = subtract_face_fluxes(&phi_hby_a, &pressure_flux)
+            .expect("legacy incomplete corrected flux");
+        let omitted_balance = net_cell_flux(&runtime.mesh, &omitted_non_orthogonal)
+            .expect("legacy incomplete flux balance");
+        assert!(
+            omitted_balance
+                .iter()
+                .zip(&matrix_balance)
+                .zip(&system.rhs)
+                .any(|((actual, matrix), rhs)| (actual - (matrix - rhs)).abs() > 1.0e-12),
+            "omitting the final explicit non-orthogonal flux must leave a continuity defect"
+        );
     }
 
     #[test]

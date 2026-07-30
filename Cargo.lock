@@ -70,6 +70,7 @@ dependencies = [
 name = "ferrum-cli"
 version = "0.1.0"
 dependencies = [
+ "ferrum-finite-volume",
  "ferrum-mesh",
 ]
 
@@ -93,6 +94,7 @@ name = "ferrum-run"
 version = "0.1.0"
 dependencies = [
  "ferrum-cli",
+ "ferrum-mesh",
 ]
 
 [[package]]

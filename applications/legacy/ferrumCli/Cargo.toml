@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+ferrum-finite-volume = { path = "../../../src/ferrumFiniteVolume" }
 ferrum-mesh = { path = "../../../src/ferrumMesh" }
 
 [lib]

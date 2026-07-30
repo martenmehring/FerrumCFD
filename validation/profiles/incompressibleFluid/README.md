@@ -20,6 +20,11 @@ Profiles:
 - `laminarPipe/gamg-converged` and `planeChannel/gamg-converged`: combine the
   same outer convergence criteria with pressure `GAMG`, `faceAreaPair`, and
   `symGaussSeidel`.
+- `cylinder/c3`: the bounded physical-acceptance profile for the generated
+  `Coarse` and `Fine` Cylinder O-grids. It allows at most 5,000 SIMPLE
+  iterations, requires `U=1e-5` and `p=1e-5` residual control, and retains one
+  corrected non-orthogonal pressure pass. Its Coarse/Coarse/Fine release gate
+  passed on 2026-07-29.
 
 These profiles document accepted validation controls; they are not executable
 launchers and add no user dependency. PCG remains the default.
