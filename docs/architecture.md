@@ -499,6 +499,15 @@ remain authoritative. GAMG remains invalid for the
 nonsymmetric momentum equation, and unsupported controls fail without
 substituting PCG or another agglomerator.
 
+Pressure-PCG kernel profiling is an explicit diagnostic path. The normal
+`solve_laminar_simple` and `solve_laminar_simple_with_observer` entry points
+use the unprofiled PCG workspace and perform no per-kernel clock reads. The
+additive `solve_laminar_simple_profiled_pcg` entry points, or CLI
+`--profilePcg`, execute the same arithmetic order while collecting PCG phase
+timings and counters. Profiling requires pressure `PCG`; incompatible or mixed
+PCG/GAMG profiling requests fail without solver fallback. Profile parity is
+tested with bit-identical fields, residuals, and iteration counts.
+
 GAMG cycle profiling is an explicit diagnostic path selected with
 `--profileGamg`; it is not a case-dictionary control and does not alter the
 equation, convergence criteria, cycle controls, or solver selection. The normal

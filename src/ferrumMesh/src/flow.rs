@@ -681,10 +681,37 @@ pub fn solve_laminar_simple_with_observer(
     on_iteration: Option<&mut dyn FnMut(&LaminarSimpleIterationSummary)>,
 ) -> Result<LaminarSimpleReport> {
     #[cfg(test)]
-    return solve_laminar_simple_driven(runtime, fields, options, on_iteration, None);
+    return solve_laminar_simple_driven(runtime, fields, options, on_iteration, false, None);
 
     #[cfg(not(test))]
-    solve_laminar_simple_driven(runtime, fields, options, on_iteration)
+    solve_laminar_simple_driven(runtime, fields, options, on_iteration, false)
+}
+
+/// Runs the laminar SIMPLE solver with pressure-PCG kernel profiling enabled.
+///
+/// This diagnostic entry point executes the same solver operations as
+/// [`solve_laminar_simple`] and differs only by collecting per-phase PCG clock
+/// readings and counters. It requires the pressure solver to be `PCG`.
+pub fn solve_laminar_simple_profiled_pcg(
+    runtime: &mut SolverRuntimeData,
+    fields: &InitialFieldSet,
+    options: &LaminarSimpleOptions,
+) -> Result<LaminarSimpleReport> {
+    solve_laminar_simple_profiled_pcg_with_observer(runtime, fields, options, None)
+}
+
+/// Observer-enabled form of [`solve_laminar_simple_profiled_pcg`].
+pub fn solve_laminar_simple_profiled_pcg_with_observer(
+    runtime: &mut SolverRuntimeData,
+    fields: &InitialFieldSet,
+    options: &LaminarSimpleOptions,
+    on_iteration: Option<&mut dyn FnMut(&LaminarSimpleIterationSummary)>,
+) -> Result<LaminarSimpleReport> {
+    #[cfg(test)]
+    return solve_laminar_simple_driven(runtime, fields, options, on_iteration, true, None);
+
+    #[cfg(not(test))]
+    solve_laminar_simple_driven(runtime, fields, options, on_iteration, true)
 }
 
 #[cfg(test)]
@@ -696,11 +723,17 @@ fn solve_laminar_simple_driven(
     fields: &InitialFieldSet,
     options: &LaminarSimpleOptions,
     mut on_iteration: Option<&mut dyn FnMut(&LaminarSimpleIterationSummary)>,
+    profile_pcg: bool,
     #[cfg(test)] mut drive_pressure_report: Option<PressureReportDriver<'_>>,
 ) -> Result<LaminarSimpleReport> {
     let solver_started = Instant::now();
     let setup_started = Instant::now();
     validate_laminar_simple_options(options)?;
+    if profile_pcg && options.pressure_linear_solver != LaminarSimpleLinearSolver::Pcg {
+        return Err(invalid_input(
+            "laminar SIMPLE PCG profiling requires the PCG pressure solver".to_string(),
+        ));
+    }
     validate_runtime_mesh(&runtime.mesh)?;
 
     let velocity_field = find_field(fields, "U", "volVectorField")?;
@@ -1123,6 +1156,7 @@ fn solve_laminar_simple_driven(
                     max_iterations: options.pressure_max_linear_iterations,
                     gamg_options: options.pressure_gamg_options,
                     profile_gamg: options.profile_gamg,
+                    profile_pcg,
                 },
                 &mut scalar_solve_workspace,
                 pressure_pcg_workspace.as_mut(),
@@ -1593,6 +1627,7 @@ struct ScalarSolveControls {
     max_iterations: usize,
     gamg_options: Option<GamgOptions>,
     profile_gamg: bool,
+    profile_pcg: bool,
 }
 
 // OpenFOAM Foundation's solver-performance convergence check treats relTol as
@@ -1927,6 +1962,7 @@ fn solve_momentum_predictor(
                 max_iterations: options.momentum_max_linear_iterations,
                 gamg_options: None,
                 profile_gamg: false,
+                profile_pcg: false,
             },
             scalar_solve_workspace,
             None,
@@ -2328,9 +2364,24 @@ fn solve_scalar_system_with_workspaces(
                 tolerance: solver_tolerance,
                 preconditioner: map_cg_preconditioner(controls.preconditioner),
             };
-            if let Some(workspace) = pcg_workspace {
-                let profiled = workspace.solve_profiled(matrix, rhs, initial, pcg_options)?;
-                (profiled.report, Some(profiled.timing), None)
+            if controls.profile_pcg {
+                if let Some(workspace) = pcg_workspace {
+                    let profiled = workspace.solve_profiled(matrix, rhs, initial, pcg_options)?;
+                    (profiled.report, Some(profiled.timing), None)
+                } else {
+                    let mut workspace = PreconditionedConjugateGradientWorkspace::new(
+                        matrix,
+                        pcg_options.preconditioner,
+                    )?;
+                    let profiled = workspace.solve_profiled(matrix, rhs, initial, pcg_options)?;
+                    (profiled.report, Some(profiled.timing), None)
+                }
+            } else if let Some(workspace) = pcg_workspace {
+                (
+                    workspace.solve(matrix, rhs, initial, pcg_options)?,
+                    None,
+                    None,
+                )
             } else {
                 (
                     preconditioned_conjugate_gradient_solve(matrix, rhs, initial, pcg_options)?,
@@ -7850,6 +7901,7 @@ mod tests {
                 &fields,
                 &options,
                 None,
+                false,
                 Some(&mut invalidate_second_profile),
             )
             .expect_err("a changed later GAMG profile must fail after payload transfer")
@@ -7981,27 +8033,151 @@ mod tests {
     }
 
     #[test]
-    fn reports_profiled_pressure_pcg_kernel_work() {
+    fn pressure_pcg_profiling_is_opt_in_and_bit_identical() {
+        let mut plain_runtime = two_cell_runtime();
+        let mut profiled_runtime = two_cell_runtime();
+        let fields = two_cell_fields();
+        let mut plain_options = minimal_laminar_options();
+        plain_options.pressure_linear_solver = LaminarSimpleLinearSolver::Pcg;
+        plain_options.pressure_preconditioner = LaminarSimplePreconditioner::IncompleteCholesky;
+
+        let plain = solve_laminar_simple(&mut plain_runtime, &fields, &plain_options)
+            .expect("plain SIMPLE PCG report");
+        let profiled = super::solve_laminar_simple_profiled_pcg(
+            &mut profiled_runtime,
+            &fields,
+            &plain_options,
+        )
+        .expect("profiled SIMPLE PCG report");
+
+        assert_eq!(plain.timing.pressure_pcg_total_seconds.to_bits(), 0);
+        assert_eq!(
+            plain
+                .timing
+                .pressure_preconditioner_update_seconds
+                .to_bits(),
+            0
+        );
+        assert_eq!(plain.timing.pressure_matrix_vector_seconds.to_bits(), 0);
+        assert_eq!(
+            plain
+                .timing
+                .pressure_preconditioner_application_seconds
+                .to_bits(),
+            0
+        );
+        assert_eq!(plain.timing.pressure_vector_operation_seconds.to_bits(), 0);
+        assert_eq!(plain.timing.pressure_pcg_other_seconds.to_bits(), 0);
+        assert_eq!(plain.timing.pressure_matrix_vector_products, 0);
+        assert_eq!(plain.timing.pressure_preconditioner_applications, 0);
+
+        assert!(profiled.timing.pressure_pcg_total_seconds >= 0.0);
+        assert!(profiled.timing.pressure_preconditioner_update_seconds >= 0.0);
+        assert!(profiled.timing.pressure_matrix_vector_products > 0);
+        assert!(
+            profiled.timing.pressure_preconditioner_applications
+                <= profiled.timing.pressure_matrix_vector_products
+        );
+        assert!(
+            profiled.timing.pressure_pcg_total_seconds
+                <= profiled.timing.pressure_linear_solve_seconds + 1.0e-9
+        );
+
+        assert_eq!(plain.simple_iterations, profiled.simple_iterations);
+        assert_eq!(plain.converged, profiled.converged);
+        assert_eq!(plain.stop_reason, profiled.stop_reason);
+        assert_eq!(
+            plain.total_momentum_linear_iterations,
+            profiled.total_momentum_linear_iterations
+        );
+        assert_eq!(
+            plain.total_pressure_linear_iterations,
+            profiled.total_pressure_linear_iterations
+        );
+        assert_eq!(
+            plain.final_momentum_normalized_residual_norm.to_bits(),
+            profiled.final_momentum_normalized_residual_norm.to_bits()
+        );
+        assert_eq!(
+            plain
+                .final_pressure_correction_normalized_residual_norm
+                .to_bits(),
+            profiled
+                .final_pressure_correction_normalized_residual_norm
+                .to_bits()
+        );
+        for (plain, profiled) in plain.final_pressure.iter().zip(&profiled.final_pressure) {
+            assert_eq!(plain.to_bits(), profiled.to_bits());
+        }
+        for (plain, profiled) in plain.final_velocity.iter().zip(&profiled.final_velocity) {
+            assert_eq!(plain.x.to_bits(), profiled.x.to_bits());
+            assert_eq!(plain.y.to_bits(), profiled.y.to_bits());
+            assert_eq!(plain.z.to_bits(), profiled.z.to_bits());
+        }
+        for (plain, profiled) in plain.final_phi.iter().zip(&profiled.final_phi) {
+            assert_eq!(plain.to_bits(), profiled.to_bits());
+        }
+        assert_eq!(plain.history.len(), profiled.history.len());
+        for (plain, profiled) in plain.history.iter().zip(&profiled.history) {
+            assert_eq!(plain.iteration, profiled.iteration);
+            assert_eq!(
+                plain.pressure_linear_iterations,
+                profiled.pressure_linear_iterations
+            );
+            assert_eq!(
+                plain.pressure_correction_normalized_residual_norm.to_bits(),
+                profiled
+                    .pressure_correction_normalized_residual_norm
+                    .to_bits()
+            );
+            assert_eq!(
+                plain.momentum_normalized_residual_norm.to_bits(),
+                profiled.momentum_normalized_residual_norm.to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn profiled_pcg_api_rejects_other_pressure_solvers_without_consuming_fields() {
         let mut runtime = two_cell_runtime();
         let fields = two_cell_fields();
         let mut options = minimal_laminar_options();
-        options.pressure_linear_solver = LaminarSimpleLinearSolver::Pcg;
-        options.pressure_preconditioner = LaminarSimplePreconditioner::IncompleteCholesky;
+        options.pressure_linear_solver = LaminarSimpleLinearSolver::Cg;
+        let velocity_before = runtime.fields[0]
+            .values
+            .as_ref()
+            .expect("velocity payload before rejection");
+        let pressure_before = runtime.fields[1]
+            .values
+            .as_ref()
+            .expect("pressure payload before rejection");
+        let velocity_ptr = velocity_before.as_ptr();
+        let pressure_ptr = pressure_before.as_ptr();
+        let velocity_values = velocity_before.clone();
+        let pressure_values = pressure_before.clone();
 
-        let report =
-            solve_laminar_simple(&mut runtime, &fields, &options).expect("simple PCG report");
+        let error = super::solve_laminar_simple_profiled_pcg(&mut runtime, &fields, &options)
+            .expect_err("profiled PCG API must reject a CG pressure solver");
 
-        assert!(report.timing.pressure_pcg_total_seconds >= 0.0);
-        assert!(report.timing.pressure_preconditioner_update_seconds >= 0.0);
-        assert!(report.timing.pressure_matrix_vector_products > 0);
-        assert!(
-            report.timing.pressure_preconditioner_applications
-                <= report.timing.pressure_matrix_vector_products
-        );
-        assert!(
-            report.timing.pressure_pcg_total_seconds
-                <= report.timing.pressure_linear_solve_seconds + 1.0e-9
-        );
+        match error {
+            MeshError::InvalidInput(message) => assert_eq!(
+                message,
+                "laminar SIMPLE PCG profiling requires the PCG pressure solver"
+            ),
+            other => panic!("unexpected profiling rejection: {other}"),
+        }
+        let velocity_after = runtime.fields[0]
+            .values
+            .as_ref()
+            .expect("velocity payload after rejection");
+        let pressure_after = runtime.fields[1]
+            .values
+            .as_ref()
+            .expect("pressure payload after rejection");
+        assert_eq!(velocity_after.as_ptr(), velocity_ptr);
+        assert_eq!(pressure_after.as_ptr(), pressure_ptr);
+        assert_eq!(velocity_after, &velocity_values);
+        assert_eq!(pressure_after, &pressure_values);
     }
 
     #[test]
@@ -8101,6 +8277,7 @@ mod tests {
             &fields,
             &options,
             None,
+            false,
             Some(&mut force_large_correction),
         )
         .expect("large finite update");
@@ -8189,6 +8366,7 @@ mod tests {
             &fields,
             &options,
             None,
+            false,
             Some(&mut drive_corrections),
         )
         .expect("repeated finite updates");
@@ -8293,6 +8471,7 @@ mod tests {
                 &fields,
                 &options,
                 None,
+                false,
                 Some(&mut drive_invalid),
             )
             .expect("invalid candidate report");
@@ -8420,6 +8599,7 @@ mod tests {
                 &fields,
                 &options,
                 None,
+                false,
                 Some(&mut drive),
             )
             .expect("driven SIMPLE report")
@@ -8645,6 +8825,7 @@ mod tests {
                 max_iterations: 16,
                 gamg_options: None,
                 profile_gamg: false,
+                profile_pcg: false,
             },
             &mut workspace,
             None,
@@ -8823,6 +9004,7 @@ mod tests {
                     max_iterations: 1,
                     gamg_options: None,
                     profile_gamg: false,
+                    profile_pcg: false,
                 },
                 &mut workspace,
                 None,
@@ -8888,6 +9070,7 @@ mod tests {
                 max_iterations: gamg_options.max_iterations,
                 gamg_options: Some(gamg_options),
                 profile_gamg: false,
+                profile_pcg: false,
             },
             &mut rejected_scalar_workspace,
             None,
@@ -8918,6 +9101,7 @@ mod tests {
             max_iterations: gamg_options.max_iterations,
             gamg_options: Some(gamg_options),
             profile_gamg: false,
+            profile_pcg: false,
         };
         let after_rejection = super::solve_scalar_system_with_workspaces(
             &matrix,
@@ -9025,6 +9209,7 @@ mod tests {
                 max_iterations: gamg_options.max_iterations,
                 gamg_options: Some(gamg_options),
                 profile_gamg: false,
+                profile_pcg: false,
             },
             &mut wrapper_scalar_workspace,
             None,
@@ -9131,6 +9316,7 @@ mod tests {
                 max_iterations: gamg_options.max_iterations,
                 gamg_options: Some(gamg_options),
                 profile_gamg: true,
+                profile_pcg: false,
             },
             &mut scalar_workspace,
             None,
@@ -9190,6 +9376,7 @@ mod tests {
                 max_iterations: accepted_options.max_iterations,
                 gamg_options: Some(accepted_options),
                 profile_gamg: true,
+                profile_pcg: false,
             },
             &mut accepted_scalar_workspace,
             None,
@@ -9294,6 +9481,7 @@ mod tests {
                 max_iterations: equality_options.max_iterations,
                 gamg_options: Some(equality_options),
                 profile_gamg: true,
+                profile_pcg: false,
             },
             &mut equality_scalar_workspace,
             None,
@@ -9407,6 +9595,7 @@ mod tests {
                 max_iterations: probe_options.max_iterations,
                 gamg_options: Some(probe_options),
                 profile_gamg: false,
+                profile_pcg: false,
             },
             &mut probe_scalar_workspace,
             None,
@@ -9460,6 +9649,7 @@ mod tests {
                 max_iterations: accepted_options.max_iterations,
                 gamg_options: Some(accepted_options),
                 profile_gamg: true,
+                profile_pcg: false,
             },
             &mut accepted_scalar_workspace,
             None,
@@ -9562,6 +9752,7 @@ mod tests {
                 max_iterations: equality_options.max_iterations,
                 gamg_options: Some(equality_options),
                 profile_gamg: true,
+                profile_pcg: false,
             },
             &mut equality_scalar_workspace,
             None,
@@ -9625,6 +9816,7 @@ mod tests {
             max_iterations: 4,
             gamg_options: None,
             profile_gamg: false,
+            profile_pcg: false,
         };
         let mut workspace = super::ScalarSolveWorkspace::new(2);
         let zero_initial_ptr = workspace.zero_initial.as_ptr();
@@ -9673,6 +9865,7 @@ mod tests {
             max_iterations,
             gamg_options: None,
             profile_gamg: false,
+            profile_pcg: false,
         };
 
         let zero_matrix = CsrMatrix::from_rows(vec![Vec::new()], 1).expect("zero matrix");
@@ -9746,6 +9939,7 @@ mod tests {
                 &fields,
                 &options,
                 None,
+                true,
                 Some(&mut drive_later_breakdown),
             )
             .expect("driven pressure-breakdown report")
@@ -9824,6 +10018,7 @@ mod tests {
             &fields,
             &options,
             None,
+            false,
             Some(&mut drive_exhaustion),
         )
         .expect("driven iteration-budget-exhausted SIMPLE report");
@@ -9858,6 +10053,7 @@ mod tests {
                 ..GamgOptions::default()
             }),
             profile_gamg: false,
+            profile_pcg: false,
         };
         let mut workspace = super::ScalarSolveWorkspace::new(2);
 

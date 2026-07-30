@@ -216,12 +216,15 @@ figures below remain the latest solver measurements.
 
 ## Pressure PCG Kernel Profile
 
-The reusable PCG workspace now offers an opt-in profiled solve that executes
-the same numerical routine and separately records preconditioner updates,
-matrix-vector products, preconditioner applications, and vector operations.
-The normal unprofiled linear API remains available. The SIMPLE pressure path
-exports the profile through console, JSON, and Markdown reports; the benchmark
-driver retains medians for every field.
+The reusable PCG workspace has long offered separate profiled and unprofiled
+solves. Through C4, however, the normal SIMPLE pressure-PCG route still
+selected the profiled workspace unconditionally. C5 makes that boundary
+explicit end to end: normal SIMPLE APIs and CLI execution use the unprofiled
+solve, while additive profiled APIs and `--profilePcg` select the instrumented
+solve. Console, JSON, and Markdown expose kernel detail only for the explicit
+diagnostic mode. The historical measurements below were collected on the
+instrumented path and remain diagnostic profiling evidence, not unprofiled
+runtime baselines.
 
 An optimized release run of the accepted pressure-matrix gate produced:
 

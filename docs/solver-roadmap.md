@@ -433,8 +433,12 @@ Current status:
   `38,912`-row fine, and `12,288`-row/`56.31 deg` skewed conservative systems.
   Reused and fresh PCG/IC(0) solves agree exactly, with true relative residuals
   below `1.7e-9`;
-- opt-in PCG kernel profiling now reaches the normal SIMPLE console, JSON, and
-  Markdown reports and the external performance driver. Release measurements
+- pressure-PCG kernel profiling originally existed as a low-level opt-in API,
+  but the normal SIMPLE route still invoked the instrumented workspace through
+  C4. C5 separates the paths explicitly: unchanged public SIMPLE entry points
+  are unprofiled, while additive profiled entry points and `--profilePcg`
+  collect kernel timing; incompatible solver selections fail without fallback.
+  Profiled and unprofiled numerical results are bit-identical. Historical release measurements
   on the accepted matrices put IC(0) applications at `52.6%` to `55.1%` of the
   PCG kernel; current SIMPLE cases put them at about `45.8%` to `47.6%` through
   convergence. IC(0) numerical refactorization remains below `1%` throughout.
