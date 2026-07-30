@@ -5487,7 +5487,11 @@ fn write_laminar_simple_report_markdown(
 
     writeln!(writer, "# incompressibleFluid Solver Report")?;
     writeln!(writer)?;
-    writeln!(writer, "Case: `{}`", plan.case_dir.display())?;
+    writeln!(
+        writer,
+        "Case: {}",
+        escape_markdown_literal(&plan.case_dir.display().to_string())
+    )?;
     writeln!(writer)?;
     writeln!(writer, "- Schema version: `3`")?;
     writeln!(writer, "- Module: `incompressibleFluid`")?;
@@ -5828,7 +5832,7 @@ fn write_laminar_simple_report_markdown(
         writeln!(
             writer,
             "| Patches | {} |",
-            wall_forces.patch_names.join(",")
+            escape_markdown_literal(&wall_forces.patch_names.join(","))
         )?;
         writeln!(writer, "| Selected patches | {} |", value.selected_patches)?;
         writeln!(writer, "| Selected faces | {} |", value.selected_faces)?;
@@ -6206,6 +6210,21 @@ fn write_laminar_simple_report_markdown(
     }
 
     writer.flush()
+}
+
+fn escape_markdown_literal(value: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, ' ' | ',' | '-') {
+            escaped.push(character);
+        } else {
+            write!(&mut escaped, "&#{};", u32::from(character))
+                .expect("writing a numeric entity to String cannot fail");
+        }
+    }
+    escaped
 }
 
 fn write_markdown_face_flux_diagnostic(
@@ -8982,10 +9001,11 @@ mod tests {
         LaminarSimpleResidualControlSummary, LaminarSimpleSchemes, MAX_RUNNER_DRY_RUN_STEPS,
         SafeOutputRoot, ScalarDiffusionLinearSolver, SolverNumericsDictionaryPlan,
         SolverSelectionSource, WallForceReport, build_laminar_simple_post_processing,
-        estimate_iterations_to_convergence, estimate_simple_iterations_to_convergence,
-        format_optional_u128, format_pressure_gamg_console, gamg_outer_profile_counters,
-        numerics_dictionary_number, numerics_dictionary_usize, numerics_dictionary_value,
-        openfoam_gamg_options, outer_convergence_status_for_reason, parse_ferrum_run_args,
+        escape_markdown_literal, estimate_iterations_to_convergence,
+        estimate_simple_iterations_to_convergence, format_optional_u128,
+        format_pressure_gamg_console, gamg_outer_profile_counters, numerics_dictionary_number,
+        numerics_dictionary_usize, numerics_dictionary_value, openfoam_gamg_options,
+        outer_convergence_status_for_reason, parse_ferrum_run_args,
         parse_incompressible_fluid_args, parse_incompressible_fluid_plan_args,
         parse_laminar_simple_convection_scheme, parse_laminar_simple_gradient_scheme,
         parse_laminar_simple_laplacian_scheme, parse_laminar_simple_sn_grad_scheme,
@@ -10419,6 +10439,98 @@ mod tests {
                 },
             }),
         }
+    }
+
+    #[test]
+    fn markdown_report_escapes_untrusted_wall_force_patch_names() {
+        let base = output_test_dir("wall-force-markdown-escaping");
+        std::fs::create_dir_all(&base).expect("output root should be created");
+        let output_root = SafeOutputRoot::open_existing(&base).expect("output root should open");
+        let mut plan = laminar_simple_test_plan(1000.0, 0.001);
+        plan.case_dir = PathBuf::from("case`![case](https://attacker.example/case.png)");
+        let mut post_processing = output_test_post_processing_with_forces();
+        post_processing
+            .wall_forces
+            .as_mut()
+            .expect("wall-force fixture should be present")
+            .patch_names = vec![
+            "![image](https://attacker.example/pixel.png)".to_string(),
+            "[label](https://attacker.example/)".to_string(),
+            "https://attacker.example/@user#1".to_string(),
+        ];
+
+        write_laminar_simple_report_markdown(
+            &plan,
+            &minimal_laminar_simple_options_for_estimate(),
+            &output_test_report(),
+            &post_processing,
+            0.0,
+            &output_root,
+            Path::new("report.md"),
+        )
+        .expect("Markdown report should be written");
+
+        let markdown = std::fs::read_to_string(base.join("report.md"))
+            .expect("Markdown report should be readable");
+        let case_line = markdown
+            .lines()
+            .find(|line| line.starts_with("Case: "))
+            .expect("case line");
+        assert!(case_line.contains("case&#96;&#33;&#91;case&#93;&#40;https&#58;&#47;&#47;"));
+        assert!(!case_line.contains('`'));
+        assert!(!case_line.contains("https://"));
+
+        let patch_rows = markdown
+            .lines()
+            .filter(|line| line.starts_with("| Patches |"))
+            .collect::<Vec<_>>();
+        assert_eq!(patch_rows.len(), 1);
+        let patch_row = patch_rows[0];
+        assert_eq!(
+            patch_row
+                .chars()
+                .filter(|character| *character == '|')
+                .count(),
+            3
+        );
+        assert!(patch_row.contains("&#33;&#91;image&#93;&#40;https&#58;&#47;&#47;"));
+        assert!(!patch_row.contains("!["));
+        assert!(!patch_row.contains("]("));
+        assert!(!patch_row.contains("https://"));
+
+        assert_eq!(
+            escape_markdown_literal("cylinder,innerWall-1"),
+            "cylinder,innerWall-1"
+        );
+        let controls = escape_markdown_literal("<script>|`\\*_~[]()!https://x@y#1\r\n\t\u{1b}\0");
+        for entity in [
+            "&#60;", "&#62;", "&#124;", "&#96;", "&#92;", "&#42;", "&#95;", "&#126;", "&#91;",
+            "&#93;", "&#40;", "&#41;", "&#33;", "&#58;", "&#47;", "&#64;", "&#35;", "&#13;",
+            "&#10;", "&#9;", "&#27;", "&#0;",
+        ] {
+            assert!(
+                controls.contains(entity),
+                "missing entity {entity} in {controls}"
+            );
+        }
+
+        write_laminar_simple_report_json(
+            &plan,
+            &minimal_laminar_simple_options_for_estimate(),
+            &output_test_report(),
+            &post_processing,
+            0.0,
+            &output_root,
+            Path::new("report.json"),
+        )
+        .expect("JSON report should be written");
+        let json = std::fs::read_to_string(base.join("report.json"))
+            .expect("JSON report should be readable");
+        assert!(json.contains("![image](https://attacker.example/pixel.png)"));
+        assert!(json.contains("[label](https://attacker.example/)"));
+        assert!(json.contains("https://attacker.example/@user#1"));
+
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
