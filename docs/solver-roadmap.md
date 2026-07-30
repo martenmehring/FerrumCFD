@@ -433,8 +433,12 @@ Current status:
   `38,912`-row fine, and `12,288`-row/`56.31 deg` skewed conservative systems.
   Reused and fresh PCG/IC(0) solves agree exactly, with true relative residuals
   below `1.7e-9`;
-- opt-in PCG kernel profiling now reaches the normal SIMPLE console, JSON, and
-  Markdown reports and the external performance driver. Release measurements
+- pressure-PCG kernel profiling originally existed as a low-level opt-in API,
+  but the normal SIMPLE route still invoked the instrumented workspace through
+  C4. C5 separates the paths explicitly: unchanged public SIMPLE entry points
+  are unprofiled, while additive profiled entry points and `--profilePcg`
+  collect kernel timing; incompatible solver selections fail without fallback.
+  Profiled and unprofiled numerical results are bit-identical. Historical release measurements
   on the accepted matrices put IC(0) applications at `52.6%` to `55.1%` of the
   PCG kernel; current SIMPLE cases put them at about `45.8%` to `47.6%` through
   convergence. IC(0) numerical refactorization remains below `1%` throughout.
@@ -489,6 +493,17 @@ Current status:
   were `0.525295%` for `U` and `0.926074%` for `p`. Cylinder is therefore a
   remaining performance hotspot and prevents a general all-case speedup
   claim. See [Cylinder same-Linux parity](benchmarks/cylinder-linux-parity.md);
+- C5 makes pressure-PCG kernel profiling genuinely opt-in on exact commit
+  `1e3bbc42ad06`. Two Linux correctness oracles proved byte-identical final
+  `U`/`p` and canonical reports between plain and `--profilePcg`, while the
+  plain report retained exact-zero kernel timing and counters. In the pinned
+  Cylinder Fixed-1,000 `1+6` diagnostic, plain median elapsed time was
+  `64.280 s` (MAD `0.770 s`) and profiled was `65.055 s` (MAD `2.285 s`). The
+  paired profiled/plain median was `0.993060` with MAD `0.029328`, and each
+  variant won three pairs. The result establishes no measurable speed change;
+  C5 is accepted for the explicit instrumentation boundary and exact parity,
+  without a performance claim. A claimed sub-5% effect still requires the
+  stronger `2+9` protocol;
 - isolated native build screening did not establish a general compiler-profile
   gain. Native `codegen-units=1` and Fat-LTO did not improve the Pipe screen.
   Thin-LTO improved the stronger Pipe `2+9` median paired ratio from `1.2792`

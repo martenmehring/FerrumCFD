@@ -38,6 +38,7 @@ use ferrum_mesh::flow::{
     LaminarSimpleSnGradScheme, LaminarSimpleStopReason, LinearSolveConvergenceSummary,
     LinearSolveSummary, MatrixDiagnosticSummary, PressureAssemblyDiagnostics,
     ScalarDiagnosticSummary, VectorDiagnosticSummary, solve_laminar_simple,
+    solve_laminar_simple_profiled_pcg, solve_laminar_simple_profiled_pcg_with_observer,
     solve_laminar_simple_with_observer,
 };
 use ferrum_mesh::foam::{FoamWriteOptions, write_openfoam_case_with_options};
@@ -750,13 +751,26 @@ fn run_laminar_simple_solve(
             );
             let _ = std::io::stdout().flush();
         };
-        solve_laminar_simple_with_observer(
-            &mut plan.runtime_data,
-            &plan.initial_fields,
-            &options,
-            Some(&mut print_iteration),
-        )
-        .map_err(|error| error.to_string())?
+        if solve.profile_pcg {
+            solve_laminar_simple_profiled_pcg_with_observer(
+                &mut plan.runtime_data,
+                &plan.initial_fields,
+                &options,
+                Some(&mut print_iteration),
+            )
+            .map_err(|error| error.to_string())?
+        } else {
+            solve_laminar_simple_with_observer(
+                &mut plan.runtime_data,
+                &plan.initial_fields,
+                &options,
+                Some(&mut print_iteration),
+            )
+            .map_err(|error| error.to_string())?
+        }
+    } else if solve.profile_pcg {
+        solve_laminar_simple_profiled_pcg(&mut plan.runtime_data, &plan.initial_fields, &options)
+            .map_err(|error| error.to_string())?
     } else {
         solve_laminar_simple(&mut plan.runtime_data, &plan.initial_fields, &options)
             .map_err(|error| error.to_string())?
@@ -886,7 +900,7 @@ fn run_laminar_simple_solve(
         report.timing.finalization_seconds,
         report.timing.other_solver_work_seconds,
     );
-    if options.pressure_linear_solver == LaminarSimpleLinearSolver::Pcg {
+    if solve.profile_pcg {
         println!(
             "incompressibleFluid pressurePcgKernel: totalSeconds={:.6} preconditionerUpdateSeconds={:.6} matrixVectorSeconds={:.6} preconditionerApplicationSeconds={:.6} vectorOperationSeconds={:.6} otherSeconds={:.6} matrixVectorProducts={} preconditionerApplications={}",
             report.timing.pressure_pcg_total_seconds,
@@ -1119,7 +1133,10 @@ fn run_laminar_simple_solve(
             &options,
             &report,
             &post_processing,
-            wall_clock_seconds,
+            LaminarSimpleReportRunMetadata {
+                profile_pcg: solve.profile_pcg,
+                wall_clock_seconds,
+            },
             output_root.expect("output requested"),
             path,
         )
@@ -1137,7 +1154,10 @@ fn run_laminar_simple_solve(
             &options,
             &report,
             &post_processing,
-            wall_clock_seconds,
+            LaminarSimpleReportRunMetadata {
+                profile_pcg: solve.profile_pcg,
+                wall_clock_seconds,
+            },
             output_root.expect("output requested"),
             path,
         )
@@ -2036,6 +2056,9 @@ fn resolve_laminar_simple_options(
     }
     if solve.profile_gamg && pressure_linear_solver != LaminarSimpleLinearSolver::Gamg {
         return Err("--profileGamg requires solvers.p.solver GAMG".to_string());
+    }
+    if solve.profile_pcg && pressure_linear_solver != LaminarSimpleLinearSolver::Pcg {
+        return Err("--profilePcg requires solvers.p.solver PCG".to_string());
     }
     validate_openfoam_linear_controls(plan, "solvers.U", momentum_linear_solver)?;
     validate_openfoam_linear_controls(plan, "solvers.p", pressure_linear_solver)?;
@@ -3644,12 +3667,18 @@ fn write_solver_plan_json_in_root(
     writer.flush()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LaminarSimpleReportRunMetadata {
+    profile_pcg: bool,
+    wall_clock_seconds: f64,
+}
+
 fn write_laminar_simple_report_json(
     plan: &SolverCasePlan,
     options: &LaminarSimpleOptions,
     report: &LaminarSimpleReport,
     post_processing: &LaminarSimplePostProcessing,
-    wall_clock_seconds: f64,
+    run: LaminarSimpleReportRunMetadata,
     output_root: &SafeOutputRoot,
     path: &Path,
 ) -> std::io::Result<()> {
@@ -3674,7 +3703,7 @@ fn write_laminar_simple_report_json(
     write_json_key(&mut writer, 2, "backend")?;
     write_json_string(&mut writer, "cpu")?;
     writeln!(writer, ",")?;
-    write_json_laminar_simple_options(&mut writer, options)?;
+    write_json_laminar_simple_options(&mut writer, options, run.profile_pcg)?;
     writeln!(writer, ",")?;
     write_json_key(&mut writer, 2, "mesh")?;
     writeln!(writer, "{{")?;
@@ -3712,7 +3741,7 @@ fn write_laminar_simple_report_json(
     )?;
     writeln!(writer, ",")?;
     write_json_key(&mut writer, 4, "wallClockSeconds")?;
-    write_json_optional_number(&mut writer, Some(wall_clock_seconds))?;
+    write_json_optional_number(&mut writer, Some(run.wall_clock_seconds))?;
     writeln!(writer, ",")?;
     write_json_key(&mut writer, 4, "finalMomentumInitialResidual")?;
     write_json_optional_number(
@@ -3779,7 +3808,7 @@ fn write_laminar_simple_report_json(
     writeln!(writer, ",")?;
     write_json_linear_solve_summary(&mut writer, &report.linear_solve_summary)?;
     writeln!(writer, ",")?;
-    write_json_laminar_simple_timing_summary(&mut writer, report, wall_clock_seconds)?;
+    write_json_laminar_simple_timing_summary(&mut writer, report, run.wall_clock_seconds)?;
     writeln!(writer, ",")?;
     write_json_key(&mut writer, 2, "continuity")?;
     writeln!(writer, "{{")?;
@@ -4237,6 +4266,7 @@ fn write_json_residual_control_summary(
 fn write_json_laminar_simple_options(
     writer: &mut impl Write,
     options: &LaminarSimpleOptions,
+    profile_pcg: bool,
 ) -> std::io::Result<()> {
     write_json_key(writer, 2, "options")?;
     writeln!(writer, "{{")?;
@@ -4278,6 +4308,8 @@ fn write_json_laminar_simple_options(
     write_json_pressure_gamg_options(writer, 4, options.pressure_gamg_options)?;
     writeln!(writer, ",")?;
     write_json_bool_field(writer, 4, "profileGamg", options.profile_gamg)?;
+    writeln!(writer, ",")?;
+    write_json_bool_field(writer, 4, "profilePcg", profile_pcg)?;
     writeln!(writer, ",")?;
     write_json_key(writer, 4, "density")?;
     write_json_optional_number(writer, Some(options.density))?;
@@ -5478,7 +5510,7 @@ fn write_laminar_simple_report_markdown(
     options: &LaminarSimpleOptions,
     report: &LaminarSimpleReport,
     post_processing: &LaminarSimplePostProcessing,
-    wall_clock_seconds: f64,
+    run: LaminarSimpleReportRunMetadata,
     output_root: &SafeOutputRoot,
     path: &Path,
 ) -> std::io::Result<()> {
@@ -5753,7 +5785,7 @@ fn write_laminar_simple_report_markdown(
     writeln!(
         writer,
         "| Wall clock [s] | {} |",
-        format_scientific(wall_clock_seconds)
+        format_scientific(run.wall_clock_seconds)
     )?;
     writeln!(
         writer,
@@ -5901,7 +5933,7 @@ fn write_laminar_simple_report_markdown(
     writeln!(writer, "| --- | ---: |")?;
     let timing_rows = [
         ("Solver total", report.timing.solver_total_seconds),
-        ("Driver measured", wall_clock_seconds),
+        ("Driver measured", run.wall_clock_seconds),
         ("Setup", report.timing.setup_seconds),
         ("Iteration setup", report.timing.iteration_setup_seconds),
         (
@@ -5943,7 +5975,7 @@ fn write_laminar_simple_report_markdown(
     for (phase, seconds) in timing_rows {
         writeln!(writer, "| {phase} | {} |", format_scientific(seconds))?;
     }
-    if options.pressure_linear_solver == LaminarSimpleLinearSolver::Pcg {
+    if run.profile_pcg {
         writeln!(writer)?;
         writeln!(writer, "## Pressure PCG Kernel Profile")?;
         writeln!(writer)?;
@@ -7928,6 +7960,7 @@ struct LaminarSimpleSolveArgs {
     velocity_relaxation: Option<f64>,
     pressure_relaxation: Option<f64>,
     profile_gamg: bool,
+    profile_pcg: bool,
     solve_verbose: bool,
     solve_residual_csv: Option<PathBuf>,
     solve_residual_plot: Option<PathBuf>,
@@ -8040,6 +8073,7 @@ fn parse_solver_args_for_invocation(
     let mut velocity_relaxation = None;
     let mut pressure_relaxation = None;
     let mut profile_gamg = false;
+    let mut profile_pcg = false;
     let mut solve_verbose = false;
     let mut solve_residual_csv = None;
     let mut solve_residual_plot = None;
@@ -8405,6 +8439,11 @@ fn parse_solver_args_for_invocation(
                 laminar_simple_option_seen = true;
                 index += 1;
             }
+            "-profilePcg" | "--profilePcg" | "-profile-pcg" | "--profile-pcg" => {
+                profile_pcg = true;
+                laminar_simple_option_seen = true;
+                index += 1;
+            }
             "-solveReportJson"
             | "--solveReportJson"
             | "-solve-report-json"
@@ -8541,6 +8580,7 @@ fn parse_solver_args_for_invocation(
             velocity_relaxation,
             pressure_relaxation,
             profile_gamg,
+            profile_pcg,
             solve_verbose,
             solve_residual_csv,
             solve_residual_plot,
@@ -8929,6 +8969,7 @@ fn print_ferrum_run_usage() {
     println!("  --solveResidualCsv <file>        write residual history CSV");
     println!("  --solveResidualPlot <file.svg>   render a native residual SVG");
     println!("  --profileGamg                    profile GAMG phases and levels (diagnostic)");
+    println!("  --profilePcg                     profile pressure PCG kernels (diagnostic)");
     println!("  --solveReportJson <file>         write the solver report as JSON");
     println!("  --solveReportMarkdown <file>     write the solver report as Markdown");
     println!("  --writeFinalFields <dir>         write final U and p fields");
@@ -8998,14 +9039,14 @@ mod tests {
     use super::{
         ContinuityErrorsReport, ContinuitySummary, FERRUM_MAX_CASE_SIMPLE_ITERATIONS,
         LaminarSimpleIterationSummary, LaminarSimpleOptions, LaminarSimplePostProcessing,
-        LaminarSimpleResidualControlSummary, LaminarSimpleSchemes, MAX_RUNNER_DRY_RUN_STEPS,
-        SafeOutputRoot, ScalarDiffusionLinearSolver, SolverNumericsDictionaryPlan,
-        SolverSelectionSource, WallForceReport, build_laminar_simple_post_processing,
-        escape_markdown_literal, estimate_iterations_to_convergence,
-        estimate_simple_iterations_to_convergence, format_optional_u128,
-        format_pressure_gamg_console, gamg_outer_profile_counters, numerics_dictionary_number,
-        numerics_dictionary_usize, numerics_dictionary_value, openfoam_gamg_options,
-        outer_convergence_status_for_reason, parse_ferrum_run_args,
+        LaminarSimpleReportRunMetadata, LaminarSimpleResidualControlSummary, LaminarSimpleSchemes,
+        MAX_RUNNER_DRY_RUN_STEPS, SafeOutputRoot, ScalarDiffusionLinearSolver,
+        SolverNumericsDictionaryPlan, SolverSelectionSource, WallForceReport,
+        build_laminar_simple_post_processing, escape_markdown_literal,
+        estimate_iterations_to_convergence, estimate_simple_iterations_to_convergence,
+        format_optional_u128, format_pressure_gamg_console, gamg_outer_profile_counters,
+        numerics_dictionary_number, numerics_dictionary_usize, numerics_dictionary_value,
+        openfoam_gamg_options, outer_convergence_status_for_reason, parse_ferrum_run_args,
         parse_incompressible_fluid_args, parse_incompressible_fluid_plan_args,
         parse_laminar_simple_convection_scheme, parse_laminar_simple_gradient_scheme,
         parse_laminar_simple_laplacian_scheme, parse_laminar_simple_sn_grad_scheme,
@@ -9324,6 +9365,7 @@ mod tests {
             "--pressureRelaxation".to_string(),
             "0.2".to_string(),
             "--profileGamg".to_string(),
+            "--profilePcg".to_string(),
             "--solveReportJson".to_string(),
             "target/simple.json".to_string(),
             "--solveReportMarkdown".to_string(),
@@ -9359,6 +9401,7 @@ mod tests {
         assert_eq!(solve.velocity_relaxation, Some(0.6));
         assert_eq!(solve.pressure_relaxation, Some(0.2));
         assert!(solve.profile_gamg);
+        assert!(solve.profile_pcg);
         assert_eq!(solve.report_json, Some(PathBuf::from("target/simple.json")));
         assert_eq!(
             solve.report_markdown,
@@ -9674,7 +9717,10 @@ mod tests {
             &options,
             &report,
             &output_test_post_processing(),
-            0.0,
+            LaminarSimpleReportRunMetadata {
+                profile_pcg: false,
+                wall_clock_seconds: 0.0,
+            },
             &output_root,
             Path::new("report.json"),
         )
@@ -9684,11 +9730,40 @@ mod tests {
             &options,
             &report,
             &output_test_post_processing(),
-            0.0,
+            LaminarSimpleReportRunMetadata {
+                profile_pcg: false,
+                wall_clock_seconds: 0.0,
+            },
             &output_root,
             Path::new("report.md"),
         )
         .expect("Markdown report should be written");
+        write_laminar_simple_report_json(
+            &plan,
+            &options,
+            &report,
+            &output_test_post_processing(),
+            LaminarSimpleReportRunMetadata {
+                profile_pcg: true,
+                wall_clock_seconds: 0.0,
+            },
+            &output_root,
+            Path::new("profiled-report.json"),
+        )
+        .expect("profiled JSON report should be written");
+        write_laminar_simple_report_markdown(
+            &plan,
+            &options,
+            &report,
+            &output_test_post_processing(),
+            LaminarSimpleReportRunMetadata {
+                profile_pcg: true,
+                wall_clock_seconds: 0.0,
+            },
+            &output_root,
+            Path::new("profiled-report.md"),
+        )
+        .expect("profiled Markdown report should be written");
         write_laminar_simple_residual_csv(&report, &output_root, Path::new("residual.csv"))
             .expect("CSV report should be written");
 
@@ -9696,10 +9771,18 @@ mod tests {
             .expect("JSON report should be readable");
         let markdown = std::fs::read_to_string(base.join("report.md"))
             .expect("Markdown report should be readable");
+        let profiled_json = std::fs::read_to_string(base.join("profiled-report.json"))
+            .expect("profiled JSON report should be readable");
+        let profiled_markdown = std::fs::read_to_string(base.join("profiled-report.md"))
+            .expect("profiled Markdown report should be readable");
         let csv = std::fs::read_to_string(base.join("residual.csv"))
             .expect("CSV report should be readable");
         assert!(json.contains("\"momentumLinearRelativeTolerance\": 0.125"));
         assert!(json.contains("\"pressureLinearRelativeTolerance\": 1.25"));
+        assert!(json.contains("\"profilePcg\": false"));
+        assert!(!markdown.contains("## Pressure PCG Kernel Profile"));
+        assert!(profiled_json.contains("\"profilePcg\": true"));
+        assert!(profiled_markdown.contains("## Pressure PCG Kernel Profile"));
         assert!(json.contains("\"momentumComponentLinearSolves\""));
         assert!(json.contains("\"pressureCorrectionLinearSolves\""));
         assert!(json.contains("\"correction\": 1"));
@@ -9903,7 +9986,10 @@ mod tests {
             &options,
             &report,
             &output_test_post_processing(),
-            0.0,
+            LaminarSimpleReportRunMetadata {
+                profile_pcg: false,
+                wall_clock_seconds: 0.0,
+            },
             &output_root,
             Path::new("report.json"),
         )
@@ -9913,7 +9999,10 @@ mod tests {
             &options,
             &report,
             &output_test_post_processing(),
-            0.0,
+            LaminarSimpleReportRunMetadata {
+                profile_pcg: false,
+                wall_clock_seconds: 0.0,
+            },
             &output_root,
             Path::new("report.md"),
         )
@@ -9975,7 +10064,10 @@ mod tests {
                 &options,
                 &report,
                 &output_test_post_processing(),
-                0.0,
+                LaminarSimpleReportRunMetadata {
+                    profile_pcg: false,
+                    wall_clock_seconds: 0.0,
+                },
                 &output_root,
                 Path::new("overflow.json"),
             )
@@ -9985,7 +10077,10 @@ mod tests {
                 &options,
                 &report,
                 &output_test_post_processing(),
-                0.0,
+                LaminarSimpleReportRunMetadata {
+                    profile_pcg: false,
+                    wall_clock_seconds: 0.0,
+                },
                 &output_root,
                 Path::new("overflow.md"),
             )
@@ -10464,7 +10559,10 @@ mod tests {
             &minimal_laminar_simple_options_for_estimate(),
             &output_test_report(),
             &post_processing,
-            0.0,
+            LaminarSimpleReportRunMetadata {
+                profile_pcg: false,
+                wall_clock_seconds: 0.0,
+            },
             &output_root,
             Path::new("report.md"),
         )
@@ -10519,7 +10617,10 @@ mod tests {
             &minimal_laminar_simple_options_for_estimate(),
             &output_test_report(),
             &post_processing,
-            0.0,
+            LaminarSimpleReportRunMetadata {
+                profile_pcg: false,
+                wall_clock_seconds: 0.0,
+            },
             &output_root,
             Path::new("report.json"),
         )
@@ -10607,7 +10708,10 @@ mod tests {
             &options,
             &report,
             &post,
-            0.0,
+            LaminarSimpleReportRunMetadata {
+                profile_pcg: false,
+                wall_clock_seconds: 0.0,
+            },
             &output_root,
             Path::new("report.json"),
         )
@@ -10617,7 +10721,10 @@ mod tests {
             &options,
             &report,
             &post,
-            0.0,
+            LaminarSimpleReportRunMetadata {
+                profile_pcg: false,
+                wall_clock_seconds: 0.0,
+            },
             &output_root,
             Path::new("report.md"),
         )
@@ -11485,6 +11592,72 @@ mod tests {
             .expect_err("profiling PCG as GAMG must fail");
 
         assert!(error.contains("requires solvers.p.solver GAMG"));
+    }
+
+    #[test]
+    fn profile_pcg_defaults_off_and_accepts_all_cli_aliases() {
+        let parsed = parse_incompressible_fluid_args(&[]).expect("empty solver args should parse");
+        assert!(
+            !parsed
+                .laminar_simple_solve
+                .expect("default laminar SIMPLE solve args")
+                .profile_pcg
+        );
+
+        for alias in [
+            "-profilePcg",
+            "--profilePcg",
+            "-profile-pcg",
+            "--profile-pcg",
+        ] {
+            let parsed = parse_incompressible_fluid_args(&[alias.to_string()])
+                .expect("PCG profile alias should parse");
+            assert!(
+                parsed
+                    .laminar_simple_solve
+                    .expect("laminar SIMPLE solve args")
+                    .profile_pcg
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_pcg_profile_without_pcg_pressure_solver() {
+        let plan = laminar_simple_test_plan(998.2, 1.002e-3);
+        let parsed = parse_incompressible_fluid_args(&[
+            "--pressureLinearSolver".to_string(),
+            "cg".to_string(),
+            "--profilePcg".to_string(),
+        ])
+        .expect("solver args should parse");
+        let solve = parsed
+            .laminar_simple_solve
+            .expect("laminar SIMPLE solve args");
+
+        let error = resolve_laminar_simple_options(&plan, &solve)
+            .expect_err("profiling a non-PCG pressure solver must fail");
+
+        assert!(error.contains("--profilePcg requires solvers.p.solver PCG"));
+    }
+
+    #[test]
+    fn rejects_mixed_pcg_and_gamg_profile_modes() {
+        let plan = laminar_simple_test_plan(998.2, 1.002e-3);
+        let parsed = parse_incompressible_fluid_args(&[
+            "--pressureLinearSolver".to_string(),
+            "pcg".to_string(),
+            "--profilePcg".to_string(),
+            "--profileGamg".to_string(),
+        ])
+        .expect("solver args should parse");
+        let solve = parsed
+            .laminar_simple_solve
+            .expect("laminar SIMPLE solve args");
+
+        let error = resolve_laminar_simple_options(&plan, &solve)
+            .expect_err("mixed pressure profile modes must fail");
+
+        assert!(error.contains("--profileGamg requires solvers.p.solver GAMG"));
     }
 
     #[test]

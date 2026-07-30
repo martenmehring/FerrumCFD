@@ -634,13 +634,21 @@ ferrumRun -solver incompressibleFluid -case tutorials/incompressibleFluid/lamina
 ferrumRun -solver incompressibleFluid -case tutorials/incompressibleFluid/laminarPipe/ferrum/case --maxSimpleIterations 2 --writeFinalFields target/laminar-pipe-fields/1
 ```
 
-Solver report schema version 2 records `solver=incompressibleFluid`,
+Solver report schema version 3 records `solver=incompressibleFluid`,
 `algorithm=SIMPLE`, and `regime=laminar`. Its additive `timing` object separates
 solver total, driver measurement, setup, operator evaluation, momentum
 assembly, momentum gradient reconstruction, momentum matrix fill, momentum
 solve, pressure-coupling setup, pressure assembly/solve, field correction,
 finalization, and remaining solver work. These timings measure the executable
 solver only; they never include Cargo compilation.
+
+Pressure-PCG kernel timing is disabled by default. With pressure `PCG`,
+`--profilePcg` enables diagnostic timing for total PCG work, IC(0)
+update/application, matrix-vector products, and vector operations. The flag is
+rejected for non-PCG pressure solvers and cannot be combined with
+`--profileGamg`. JSON records `options.profilePcg`; when disabled, the PCG
+kernel timing and counter fields are zero, the console emits no PCG-kernel
+line, and Markdown omits the `Pressure PCG Kernel Profile` section.
 
 Both commands are geometry-independent SIMPLE execution. Analytic formulas,
 external comparisons, and geometry-specific field integration are separate
@@ -656,6 +664,7 @@ ferrumRun -solver incompressibleFluid -case tutorials/incompressibleFluid/lamina
 ferrumRun -solver incompressibleFluid -case tutorials/incompressibleFluid/laminarPipe/ferrum/case --momentumSolveTolerance 1e-7 --pressureSolveTolerance 1e-9 --momentumMaxIterations 300 --pressureMaxIterations 400
 ferrumRun -solver incompressibleFluid -case tutorials/incompressibleFluid/laminarPipe/ferrum/case --nNonOrthogonalCorrectors 1 --pRefCell 0 --pRefValue 0
 ferrumRun -solver incompressibleFluid -case tutorials/incompressibleFluid/laminarPipe/ferrum/case --simpleConsistent true --maxSimpleIterations 20
+ferrumRun -solver incompressibleFluid -case tutorials/incompressibleFluid/laminarPipe/ferrum/case --pressureLinearSolver pcg --profilePcg --solveReportJson target/profile.json --solveReportMarkdown target/profile.md
 ```
 
 By default, the current SIMPLE implementation reads OpenFOAM-style relaxation factors from
@@ -795,6 +804,8 @@ pressure flux, and corrected `phi`. JSON and Markdown reports also include a
 `linearSolves` profile with converged/non-converged momentum predictors,
 component momentum solves, pressure-correction solves, max/average linear
 iterations per SIMPLE step, and final linear-solver convergence flags. Each
+`linearSolves` history is numerical solver telemetry and is independent of the
+optional pressure-PCG kernel timing selected by `--profilePcg`. Each
 iteration also contains exactly the `x`, `y`, and `z`
 `momentumComponentLinearSolves` plus the one-based
 `pressureCorrectionLinearSolves`. Every solve records its iteration count,

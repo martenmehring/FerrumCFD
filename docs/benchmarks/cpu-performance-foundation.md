@@ -216,12 +216,15 @@ figures below remain the latest solver measurements.
 
 ## Pressure PCG Kernel Profile
 
-The reusable PCG workspace now offers an opt-in profiled solve that executes
-the same numerical routine and separately records preconditioner updates,
-matrix-vector products, preconditioner applications, and vector operations.
-The normal unprofiled linear API remains available. The SIMPLE pressure path
-exports the profile through console, JSON, and Markdown reports; the benchmark
-driver retains medians for every field.
+The reusable PCG workspace has long offered separate profiled and unprofiled
+solves. Through C4, however, the normal SIMPLE pressure-PCG route still
+selected the profiled workspace unconditionally. C5 makes that boundary
+explicit end to end: normal SIMPLE APIs and CLI execution use the unprofiled
+solve, while additive profiled APIs and `--profilePcg` select the instrumented
+solve. Console, JSON, and Markdown expose kernel detail only for the explicit
+diagnostic mode. The historical measurements below were collected on the
+instrumented path and remain diagnostic profiling evidence, not unprofiled
+runtime baselines.
 
 An optimized release run of the accepted pressure-matrix gate produced:
 
@@ -261,6 +264,43 @@ next target is the repeated IC(0) forward/backward application, beginning with
 a contiguous symbolic dependency layout that preserves operation order. If
 that does not materially improve both regression cases, the next pressure
 algorithm candidate is multigrid rather than further factor-build tuning.
+
+## Explicit Pressure-PCG Profiling A/B (C5)
+
+C5 separates normal pressure-PCG execution from its diagnostic kernel timers.
+One `target-cpu=native` Linux binary from exact commit
+`1e3bbc42ad06d06c2953a897c45733d077415ebc` and tree
+`0cac88d36e29d9684730c114101704d1fe26605d` was used for both variants. The
+plain command and `--profilePcg` were otherwise identical. Two untimed
+correctness oracles first required byte-identical final `U` and `p`, an
+identical canonical report after removing only path/timing/profile metadata,
+exactly `1,000` SIMPLE iterations, and the expected `2,000` pressure solves.
+The plain report contained exact-zero PCG timings and counters; the profiled
+report contained `107,242` pressure iterations, `109,242` matrix-vector
+products, and `107,242` preconditioner applications.
+
+The timing lane reused the exact `5,388`-cell C4 Cylinder mesh, no
+`residualControl`, and exactly `1,000` SIMPLE iterations. Both variants ran on
+pinned CPU 2 in the same one-thread WSL2/ext4 environment, with one warmup each
+and six measured pairs in alternating B/A and A/B order. External GNU-time
+elapsed seconds are primary:
+
+| Variant | Median [s] | MAD [s] | Internal median [s] | Runs |
+| --- | ---: | ---: | ---: | ---: |
+| Plain | 64.280 | 0.770 | 64.261494 | 6 |
+| `--profilePcg` | 65.055 | 2.285 | 64.949804 | 6 |
+
+The paired profiled/plain median was `0.993060` with MAD `0.029328`; each
+variant won three pairs. The separate medians and paired statistic therefore
+do not establish a measurable speed change. C5 is accepted for its explicit
+opt-in instrumentation boundary and exact numerical parity, not for a runtime
+speedup claim. A claimed sub-5% effect would require the stronger two-warmup,
+nine-pair protocol. The single binary SHA256 is
+`059f1db85365ad5abdcad49a7930292dcb19004093217c3501d128f54f01ebb6`;
+the ignored evidence is under
+`target/benchmarks/c5-linux-cylinder-pcg-profile-fixed1000-native-1e3bbc4-v1`,
+whose artifact-manifest SHA256 is
+`79f09d4ff3eb4f09a421a02360ebfda8755e7e5912a82893d5495cb2f55afed6`.
 
 ## Contiguous IC(0) Application Layout
 
