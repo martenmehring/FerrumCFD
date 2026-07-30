@@ -5,6 +5,8 @@ use std::path::{Component, Path, PathBuf};
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
+#[cfg(unix)]
+use cap_std::fs::{OpenOptionsExt, Permissions, PermissionsExt};
 
 /// The no-follow kind of an entry below a [`SafeOutputRoot`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -169,8 +171,19 @@ impl SafeOutputRoot {
     /// truncating data outside this capability root.
     pub fn open_replace_regular(&self, relative: &Path) -> io::Result<std::fs::File> {
         let (parent, name) = self.open_parent(relative, false)?;
+        #[cfg(unix)]
+        let mut replacement_mode = None;
         match parent.symlink_metadata(name) {
-            Ok(metadata) if metadata.is_file() => parent.remove_file(name)?,
+            Ok(metadata) if metadata.is_file() => {
+                #[cfg(unix)]
+                {
+                    // Preserve ordinary access permissions without copying
+                    // set-user-ID, set-group-ID, or sticky bits from a
+                    // potentially foreign hard-linked inode.
+                    replacement_mode = Some(metadata.permissions().mode() & 0o777);
+                }
+                parent.remove_file(name)?;
+            }
             Ok(_) => return Err(invalid_path("output path is not a regular file")),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
@@ -181,8 +194,23 @@ impl SafeOutputRoot {
             .write(true)
             .create_new(true)
             .follow(FollowSymlinks::No);
+        #[cfg(unix)]
+        if let Some(mode) = replacement_mode {
+            options.mode(mode);
+        }
         let file = parent.open_with(name, &options)?;
         ensure_regular_file(&file)?;
+        #[cfg(unix)]
+        if let Some(mode) = replacement_mode {
+            // `mode()` is still filtered by the process umask. Apply the
+            // captured mode through the already-open no-follow handle so the
+            // replacement is exact and cannot be redirected by a path race.
+            if let Err(error) = file.set_permissions(Permissions::from_mode(mode)) {
+                drop(file);
+                let _ = parent.remove_file(name);
+                return Err(error);
+            }
+        }
         Ok(file.into_std())
     }
 
@@ -478,12 +506,37 @@ fn validate_name(name: &OsStr) -> io::Result<()> {
         return Err(invalid_path("empty output path component"));
     }
     #[cfg(windows)]
-    if name.to_string_lossy().contains(':') {
-        return Err(invalid_path(
-            "Windows alternate data streams are not allowed",
-        ));
+    {
+        let bytes = name.as_encoded_bytes();
+        if bytes.contains(&b':') {
+            return Err(invalid_path(
+                "Windows alternate data streams are not allowed",
+            ));
+        }
+        if matches!(bytes.last(), Some(b'.' | b' ')) {
+            return Err(invalid_path(
+                "Windows output names may not end with a dot or space",
+            ));
+        }
+        let stem = bytes.split(|byte| *byte == b'.').next().unwrap_or(bytes);
+        if is_windows_reserved_name(stem) {
+            return Err(invalid_path("reserved Windows device name is not allowed"));
+        }
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn is_windows_reserved_name(name: &[u8]) -> bool {
+    name.eq_ignore_ascii_case(b"CON")
+        || name.eq_ignore_ascii_case(b"PRN")
+        || name.eq_ignore_ascii_case(b"AUX")
+        || name.eq_ignore_ascii_case(b"NUL")
+        || name.eq_ignore_ascii_case(b"CONIN$")
+        || name.eq_ignore_ascii_case(b"CONOUT$")
+        || ((name.len() == 4)
+            && (name[..3].eq_ignore_ascii_case(b"COM") || name[..3].eq_ignore_ascii_case(b"LPT"))
+            && matches!(name[3], b'1'..=b'9'))
 }
 
 fn absolute_anchor(path: &Path) -> io::Result<PathBuf> {
@@ -628,6 +681,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn replace_preserves_existing_access_permissions() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt as _};
+
+        for mode in [0o600, 0o751] {
+            let base = temp_dir(&format!("replace-mode-{mode:o}"));
+            std::fs::create_dir_all(&base).expect("create base");
+            let value = base.join("value");
+            std::fs::write(&value, "old").expect("write fixture");
+            std::fs::set_permissions(&value, std::fs::Permissions::from_mode(mode))
+                .expect("set fixture permissions");
+
+            let root = SafeOutputRoot::open_existing(&base).expect("open root");
+            let mut file = root
+                .open_replace_regular(Path::new("value"))
+                .expect("replace output");
+            file.write_all(b"new").expect("write replacement");
+            drop(file);
+
+            assert_eq!(
+                std::fs::metadata(&value).expect("stat replacement").mode() & 0o777,
+                mode
+            );
+            let _ = std::fs::remove_dir_all(base);
+        }
+    }
+
     #[test]
     fn replace_does_not_modify_an_external_hard_link_target() {
         let base = temp_dir("replace-hard-link");
@@ -681,6 +762,30 @@ mod tests {
             .expect_err("parent escape must fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_ambiguous_windows_output_names() {
+        for name in [
+            "value:stream",
+            "value.",
+            "value ",
+            "CON",
+            "con.txt",
+            "NUL.dat",
+            "COM1",
+            "lpt9.log",
+            "CONIN$",
+            "conout$.txt",
+        ] {
+            assert!(validate_name(OsStr::new(name)).is_err(), "accepted {name}");
+        }
+        for name in ["COM10", "console", ".mesh.msh", "a..b"] {
+            validate_name(OsStr::new(name)).unwrap_or_else(|error| {
+                panic!("rejected unambiguous Windows name {name}: {error}")
+            });
+        }
     }
 
     #[cfg(unix)]

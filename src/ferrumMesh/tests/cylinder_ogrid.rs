@@ -175,6 +175,163 @@ fn all_presets_are_mesh_and_byte_deterministic_and_roundtrip_exactly() {
 }
 
 #[test]
+fn gmsh_writer_rejects_trailing_separator_without_clobber() {
+    let directory = temporary_path("gmsh-trailing-separator", "dir");
+    fs::create_dir(&directory).expect("create temporary output directory");
+    let victim = directory.join("victim.msh");
+    fs::write(&victim, b"preserve me").expect("write victim file");
+    let path = PathBuf::from(format!("{}/", victim.display()));
+
+    assert!(write_msh22_ascii(&path, &gmsh_test_mesh()).is_err());
+    assert_eq!(fs::read(&victim).expect("read victim"), b"preserve me");
+    fs::remove_dir_all(&directory).expect("remove temporary output directory");
+}
+
+#[test]
+fn gmsh_writer_rejects_terminal_dot_component_without_clobber() {
+    let directory = temporary_path("gmsh-terminal-dot", "dir");
+    fs::create_dir(&directory).expect("create temporary output directory");
+    let victim = directory.join("victim.msh");
+    fs::write(&victim, b"preserve me").expect("write victim file");
+
+    assert!(write_msh22_ascii(&victim.join("."), &gmsh_test_mesh()).is_err());
+    assert_eq!(fs::read(&victim).expect("read victim"), b"preserve me");
+    fs::remove_dir_all(&directory).expect("remove temporary output directory");
+}
+
+#[test]
+fn gmsh_writer_rejects_raw_parent_component_before_normalization() {
+    let directory = temporary_path("gmsh-parent-component", "dir");
+    fs::create_dir(&directory).expect("create temporary output directory");
+    let victim = directory.join("victim.msh");
+    fs::write(&victim, b"preserve me").expect("write victim file");
+    let path = directory.join("missing").join("..").join("victim.msh");
+
+    assert!(write_msh22_ascii(&path, &gmsh_test_mesh()).is_err());
+    assert_eq!(fs::read(&victim).expect("read victim"), b"preserve me");
+    fs::remove_dir_all(&directory).expect("remove temporary output directory");
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn gmsh_writer_rejects_final_symlink_without_clobber() {
+    let directory = temporary_path("gmsh-final-symlink", "dir");
+    fs::create_dir(&directory).expect("create temporary output directory");
+    let victim = directory.join("victim.txt");
+    let output = directory.join("mesh.msh");
+    fs::write(&victim, b"preserve me").expect("write victim file");
+    if create_file_symlink(&victim, &output).is_err() {
+        fs::remove_dir_all(&directory).expect("remove temporary output directory");
+        return;
+    }
+
+    assert!(write_msh22_ascii(&output, &gmsh_test_mesh()).is_err());
+    assert_eq!(
+        fs::read(&victim).expect("read symlink target"),
+        b"preserve me"
+    );
+    fs::remove_dir_all(&directory).expect("remove temporary output directory");
+}
+
+#[test]
+fn gmsh_writer_replaces_hardlink_without_modifying_target() {
+    let directory = temporary_path("gmsh-hardlink", "dir");
+    fs::create_dir(&directory).expect("create temporary output directory");
+    let victim = directory.join("victim.txt");
+    let output = directory.join("mesh.msh");
+    fs::write(&victim, b"preserve me").expect("write victim file");
+
+    fs::hard_link(&victim, &output).expect("create output hard link");
+    write_msh22_ascii(&output, &gmsh_test_mesh()).expect("replace hard link safely");
+    assert_eq!(
+        fs::read(&victim).expect("read hard-link target"),
+        b"preserve me"
+    );
+    assert!(
+        fs::read(&output)
+            .expect("read replacement output")
+            .starts_with(b"$MeshFormat\n")
+    );
+    fs::remove_dir_all(&directory).expect("remove temporary output directory");
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn gmsh_writer_rejects_symlink_or_reparse_parent() {
+    let directory = temporary_path("gmsh-linked-parent", "dir");
+    let linked_directory = temporary_path("gmsh-linked-parent-alias", "dir");
+    fs::create_dir(&directory).expect("create temporary output directory");
+    if create_directory_symlink(&directory, &linked_directory).is_err() {
+        fs::remove_dir_all(&directory).expect("remove temporary output directory");
+        return;
+    }
+
+    assert!(write_msh22_ascii(&linked_directory.join("escaped.msh"), &gmsh_test_mesh()).is_err());
+    assert!(!directory.join("escaped.msh").exists());
+    remove_directory_symlink(&linked_directory).expect("remove output directory symlink");
+    fs::remove_dir_all(&directory).expect("remove temporary output directory");
+}
+
+#[cfg(unix)]
+#[test]
+fn gmsh_writer_preserves_existing_access_mode() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    for mode in [0o600, 0o750] {
+        let directory = temporary_path(&format!("gmsh-mode-{mode:o}"), "dir");
+        fs::create_dir(&directory).expect("create temporary output directory");
+        let output = directory.join("mesh.msh");
+        fs::write(&output, b"old").expect("write existing output");
+        fs::set_permissions(&output, fs::Permissions::from_mode(mode))
+            .expect("set existing output mode");
+
+        write_msh22_ascii(&output, &gmsh_test_mesh()).expect("replace output");
+        assert_eq!(
+            fs::metadata(&output).expect("stat output").mode() & 0o777,
+            mode
+        );
+        fs::remove_dir_all(&directory).expect("remove temporary output directory");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn gmsh_writer_rejects_trailing_dot_space_and_ads_aliases() {
+    let directory = temporary_path("gmsh-windows-alias", "dir");
+    fs::create_dir(&directory).expect("create temporary output directory");
+    let victim = directory.join("victim.msh");
+    fs::write(&victim, b"preserve me").expect("write victim file");
+
+    for alias in ["victim.msh.", "victim.msh ", "victim.msh:stream"] {
+        assert!(write_msh22_ascii(&directory.join(alias), &gmsh_test_mesh()).is_err());
+        assert_eq!(fs::read(&victim).expect("read victim"), b"preserve me");
+    }
+    fs::remove_dir_all(&directory).expect("remove temporary output directory");
+}
+
+#[test]
+fn gmsh_writer_accepts_unambiguous_dot_names() {
+    let directory = temporary_path("gmsh-valid-dot-names", "dir");
+    fs::create_dir(&directory).expect("create temporary output directory");
+    fs::create_dir(directory.join("a..b")).expect("create dotted parent");
+    let mesh = gmsh_test_mesh();
+
+    for output in [
+        directory.join(".").join("mesh.msh"),
+        directory.join(".mesh.msh"),
+        directory.join("a..b").join("mesh.msh"),
+    ] {
+        write_msh22_ascii(&output, &mesh).expect("write unambiguous dotted path");
+        assert!(
+            fs::read(&output)
+                .expect("read output")
+                .starts_with(b"$MeshFormat\n")
+        );
+    }
+    fs::remove_dir_all(&directory).expect("remove temporary output directory");
+}
+
+#[test]
 fn legacy_smoke_roundtrips_with_valid_raw_poly_mesh_quality() {
     assert_preset_roundtrip_quality(CylinderOGridPreset::LegacySmoke, [4, 12, 16, 96], false);
 }
@@ -497,6 +654,46 @@ fn assert_close(left: f64, right: f64, tolerance: f64) {
         (left - right).abs() <= tolerance,
         "expected {left} to be within {tolerance} of {right}"
     );
+}
+
+fn gmsh_test_mesh() -> Mesh {
+    generate_cylinder_ogrid(&CylinderOGridPreset::LegacySmoke.config()).expect("generate test mesh")
+}
+
+#[cfg(unix)]
+fn create_file_symlink(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_file_symlink(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
+}
+
+#[cfg(unix)]
+fn create_directory_symlink(
+    target: &std::path::Path,
+    link: &std::path::Path,
+) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_directory_symlink(
+    target: &std::path::Path,
+    link: &std::path::Path,
+) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_dir(target, link)
+}
+
+#[cfg(unix)]
+fn remove_directory_symlink(link: &std::path::Path) -> std::io::Result<()> {
+    fs::remove_file(link)
+}
+
+#[cfg(windows)]
+fn remove_directory_symlink(link: &std::path::Path) -> std::io::Result<()> {
+    fs::remove_dir(link)
 }
 
 fn temporary_path(stem: &str, extension: &str) -> PathBuf {
