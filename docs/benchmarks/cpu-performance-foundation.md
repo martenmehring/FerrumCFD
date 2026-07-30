@@ -1,7 +1,7 @@
 # Scalar CPU Performance Foundation
 
 Date: 2026-07-16
-Latest measurement: 2026-07-17
+Latest measurement: 2026-07-30
 
 This diagnostic establishes a release-only Ferrum performance profile for the
 existing `laminarPipe` and `planeChannel` regression cases. Cargo build time is
@@ -301,6 +301,34 @@ the ignored evidence is under
 `target/benchmarks/c5-linux-cylinder-pcg-profile-fixed1000-native-1e3bbc4-v1`,
 whose artifact-manifest SHA256 is
 `79f09d4ff3eb4f09a421a02360ebfda8755e7e5912a82893d5495cb2f55afed6`.
+
+## Persistent Momentum Assembly Workspace A/B (C6)
+
+C6 tested one persistent momentum-assembly workspace against exact base
+`c4347229e0da27dd01b344f5fec6b7df665d28e2`. Candidate
+`c3a30ea120f43836835db9b32fa17a584b4e5b1e` changed only
+`src/ferrumMesh/src/flow.rs`. It reused component CSR matrices and right-hand
+sides, old component fields, optional linear-upwind gradients, source,
+diagonal-relaxation, diagonal, and H1 storage without changing equations,
+controls, traversal order, or stopping semantics.
+
+Both commits were built separately on WSL2/ext4 with Rust 1.94.0,
+`target-cpu=native`, CPU 2, and one thread. One warmup pair and six alternating
+measured pairs used external GNU elapsed time as the primary metric:
+
+| Case | Base median [s] | Candidate median [s] | Change | Paired ratio median | MAD | Candidate wins |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Pipe, GAMG, 10 SIMPLE | 3.495 | 3.815 | +9.16% | 1.10728 | 0.19391 | 3/6 |
+| Channel, GAMG, 500 SIMPLE | 9.675 | 10.475 | +8.27% | 1.07221 | 0.24306 | 3/6 |
+| Cylinder, PCG/DIC, 1,000 SIMPLE | 61.160 | 61.650 | +0.80% | 1.01538 | 0.03714 | 3/6 |
+
+Base and candidate produced byte-identical final `U`, final `p`, and canonical
+reports after removing only path and timing fields in all three cases. Exact
+SIMPLE counts and input hashes were retained. Pipe and Channel order cohorts
+disagreed strongly; Cylinder was effectively neutral. Because every raw median
+regressed and each case won only three pairs, the fixed-work gate rejects C6.
+No confirmation or time-to-accuracy run is justified. The source remains local
+and unmerged; no speedup or Fable-review claim is made.
 
 ## Contiguous IC(0) Application Layout
 
