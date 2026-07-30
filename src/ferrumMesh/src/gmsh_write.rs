@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::path::{Component, Path};
 
 use crate::safe_output::SafeOutputRoot;
 use crate::{Mesh, MeshError, PhysicalName, Result};
@@ -10,6 +10,7 @@ use crate::{Mesh, MeshError, PhysicalName, Result};
 /// Writes a validated mesh as neutral Gmsh 2.2 ASCII.
 pub fn write_msh22_ascii(path: &Path, mesh: &Mesh) -> Result<()> {
     validate_mesh(mesh)?;
+    validate_output_path_syntax(path)?;
     let file_name = path
         .file_name()
         .ok_or_else(|| invalid("Gmsh output path has no file name"))?;
@@ -19,6 +20,36 @@ pub fn write_msh22_ascii(path: &Path, mesh: &Mesh) -> Result<()> {
     write_validated_msh22_ascii(&mut writer, mesh)?;
     writer.flush()?;
     Ok(())
+}
+
+fn validate_output_path_syntax(path: &Path) -> Result<()> {
+    let encoded = path.as_os_str().as_encoded_bytes();
+    if encoded.is_empty() {
+        return Err(invalid("Gmsh output path has no file name"));
+    }
+    if encoded.last().is_some_and(|byte| is_path_separator(*byte)) {
+        return Err(invalid("Gmsh output path ends with a separator"));
+    }
+    let final_component = encoded
+        .rsplit(|byte| is_path_separator(*byte))
+        .next()
+        .unwrap_or(encoded);
+    if matches!(final_component, b"." | b"..") {
+        return Err(invalid("Gmsh output path may not end with a dot component"));
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(invalid(
+            "Gmsh output path may not contain parent-directory components",
+        ));
+    }
+    Ok(())
+}
+
+fn is_path_separator(byte: u8) -> bool {
+    byte == b'/' || (cfg!(windows) && byte == b'\\')
 }
 
 /// Writes a validated mesh to an arbitrary byte sink.
