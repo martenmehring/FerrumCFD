@@ -36,6 +36,8 @@ pub enum LaminarSimplePreconditioner {
     None,
     Diagonal,
     IncompleteCholesky,
+    Dic,
+    Fdic,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -556,6 +558,8 @@ impl std::fmt::Display for LaminarSimplePreconditioner {
             Self::None => formatter.write_str("none"),
             Self::Diagonal => formatter.write_str("diagonal"),
             Self::IncompleteCholesky => formatter.write_str("incompleteCholesky"),
+            Self::Dic => formatter.write_str("DIC"),
+            Self::Fdic => formatter.write_str("FDIC"),
         }
     }
 }
@@ -2668,6 +2672,8 @@ fn map_cg_preconditioner(preconditioner: LaminarSimplePreconditioner) -> CgPreco
         LaminarSimplePreconditioner::None => CgPreconditioner::None,
         LaminarSimplePreconditioner::Diagonal => CgPreconditioner::Diagonal,
         LaminarSimplePreconditioner::IncompleteCholesky => CgPreconditioner::IncompleteCholesky,
+        LaminarSimplePreconditioner::Dic => CgPreconditioner::Dic,
+        LaminarSimplePreconditioner::Fdic => CgPreconditioner::Fdic,
     }
 }
 
@@ -5856,6 +5862,15 @@ fn validate_solver_preconditioner(
             "laminar SIMPLE {name} incompleteCholesky preconditioner requires pcg on an SPD matrix, got {solver}"
         )));
     }
+    if matches!(
+        preconditioner,
+        LaminarSimplePreconditioner::Dic | LaminarSimplePreconditioner::Fdic
+    ) && solver != LaminarSimpleLinearSolver::Pcg
+    {
+        return Err(invalid_input(format!(
+            "laminar SIMPLE {name} {preconditioner} preconditioner requires pcg on a symmetric SPD matrix, got {solver}"
+        )));
+    }
     Ok(())
 }
 
@@ -6152,6 +6167,53 @@ mod tests {
         vector_convection_divergence, vector_face_treatments, velocity_from_hby_a, zero,
     };
     use crate::{MeshError, Point3};
+
+    #[test]
+    fn dic_fdic_and_ic0_remain_distinct_and_require_their_supported_solver() {
+        for (preconditioner, mapped, label) in [
+            (
+                LaminarSimplePreconditioner::Dic,
+                CgPreconditioner::Dic,
+                "DIC",
+            ),
+            (
+                LaminarSimplePreconditioner::Fdic,
+                CgPreconditioner::Fdic,
+                "FDIC",
+            ),
+            (
+                LaminarSimplePreconditioner::IncompleteCholesky,
+                CgPreconditioner::IncompleteCholesky,
+                "incompleteCholesky",
+            ),
+        ] {
+            assert_eq!(super::map_cg_preconditioner(preconditioner), mapped);
+            assert_eq!(preconditioner.to_string(), label);
+            super::validate_solver_preconditioner(
+                "pressure",
+                LaminarSimpleLinearSolver::Pcg,
+                preconditioner,
+            )
+            .expect("symmetric pressure PCG preconditioner should be accepted");
+        }
+
+        for preconditioner in [
+            LaminarSimplePreconditioner::Dic,
+            LaminarSimplePreconditioner::Fdic,
+        ] {
+            let error = super::validate_solver_preconditioner(
+                "pressure",
+                LaminarSimpleLinearSolver::BiCgStab,
+                preconditioner,
+            )
+            .expect_err("face-LDU DIC/FDIC must remain restricted to PCG");
+            assert!(
+                error
+                    .to_string()
+                    .contains("requires pcg on a symmetric SPD matrix")
+            );
+        }
+    }
 
     #[test]
     fn vector_momentum_norm_aggregates_residuals_before_normalizing() {
@@ -7908,6 +7970,54 @@ mod tests {
                 if message
                     == "runtime field 'U' initial payload was already consumed or not loaded"
         ));
+    }
+
+    #[test]
+    fn dic_and_fdic_run_through_public_simple_entrypoint_bit_identically() {
+        let mut reports = Vec::new();
+        for preconditioner in [
+            LaminarSimplePreconditioner::Dic,
+            LaminarSimplePreconditioner::Fdic,
+        ] {
+            let mut runtime = two_cell_runtime();
+            let fields = two_cell_fields();
+            let mut options = minimal_laminar_options();
+            options.pressure_linear_solver = LaminarSimpleLinearSolver::Pcg;
+            options.pressure_preconditioner = preconditioner;
+
+            reports.push(
+                solve_laminar_simple(&mut runtime, &fields, &options)
+                    .expect("public SIMPLE pressure PCG with face-LDU preconditioner"),
+            );
+        }
+
+        let dic = &reports[0];
+        let fdic = &reports[1];
+        assert!(dic.total_pressure_linear_iterations > 0);
+        assert_eq!(
+            dic.total_pressure_linear_iterations,
+            fdic.total_pressure_linear_iterations
+        );
+        assert_eq!(
+            dic.final_pressure
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            fdic.final_pressure
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            dic.final_velocity
+                .iter()
+                .flat_map(|value| [value.x.to_bits(), value.y.to_bits(), value.z.to_bits()])
+                .collect::<Vec<_>>(),
+            fdic.final_velocity
+                .iter()
+                .flat_map(|value| [value.x.to_bits(), value.y.to_bits(), value.z.to_bits()])
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

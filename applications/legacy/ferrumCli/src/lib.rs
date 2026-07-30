@@ -2945,9 +2945,9 @@ fn parse_openfoam_laminar_preconditioner(
 ) -> Result<LaminarSimplePreconditioner, String> {
     match value.trim().trim_end_matches(';') {
         "none" | "None" => Ok(LaminarSimplePreconditioner::None),
-        "DIC" | "FDIC" | "incompleteCholesky" | "ic0" | "IC0" => {
-            Ok(LaminarSimplePreconditioner::IncompleteCholesky)
-        }
+        "DIC" => Ok(LaminarSimplePreconditioner::Dic),
+        "FDIC" => Ok(LaminarSimplePreconditioner::Fdic),
+        "incompleteCholesky" | "ic0" | "IC0" => Ok(LaminarSimplePreconditioner::IncompleteCholesky),
         "diagonal" | "Diagonal" => Ok(LaminarSimplePreconditioner::Diagonal),
         "DILU" => Err(
             "DILU is not implemented yet; refusing to substitute a diagonal preconditioner"
@@ -3233,7 +3233,7 @@ fn print_openfoam_case_compatibility_warnings(warnings: &[String]) {
 fn print_linear_solver_capabilities() {
     let capabilities = linear_solver_capabilities();
     println!(
-        "linear solvers: cpuCsr={} cpuJacobi={} cpuGaussSeidel={} cpuSymGaussSeidel={} cpuCg={} cpuPcg={} cpuBiCgStab={} cpuGamg={} cpuDiagonalPreconditioner={} cpuIncompleteCholeskyPreconditioner={} gpuLinearSolvers={}",
+        "linear solvers: cpuCsr={} cpuJacobi={} cpuGaussSeidel={} cpuSymGaussSeidel={} cpuCg={} cpuPcg={} cpuBiCgStab={} cpuGamg={} cpuDiagonalPreconditioner={} cpuIncompleteCholeskyPreconditioner={} cpuDicPreconditioner={} cpuFdicPreconditioner={} gpuLinearSolvers={}",
         yes_no(capabilities.cpu_csr),
         yes_no(capabilities.cpu_jacobi),
         yes_no(capabilities.cpu_gauss_seidel),
@@ -3244,6 +3244,8 @@ fn print_linear_solver_capabilities() {
         yes_no(capabilities.cpu_gamg),
         yes_no(capabilities.cpu_diagonal_preconditioner),
         yes_no(capabilities.cpu_incomplete_cholesky_preconditioner),
+        yes_no(capabilities.cpu_dic_preconditioner),
+        yes_no(capabilities.cpu_fdic_preconditioner),
         yes_no(capabilities.gpu_linear_solvers)
     );
 }
@@ -8216,7 +8218,7 @@ fn parse_solver_args_for_invocation(
             | "-momentum-preconditioner"
             | "--momentum-preconditioner" => {
                 let value = args.get(index + 1).ok_or_else(|| {
-                    "--momentumPreconditioner requires 'none', 'diagonal', 'DIC', or 'incompleteCholesky'"
+                    "--momentumPreconditioner requires 'none', 'diagonal', 'DIC', 'FDIC', 'ic0', or 'incompleteCholesky'"
                         .to_string()
                 })?;
                 momentum_preconditioner = Some(parse_laminar_simple_preconditioner(value)?);
@@ -8228,7 +8230,7 @@ fn parse_solver_args_for_invocation(
             | "-pressure-preconditioner"
             | "--pressure-preconditioner" => {
                 let value = args.get(index + 1).ok_or_else(|| {
-                    "--pressurePreconditioner requires 'none', 'diagonal', 'DIC', or 'incompleteCholesky'"
+                    "--pressurePreconditioner requires 'none', 'diagonal', 'DIC', 'FDIC', 'ic0', or 'incompleteCholesky'"
                         .to_string()
                 })?;
                 pressure_preconditioner = Some(parse_laminar_simple_preconditioner(value)?);
@@ -10917,7 +10919,7 @@ mod tests {
         );
         assert_eq!(
             solve.pressure_preconditioner,
-            Some(LaminarSimplePreconditioner::IncompleteCholesky)
+            Some(LaminarSimplePreconditioner::Dic)
         );
     }
 
@@ -11433,6 +11435,14 @@ mod tests {
                 numerics_dictionary_value(&dictionary, "solvers.p", "preconditioner").unwrap()
             )
             .unwrap(),
+            LaminarSimplePreconditioner::Dic
+        );
+        assert_eq!(
+            parse_openfoam_laminar_preconditioner("FDIC").unwrap(),
+            LaminarSimplePreconditioner::Fdic
+        );
+        assert_eq!(
+            parse_openfoam_laminar_preconditioner("ic0").unwrap(),
             LaminarSimplePreconditioner::IncompleteCholesky
         );
         assert!(parse_openfoam_laminar_preconditioner("DILU").is_err());

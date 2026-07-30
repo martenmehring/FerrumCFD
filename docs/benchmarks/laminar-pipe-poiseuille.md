@@ -162,11 +162,14 @@ Follow-up isolation on 2026-07-09 with the pressure-assembly reports shows:
   face-normal distance instead of raw cell-centre distance; this is geometrically
   closer to OpenFOAM-style corrected laplacian assembly, but still needs a
   settled benchmark rerun before claiming fine-mesh accuracy improvement.
-- OpenFOAM `DIC`/`FDIC` now maps to a CPU IC(0) incomplete-Cholesky
-  preconditioner for pressure PCG. A 2-SIMPLE-iteration smoke run on the medium
-  pipe reports `pressurePreconditioner=incompleteCholesky`, pressure-matrix
-  diagnostics, and `424` pressure linear iterations, down from the earlier
-  diagonal-preconditioned order of `1133` for the same short run.
+- At the time of this historical run, the `DIC`/`FDIC` compatibility aliases
+  mapped to the CPU IC(0) incomplete-Cholesky preconditioner for pressure PCG.
+  A 2-SIMPLE-iteration smoke run on the medium pipe reported
+  `pressurePreconditioner=incompleteCholesky`, pressure-matrix diagnostics, and
+  `424` pressure linear iterations, down from the earlier
+  diagonal-preconditioned order of `1133` for the same short run. Current
+  `DIC`/`FDIC` and `ic0` behavior is documented separately in the user guide;
+  these historical timings do not benchmark the later true face-LDU paths.
 
 ### Historical SIMPLE Solver Experiments
 

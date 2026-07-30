@@ -595,12 +595,16 @@ scheme, benchmark, performance, and generalization work.
 `smoothSolver` on `U` requires and executes a supported `GaussSeidel` or
 `symGaussSeidel` smoother, and
 explicit `bicgstab` remains available for nonsymmetric momentum experiments.
-OpenFOAM `DIC`/`FDIC` on pressure PCG maps to IC(0). `DILU` is rejected until a
-true nonsymmetric ILU/DILU preconditioner exists; Ferrum never substitutes a
-diagonal preconditioner silently. The selected pressure PCG path shares the
-mesh-dependent CSR pattern, reuses matrix/RHS and PCG work storage, and retains
-the IC(0) symbolic structure while refactoring its numerical values for each
-pressure equation. The OpenFOAM-normalized scalar-solve reporting layer also
+OpenFOAM `DIC` and `FDIC` on symmetric pressure PCG select independent safe-Rust
+implementations of the corresponding face-LDU diagonal recurrence and
+forward/reverse face sweeps. `FDIC` precomputes the diagonal-scaled face
+multipliers; `DIC` computes them during application. `ic0` and
+`incompleteCholesky` retain the separate full CSR IC(0) factorization. `DILU`
+is rejected until a true nonsymmetric ILU/DILU preconditioner exists; Ferrum
+never substitutes a diagonal preconditioner silently. The selected pressure
+PCG path shares the mesh-dependent CSR pattern, reuses matrix/RHS and PCG work
+storage, and refreshes only numerical preconditioner state for each pressure
+equation. The OpenFOAM-normalized scalar-solve reporting layer also
 retains its zero-initial, matrix-product, and residual buffers across momentum
 and pressure equations. A topology, workspace, or preconditioner mismatch is an
 error, not a fallback. CLI flags remain explicit experiment overrides. Solver

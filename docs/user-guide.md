@@ -643,10 +643,10 @@ finalization, and remaining solver work. These timings measure the executable
 solver only; they never include Cargo compilation.
 
 Pressure-PCG kernel timing is disabled by default. With pressure `PCG`,
-`--profilePcg` enables diagnostic timing for total PCG work, IC(0)
-update/application, matrix-vector products, and vector operations. The flag is
-rejected for non-PCG pressure solvers and cannot be combined with
-`--profileGamg`. JSON records `options.profilePcg`; when disabled, the PCG
+`--profilePcg` enables diagnostic timing for total PCG work, selected
+preconditioner update/application, matrix-vector products, and vector
+operations. The flag is rejected for non-PCG pressure solvers and cannot be
+combined with `--profileGamg`. JSON records `options.profilePcg`; when disabled, the PCG
 kernel timing and counter fields are zero, the console emits no PCG-kernel
 line, and Markdown omits the `Pressure PCG Kernel Profile` section.
 
@@ -680,9 +680,14 @@ performance default. The frozen Linux acceptance gate found a robust benefit
 for the current Plane Channel configuration but rejected the current Pipe
 configuration on accuracy and pressure-work limits; select it deliberately and
 validate the chosen case rather than assuming a universal speedup.
-For pressure PCG, OpenFOAM `DIC`/`FDIC` maps to Ferrum's CPU IC(0)
-incomplete-Cholesky preconditioner. `DILU` is rejected until a true
-nonsymmetric ILU/DILU preconditioner exists; no diagonal fallback is applied.
+For symmetric pressure PCG, `DIC` selects Ferrum's face-LDU diagonal
+incomplete-Cholesky recurrence and deterministic forward/reverse face sweeps.
+`FDIC` uses the same recurrence and result while caching the two
+diagonal-scaled face multipliers used by those sweeps. The implementation is
+independent safe Rust with explicit symmetry, finite-value, and positive-pivot
+gates. `ic0` and `incompleteCholesky` continue to select Ferrum's separate full
+CSR IC(0) factorization. `DILU` is rejected until a true nonsymmetric ILU/DILU
+preconditioner exists; no diagonal fallback is applied.
 OpenFOAM `smoothSolver` on `U` requires a `smoother` entry and executes the
 matching CPU `GaussSeidel` or `symGaussSeidel` path. Explicit `bicgstab` remains available for nonsymmetric momentum
 experiments. The generic `--solveTolerance` and `--maxIterations` flags remain
