@@ -641,6 +641,14 @@ Ferrum is faster for every mesh, solver configuration, accuracy target, or
 physics model. OpenFOAM cases, executables, and the external comparison harness
 are not distributed with FerrumCFD.
 
+The later C4 [Cylinder same-Linux parity](cylinder-linux-parity.md) comparison
+uses exact current commit `3d84b33f2406`, one byte-identical official
+5,388-cell mesh, Fixed-1,000 work, and a separate residual-controlled TTA
+track. Ferrum consumed a median paired `2.752571x` the OpenFOAM elapsed time at
+fixed work and `3.335669x` in TTA. Cylinder is therefore a documented
+performance hotspot; the Pipe/Channel rows above must not be generalized to
+all cases.
+
 ### Rejected `interpolateCorrection` Performance Leaf
 
 PR `#93` added Foundation-style correction interpolation as an explicit,

@@ -71,9 +71,10 @@ The accepted Rust readback path records these raw maxima:
 | `Fine` | 44.296535 deg | 0.499926 | 3.477364 |
 
 All applicable C2 tests pass. The larger Legacy aspect value is retained as
-raw evidence rather than hidden by a cap. C3 now supplies the automated force,
-continuity, convergence, refinement, and determinism acceptance. C4 must still
-perform the same-Linux comparison with OpenFOAM Foundation 13.
+raw evidence rather than hidden by a cap. C3 supplies the automated force,
+continuity, convergence, refinement, and determinism acceptance. C4 now adds
+the accepted same-Linux comparison with OpenFOAM Foundation 13, documented in
+[Cylinder same-Linux parity](../../../docs/benchmarks/cylinder-linux-parity.md).
 
 From the repository root, run Ferrum without modifying the source case:
 
@@ -124,8 +125,30 @@ default test suite. It passed on 2026-07-29 with the following evidence:
 
 The Coarse/Fine drag drift is `0.275907%`, below the `5%` gate. The two Coarse
 runs also produced bit-identical final `U` and `p`. These are physical and
-deterministic C3 results, not a speed comparison. C4 performs the separate
-same-Linux comparison against Foundation 13.
+deterministic C3 results, not a speed comparison. The separate C4 same-Linux
+comparison against Foundation 13 is recorded in
+[Cylinder same-Linux parity](../../../docs/benchmarks/cylinder-linux-parity.md).
+
+## C4 same-Linux comparison
+
+C4 uses the same generated official 5,388-cell `polyMesh`, physical fields,
+schemes, linear solvers, relaxation factors, CPU affinity, one-thread Linux
+environment, and external elapsed-time metric for both engines. The
+engine-specific outer-control spelling is mapped to one equivalent predictor /
+pressure-corrector cycle rather than claimed byte-identical.
+
+On exact commit `3d84b33f2406b143e6349ea6a9e9438c029a324f`, the accepted
+Fixed-1,000 track measured medians of `85.170 s` for Ferrum and `31.335 s` for
+OpenFOAM, with a paired Ferrum/OpenFOAM median ratio of `2.752571`. The separate
+`U,p = 1e-5` time-to-accuracy track measured `129.680 s` versus `38.735 s` and
+a paired ratio of `3.335669`; Ferrum reached the threshold in 986 outer steps
+versus 995 for OpenFOAM. The full-field relative L2 differences were
+`0.525295%` for `U` and `0.926074%` for `p`, both below the `2%` gate.
+
+Residual stopping remains optional: the TTA track supplies `residualControl`,
+while the Fixed-1,000 track omits it and proves exact execution of the longer
+budget. These results identify Cylinder as a remaining performance hotspot and
+do not support a general all-case speedup claim.
 
 ## Numerical benchmark
 
@@ -147,5 +170,5 @@ mesh.
 There is no useful closed-form solution for this finite-domain viscous cylinder
 problem, so the documented numerical benchmark is used instead. Current
 limitations are the finite outer boundary and steady laminar model. Runtime is
-intentionally not a C3 acceptance value because it depends on hardware; the
-same-Linux performance comparison belongs to C4.
+not a C3 acceptance value because it depends on hardware; C4 records it under
+the controlled same-Linux protocol linked above.

@@ -478,6 +478,17 @@ Current status:
   so Channel is clearly faster in this fixed-work lane. Build time is excluded,
   engine-native timers remain diagnostic only, and no general all-case speedup
   is claimed;
+- C4 extends the canonical Linux-parity lane to the official 5,388-cell
+  Foundation 13 Cylinder mesh on exact commit `3d84b33f2406`. With one warmup
+  and six measured AB/BA pairs, the exact 1,000-step fixed-work medians were
+  `85.170 s` for Ferrum and `31.335 s` for OpenFOAM; the median paired
+  Ferrum/OpenFOAM ratio was `2.752571` with MAD `0.495953`. The separate
+  `U,p=1e-5` TTA replay used 986 Ferrum and 995 OpenFOAM outer steps and
+  measured `129.680 s` versus `38.735 s`, with paired ratio `3.335669` and MAD
+  `0.608799`. `Cd` differed by `0.153984%`; full-field relative L2 differences
+  were `0.525295%` for `U` and `0.926074%` for `p`. Cylinder is therefore a
+  remaining performance hotspot and prevents a general all-case speedup
+  claim. See [Cylinder same-Linux parity](benchmarks/cylinder-linux-parity.md);
 - isolated native build screening did not establish a general compiler-profile
   gain. Native `codegen-units=1` and Fat-LTO did not improve the Pipe screen.
   Thin-LTO improved the stronger Pipe `2+9` median paired ratio from `1.2792`
@@ -718,13 +729,13 @@ resident across iterations and reports every unavoidable host transfer.
 
 Before Driver 2 starts, steady incompressible SIMPLE/SIMPLEC must pass this
 tutorial matrix. The status column is the audited repository state on
-2026-07-29; a smoke run is not the same as full physical acceptance.
+2026-07-30; a smoke run is not the same as full physical acceptance.
 
 | Order | Case | Primary coverage | Current status | Reference |
 | ---: | --- | --- | --- | --- |
 | 1 | `laminarPipe` | 3D internal flow and pressure loss | Runnable case, analytical checks, convergence profiles, and performance evidence present | Hagen-Poiseuille analytical solution |
 | 2 | `planeChannel` | true 2D `empty` handling | Runnable case, analytical checks, executable `empty` coverage, convergence profiles, and performance evidence present | Plane-Poiseuille analytical solution |
-| 3 | `cylinder` | steady laminar external flow at `Re = 1` and corrected non-orthogonal pressure coupling | Independently authored 48-cell `LegacySmoke` case, accepted C2 deterministic Coarse/Fine O-grids, generic force/continuity reporting, and the complete C3 Coarse/Coarse/Fine physical gate pass; C4 same-Linux comparison remains open | Documented OpenFOAM Foundation 13 observables selected by the focused case task |
+| 3 | `cylinder` | steady laminar external flow at `Re = 1` and corrected non-orthogonal pressure coupling | Independently authored 48-cell `LegacySmoke` case, accepted C2 deterministic Coarse/Fine O-grids, generic force/continuity reporting, complete C3 Coarse/Coarse/Fine physical gates, and accepted C4 same-Linux fixed-work/TTA/field-parity evidence | [Cylinder same-Linux parity](benchmarks/cylinder-linux-parity.md) against documented OpenFOAM Foundation 13 observables |
 | 4 | `lidDrivenCavity` | recirculation and closed-pressure reference | Independently authored 4-cell case plus preflight and two-SIMPLE-iteration E2E smoke present; the nonzero `pRefValue` is verified in the written field and all eight fixed-velocity faces exercise the pressure constraint; refined centerline/vortex acceptance remains open | Ghia, Ghia, and Shin Re=100 published benchmark |
 | 5 | `backwardFacingStep` | separation, reattachment, outlet robustness, and actual reverse-flow switching | Not implemented as an executable Ferrum tutorial | Published benchmark |
 | 6 | `axisymmetricPipe` | executable `wedge` handling | Not implemented as an executable Ferrum tutorial | Hagen-Poiseuille analytical solution |
@@ -1533,8 +1544,8 @@ The immediate sequence is:
 18. **F-PERF-GPU (planned later leaf):** Start GPU work only after the scalar,
     SIMD, and shared-memory contracts above are measured. Keep it isolated from
     CPU acceptance and apply the same fixed-work plus time-to-accuracy evidence.
-19. **F-D1-CYLINDER-LIMITED-SCHEMES / F-D1-CASE-CYLINDER (C1/C2/C3 accepted;
-   C4 open):** Limited schemes, the
+19. **F-D1-CYLINDER-LIMITED-SCHEMES / F-D1-CASE-CYLINDER (C1-C4 accepted):**
+   Limited schemes, the
    independently authored Cylinder case, preflight, and a two-iteration smoke
    are present. The first `ferrumFiniteVolume` leaf provides generic
    stationary-no-slip pressure, viscous-force, and Cd/Cl integration for
@@ -1593,9 +1604,22 @@ The immediate sequence is:
    `phi` now subtracts the solved pressure flux from the exact face-flux base
    used to assemble the final pressure equation. A skewed-mesh regression
    proves matrix-residual/flux-divergence parity, while the zero-corrector path
-   retains its existing behavior. C4 remains the external same-Linux
-   comparison against OpenFOAM Foundation v13. Validation order remains Pipe,
-   Channel, then Cylinder.
+   retains its existing behavior.
+
+   C4 passed on 2026-07-30 using exact commit `3d84b33f2406`, one common
+   generated official 5,388-cell `polyMesh`, OpenFOAM Foundation 13 build
+   `13-441953dfbb42`, serial CPU2 WSL2/ext4 execution, and one warmup plus six
+   measured alternating pairs. The exact 1,000-step fixed-work paired ratio
+   was `2.752571` (MAD `0.495953`); the common `U,p=1e-5` TTA paired ratio was
+   `3.335669` (MAD `0.608799`) at 986 Ferrum versus 995 OpenFOAM steps. Drag,
+   lift, continuity, and cross-engine field gates passed, including relative
+   L2 `0.525295%` for `U` and `0.926074%` for `p`. Residual stopping remains
+   optional: TTA supplies `residualControl`, while Fixed-1,000 omits it and
+   executes the full budget. The external evidence, post-run TTA field-gate
+   provenance, and fixed-only packaging-recovery caveat are recorded in
+   [Cylinder same-Linux parity](benchmarks/cylinder-linux-parity.md). No
+   OpenFOAM case, source, executable, or comparison launcher is tracked.
+   Validation order remains Pipe, Channel, then Cylinder.
 20. **F-AUTO-1 (accepted external dependency):** Keep the accepted isolated n8n
    coding workflow in the AI Dev Orchestrator repository and preserve the
    existing analysis workflow as a separate read-only path.
