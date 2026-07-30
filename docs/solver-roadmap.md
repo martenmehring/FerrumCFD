@@ -677,10 +677,12 @@ Next performance targets:
   settings per case, loosen tolerances, add artificial caps, or hide a fallback.
   Preserve outer convergence and physical accuracy, and report intentional
   changes in linear work instead of requiring identical V-cycle counts;
-- SIMPLE/momentum persistence has failed two end-to-end timing gates despite
-  exact semantics. Do not merge C6 or repeat a broad workspace bundle. Revisit
-  persistence only for one independently profiled allocation or scan with a
-  predeclared cross-case gate;
+- SIMPLE/momentum persistence and the three isolated C7 scan-reuse leaves have
+  failed their end-to-end timing gates despite exact semantics. Do not merge
+  C6/C7 or repeat these broad workspace, final-pressure, net-flux, or
+  cell-adjacency candidates. Revisit this area only after a fresh profile
+  identifies a different dominant mechanism with a predeclared cross-case
+  gate;
 - accept the implemented static OpenFOAM-style `relTol` only with unchanged
   final outer acceptance, explicit effective-target telemetry, linear-work
   accounting, and time-to-accuracy evidence. Persistence is not a prerequisite
@@ -997,6 +999,17 @@ The immediate sequence is:
    wins in every case and split order cohorts. Candidate `c3a30ea` remains
    local and unmerged; no performance or Fable claim is made. Any later
    persistence leaf must be smaller and independently profiled.
+   Three subsequent one-file C7 leaves isolated intermediate diagnostic
+   summarization of pressure data (`9f0fdd2d`), shared bounded net-cell flux
+   (`2c332663`), and lazy
+   solve-local cell-to-face adjacency (`038b78b8`). All three retained exact
+   fixed-work fields, reports, iterations, failures, and input hashes across
+   Pipe, Channel, and Cylinder. The frozen Native Linux `1+6` gates rejected
+   every leaf: C7-A regressed Pipe; C7-B crossed the Pipe no-path regression
+   gate; and the directionally favorable C7-B/C Cylinder paired gains of
+   `4.011%` and `2.600%` did not exceed their respective `2 x MAD` thresholds
+   of `4.443%` and `8.884%`. No confirmation run was permitted. All C7 source
+   commits remain local and unmerged, and no speedup or Fable claim is made.
 5. **F-PERF-LINUX-PARITY (completed evidence, harness retired):** The external
    same-Linux protocol produced accepted portable, Native `1+5`, and Native
    Pipe `2+9` baseline evidence with pinned Rust, CPU affinity, serial
