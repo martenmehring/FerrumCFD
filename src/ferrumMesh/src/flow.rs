@@ -505,6 +505,37 @@ enum ScalarFaceTreatment {
     Constraint,
 }
 
+fn resolve_pressure_inlet_outlet(
+    boundary: &[ScalarFaceTreatment],
+    flux: &[f64],
+) -> Result<Vec<ScalarFaceTreatment>> {
+    if boundary.len() != flux.len() {
+        return Err(invalid_input(format!(
+            "pressure inletOutlet resolution requires one flux per face, got {} treatments and {} fluxes",
+            boundary.len(),
+            flux.len()
+        )));
+    }
+    for (face_index, (treatment, face_flux)) in boundary.iter().zip(flux).enumerate() {
+        if matches!(treatment, ScalarFaceTreatment::InletOutlet(_)) && !face_flux.is_finite() {
+            return Err(invalid_input(format!(
+                "pressure inletOutlet face {face_index} has non-finite decision flux {face_flux}"
+            )));
+        }
+    }
+    Ok(boundary
+        .iter()
+        .zip(flux)
+        .map(|(treatment, face_flux)| match *treatment {
+            ScalarFaceTreatment::InletOutlet(value) if *face_flux < 0.0 => {
+                ScalarFaceTreatment::FixedValue(value)
+            }
+            ScalarFaceTreatment::InletOutlet(_) => ScalarFaceTreatment::ZeroGradient,
+            treatment => treatment,
+        })
+        .collect())
+}
+
 impl std::fmt::Display for LaminarSimpleLinearSolver {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -681,7 +712,7 @@ pub fn solve_laminar_simple_with_observer(
     on_iteration: Option<&mut dyn FnMut(&LaminarSimpleIterationSummary)>,
 ) -> Result<LaminarSimpleReport> {
     #[cfg(test)]
-    return solve_laminar_simple_driven(runtime, fields, options, on_iteration, false, None);
+    return solve_laminar_simple_driven(runtime, fields, options, on_iteration, false, None, None);
 
     #[cfg(not(test))]
     solve_laminar_simple_driven(runtime, fields, options, on_iteration, false)
@@ -708,7 +739,7 @@ pub fn solve_laminar_simple_profiled_pcg_with_observer(
     on_iteration: Option<&mut dyn FnMut(&LaminarSimpleIterationSummary)>,
 ) -> Result<LaminarSimpleReport> {
     #[cfg(test)]
-    return solve_laminar_simple_driven(runtime, fields, options, on_iteration, true, None);
+    return solve_laminar_simple_driven(runtime, fields, options, on_iteration, true, None, None);
 
     #[cfg(not(test))]
     solve_laminar_simple_driven(runtime, fields, options, on_iteration, true)
@@ -718,6 +749,10 @@ pub fn solve_laminar_simple_profiled_pcg_with_observer(
 type PressureReportDriver<'a> =
     &'a mut dyn FnMut(usize, &mut ScalarSolveReport, &[Point3], &[f64], ContinuitySummary);
 
+#[cfg(test)]
+type PressureBoundaryDriver<'a> =
+    &'a mut dyn FnMut(usize, &mut Vec<f64>, Option<&[ScalarFaceTreatment]>);
+
 fn solve_laminar_simple_driven(
     runtime: &mut SolverRuntimeData,
     fields: &InitialFieldSet,
@@ -725,6 +760,7 @@ fn solve_laminar_simple_driven(
     mut on_iteration: Option<&mut dyn FnMut(&LaminarSimpleIterationSummary)>,
     profile_pcg: bool,
     #[cfg(test)] mut drive_pressure_report: Option<PressureReportDriver<'_>>,
+    #[cfg(test)] mut drive_pressure_boundary: Option<PressureBoundaryDriver<'_>>,
 ) -> Result<LaminarSimpleReport> {
     let solver_started = Instant::now();
     let setup_started = Instant::now();
@@ -790,11 +826,13 @@ fn solve_laminar_simple_driven(
     let mut total_pressure_linear_iterations = 0;
     let mut surface_flux = initial_phi;
     let mut final_phi = surface_flux.clone();
+    let initial_pressure_boundary =
+        resolve_pressure_inlet_outlet(&pressure_boundary, &surface_flux)?;
     let mut final_grad_p = scalar_gradient_with_geometry(
         &runtime.mesh,
         &mesh_cache.scalar_gradient,
         &pressure,
-        &pressure_boundary,
+        &initial_pressure_boundary,
         options.schemes.grad_p,
     )?;
     let mut final_hby_a = vec![zero(); runtime.mesh.cells];
@@ -820,6 +858,7 @@ fn solve_laminar_simple_driven(
         let previous_velocity = velocity.clone();
         let previous_pressure = pressure.clone();
         let phi = surface_flux.clone();
+        let carried_pressure_boundary = resolve_pressure_inlet_outlet(&pressure_boundary, &phi)?;
         let continuity_before = summarize_continuity(&net_cell_flux(&runtime.mesh, &phi)?);
         timing.iteration_setup_seconds += iteration_setup_started.elapsed().as_secs_f64();
         let operator_evaluation_started = Instant::now();
@@ -827,7 +866,7 @@ fn solve_laminar_simple_driven(
             &runtime.mesh,
             &mesh_cache.scalar_gradient,
             &pressure,
-            &pressure_boundary,
+            &carried_pressure_boundary,
             options.schemes.grad_p,
         )?;
         timing.operator_evaluation_seconds += operator_evaluation_started.elapsed().as_secs_f64();
@@ -968,11 +1007,21 @@ fn solve_laminar_simple_driven(
         };
         let mut hby_a = hby_a_from_predicted_velocity(&predicted_velocity, &grad_p, &r_au)?;
         let mut phi_hby_a = compute_phi_hby_a(&runtime.mesh, &hby_a, &velocity_boundary)?;
+        #[cfg(test)]
+        if let Some(driver) = drive_pressure_boundary.as_deref_mut() {
+            driver(iteration, &mut phi_hby_a, None);
+        }
+        let coupling_pressure_boundary =
+            resolve_pressure_inlet_outlet(&pressure_boundary, &phi_hby_a)?;
+        #[cfg(test)]
+        if let Some(driver) = drive_pressure_boundary.as_deref_mut() {
+            driver(iteration, &mut phi_hby_a, Some(&coupling_pressure_boundary));
+        }
         let phi_hby_a_before_adjust_summary = summarize_face_fluxes(&runtime.mesh, &phi_hby_a);
         let adjust_phi_summary = adjust_phi_hby_a(
             &runtime.mesh,
             &velocity_boundary,
-            &pressure_boundary,
+            &coupling_pressure_boundary,
             &mut phi_hby_a,
         )?;
         let phi_hby_a_after_adjust_summary = summarize_face_fluxes(&runtime.mesh, &phi_hby_a);
@@ -980,7 +1029,7 @@ fn solve_laminar_simple_driven(
             let consistent_phi_correction = consistent_phi_hby_a_pressure_correction(
                 &runtime.mesh,
                 &pressure,
-                &pressure_boundary,
+                &coupling_pressure_boundary,
                 &r_au,
                 &r_at_u,
             )?;
@@ -1041,7 +1090,7 @@ fn solve_laminar_simple_driven(
         }
         let constrained_pressure_boundary = constrained_pressure_treatments(
             &runtime.mesh,
-            &pressure_boundary,
+            &coupling_pressure_boundary,
             &velocity_boundary,
             &predicted_velocity,
             &phi_hby_a,
@@ -7540,19 +7589,21 @@ mod tests {
     }
 
     #[test]
-    fn inlet_outlet_pressure_inflow_is_constrained() {
+    fn pressure_inlet_outlet_backflow_survives_constrain_pressure_as_fixed_value() {
         let runtime = two_cell_runtime();
         let mut velocity_boundary = vec![VectorFaceTreatment::ZeroGradient; runtime.mesh.faces];
-        velocity_boundary[2] = VectorFaceTreatment::FixedValue(point(-2.0, 0.0, 0.0));
+        velocity_boundary[2] = VectorFaceTreatment::InletOutlet(point(-2.0, 0.0, 0.0));
         let mut pressure_boundary = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
-        pressure_boundary[2] = ScalarFaceTreatment::InletOutlet(0.0);
+        pressure_boundary[2] = ScalarFaceTreatment::InletOutlet(3.5);
         let velocity = vec![point(0.0, 0.0, 0.0), point(0.0, 0.0, 0.0)];
         let phi_hby_a = vec![0.0, 0.0, -1.0];
         let r_au = vec![1.0, 1.0];
+        let resolved = super::resolve_pressure_inlet_outlet(&pressure_boundary, &phi_hby_a)
+            .expect("resolved pressure");
 
         let constrained = constrained_pressure_treatments(
             &runtime.mesh,
-            &pressure_boundary,
+            &resolved,
             &velocity_boundary,
             &velocity,
             &phi_hby_a,
@@ -7562,24 +7613,26 @@ mod tests {
 
         assert!(matches!(
             constrained[2],
-            ScalarFaceTreatment::FixedGradient(_)
+            ScalarFaceTreatment::FixedValue(value) if value == 3.5
         ));
     }
 
     #[test]
-    fn inlet_outlet_pressure_outflow_remains_unconstrained() {
+    fn pressure_inlet_outlet_outflow_survives_constrain_pressure_as_zero_gradient() {
         let runtime = two_cell_runtime();
         let mut velocity_boundary = vec![VectorFaceTreatment::ZeroGradient; runtime.mesh.faces];
-        velocity_boundary[2] = VectorFaceTreatment::FixedValue(point(-2.0, 0.0, 0.0));
+        velocity_boundary[2] = VectorFaceTreatment::InletOutlet(point(-2.0, 0.0, 0.0));
         let mut pressure_boundary = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
         pressure_boundary[2] = ScalarFaceTreatment::InletOutlet(0.0);
         let velocity = vec![point(0.0, 0.0, 0.0), point(0.0, 0.0, 0.0)];
         let phi_hby_a = vec![0.0, 0.0, 1.0];
         let r_au = vec![1.0, 1.0];
+        let resolved = super::resolve_pressure_inlet_outlet(&pressure_boundary, &phi_hby_a)
+            .expect("resolved pressure");
 
         let constrained = constrained_pressure_treatments(
             &runtime.mesh,
-            &pressure_boundary,
+            &resolved,
             &velocity_boundary,
             &velocity,
             &phi_hby_a,
@@ -7587,10 +7640,209 @@ mod tests {
         )
         .expect("constrained pressure");
 
+        assert!(matches!(constrained[2], ScalarFaceTreatment::ZeroGradient));
+    }
+
+    #[test]
+    fn pressure_inlet_outlet_resolver_uses_exact_flux_sign_including_signed_zero() {
+        let boundary = [
+            ScalarFaceTreatment::InletOutlet(1.0),
+            ScalarFaceTreatment::InletOutlet(2.0),
+            ScalarFaceTreatment::InletOutlet(3.0),
+            ScalarFaceTreatment::InletOutlet(4.0),
+            ScalarFaceTreatment::FixedGradient(5.0),
+        ];
+        let resolved = super::resolve_pressure_inlet_outlet(
+            &boundary,
+            &[-f64::MIN_POSITIVE, -0.0, 0.0, 1.0, 6.0],
+        )
+        .expect("finite fluxes resolve");
+
         assert!(matches!(
-            constrained[2],
-            ScalarFaceTreatment::InletOutlet(_)
+            resolved[0],
+            ScalarFaceTreatment::FixedValue(value) if value == 1.0
         ));
+        assert!(matches!(resolved[1], ScalarFaceTreatment::ZeroGradient));
+        assert!(matches!(resolved[2], ScalarFaceTreatment::ZeroGradient));
+        assert!(matches!(resolved[3], ScalarFaceTreatment::ZeroGradient));
+        assert!(matches!(
+            resolved[4],
+            ScalarFaceTreatment::FixedGradient(value) if value == 5.0
+        ));
+    }
+
+    #[test]
+    fn pressure_inlet_outlet_resolver_rejects_non_finite_decision_flux() {
+        for flux in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let error = super::resolve_pressure_inlet_outlet(
+                &[ScalarFaceTreatment::InletOutlet(7.0)],
+                &[flux],
+            )
+            .expect_err("non-finite decision flux must fail");
+            assert!(matches!(
+                error,
+                MeshError::InvalidInput(message)
+                    if message.contains("non-finite decision flux")
+            ));
+        }
+    }
+
+    #[test]
+    fn pressure_inlet_outlet_resolved_treatments_match_local_numerical_oracles() {
+        let runtime = two_cell_runtime();
+        let geometry = ScalarGradientGeometry::from_mesh(&runtime.mesh).expect("gradient geometry");
+        let values = [1.25, -0.5];
+        let diffusivity = [1.0, 2.0];
+        let source = [0.25, -0.75];
+        for (decision_flux, explicit) in [
+            (-1.0, ScalarFaceTreatment::FixedValue(3.5)),
+            (1.0, ScalarFaceTreatment::ZeroGradient),
+        ] {
+            let mut mixed = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
+            mixed[2] = ScalarFaceTreatment::InletOutlet(3.5);
+            let mut flux = vec![0.0; runtime.mesh.faces];
+            flux[2] = decision_flux;
+            let resolved = super::resolve_pressure_inlet_outlet(&mixed, &flux)
+                .expect("resolved mixed pressure");
+            let mut oracle = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
+            oracle[2] = explicit;
+
+            let actual_system = assemble_variable_scalar_component_system(
+                &runtime.mesh,
+                &diffusivity,
+                &source,
+                &resolved,
+            )
+            .expect("resolved system");
+            let oracle_system = assemble_variable_scalar_component_system(
+                &runtime.mesh,
+                &diffusivity,
+                &source,
+                &oracle,
+            )
+            .expect("oracle system");
+            assert_eq!(actual_system.matrix.values(), oracle_system.matrix.values());
+            assert_eq!(actual_system.rhs, oracle_system.rhs);
+
+            let actual_gradient = super::scalar_gradient_with_geometry(
+                &runtime.mesh,
+                &geometry,
+                &values,
+                &resolved,
+                LaminarSimpleGradientScheme::GaussLinear,
+            )
+            .expect("resolved gradient");
+            let oracle_gradient = super::scalar_gradient_with_geometry(
+                &runtime.mesh,
+                &geometry,
+                &values,
+                &oracle,
+                LaminarSimpleGradientScheme::GaussLinear,
+            )
+            .expect("oracle gradient");
+            for (actual, expected) in actual_gradient.iter().zip(&oracle_gradient) {
+                assert_eq!(actual.x.to_bits(), expected.x.to_bits());
+                assert_eq!(actual.y.to_bits(), expected.y.to_bits());
+                assert_eq!(actual.z.to_bits(), expected.z.to_bits());
+            }
+            assert_eq!(
+                super::pressure_equation_flux(&runtime.mesh, &values, &diffusivity, &resolved)
+                    .expect("resolved pressure flux"),
+                super::pressure_equation_flux(&runtime.mesh, &values, &diffusivity, &oracle)
+                    .expect("oracle pressure flux")
+            );
+        }
+    }
+
+    #[test]
+    fn pressure_reference_tracks_resolved_inlet_outlet_state() {
+        let runtime = two_cell_runtime();
+        let mut mixed = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
+        mixed[2] = ScalarFaceTreatment::InletOutlet(4.0);
+        let options = minimal_laminar_options();
+        let make_system = || {
+            assemble_variable_scalar_component_system(
+                &runtime.mesh,
+                &[1.0, 1.0],
+                &[0.0, 0.0],
+                &vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces],
+            )
+            .expect("pressure system")
+        };
+
+        let open = super::resolve_pressure_inlet_outlet(&mixed, &[0.0, 0.0, -1.0])
+            .expect("backflow resolution");
+        let mut open_system = make_system();
+        let open_values = open_system.matrix.values().to_vec();
+        let open_rhs = open_system.rhs.clone();
+        apply_pressure_reference(&mut open_system, &runtime.mesh, &open, &options)
+            .expect("open pressure system");
+        assert_eq!(open_system.matrix.values(), open_values);
+        assert_eq!(open_system.rhs, open_rhs);
+
+        let closed = super::resolve_pressure_inlet_outlet(&mixed, &[0.0, 0.0, 1.0])
+            .expect("outflow resolution");
+        let mut closed_system = make_system();
+        let closed_values = closed_system.matrix.values().to_vec();
+        apply_pressure_reference(&mut closed_system, &runtime.mesh, &closed, &options)
+            .expect("closed pressure system");
+        assert_ne!(closed_system.matrix.values(), closed_values);
+    }
+
+    #[test]
+    fn simple_entrypoint_tracks_pressure_inlet_outlet_reversal_each_step() {
+        let mut runtime = two_cell_runtime();
+        let mut fields = two_cell_fields();
+        fields.fields[0].boundary_patches[1].patch_type = Some("inletOutlet".to_string());
+        fields.fields[0].boundary_patches[1].inlet_value =
+            Some(FieldValueSummary::Uniform("(0 0 0)".to_string()));
+        fields.fields[1].boundary_patches[1].patch_type = Some("inletOutlet".to_string());
+        fields.fields[1].boundary_patches[1].inlet_value =
+            Some(FieldValueSummary::Uniform("3.5".to_string()));
+        fields.fields[1].boundary_patches[1].value = None;
+        let mut options = minimal_laminar_options();
+        options.max_simple_iterations = 3;
+        let signs = [1.0, -1.0, 1.0];
+        let mut resolved_steps = 0;
+        let mut drive_reversal =
+            |iteration: usize,
+             phi_hby_a: &mut Vec<f64>,
+             resolved: Option<&[ScalarFaceTreatment]>| {
+                let sign = signs[iteration - 1];
+                if let Some(resolved) = resolved {
+                    if sign < 0.0 {
+                        assert!(matches!(
+                            resolved[2],
+                            ScalarFaceTreatment::FixedValue(value) if value == 3.5
+                        ));
+                    } else {
+                        assert!(matches!(resolved[2], ScalarFaceTreatment::ZeroGradient));
+                    }
+                    resolved_steps += 1;
+                } else {
+                    phi_hby_a[2] = sign;
+                }
+            };
+
+        let report = super::solve_laminar_simple_driven(
+            &mut runtime,
+            &fields,
+            &options,
+            None,
+            false,
+            None,
+            Some(&mut drive_reversal),
+        )
+        .expect("three-step pressure inletOutlet reversal");
+
+        assert_eq!(report.history.len(), 3);
+        assert!(
+            report
+                .history
+                .iter()
+                .all(|step| step.pressure_correction_accepted)
+        );
+        assert_eq!(resolved_steps, 3);
     }
 
     #[test]
@@ -7903,6 +8155,7 @@ mod tests {
                 None,
                 false,
                 Some(&mut invalidate_second_profile),
+                None,
             )
             .expect_err("a changed later GAMG profile must fail after payload transfer")
         };
@@ -8279,6 +8532,7 @@ mod tests {
             None,
             false,
             Some(&mut force_large_correction),
+            None,
         )
         .expect("large finite update");
 
@@ -8368,6 +8622,7 @@ mod tests {
             None,
             false,
             Some(&mut drive_corrections),
+            None,
         )
         .expect("repeated finite updates");
 
@@ -8473,6 +8728,7 @@ mod tests {
                 None,
                 false,
                 Some(&mut drive_invalid),
+                None,
             )
             .expect("invalid candidate report");
 
@@ -8601,6 +8857,7 @@ mod tests {
                 None,
                 false,
                 Some(&mut drive),
+                None,
             )
             .expect("driven SIMPLE report")
         }
@@ -9941,6 +10198,7 @@ mod tests {
                 None,
                 true,
                 Some(&mut drive_later_breakdown),
+                None,
             )
             .expect("driven pressure-breakdown report")
         };
@@ -10020,6 +10278,7 @@ mod tests {
             None,
             false,
             Some(&mut drive_exhaustion),
+            None,
         )
         .expect("driven iteration-budget-exhausted SIMPLE report");
         assert_ne!(
