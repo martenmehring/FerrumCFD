@@ -1715,9 +1715,17 @@ The immediate sequence is:
 
    **Post-C4 Cylinder pressure and accuracy sequence (planned):**
 
-   1. **F-CYL-PCG-PROFILE:** produce a fresh opt-in PCG phase profile on the
-      exact accepted post-merge `main`, proving plain/profiled field, report,
-      iteration, counter, and failure parity before choosing a kernel;
+   1. **F-CYL-PCG-PROFILE (completed diagnostic; no speed claim):** Exact
+      post-merge commit `966e32ee9508` and tree `caff8b6a6b4f` were archived
+      into a fresh WSL ext4 build with Rust `1.94.0`, `target-cpu=native`, and
+      pinned serial CPU `2`. On the unchanged official 5,388-cell Fixed case,
+      plain and profiled 20-step runs produced identical canonical reports and
+      bit-identical final `U`/`p`. The profiled 200-step run executed 25,323
+      pressure-PCG iterations. Of `9.475771 s` measured PCG time,
+      preconditioner application used `44.967%`, vector operations `26.675%`,
+      matrix-vector products `26.441%`, factor refresh `1.492%`, and other work
+      `0.425%`. This phase ranking selects the preconditioner application path
+      for point 2; it does not establish an end-to-end performance change;
    2. **F-CYL-DIC-FDIC:** add true symmetric face-LDU `DIC` and `FDIC`
       preconditioners while preserving the existing full CSR IC(0) path behind
       `ic0`/`incompleteCholesky`. Match the OpenFOAM Foundation 13 mathematical
