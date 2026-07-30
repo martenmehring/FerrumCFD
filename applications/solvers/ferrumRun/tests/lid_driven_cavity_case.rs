@@ -1,20 +1,17 @@
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 struct Cleanup {
     paths: Vec<PathBuf>,
-    empty_dirs: Vec<PathBuf>,
 }
 
 impl Drop for Cleanup {
     fn drop(&mut self) {
         for path in &self.paths {
             let _ = fs::remove_dir_all(path);
-        }
-        for path in &self.empty_dirs {
-            let _ = fs::remove_dir(path);
         }
     }
 }
@@ -23,11 +20,29 @@ fn copy_tree(source: &Path, destination: &Path) {
     fs::create_dir_all(destination).expect("create temporary case directory");
     for entry in fs::read_dir(source).expect("read packaged lid-driven cavity case") {
         let entry = entry.expect("read lid-driven cavity entry");
+        let path = entry.path();
         let target = destination.join(entry.file_name());
-        if entry.file_type().expect("read entry type").is_dir() {
-            copy_tree(&entry.path(), &target);
+        let file_type = entry.file_type().expect("read entry type");
+        if file_type.is_dir() {
+            copy_tree(&path, &target);
+        } else if file_type.is_file() {
+            let mut source_file = fs::File::open(&path)
+                .unwrap_or_else(|error| panic!("open fixture file {}: {error}", path.display()));
+            let mut destination_file = fs::File::create(&target).unwrap_or_else(|error| {
+                panic!(
+                    "create temporary fixture file {}: {error}",
+                    target.display()
+                )
+            });
+            io::copy(&mut source_file, &mut destination_file).unwrap_or_else(|error| {
+                panic!(
+                    "copy fixture file {} to {}: {error}",
+                    path.display(),
+                    target.display()
+                )
+            });
         } else {
-            fs::copy(entry.path(), target).expect("copy lid-driven cavity case file");
+            panic!("unsupported fixture entry: {}", path.display());
         }
     }
 }
@@ -39,6 +54,7 @@ fn run_case(case: &Path, extra: &[String]) -> Output {
         .arg("incompressibleFluid")
         .arg("-case")
         .arg(case)
+        .current_dir(case)
         .args(extra);
     command
         .output()
@@ -137,14 +153,8 @@ fn packaged_lid_driven_cavity_exercises_closed_pressure_reference_end_to_end() {
     ));
     let case_three = temporary_root.join("pRef3");
     let case_zero = temporary_root.join("pRef0");
-    let artifact_relative = PathBuf::from(format!(
-        "target/lid-driven-cavity-tests/{}-{nonce}",
-        std::process::id()
-    ));
-    let artifacts = package.join(&artifact_relative);
     let _cleanup = Cleanup {
-        paths: vec![temporary_root.clone(), artifacts.clone()],
-        empty_dirs: vec![package.join("target/lid-driven-cavity-tests")],
+        paths: vec![temporary_root.clone()],
     };
     copy_tree(&source, &case_three);
     copy_tree(&source, &case_zero);
@@ -175,16 +185,16 @@ fn packaged_lid_driven_cavity_exercises_closed_pressure_reference_end_to_end() {
     assert!(preflight_stdout.contains("SIMPLE.pRefValue=3"));
 
     let run = |case: &Path, label: &str| {
-        let output_relative = artifact_relative.join(label);
+        let output = PathBuf::from("artifacts");
         let solve = run_case(
             case,
             &[
                 "--maxSimpleIterations".to_string(),
                 "2".to_string(),
                 "--solveReportJson".to_string(),
-                output_relative.join("report.json").display().to_string(),
+                output.join("report.json").display().to_string(),
                 "--writeFinalFields".to_string(),
-                output_relative.join("fields").display().to_string(),
+                output.join("fields").display().to_string(),
             ],
         );
         assert!(
@@ -193,7 +203,7 @@ fn packaged_lid_driven_cavity_exercises_closed_pressure_reference_end_to_end() {
             String::from_utf8_lossy(&solve.stderr),
             String::from_utf8_lossy(&solve.stdout)
         );
-        (stdout(&solve), package.join(output_relative))
+        (stdout(&solve), case.join(output))
     };
 
     let (stdout_three, artifacts_three) = run(&case_three, "pRef3");
