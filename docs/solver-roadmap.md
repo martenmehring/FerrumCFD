@@ -493,6 +493,17 @@ Current status:
   were `0.525295%` for `U` and `0.926074%` for `p`. Cylinder is therefore a
   remaining performance hotspot and prevents a general all-case speedup
   claim. See [Cylinder same-Linux parity](benchmarks/cylinder-linux-parity.md);
+- C5 makes pressure-PCG kernel profiling genuinely opt-in on exact commit
+  `1e3bbc42ad06`. Two Linux correctness oracles proved byte-identical final
+  `U`/`p` and canonical reports between plain and `--profilePcg`, while the
+  plain report retained exact-zero kernel timing and counters. In the pinned
+  Cylinder Fixed-1,000 `1+6` diagnostic, plain median elapsed time was
+  `64.280 s` (MAD `0.770 s`) and profiled was `65.055 s` (MAD `2.285 s`). The
+  paired profiled/plain median was `0.993060` with MAD `0.029328`, and each
+  variant won three pairs. The result establishes no measurable speed change;
+  C5 is accepted for the explicit instrumentation boundary and exact parity,
+  without a performance claim. A claimed sub-5% effect still requires the
+  stronger `2+9` protocol;
 - isolated native build screening did not establish a general compiler-profile
   gain. Native `codegen-units=1` and Fat-LTO did not improve the Pipe screen.
   Thin-LTO improved the stronger Pipe `2+9` median paired ratio from `1.2792`
