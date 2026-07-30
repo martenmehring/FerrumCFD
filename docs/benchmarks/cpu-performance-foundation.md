@@ -330,6 +330,41 @@ regressed and each case won only three pairs, the fixed-work gate rejects C6.
 No confirmation or time-to-accuracy run is justified. The source remains local
 and unmerged; no speedup or Fable-review claim is made.
 
+## Bounded SIMPLE Scan Reuse A/B (C7)
+
+C7 split three remaining `flow.rs` scans into independent, semantics-preserving
+leaves. C7-A skipped overwritten intermediate pressure-diagnostic
+summarizations and retained only the final corrector summary. C7-B shared the
+already bounded momentum
+net-cell-flux result. C7-C lazily cached cell-to-face adjacency once per solve
+and reused it during limited-gradient finalization. Each leaf retained solver
+semantics, stopping behavior, failure behavior, public APIs, fixed SIMPLE
+counts, final `U` and `p` bytes, and canonical timing-stripped reports.
+
+Each candidate was built separately on WSL2/ext4 with Rust 1.94.0,
+`target-cpu=native`, CPU 2, and one thread. Stage A used one warmup plus six
+alternating measured pairs for Pipe, Channel, and Cylinder. Candidate/base
+ratios below use external GNU elapsed time; lower is faster:
+
+| Leaf | Base -> candidate | Pipe paired / wins | Channel paired / wins | Cylinder paired / wins | Decision |
+| --- | --- | ---: | ---: | ---: | --- |
+| C7-A final-pressure diagnostics | `c4347229` -> `9f0fdd2d` | `1.121377`, 2/6 | `0.990500`, 3/6 | `0.992042`, 3/6 | reject: Pipe regression and unstable Cylinder |
+| C7-B shared net-cell flux | `034db386` -> `2c332663` | `1.046492`, 2/6 | `0.988569`, 4/6 | `0.959890`, 6/6 | reject: Pipe no-path regression; Cylinder gain below `2 x MAD` |
+| C7-C cell-face adjacency | `034db386` -> `038b78b8` | `0.848252`, 4/6 | `0.986137`, 3/6 | `0.973997`, 5/6 | reject: Cylinder gain below `2 x MAD` |
+
+C7-A's Pipe order cohorts were `1.240260/1.002494`. C7-B's Pipe
+cohorts were `1.087344/1.005639`, so both independently crossed the frozen
+no-path regression gate. C7-B's Cylinder paired gain was `4.011%`, below
+`2 x MAD = 4.443%`. C7-C's Cylinder paired gain was `2.600%`, below
+`2 x MAD = 8.884%`; its two cohorts agreed in direction, but the signal was
+still too small relative to the measured variation. Independent source and
+statistics reviews confirmed the C7-C rejection.
+
+All 126 timed Stage-A processes across the three leaves exited successfully,
+and no confirmation round was authorized after a failed frozen gate. The three
+source commits remain local and unmerged. C7 therefore establishes no runtime
+speedup and closes these broad scan-reuse candidates as generic defaults.
+
 ## Contiguous IC(0) Application Layout
 
 The backward IC(0) substitution previously stored one `Vec` per matrix row.
