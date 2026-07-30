@@ -2599,6 +2599,56 @@ fn agglomerate_pair_edges(
     coarse_edges
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExternalNeighbourCountMethod {
+    MembershipIntersection,
+    UnionScan,
+}
+
+fn external_neighbour_count(
+    lower: usize,
+    upper: usize,
+    lower_neighbours: &BTreeSet<usize>,
+    upper_neighbours: &BTreeSet<usize>,
+) -> (usize, ExternalNeighbourCountMethod) {
+    let (smaller, larger) = if lower_neighbours.len() <= upper_neighbours.len() {
+        (lower_neighbours, upper_neighbours)
+    } else {
+        (upper_neighbours, lower_neighbours)
+    };
+    let membership_steps = smaller.len().saturating_mul(
+        larger
+            .len()
+            .max(1)
+            .ilog2()
+            .saturating_add(1)
+            .try_into()
+            .unwrap_or(usize::MAX),
+    );
+    let union_steps = lower_neighbours
+        .len()
+        .saturating_add(upper_neighbours.len());
+
+    if membership_steps < union_steps {
+        let shared_neighbours = smaller
+            .iter()
+            .filter(|neighbour| larger.contains(neighbour))
+            .count();
+        (
+            lower_neighbours.len() + upper_neighbours.len() - shared_neighbours - 2,
+            ExternalNeighbourCountMethod::MembershipIntersection,
+        )
+    } else {
+        (
+            lower_neighbours
+                .union(upper_neighbours)
+                .filter(|&&cell| cell != lower && cell != upper)
+                .count(),
+            ExternalNeighbourCountMethod::UnionScan,
+        )
+    }
+}
+
 fn pair_map_from_edges(
     n_cells: usize,
     edges: &[PairEdge],
@@ -2627,10 +2677,9 @@ fn pair_map_from_edges(
     let external_neighbour_counts = edges
         .iter()
         .map(|edge| {
-            cell_neighbours[edge.lower]
-                .union(&cell_neighbours[edge.upper])
-                .filter(|&&cell| cell != edge.lower && cell != edge.upper)
-                .count()
+            let lower_neighbours = &cell_neighbours[edge.lower];
+            let upper_neighbours = &cell_neighbours[edge.upper];
+            external_neighbour_count(edge.lower, edge.upper, lower_neighbours, upper_neighbours).0
         })
         .collect::<Vec<_>>();
 
@@ -2882,11 +2931,14 @@ fn checked_dense_storage_len(n: usize) -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{
-        GamgAgglomerator, GamgFacePairWeight, GamgInterpolationScratch, GamgKernelTiming,
-        GamgOptions, GamgOuterSolver, GamgSmoother, GamgSolveControls, GamgTransfer, GamgWorkspace,
-        MAX_DENSE_COARSEST_CELLS, NormalizedL1GamgSolveControls, PairEdge, algebraic_pair_map,
-        checked_dense_storage_len, dense_lu_solve, fcg_mmax_one_direction, gamg_solve,
+        ExternalNeighbourCountMethod, GamgAgglomerator, GamgFacePairWeight,
+        GamgInterpolationScratch, GamgKernelTiming, GamgOptions, GamgOuterSolver, GamgSmoother,
+        GamgSolveControls, GamgTransfer, GamgWorkspace, MAX_DENSE_COARSEST_CELLS,
+        NormalizedL1GamgSolveControls, PairEdge, algebraic_pair_map, checked_dense_storage_len,
+        dense_lu_solve, external_neighbour_count, fcg_mmax_one_direction, gamg_solve,
         pair_map_from_edges, validate_fcg_preconditioner_output,
     };
     use crate::linear::{
@@ -7865,6 +7917,132 @@ mod tests {
         assert_eq!(coarse_map[2], coarse_map[3]);
         assert_eq!(coarse_map[2], coarse_map[4]);
         assert_eq!(n_coarse, 2);
+    }
+
+    #[test]
+    fn external_neighbour_count_matches_union_oracle_for_all_small_graphs() {
+        for n_cells in 2usize..=5 {
+            let possible_edges = (0..n_cells)
+                .flat_map(|lower| ((lower + 1)..n_cells).map(move |upper| (lower, upper)))
+                .collect::<Vec<_>>();
+            for mask in 1usize..(1usize << possible_edges.len()) {
+                let mut neighbours = vec![BTreeSet::<usize>::new(); n_cells];
+                let mut edges = Vec::new();
+                for (bit, &(lower, upper)) in possible_edges.iter().enumerate() {
+                    if mask & (1usize << bit) != 0 {
+                        neighbours[lower].insert(upper);
+                        neighbours[upper].insert(lower);
+                        edges.push((lower, upper));
+                    }
+                }
+                for (lower, upper) in edges {
+                    let expected = neighbours[lower]
+                        .union(&neighbours[upper])
+                        .filter(|&&cell| cell != lower && cell != upper)
+                        .count();
+                    let actual = external_neighbour_count(
+                        lower,
+                        upper,
+                        &neighbours[lower],
+                        &neighbours[upper],
+                    )
+                    .0;
+                    assert_eq!(actual, expected, "graph mask {mask}, edge {lower}-{upper}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_neighbour_triangle_prefers_the_narrower_stencil() {
+        let edges = [
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (0, 4),
+            (1, 2),
+            (1, 3),
+            (1, 4),
+            (2, 5),
+        ]
+        .into_iter()
+        .map(|(lower, upper)| PairEdge {
+            lower,
+            upper,
+            weight: 1.0,
+        })
+        .collect::<Vec<_>>();
+
+        let (coarse_map, _) =
+            pair_map_from_edges(6, &edges, true).expect("shared-neighbour pair map");
+        assert_eq!(coarse_map[0], coarse_map[1]);
+        assert_ne!(coarse_map[0], coarse_map[2]);
+    }
+
+    #[test]
+    fn parallel_and_reversed_edges_preserve_the_pair_map() {
+        let unique = vec![
+            PairEdge {
+                lower: 0,
+                upper: 1,
+                weight: 4.0,
+            },
+            PairEdge {
+                lower: 0,
+                upper: 2,
+                weight: 4.0,
+            },
+            PairEdge {
+                lower: 1,
+                upper: 2,
+                weight: 1.0,
+            },
+            PairEdge {
+                lower: 2,
+                upper: 3,
+                weight: 2.0,
+            },
+        ];
+        let mut repeated = unique.clone();
+        repeated.extend([
+            PairEdge {
+                lower: 1,
+                upper: 0,
+                weight: 4.0,
+            },
+            PairEdge {
+                lower: 0,
+                upper: 1,
+                weight: 3.0,
+            },
+        ]);
+
+        for forward in [true, false] {
+            assert_eq!(
+                pair_map_from_edges(4, &repeated, forward).expect("repeated pair map"),
+                pair_map_from_edges(4, &unique, forward).expect("unique pair map")
+            );
+        }
+    }
+
+    #[test]
+    fn external_neighbour_count_adapts_between_star_and_dense_graphs() {
+        let n_star = 4097usize;
+        let hub = (1..n_star).collect::<BTreeSet<_>>();
+        let leaf = BTreeSet::from([0usize]);
+        let (star_count, star_method) = external_neighbour_count(0, 1, &hub, &leaf);
+        assert_eq!(star_count, n_star - 2);
+        assert_eq!(
+            star_method,
+            ExternalNeighbourCountMethod::MembershipIntersection
+        );
+
+        let n_dense = 64usize;
+        let first = (0..n_dense).filter(|&cell| cell != 0).collect();
+        let second = (0..n_dense).filter(|&cell| cell != 1).collect();
+        let (dense_count, dense_method) = external_neighbour_count(0, 1, &first, &second);
+        assert_eq!(dense_count, n_dense - 2);
+        assert_eq!(dense_method, ExternalNeighbourCountMethod::UnionScan);
     }
 
     #[test]
