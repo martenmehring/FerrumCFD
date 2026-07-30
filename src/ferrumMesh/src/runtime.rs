@@ -2,7 +2,7 @@ use std::mem::size_of;
 use std::path::Path;
 
 use crate::fields::{FieldLoadPolicy, FieldValueSummary, InitialFieldSet};
-use crate::geometry::compute_poly_mesh_geometry;
+use crate::geometry::compute_solver_runtime_geometry;
 use crate::poly_mesh::PolyMesh;
 use crate::solver_state::{
     SolverStateCpuBufferStatus, SolverStateFieldKind, SolverStateFieldPlan, SolverStatePlan,
@@ -374,7 +374,7 @@ fn discard_remaining_internal_payloads(fields: &mut InitialFieldSet) {
 }
 
 fn build_solver_runtime_mesh(mesh: &PolyMesh) -> Result<SolverRuntimeMeshData> {
-    let geometry = compute_poly_mesh_geometry(mesh)?;
+    let geometry = compute_solver_runtime_geometry(mesh)?;
     let mut neighbour = vec![None; mesh.faces.len()];
     for (face_index, cell) in mesh.neighbour.iter().copied().enumerate() {
         neighbour[face_index] = Some(cell);
@@ -487,6 +487,7 @@ mod tests {
 
     use crate::Point3;
     use crate::fields::{FieldFile, FieldLoadPolicy, FieldValueSummary, InitialFieldSet};
+    use crate::geometry::{compute_poly_mesh_geometry, compute_solver_runtime_geometry};
     use crate::poly_mesh::{BoundaryPatch, PolyMesh};
     use crate::solver_state::{
         SolverStateCpuBufferPlan, SolverStateCpuBufferStatus, SolverStateFieldKind,
@@ -498,6 +499,172 @@ mod tests {
         SolverRuntimeFieldBuffer, build_solver_runtime_data,
         transfer_preflighted_nonuniform_payloads,
     };
+
+    #[test]
+    fn runtime_rejects_naturally_negative_oriented_volume_before_field_transfer() {
+        assert_runtime_volume_error(
+            &naturally_negative_mesh(),
+            "cell 0 has invalid oriented volume -0.5",
+        );
+    }
+
+    #[test]
+    fn runtime_rejects_naturally_zero_oriented_volume_before_field_transfer() {
+        let mut mesh = unit_cube_mesh();
+        for point in &mut mesh.points {
+            point.z = 0.0;
+        }
+        assert_runtime_volume_error(&mesh, "cell 0 has invalid oriented volume 0");
+    }
+
+    #[test]
+    fn runtime_rejects_naturally_nonfinite_oriented_volume_before_field_transfer() {
+        let mut mesh = unit_cube_mesh();
+        mesh.points[0].x = f64::NAN;
+        assert_runtime_volume_error(&mesh, "cell 0 has invalid oriented volume NaN");
+    }
+
+    #[test]
+    fn runtime_reports_lowest_natural_invalid_volume() {
+        let mesh = lowest_invalid_mesh();
+        assert_eq!(mesh.owner[0], 1);
+        let error = build_empty_runtime(&mesh).expect_err("both invalid cells must be rejected");
+        assert_eq!(error.to_string(), "cell 0 has invalid oriented volume -0.5");
+    }
+
+    #[test]
+    fn runtime_volume_failure_preserves_field_payload_allocations() {
+        let mesh = naturally_negative_mesh();
+        let mut state = runtime_state();
+        for field in &mut state.fields {
+            field.mesh_cells = Some(2);
+            field.mesh_faces = Some(3);
+            field.mesh_boundary_patches = Some(1);
+            field.internal_field.value_count = Some(2);
+            field.internal_field.expected_count = Some(2);
+            field.storage.scalar_slots = Some(2);
+            field.storage.bytes_f64 = Some(16);
+            field.cpu_buffer.scalar_slots = Some(2);
+            field.cpu_buffer.bytes_f64 = Some(16);
+        }
+        state.fields[1].internal_field.loaded_scalars = Some(2);
+
+        let mut fields = initial_fields();
+        let Some(FieldValueSummary::NonUniform { count, values, .. }) =
+            fields.fields[1].internal_field.as_mut()
+        else {
+            panic!("nonuniform fixture missing");
+        };
+        *count = Some(2);
+        *values = Some(vec![300.0, f64::from_bits(0x7ff8_0000_0000_0042)]);
+
+        let structure = format!("{fields:?}");
+        let outer = (
+            fields.fields.as_ptr(),
+            fields.fields.len(),
+            fields.fields.capacity(),
+        );
+        let payloads = fields
+            .fields
+            .iter()
+            .filter_map(|field| match &field.internal_field {
+                Some(FieldValueSummary::NonUniform {
+                    values: Some(values),
+                    ..
+                }) => Some((
+                    values.as_ptr(),
+                    values.len(),
+                    values.capacity(),
+                    values
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        let error = build_solver_runtime_data(
+            Path::new("case"),
+            &mesh,
+            &state,
+            &mut fields,
+            FieldLoadPolicy::Full,
+        )
+        .expect_err("invalid geometry must fail before payload transfer");
+
+        assert_eq!(error.to_string(), "cell 0 has invalid oriented volume -0.5");
+        assert_eq!(format!("{fields:?}"), structure);
+        assert_eq!(
+            (
+                fields.fields.as_ptr(),
+                fields.fields.len(),
+                fields.fields.capacity()
+            ),
+            outer
+        );
+        let preserved = fields
+            .fields
+            .iter()
+            .filter_map(|field| match &field.internal_field {
+                Some(FieldValueSummary::NonUniform {
+                    values: Some(values),
+                    ..
+                }) => Some((
+                    values.as_ptr(),
+                    values.len(),
+                    values.capacity(),
+                    values
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(preserved, payloads);
+    }
+
+    #[test]
+    fn runtime_accepts_tiny_positive_oriented_volume_without_threshold() {
+        let mut mesh = unit_cube_mesh();
+        for point in &mut mesh.points {
+            point.x *= 1.0e-100;
+            point.y *= 1.0e-100;
+            point.z *= 1.0e-100;
+        }
+        let runtime = build_empty_runtime(&mesh).expect("positive subnormal-scale volume is valid");
+        assert!(runtime.mesh.cell_volumes[0].is_finite());
+        assert!(runtime.mesh.cell_volumes[0] > 0.0);
+        assert!(runtime.mesh.cell_volumes[0] < 1.0e-299);
+    }
+
+    #[test]
+    fn runtime_strict_geometry_matches_public_valid_geometry_bitwise() {
+        let mesh = unit_cube_mesh();
+        let public = compute_poly_mesh_geometry(&mesh).expect("public geometry");
+        let strict = compute_solver_runtime_geometry(&mesh).expect("strict geometry");
+
+        assert_point_bits_eq(&strict.face_centres, &public.face_centres);
+        assert_point_bits_eq(&strict.face_area_vectors, &public.face_area_vectors);
+        assert_point_bits_eq(&strict.cell_centres, &public.cell_centres);
+        assert_eq!(
+            strict
+                .cell_volumes
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            public
+                .cell_volumes
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            strict.non_positive_cell_volumes,
+            public.non_positive_cell_volumes
+        );
+    }
 
     #[test]
     fn builds_runtime_mesh_geometry_and_uniform_field_buffer() {
@@ -1320,6 +1487,93 @@ mod tests {
                 faces: 6,
                 start_face: 0,
             }],
+        }
+    }
+
+    fn naturally_negative_mesh() -> PolyMesh {
+        PolyMesh {
+            path: PathBuf::from("polyMesh"),
+            points: natural_fixture_points(),
+            faces: vec![vec![0, 1, 2], vec![3, 4, 5], vec![6, 7, 8]],
+            owner: vec![0, 0, 1],
+            neighbour: vec![1],
+            patches: vec![BoundaryPatch {
+                name: "walls".to_string(),
+                patch_type: "wall".to_string(),
+                faces: 2,
+                start_face: 1,
+            }],
+        }
+    }
+
+    fn lowest_invalid_mesh() -> PolyMesh {
+        PolyMesh {
+            path: PathBuf::from("polyMesh"),
+            points: natural_fixture_points(),
+            faces: vec![
+                vec![0, 1, 2],
+                vec![0, 1, 2],
+                vec![3, 4, 5],
+                vec![3, 4, 5],
+                vec![6, 7, 8],
+            ],
+            owner: vec![1, 0, 1, 0, 2],
+            neighbour: vec![2, 2],
+            patches: vec![BoundaryPatch {
+                name: "walls".to_string(),
+                patch_type: "wall".to_string(),
+                faces: 3,
+                start_face: 2,
+            }],
+        }
+    }
+
+    fn natural_fixture_points() -> Vec<Point3> {
+        [
+            (0.0, -1.0, -1.0),
+            (0.0, 1.0, -1.0),
+            (0.0, 0.0, 2.0),
+            (0.0, -1.0, 0.0),
+            (2.0, -1.0, 0.0),
+            (1.0, 2.0, 0.0),
+            (1.0, -1.0, 0.0),
+            (3.0, -1.0, 0.0),
+            (2.0, 2.0, 0.0),
+        ]
+        .into_iter()
+        .map(|(x, y, z)| Point3 { x, y, z })
+        .collect()
+    }
+
+    fn build_empty_runtime(mesh: &PolyMesh) -> crate::Result<super::SolverRuntimeData> {
+        let state = SolverStatePlan {
+            fields: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let mut fields = InitialFieldSet {
+            case_dir: PathBuf::from("case"),
+            fields: Vec::new(),
+        };
+        build_solver_runtime_data(
+            Path::new("case"),
+            mesh,
+            &state,
+            &mut fields,
+            FieldLoadPolicy::Full,
+        )
+    }
+
+    fn assert_runtime_volume_error(mesh: &PolyMesh, expected: &str) {
+        let error = build_empty_runtime(mesh).expect_err("invalid volume must reject runtime data");
+        assert_eq!(error.to_string(), expected);
+    }
+
+    fn assert_point_bits_eq(left: &[Point3], right: &[Point3]) {
+        assert_eq!(left.len(), right.len());
+        for (left, right) in left.iter().zip(right) {
+            assert_eq!(left.x.to_bits(), right.x.to_bits());
+            assert_eq!(left.y.to_bits(), right.y.to_bits());
+            assert_eq!(left.z.to_bits(), right.z.to_bits());
         }
     }
 
