@@ -365,6 +365,48 @@ and no confirmation round was authorized after a failed frozen gate. The three
 source commits remain local and unmerged. C7 therefore establishes no runtime
 speedup and closes these broad scan-reuse candidates as generic defaults.
 
+## PCG Residual Dot/Norm Fusion A/B (C8)
+
+C8 tested one exact-order PCG reduction leaf against clean base
+`7b08e7dc0cf2f6418df99193147f312061788c38`, tree
+`3849e2acea7b67d8149b75323b5478b5398f0852`. Candidate
+`812ff714ad585ddb5057c60f812155b20c40235e`, tree
+`3e494aefd9dc21c08277fa8fc0d90d44eef4f709`, combined the existing residual
+dot product and right-hand squared norm in one ascending traversal while
+retaining independent accumulators and reusing the already available residual
+norm. It changed only `src/ferrumMesh/src/linear.rs`; the search-direction
+denominator path, preconditioner, recurrence, tolerances, termination, reports,
+allocations, and public APIs remained unchanged.
+
+Focused mechanism tests and the complete Rust 1.94 workspace, release
+pressure-matrix, formatting, and locked/offline Clippy gates passed. The Native
+Linux same-process mechanism benchmark won all `15/15` pairs, with separate
+and fused medians of `0.010264298 s` and `0.003548726 s`, a paired ratio of
+`0.335978`, and both order cohorts faster. The frozen end-to-end gate then built
+base and candidate separately on
+WSL2/ext4 with `target-cpu=native`, CPU 2, and one thread. It ran two warmup
+pairs plus ten alternating measured pairs for fixed-work PCG/DIC Pipe,
+Channel, and Cylinder. Ratios are candidate/base; lower is faster:
+
+| Case | External raw / paired | Solver raw / paired | Pressure raw / paired | Pressure MAD | Pressure wins | Result |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Pipe, 10 SIMPLE | `0.994987 / 1.039508` | `1.005712 / 1.041996` | `1.021151 / 1.051784` | `0.200014` | `5/10` | reject |
+| Channel, 500 SIMPLE | `1.106462 / 1.119530` | `1.102497 / 1.115726` | `1.101200 / 1.121522` | `0.316108` | `4/10` | reject |
+| Cylinder, 1,000 SIMPLE | `0.957707 / 0.968107` | `0.955982 / 0.967471` | `0.970674 / 0.984870` | `0.017032` | `8/10` | reject |
+
+All paired runs retained byte-identical final `U` and `p` fields,
+timing-stripped reports, work counters, and successful linear solves.
+Cylinder's external-time direction was favorable, but
+its `1.513%` pressure-time gain did not exceed the required
+`2 x MAD = 3.406%`; Pipe and Channel regressed. The frozen all-case decision is
+therefore **reject**. No confirmation rerun was permitted, the source remains
+local and unpushed, and no end-to-end speedup, Fable approval, or publication
+claim is made. The frozen end-to-end evidence is retained under
+`target/benchmarks/c8-linux-pcg-dot-norm-native-812ff714-v1`. The frozen gate
+and harness SHA256 values are respectively
+`d81967bb5daa6a5da7b8ebd0c118b8bff117495d622ede654b7c30e56475b3d3` and
+`a04988e86c9f587f0b09e89b080aa1c340031746a3e9f7c9a62bec44a38eb8bf`.
+
 ## Contiguous IC(0) Application Layout
 
 The backward IC(0) substitution previously stored one `Vec` per matrix row.

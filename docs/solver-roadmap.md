@@ -622,7 +622,21 @@ The first optimization sequence is tracked as follows:
     passed its source and field-accuracy gates but changed
     the frozen pressure-work fingerprint in both cases, so it stopped before
     Stage A and remains local and unmerged. Return to isolated hierarchy and
-    exact-work reductions before attempting further arithmetic substitutions;
+    exact-work reductions before attempting further arithmetic substitutions.
+    A later one-file C8 PCG residual-product leaf on exact base `7b08e7d`
+    fused `r dot z` and `z dot z` while reusing the known residual norm. Its
+    exact-semantics proofs and isolated mechanism gate passed; Native Linux won
+    `15/15` mechanism pairs with paired ratio `0.335978`. The frozen PCG/DIC
+    `2+10` end-to-end gate nevertheless rejected the candidate. Pipe
+    external/pressure paired ratios were `1.039508/1.051784`, Channel
+    `1.119530/1.121522`, and Cylinder `0.968107/0.984870`. Cylinder won `8/10`
+    pressure pairs, but its `1.513%` paired pressure gain was below
+    `2 x MAD = 3.406%`. All final fields, canonical reports, work counters, and
+    solver outcomes remained exact. Candidate `812ff714` stays local and
+    unmerged; no rerun, publication, Fable approval, or speedup is claimed.
+    This closes residual-side PCG micro-fusion as a generic default. Do not
+    stack further changes onto the rejected candidate; select the next
+    materially larger measured hotspot from a fresh clean base;
 21. completed: add a profiled-only GAMG hierarchy diagnostic gate with exact
     level/transfer shapes, aggregate histograms, grid/operator-complexity terms,
     NNZ-weighted work proxies, and coarsest-iteration counts. Cache the static
@@ -683,6 +697,11 @@ Next performance targets:
   cell-adjacency candidates. Revisit this area only after a fresh profile
   identifies a different dominant mechanism with a predeclared cross-case
   gate;
+- the exact-order C8 PCG residual dot/norm fusion passed its isolated mechanism
+  and complete semantic gates but failed the frozen Native Linux Pipe/Channel/
+  Cylinder end-to-end gate. Keep it unmerged and do not repeat reduction-only
+  PCG micro-fusions without a fresh profile showing a materially larger share;
+  prioritize a larger dominant kernel such as repeated IC(0) application;
 - accept the implemented static OpenFOAM-style `relTol` only with unchanged
   final outer acceptance, explicit effective-target telemetry, linear-work
   accounting, and time-to-accuracy evidence. Persistence is not a prerequisite
