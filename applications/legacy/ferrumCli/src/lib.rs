@@ -1,5 +1,6 @@
 mod case;
 
+use std::collections::{BTreeMap, btree_map::Entry};
 use std::env;
 use std::fmt;
 use std::fs::File;
@@ -2163,13 +2164,14 @@ fn resolve_laminar_simple_schemes(plan: &SolverCasePlan) -> Result<LaminarSimple
         })
         .and_then(|value| parse_laminar_simple_laplacian_scheme(value, sn_grad))?;
 
-    let grad_p = resolved_gradient_scheme_value(plan, "grad(p)", Some("default"))?;
-    let grad_u = resolved_gradient_scheme_value(plan, "grad(U)", Some("default"))?;
+    let gradient_schemes = GradientSchemeAliasIndex::new(&plan.numerics.fv_schemes);
+    let grad_p = gradient_schemes.resolve("grad(p)", Some("default"))?;
+    let grad_u = gradient_schemes.resolve("grad(U)", Some("default"))?;
 
     Ok(LaminarSimpleSchemes {
         grad_p: parse_laminar_simple_gradient_scheme(&grad_p)?,
         grad_u: parse_laminar_simple_gradient_scheme(&grad_u)?,
-        div_phi_u: resolve_laminar_simple_convection_scheme(plan)?,
+        div_phi_u: resolve_laminar_simple_convection_scheme_with_index(plan, &gradient_schemes)?,
         laplacian,
         interpolation: parse_laminar_simple_interpolation_scheme(required_fv_scheme(
             plan,
@@ -2235,102 +2237,134 @@ fn parse_laminar_simple_gradient_scheme(
     }
 }
 
+#[derive(Clone, Copy)]
+struct IndexedGradientScheme<'a> {
+    value: &'a str,
+    count: usize,
+    id: usize,
+}
+
+struct GradientSchemeAliasIndex<'a> {
+    entries: BTreeMap<&'a str, IndexedGradientScheme<'a>>,
+}
+
+impl<'a> GradientSchemeAliasIndex<'a> {
+    fn new(dictionary: &'a SolverNumericsDictionaryPlan) -> Self {
+        // The ordered index gives attacker-controlled names a deterministic
+        // logarithmic lookup bound without changing the accepted alias depth.
+        let mut entries = BTreeMap::new();
+        for entry in dictionary
+            .entries
+            .iter()
+            .filter(|entry| entry.section == "gradSchemes")
+        {
+            let next_id = entries.len();
+            match entries.entry(entry.key.as_str()) {
+                Entry::Vacant(slot) => {
+                    slot.insert(IndexedGradientScheme {
+                        value: entry.value.as_str(),
+                        count: 1,
+                        id: next_id,
+                    });
+                }
+                Entry::Occupied(mut slot) => slot.get_mut().count += 1,
+            }
+        }
+        Self { entries }
+    }
+
+    fn resolve(&self, key: &str, fallback_key: Option<&str>) -> Result<String, String> {
+        let section = "gradSchemes";
+        let selected_key = self
+            .entries
+            .get_key_value(key)
+            .map(|(stored, _)| *stored)
+            .or_else(|| {
+                fallback_key.and_then(|fallback| {
+                    self.entries
+                        .get_key_value(fallback)
+                        .map(|(stored, _)| *stored)
+                })
+            })
+            .ok_or_else(|| match fallback_key {
+                Some(fallback) => format!("fvSchemes {section} requires {key} or {fallback}"),
+                None => format!("fvSchemes {section} requires {key}"),
+            })?;
+
+        let mut current = selected_key;
+        let mut visited = vec![false; self.entries.len()];
+        let mut path = Vec::new();
+        loop {
+            let Some((stored_key, entry)) = self.entries.get_key_value(current) else {
+                return Err(format!(
+                    "fvSchemes gradSchemes alias '${current}' references a missing entry"
+                ));
+            };
+            if visited[entry.id] {
+                path.push(*stored_key);
+                return Err(format!(
+                    "fvSchemes gradSchemes alias cycle: {}",
+                    path.join(" -> ")
+                ));
+            }
+            visited[entry.id] = true;
+            path.push(*stored_key);
+            if entry.count != 1 {
+                return Err(format!(
+                    "fvSchemes gradSchemes entry '{current}' must be unique, found {}",
+                    entry.count
+                ));
+            }
+
+            let raw_value = entry.value;
+            let value = raw_value.trim().trim_end_matches(';').trim();
+            if !value.contains('$') {
+                return Ok(value.to_string());
+            }
+            let mut tokens = value.split_whitespace();
+            let Some(token) = tokens.next() else {
+                return Err(format!(
+                    "fvSchemes gradSchemes alias in '{current}' must be one token, got '{raw_value}'"
+                ));
+            };
+            if tokens.next().is_some() {
+                return Err(format!(
+                    "fvSchemes gradSchemes alias in '{current}' must be one token, got '{raw_value}'"
+                ));
+            }
+            let Some(reference) = token.strip_prefix('$') else {
+                return Err(format!(
+                    "fvSchemes gradSchemes entry '{current}' contains an embedded alias '{token}'"
+                ));
+            };
+            if reference.is_empty() {
+                return Err(format!(
+                    "fvSchemes gradSchemes entry '{current}' contains a bare '$' alias"
+                ));
+            }
+            if reference.contains('$')
+                || reference.contains('.')
+                || reference.contains('/')
+                || reference.contains(':')
+                || reference.contains('{')
+                || reference.contains('}')
+            {
+                return Err(format!(
+                    "fvSchemes gradSchemes alias '{token}' in '{current}' is not an exact same-section reference"
+                ));
+            }
+            current = reference;
+        }
+    }
+}
+
+#[cfg(test)]
 fn resolved_gradient_scheme_value(
     plan: &SolverCasePlan,
     key: &str,
     fallback_key: Option<&str>,
 ) -> Result<String, String> {
-    let section = "gradSchemes";
-    let selected_key = if dictionary_entry_count(&plan.numerics.fv_schemes, section, key) > 0 {
-        key
-    } else if let Some(fallback) = fallback_key
-        && dictionary_entry_count(&plan.numerics.fv_schemes, section, fallback) > 0
-    {
-        fallback
-    } else {
-        return Err(match fallback_key {
-            Some(fallback) => format!("fvSchemes {section} requires {key} or {fallback}"),
-            None => format!("fvSchemes {section} requires {key}"),
-        });
-    };
-
-    let mut current = selected_key.to_string();
-    let mut visited = Vec::new();
-    loop {
-        if visited.iter().any(|seen| seen == &current) {
-            visited.push(current);
-            return Err(format!(
-                "fvSchemes gradSchemes alias cycle: {}",
-                visited.join(" -> ")
-            ));
-        }
-        visited.push(current.clone());
-        let matches = plan
-            .numerics
-            .fv_schemes
-            .entries
-            .iter()
-            .filter(|entry| entry.section == section && entry.key == current)
-            .collect::<Vec<_>>();
-        if matches.is_empty() {
-            return Err(format!(
-                "fvSchemes gradSchemes alias '${current}' references a missing entry"
-            ));
-        }
-        if matches.len() != 1 {
-            return Err(format!(
-                "fvSchemes gradSchemes entry '{current}' must be unique, found {}",
-                matches.len()
-            ));
-        }
-
-        let value = matches[0].value.trim().trim_end_matches(';').trim();
-        if !value.contains('$') {
-            return Ok(value.to_string());
-        }
-        let tokens = value.split_whitespace().collect::<Vec<_>>();
-        if tokens.len() != 1 {
-            return Err(format!(
-                "fvSchemes gradSchemes alias in '{current}' must be one token, got '{}'",
-                matches[0].value
-            ));
-        }
-        let token = tokens[0];
-        let Some(reference) = token.strip_prefix('$') else {
-            return Err(format!(
-                "fvSchemes gradSchemes entry '{current}' contains an embedded alias '{token}'"
-            ));
-        };
-        if reference.is_empty() {
-            return Err(format!(
-                "fvSchemes gradSchemes entry '{current}' contains a bare '$' alias"
-            ));
-        }
-        if reference.contains('$')
-            || reference.contains('.')
-            || reference.contains('/')
-            || reference.contains(':')
-            || reference.contains('{')
-            || reference.contains('}')
-        {
-            return Err(format!(
-                "fvSchemes gradSchemes alias '{token}' in '{current}' is not an exact same-section reference"
-            ));
-        }
-        current = reference.to_string();
-    }
-}
-
-fn dictionary_entry_count(
-    dictionary: &SolverNumericsDictionaryPlan,
-    section: &str,
-    key: &str,
-) -> usize {
-    dictionary
-        .entries
-        .iter()
-        .filter(|entry| entry.section == section && entry.key == key)
-        .count()
+    GradientSchemeAliasIndex::new(&plan.numerics.fv_schemes).resolve(key, fallback_key)
 }
 
 fn parse_laminar_simple_convection_scheme(
@@ -2353,18 +2387,27 @@ fn parse_laminar_simple_convection_scheme(
     }
 }
 
-fn resolve_laminar_simple_convection_scheme(
+fn resolve_laminar_simple_convection_scheme_with_index(
     plan: &SolverCasePlan,
+    gradient_schemes: &GradientSchemeAliasIndex<'_>,
 ) -> Result<LaminarSimpleConvectionScheme, String> {
     let value = required_fv_scheme(plan, "divSchemes", "div(phi,U)", Some("default"))?;
     let tokens = normalized_scheme_tokens(value);
     if scheme_tokens_are(&tokens, &["bounded", "gauss", "linearupwind", "limited"]) {
-        let limited = resolved_gradient_scheme_value(plan, "limited", None)?;
+        let limited = gradient_schemes.resolve("limited", None)?;
         return Ok(LaminarSimpleConvectionScheme::BoundedGaussLinearUpwind(
             parse_laminar_simple_gradient_scheme(&limited)?,
         ));
     }
     parse_laminar_simple_convection_scheme(value)
+}
+
+#[cfg(test)]
+fn resolve_laminar_simple_convection_scheme(
+    plan: &SolverCasePlan,
+) -> Result<LaminarSimpleConvectionScheme, String> {
+    let gradient_schemes = GradientSchemeAliasIndex::new(&plan.numerics.fv_schemes);
+    resolve_laminar_simple_convection_scheme_with_index(plan, &gradient_schemes)
 }
 
 fn parse_laminar_simple_interpolation_scheme(
@@ -8948,11 +8991,11 @@ mod tests {
         parse_laminar_simple_laplacian_scheme, parse_laminar_simple_sn_grad_scheme,
         parse_openfoam_laminar_preconditioner, parse_openfoam_laminar_solver, parse_solver_args,
         resolve_laminar_simple_convection_scheme, resolve_laminar_simple_options,
-        resolve_solver_dispatch, resolved_gradient_scheme_value, run_ferrum_subcommand,
-        validate_laminar_residual_control_dictionary, validate_module_execution_contract,
-        validate_wall_force_boundary_conditions, write_json_gamg_hierarchy,
-        write_json_optional_u128_decimal, write_json_solver_state, write_json_string,
-        write_laminar_simple_fields, write_laminar_simple_report_json,
+        resolve_laminar_simple_schemes, resolve_solver_dispatch, resolved_gradient_scheme_value,
+        run_ferrum_subcommand, validate_laminar_residual_control_dictionary,
+        validate_module_execution_contract, validate_wall_force_boundary_conditions,
+        write_json_gamg_hierarchy, write_json_optional_u128_decimal, write_json_solver_state,
+        write_json_string, write_laminar_simple_fields, write_laminar_simple_report_json,
         write_laminar_simple_report_markdown, write_laminar_simple_residual_csv,
         write_laminar_simple_residual_plot, write_solver_plan_json_in_root,
     };
@@ -12152,6 +12195,197 @@ mod tests {
                 "'{value}' must be rejected"
             );
         }
+    }
+
+    fn set_gradient_scheme_value(plan: &mut SolverCasePlan, key: &str, value: String) {
+        if let Some(entry) = plan
+            .numerics
+            .fv_schemes
+            .entries
+            .iter_mut()
+            .find(|entry| entry.section == "gradSchemes" && entry.key == key)
+        {
+            entry.value = value;
+        } else {
+            plan.numerics
+                .fv_schemes
+                .entries
+                .push(SolverNumericsEntryPlan {
+                    section: "gradSchemes".to_string(),
+                    key: key.to_string(),
+                    value,
+                });
+        }
+    }
+
+    fn append_gradient_alias_chain(
+        plan: &mut SolverCasePlan,
+        start: &str,
+        prefix: &str,
+        aliases: usize,
+        terminal: &str,
+    ) {
+        assert!(aliases > 0);
+        set_gradient_scheme_value(plan, start, format!("${prefix}0"));
+        plan.numerics
+            .fv_schemes
+            .entries
+            .extend((0..aliases).map(|index| SolverNumericsEntryPlan {
+                section: "gradSchemes".to_string(),
+                key: format!("{prefix}{index}"),
+                value: if index + 1 == aliases {
+                    terminal.to_string()
+                } else {
+                    format!("${prefix}{}", index + 1)
+                },
+            }));
+    }
+
+    #[test]
+    fn gradient_alias_chains_have_no_artificial_depth_limit() {
+        for aliases in [65, 4_096] {
+            let mut plan = laminar_simple_test_plan(1.0, 1.0);
+            let prefix = format!("long{aliases}_");
+            append_gradient_alias_chain(&mut plan, "default", &prefix, aliases, "Gauss linear");
+
+            assert_eq!(
+                resolved_gradient_scheme_value(&plan, "grad(U)", Some("default"))
+                    .expect("valid long alias chain"),
+                "Gauss linear"
+            );
+        }
+    }
+
+    #[test]
+    fn late_gradient_alias_failures_preserve_exact_semantics() {
+        let mut cyclic = laminar_simple_test_plan(1.0, 1.0);
+        append_gradient_alias_chain(&mut cyclic, "default", "cycle", 96, "$cycle32");
+        let cycle_error = resolved_gradient_scheme_value(&cyclic, "grad(U)", Some("default"))
+            .expect_err("late cycle must fail");
+        assert!(cycle_error.starts_with("fvSchemes gradSchemes alias cycle: default -> cycle0"));
+        assert!(cycle_error.ends_with("cycle95 -> cycle32"));
+
+        let mut missing = laminar_simple_test_plan(1.0, 1.0);
+        append_gradient_alias_chain(&mut missing, "default", "missing", 96, "$missingTail");
+        assert_eq!(
+            resolved_gradient_scheme_value(&missing, "grad(U)", Some("default"))
+                .expect_err("late missing alias must fail"),
+            "fvSchemes gradSchemes alias '$missingTail' references a missing entry"
+        );
+
+        let mut duplicate = laminar_simple_test_plan(1.0, 1.0);
+        append_gradient_alias_chain(&mut duplicate, "default", "duplicate", 96, "Gauss linear");
+        duplicate
+            .numerics
+            .fv_schemes
+            .entries
+            .push(SolverNumericsEntryPlan {
+                section: "gradSchemes".to_string(),
+                key: "duplicate95".to_string(),
+                value: "Gauss linear".to_string(),
+            });
+        assert_eq!(
+            resolved_gradient_scheme_value(&duplicate, "grad(U)", Some("default"))
+                .expect_err("late duplicate alias must fail"),
+            "fvSchemes gradSchemes entry 'duplicate95' must be unique, found 2"
+        );
+    }
+
+    #[test]
+    fn gradient_alias_index_is_lazy_exact_and_same_section() {
+        let mut plan = laminar_simple_test_plan(1.0, 1.0);
+        plan.numerics.fv_schemes.entries.extend([
+            SolverNumericsEntryPlan {
+                section: "gradSchemes".to_string(),
+                key: "unreachableDuplicate".to_string(),
+                value: "$".to_string(),
+            },
+            SolverNumericsEntryPlan {
+                section: "gradSchemes".to_string(),
+                key: "unreachableDuplicate".to_string(),
+                value: "$missing".to_string(),
+            },
+            SolverNumericsEntryPlan {
+                section: "divSchemes".to_string(),
+                key: "default".to_string(),
+                value: "$broken".to_string(),
+            },
+            SolverNumericsEntryPlan {
+                section: "divSchemes".to_string(),
+                key: "foreignOnly".to_string(),
+                value: "Gauss linear".to_string(),
+            },
+        ]);
+        assert_eq!(
+            resolved_gradient_scheme_value(&plan, "grad(U)", Some("default"))
+                .expect("unreachable and other-section entries must be ignored"),
+            "Gauss linear"
+        );
+
+        set_gradient_scheme_value(&mut plan, "default", "$foreignOnly".to_string());
+        assert_eq!(
+            resolved_gradient_scheme_value(&plan, "grad(U)", Some("default"))
+                .expect_err("other-section entry must not satisfy an alias"),
+            "fvSchemes gradSchemes alias '$foreignOnly' references a missing entry"
+        );
+    }
+
+    #[test]
+    fn requested_gradient_duplicate_precedes_valid_fallback() {
+        let mut plan = laminar_simple_test_plan(1.0, 1.0);
+        for value in ["Gauss linear", "cellLimited Gauss linear 1"] {
+            plan.numerics
+                .fv_schemes
+                .entries
+                .push(SolverNumericsEntryPlan {
+                    section: "gradSchemes".to_string(),
+                    key: "grad(U)".to_string(),
+                    value: value.to_string(),
+                });
+        }
+
+        assert_eq!(
+            resolved_gradient_scheme_value(&plan, "grad(U)", Some("default"))
+                .expect_err("requested duplicate must not fall back"),
+            "fvSchemes gradSchemes entry 'grad(U)' must be unique, found 2"
+        );
+    }
+
+    #[test]
+    fn laminar_scheme_entrypoint_shares_gradient_alias_index() {
+        let mut plan = laminar_simple_test_plan(1.0, 1.0);
+        set_gradient_scheme_value(&mut plan, "grad(p)", "$shared".to_string());
+        set_gradient_scheme_value(&mut plan, "grad(U)", "$velocity".to_string());
+        set_gradient_scheme_value(&mut plan, "velocity", "$shared".to_string());
+        set_gradient_scheme_value(&mut plan, "limited", "$shared".to_string());
+        set_gradient_scheme_value(
+            &mut plan,
+            "shared",
+            "cellLimited Gauss linear 1".to_string(),
+        );
+        plan.numerics
+            .fv_schemes
+            .entries
+            .iter_mut()
+            .find(|entry| entry.section == "divSchemes" && entry.key == "div(phi,U)")
+            .expect("div scheme")
+            .value = "bounded Gauss linearUpwind limited".to_string();
+
+        let schemes = resolve_laminar_simple_schemes(&plan).expect("shared alias index");
+        assert_eq!(
+            schemes.grad_p,
+            LaminarSimpleGradientScheme::CellLimitedGaussLinear(1.0)
+        );
+        assert_eq!(
+            schemes.grad_u,
+            LaminarSimpleGradientScheme::CellLimitedGaussLinear(1.0)
+        );
+        assert_eq!(
+            schemes.div_phi_u,
+            LaminarSimpleConvectionScheme::BoundedGaussLinearUpwind(
+                LaminarSimpleGradientScheme::CellLimitedGaussLinear(1.0)
+            )
+        );
     }
 
     #[test]
