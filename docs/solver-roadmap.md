@@ -604,8 +604,10 @@ The first optimization sequence is tracked as follows:
     run was host-load-contaminated and therefore not accepted. PR `#77`
     restored the exact accepted pre-B2 tree from `905d698`; LDU SymGS is not a
     production path and no speedup is claimed;
-18. persist SIMPLE and momentum state with explicit invalidation and unchanged
-    equations, boundaries, and convergence semantics;
+18. evaluated, not accepted: two isolated SIMPLE/momentum persistence leaves
+    preserved numerical semantics but failed their paired Native Linux timing
+    gates. Future persistence work must isolate a measured sub-hot-path rather
+    than bundle another broad workspace;
 19. completed: establish the canonical Linux-parity benchmark lane before
     making further Ferrum-versus-OpenFOAM solver-performance claims;
 20. continue isolated CSR residual, scaling, and row-traversal leaves because
@@ -675,9 +677,10 @@ Next performance targets:
   settings per case, loosen tolerances, add artificial caps, or hide a fallback.
   Preserve outer convergence and physical accuracy, and report intentional
   changes in linear work instead of requiring identical V-cycle counts;
-- next persist SIMPLE and momentum topology, coefficients where valid,
-  preconditioner state, histories, and workspaces. Define explicit invalidation
-  and preserve equations, boundaries, and convergence semantics;
+- SIMPLE/momentum persistence has failed two end-to-end timing gates despite
+  exact semantics. Do not merge C6 or repeat a broad workspace bundle. Revisit
+  persistence only for one independently profiled allocation or scan with a
+  predeclared cross-case gate;
 - accept the implemented static OpenFOAM-style `relTol` only with unchanged
   final outer acceptance, explicit effective-target telemetry, linear-work
   accounting, and time-to-accuracy evidence. Persistence is not a prerequisite
@@ -986,7 +989,14 @@ The immediate sequence is:
    Linux `2+10` A/B was order-sensitive in both cases: Pipe had a paired median
    ratio of `0.9500` with opposing cohorts and Channel `0.9837` with opposing
    cohorts. It therefore provides no accepted speedup and remains unmerged.
-   Any later persistence leaf must be smaller and independently profiled.
+   A second one-file C6 leaf on base `c4347229` retained momentum assembly
+   matrices, right-hand sides, old fields, optional gradients, source,
+   diagonal, relaxation, and H1 storage. Exact Pipe/Channel/Cylinder field and
+   canonical-report parity passed. Native Linux `1+6` medians nevertheless
+   regressed by `9.16%`, `8.27%`, and `0.80%`, respectively, with only `3/6`
+   wins in every case and split order cohorts. Candidate `c3a30ea` remains
+   local and unmerged; no performance or Fable claim is made. Any later
+   persistence leaf must be smaller and independently profiled.
 5. **F-PERF-LINUX-PARITY (completed evidence, harness retired):** The external
    same-Linux protocol produced accepted portable, Native `1+5`, and Native
    Pipe `2+9` baseline evidence with pinned Rust, CPU affinity, serial
