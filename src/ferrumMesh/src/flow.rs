@@ -24,12 +24,15 @@ mod gradient;
 
 use compact_faces::CompactSimpleFaceAddressing;
 use gradient::{
-    ScalarGradientGeometry, gauss_linear_owner_weight,
-    scalar_gradient_with_geometry_and_addressing, vector_component_gradients_with_addressing,
+    ScalarGradientGeometry, WeightedLeastSquaresGeometry, gauss_linear_owner_weight,
+    scalar_gradient_with_scheme_and_addressing,
+    vector_component_gradients_with_scheme_and_addressing,
 };
 
 #[cfg(test)]
-use gradient::limit_scalar_gradient_with_addressing;
+use gradient::{
+    limit_scalar_gradient_with_addressing, scalar_gradient_with_geometry_and_addressing,
+};
 
 #[derive(Clone, Copy, Debug)]
 struct SimpleUpdateMetrics {
@@ -67,6 +70,7 @@ pub enum LaminarSimpleMomentumExecution {
 #[derive(Clone, Copy, Debug)]
 pub enum LaminarSimpleGradientScheme {
     GaussLinear,
+    LeastSquares,
     CellLimitedGaussLinear(f64),
 }
 
@@ -100,6 +104,7 @@ impl PartialEq for LaminarSimpleGradientScheme {
     fn eq(&self, other: &Self) -> bool {
         match (*self, *other) {
             (Self::GaussLinear, Self::GaussLinear) => true,
+            (Self::LeastSquares, Self::LeastSquares) => true,
             (Self::CellLimitedGaussLinear(left), Self::CellLimitedGaussLinear(right)) => {
                 left.to_bits() == right.to_bits()
             }
@@ -621,10 +626,17 @@ impl std::fmt::Display for LaminarSimpleGradientScheme {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::GaussLinear => formatter.write_str("Gauss linear"),
+            Self::LeastSquares => formatter.write_str("leastSquares"),
             Self::CellLimitedGaussLinear(coefficient) => {
                 write!(formatter, "cellLimited Gauss linear {coefficient}")
             }
         }
+    }
+}
+
+impl LaminarSimpleGradientScheme {
+    fn uses_weighted_least_squares(self) -> bool {
+        matches!(self, Self::LeastSquares)
     }
 }
 
@@ -657,6 +669,17 @@ impl LaminarSimpleConvectionScheme {
             Self::BoundedGaussLinearUpwind(scheme) => scheme,
             _ => fallback,
         }
+    }
+}
+
+impl LaminarSimpleSchemes {
+    fn uses_weighted_least_squares(self) -> bool {
+        self.grad_p.uses_weighted_least_squares()
+            || (self.div_phi_u.uses_linear_upwind()
+                && self
+                    .div_phi_u
+                    .gradient_scheme(self.grad_u)
+                    .uses_weighted_least_squares())
     }
 }
 
@@ -816,7 +839,7 @@ fn solve_laminar_simple_driven(
     let pressure_boundary = scalar_face_treatments(&runtime.mesh, pressure_field)?;
     let boundary_summary =
         summarize_boundaries(&runtime.mesh, &velocity_boundary, &pressure_boundary);
-    let mesh_cache = LaminarSimpleMeshCache::from_mesh(&runtime.mesh)?;
+    let mesh_cache = LaminarSimpleMeshCache::from_mesh(&runtime.mesh, options.schemes)?;
     let mut pressure_system = ScalarComponentSystem {
         matrix: CsrMatrix::from_pattern(
             &mesh_cache.momentum.sparsity,
@@ -881,9 +904,10 @@ fn solve_laminar_simple_driven(
     let mut final_phi = surface_flux.clone();
     let initial_pressure_boundary =
         resolve_pressure_inlet_outlet(&pressure_boundary, &surface_flux)?;
-    let mut final_grad_p = scalar_gradient_with_geometry_and_addressing(
+    let mut final_grad_p = scalar_gradient_with_scheme_and_addressing(
         &runtime.mesh,
         &mesh_cache.scalar_gradient,
+        mesh_cache.weighted_least_squares.as_ref(),
         &mesh_cache.face_addressing,
         &pressure,
         &initial_pressure_boundary,
@@ -920,9 +944,10 @@ fn solve_laminar_simple_driven(
         )?);
         timing.iteration_setup_seconds += iteration_setup_started.elapsed().as_secs_f64();
         let operator_evaluation_started = Instant::now();
-        let grad_p = scalar_gradient_with_geometry_and_addressing(
+        let grad_p = scalar_gradient_with_scheme_and_addressing(
             &runtime.mesh,
             &mesh_cache.scalar_gradient,
+            mesh_cache.weighted_least_squares.as_ref(),
             &mesh_cache.face_addressing,
             &pressure,
             &carried_pressure_boundary,
@@ -1212,6 +1237,7 @@ fn solve_laminar_simple_driven(
                             &runtime.mesh,
                             &mesh_cache.pressure_geometry,
                             &mesh_cache.scalar_gradient,
+                            mesh_cache.weighted_least_squares.as_ref(),
                             &mesh_cache.face_addressing,
                             initial_pressure,
                             &r_at_u,
@@ -1426,9 +1452,10 @@ fn solve_laminar_simple_driven(
         for (value, delta) in corrected_pressure.iter_mut().zip(&pressure_delta) {
             *value += delta;
         }
-        let corrected_pressure_gradient = scalar_gradient_with_geometry_and_addressing(
+        let corrected_pressure_gradient = scalar_gradient_with_scheme_and_addressing(
             &runtime.mesh,
             &mesh_cache.scalar_gradient,
+            mesh_cache.weighted_least_squares.as_ref(),
             &mesh_cache.face_addressing,
             &corrected_pressure,
             &constrained_pressure_boundary,
@@ -1632,6 +1659,7 @@ fn solve_laminar_simple_driven(
     let final_convection = vector_convection_divergence_with_addressing(
         &runtime.mesh,
         &mesh_cache.scalar_gradient,
+        mesh_cache.weighted_least_squares.as_ref(),
         &mesh_cache.face_addressing,
         &velocity,
         &velocity_boundary,
@@ -2287,18 +2315,25 @@ struct PressureGeometryCache {
 struct LaminarSimpleMeshCache {
     momentum: MomentumCsrPattern,
     scalar_gradient: ScalarGradientGeometry,
+    weighted_least_squares: Option<WeightedLeastSquaresGeometry>,
     pressure_geometry: PressureGeometryCache,
     gamg_face_area_weights: Vec<GamgFacePairWeight>,
     face_addressing: CompactSimpleFaceAddressing,
 }
 
 impl LaminarSimpleMeshCache {
-    fn from_mesh(mesh: &SolverRuntimeMeshData) -> Result<Self> {
+    fn from_mesh(mesh: &SolverRuntimeMeshData, schemes: LaminarSimpleSchemes) -> Result<Self> {
         let momentum = MomentumCsrPattern::from_mesh(mesh)?;
         let scalar_gradient = ScalarGradientGeometry::from_mesh(mesh)?;
+        let face_addressing = CompactSimpleFaceAddressing::from_mesh(mesh)?;
+        let weighted_least_squares = schemes
+            .uses_weighted_least_squares()
+            .then(|| {
+                WeightedLeastSquaresGeometry::from_mesh(mesh, &scalar_gradient, &face_addressing)
+            })
+            .transpose()?;
         let pressure_geometry = PressureGeometryCache::from_mesh(mesh);
         let gamg_face_area_weights = gamg_face_area_pair_weights(mesh)?;
-        let face_addressing = CompactSimpleFaceAddressing::from_mesh(mesh)?;
         debug_assert_eq!(
             face_addressing.internal_faces().len() + face_addressing.boundary_faces().len(),
             mesh.faces
@@ -2306,6 +2341,7 @@ impl LaminarSimpleMeshCache {
         Ok(Self {
             momentum,
             scalar_gradient,
+            weighted_least_squares,
             pressure_geometry,
             gamg_face_area_weights,
             face_addressing,
@@ -2479,6 +2515,7 @@ fn solve_momentum_predictor(
     let equation = assemble_momentum_equation(
         mesh,
         mesh_cache,
+        velocity,
         velocity_boundary,
         flux,
         grad_p,
@@ -2610,9 +2647,11 @@ fn solve_momentum_components_serial(
     ])
 }
 
+#[allow(clippy::too_many_arguments)]
 fn assemble_momentum_equation(
     mesh: &SolverRuntimeMeshData,
     mesh_cache: &LaminarSimpleMeshCache,
+    velocity: &[Point3],
     velocity_boundary: &[VectorFaceTreatment],
     flux: &[f64],
     grad_p: &[Point3],
@@ -2628,32 +2667,16 @@ fn assemble_momentum_equation(
             .schemes
             .div_phi_u
             .gradient_scheme(options.schemes.grad_u);
-        Some([
-            scalar_gradient_with_geometry_and_addressing(
-                mesh,
-                &mesh_cache.scalar_gradient,
-                &mesh_cache.face_addressing,
-                &old_components[0],
-                &scalar_component_boundary(velocity_boundary, 0),
-                gradient_scheme,
-            )?,
-            scalar_gradient_with_geometry_and_addressing(
-                mesh,
-                &mesh_cache.scalar_gradient,
-                &mesh_cache.face_addressing,
-                &old_components[1],
-                &scalar_component_boundary(velocity_boundary, 1),
-                gradient_scheme,
-            )?,
-            scalar_gradient_with_geometry_and_addressing(
-                mesh,
-                &mesh_cache.scalar_gradient,
-                &mesh_cache.face_addressing,
-                &old_components[2],
-                &scalar_component_boundary(velocity_boundary, 2),
-                gradient_scheme,
-            )?,
-        ])
+        Some(vector_component_gradients_with_scheme_and_addressing(
+            mesh,
+            &mesh_cache.scalar_gradient,
+            mesh_cache.weighted_least_squares.as_ref(),
+            &mesh_cache.face_addressing,
+            velocity,
+            velocity_boundary,
+            flux,
+            gradient_scheme,
+        )?)
     } else {
         None
     };
@@ -4525,10 +4548,21 @@ fn non_orthogonal_pressure_flux_correction_with_geometry(
     gradient_scheme: LaminarSimpleGradientScheme,
 ) -> Result<Vec<f64>> {
     let face_addressing = CompactSimpleFaceAddressing::from_mesh(mesh)?;
+    let weighted_least_squares = gradient_scheme
+        .uses_weighted_least_squares()
+        .then(|| {
+            WeightedLeastSquaresGeometry::from_mesh(
+                mesh,
+                scalar_gradient_geometry,
+                &face_addressing,
+            )
+        })
+        .transpose()?;
     non_orthogonal_pressure_flux_correction_with_geometry_and_addressing(
         mesh,
         pressure_geometry,
         scalar_gradient_geometry,
+        weighted_least_squares.as_ref(),
         &face_addressing,
         pressure,
         r_at_u,
@@ -4542,6 +4576,7 @@ fn non_orthogonal_pressure_flux_correction_with_geometry_and_addressing(
     mesh: &SolverRuntimeMeshData,
     pressure_geometry: &PressureGeometryCache,
     scalar_gradient_geometry: &ScalarGradientGeometry,
+    weighted_least_squares: Option<&WeightedLeastSquaresGeometry>,
     face_addressing: &CompactSimpleFaceAddressing,
     pressure: &[f64],
     r_at_u: &[f64],
@@ -4571,9 +4606,10 @@ fn non_orthogonal_pressure_flux_correction_with_geometry_and_addressing(
         )));
     }
 
-    let pressure_gradient = scalar_gradient_with_geometry_and_addressing(
+    let pressure_gradient = scalar_gradient_with_scheme_and_addressing(
         mesh,
         scalar_gradient_geometry,
+        weighted_least_squares,
         face_addressing,
         pressure,
         boundary,
@@ -4686,9 +4722,14 @@ fn scalar_gradient(
 ) -> Result<Vec<Point3>> {
     let geometry = ScalarGradientGeometry::from_mesh(mesh)?;
     let face_addressing = CompactSimpleFaceAddressing::from_mesh(mesh)?;
-    scalar_gradient_with_geometry_and_addressing(
+    let weighted_least_squares = scheme
+        .uses_weighted_least_squares()
+        .then(|| WeightedLeastSquaresGeometry::from_mesh(mesh, &geometry, &face_addressing))
+        .transpose()?;
+    scalar_gradient_with_scheme_and_addressing(
         mesh,
         &geometry,
+        weighted_least_squares.as_ref(),
         &face_addressing,
         values,
         boundary,
@@ -4705,9 +4746,14 @@ fn scalar_gradient_with_geometry(
     scheme: LaminarSimpleGradientScheme,
 ) -> Result<Vec<Point3>> {
     let face_addressing = CompactSimpleFaceAddressing::from_mesh(mesh)?;
-    scalar_gradient_with_geometry_and_addressing(
+    let weighted_least_squares = scheme
+        .uses_weighted_least_squares()
+        .then(|| WeightedLeastSquaresGeometry::from_mesh(mesh, geometry, &face_addressing))
+        .transpose()?;
+    scalar_gradient_with_scheme_and_addressing(
         mesh,
         geometry,
+        weighted_least_squares.as_ref(),
         &face_addressing,
         values,
         boundary,
@@ -4726,9 +4772,17 @@ fn vector_convection_divergence(
 ) -> Result<Vec<Point3>> {
     let scalar_gradient_geometry = ScalarGradientGeometry::from_mesh(mesh)?;
     let face_addressing = CompactSimpleFaceAddressing::from_mesh(mesh)?;
+    let effective_gradient_scheme = scheme.gradient_scheme(gradient_scheme);
+    let weighted_least_squares = (scheme.uses_linear_upwind()
+        && effective_gradient_scheme.uses_weighted_least_squares())
+    .then(|| {
+        WeightedLeastSquaresGeometry::from_mesh(mesh, &scalar_gradient_geometry, &face_addressing)
+    })
+    .transpose()?;
     vector_convection_divergence_with_addressing(
         mesh,
         &scalar_gradient_geometry,
+        weighted_least_squares.as_ref(),
         &face_addressing,
         velocity,
         boundary,
@@ -4742,6 +4796,7 @@ fn vector_convection_divergence(
 fn vector_convection_divergence_with_addressing(
     mesh: &SolverRuntimeMeshData,
     scalar_gradient_geometry: &ScalarGradientGeometry,
+    weighted_least_squares: Option<&WeightedLeastSquaresGeometry>,
     face_addressing: &CompactSimpleFaceAddressing,
     velocity: &[Point3],
     boundary: &[VectorFaceTreatment],
@@ -4757,12 +4812,14 @@ fn vector_convection_divergence_with_addressing(
         )));
     }
     let gradients = if scheme.uses_linear_upwind() {
-        Some(vector_component_gradients_with_addressing(
+        Some(vector_component_gradients_with_scheme_and_addressing(
             mesh,
             scalar_gradient_geometry,
+            weighted_least_squares,
             face_addressing,
             velocity,
             boundary,
+            flux,
             scheme.gradient_scheme(gradient_scheme),
         )?)
     } else {
@@ -7771,7 +7828,8 @@ mod tests {
     fn assembles_momentum_equation_with_component_systems_and_h1() {
         let runtime = two_cell_runtime();
         let mesh_cache =
-            LaminarSimpleMeshCache::from_mesh(&runtime.mesh).expect("SIMPLE mesh cache");
+            LaminarSimpleMeshCache::from_mesh(&runtime.mesh, LaminarSimpleSchemes::default())
+                .expect("SIMPLE mesh cache");
         let fields = two_cell_fields();
         let u_field = fields
             .fields
@@ -7788,6 +7846,7 @@ mod tests {
         let equation = assemble_momentum_equation(
             &runtime.mesh,
             &mesh_cache,
+            &velocity,
             &vector_boundary,
             &flux,
             &grad_p,
@@ -8212,7 +8271,9 @@ mod tests {
     #[test]
     fn compact_face_cache_matches_runtime_and_legacy_cell_face_oracles() {
         let runtime = two_cell_runtime();
-        let cache = LaminarSimpleMeshCache::from_mesh(&runtime.mesh).expect("SIMPLE mesh cache");
+        let cache =
+            LaminarSimpleMeshCache::from_mesh(&runtime.mesh, LaminarSimpleSchemes::default())
+                .expect("SIMPLE mesh cache");
         let addressing = &cache.face_addressing;
         let legacy = cell_face_adjacency(&runtime.mesh).expect("legacy adjacency oracle");
 
@@ -8314,7 +8375,9 @@ mod tests {
     #[test]
     fn compact_face_cache_reuses_all_storage_for_ten_limiter_lifecycles() {
         let runtime = two_cell_runtime();
-        let cache = LaminarSimpleMeshCache::from_mesh(&runtime.mesh).expect("SIMPLE mesh cache");
+        let cache =
+            LaminarSimpleMeshCache::from_mesh(&runtime.mesh, LaminarSimpleSchemes::default())
+                .expect("SIMPLE mesh cache");
         let storage_identity = cache.face_addressing.storage_identity();
         let values = [1.0, 2.0];
         let boundary = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
@@ -8406,6 +8469,134 @@ mod tests {
                     .all(|value| value.is_finite())
             );
         }
+    }
+
+    #[test]
+    fn least_squares_cache_is_selection_driven_and_gauss_dispatch_stays_bit_identical() {
+        let runtime = two_cell_runtime();
+        let default_cache =
+            LaminarSimpleMeshCache::from_mesh(&runtime.mesh, LaminarSimpleSchemes::default())
+                .expect("default mesh cache");
+        assert!(default_cache.weighted_least_squares.is_none());
+
+        let values = [2.0, 10.0];
+        let boundary = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
+        let direct = super::scalar_gradient_with_geometry_and_addressing(
+            &runtime.mesh,
+            &default_cache.scalar_gradient,
+            &default_cache.face_addressing,
+            &values,
+            &boundary,
+            LaminarSimpleGradientScheme::GaussLinear,
+        )
+        .expect("direct Gauss gradient");
+        let dispatched = super::scalar_gradient_with_scheme_and_addressing(
+            &runtime.mesh,
+            &default_cache.scalar_gradient,
+            None,
+            &default_cache.face_addressing,
+            &values,
+            &boundary,
+            LaminarSimpleGradientScheme::GaussLinear,
+        )
+        .expect("scheme-dispatched Gauss gradient");
+        for (actual, expected) in dispatched.iter().zip(&direct) {
+            assert_eq!(actual.x.to_bits(), expected.x.to_bits());
+            assert_eq!(actual.y.to_bits(), expected.y.to_bits());
+            assert_eq!(actual.z.to_bits(), expected.z.to_bits());
+        }
+
+        let extruded = two_cell_runtime_with_empty_sides();
+        let mut schemes = LaminarSimpleSchemes {
+            grad_p: LaminarSimpleGradientScheme::LeastSquares,
+            ..LaminarSimpleSchemes::default()
+        };
+        let weighted_cache = LaminarSimpleMeshCache::from_mesh(&extruded.mesh, schemes)
+            .expect("selected leastSquares cache");
+        assert!(weighted_cache.weighted_least_squares.is_some());
+
+        schemes.grad_p = LaminarSimpleGradientScheme::GaussLinear;
+        schemes.grad_u = LaminarSimpleGradientScheme::LeastSquares;
+        schemes.div_phi_u = LaminarSimpleConvectionScheme::GaussUpwind;
+        let unused_velocity_cache = LaminarSimpleMeshCache::from_mesh(&extruded.mesh, schemes)
+            .expect("upwind does not consume grad(U)");
+        assert!(unused_velocity_cache.weighted_least_squares.is_none());
+
+        schemes.div_phi_u = LaminarSimpleConvectionScheme::GaussLinearUpwind;
+        let selected_velocity_cache = LaminarSimpleMeshCache::from_mesh(&extruded.mesh, schemes)
+            .expect("linearUpwind consumes grad(U)");
+        assert!(selected_velocity_cache.weighted_least_squares.is_some());
+    }
+
+    #[test]
+    fn public_least_squares_paths_run_zero_one_and_two_correctors_without_fallback() {
+        let fields = two_cell_fields_with_empty_sides();
+        for correctors in 0..=2 {
+            let mut runtime = two_cell_runtime_with_empty_sides();
+            let mut options = minimal_laminar_options();
+            options.max_simple_iterations = 1;
+            options.non_orthogonal_correctors = correctors;
+            options.schemes.grad_p = LaminarSimpleGradientScheme::LeastSquares;
+            options.schemes.grad_u = LaminarSimpleGradientScheme::LeastSquares;
+            options.schemes.div_phi_u = LaminarSimpleConvectionScheme::GaussLinearUpwind;
+
+            let report = solve_laminar_simple(&mut runtime, &fields, &options)
+                .expect("public leastSquares SIMPLE solve");
+            assert_eq!(report.simple_iterations, 1);
+            assert_eq!(report.history[0].pressure_linear_solves, correctors + 1);
+            assert!(
+                report
+                    .final_pressure
+                    .iter()
+                    .chain(report.final_phi.iter())
+                    .all(|value| value.is_finite())
+            );
+            assert!(report.final_velocity.iter().all(|value| {
+                value.x.is_finite() && value.y.is_finite() && value.z.is_finite()
+            }));
+        }
+
+        let runtime = two_cell_runtime_with_empty_sides();
+        let boundary = vec![
+            ScalarFaceTreatment::ZeroGradient,
+            ScalarFaceTreatment::FixedValue(0.0),
+            ScalarFaceTreatment::FixedValue(2.0),
+            ScalarFaceTreatment::Constraint,
+            ScalarFaceTreatment::Constraint,
+            ScalarFaceTreatment::Constraint,
+            ScalarFaceTreatment::Constraint,
+            ScalarFaceTreatment::Constraint,
+            ScalarFaceTreatment::Constraint,
+            ScalarFaceTreatment::Constraint,
+            ScalarFaceTreatment::Constraint,
+        ];
+        let gradient = scalar_gradient(
+            &runtime.mesh,
+            &[0.5, 1.5],
+            &boundary,
+            LaminarSimpleGradientScheme::LeastSquares,
+        )
+        .expect("public scalar leastSquares gradient");
+        for value in gradient {
+            assert_close(value.x, 2.0);
+            assert_eq!(value.y.to_bits(), 0.0f64.to_bits());
+            assert_eq!(value.z.to_bits(), 0.0f64.to_bits());
+        }
+    }
+
+    #[test]
+    fn least_squares_geometry_failure_precedes_runtime_field_consumption() {
+        let mut runtime = two_cell_runtime();
+        let fields = two_cell_fields();
+        let mut options = minimal_laminar_options();
+        options.schemes.grad_p = LaminarSimpleGradientScheme::LeastSquares;
+        let error = solve_laminar_simple(&mut runtime, &fields, &options)
+            .expect_err("rank-deficient selected WLS geometry must fail");
+        assert!(error.to_string().contains("weighted least-squares"));
+        assert!(
+            runtime.fields.iter().all(|field| field.values.is_some()),
+            "failed WLS cache construction must not consume runtime fields"
+        );
     }
 
     #[test]
@@ -12406,6 +12597,41 @@ mod tests {
         }
     }
 
+    fn two_cell_runtime_with_empty_sides() -> SolverRuntimeData {
+        let mut runtime = two_cell_runtime();
+        runtime.mesh.faces = 11;
+        runtime.mesh.boundary_faces = 10;
+        runtime.mesh.owner.extend([0, 0, 0, 0, 1, 1, 1, 1]);
+        runtime.mesh.neighbour.extend([None; 8]);
+        runtime.mesh.face_centres.extend([
+            point(0.25, 0.5, 0.0),
+            point(0.25, -0.5, 0.0),
+            point(0.25, 0.0, 0.5),
+            point(0.25, 0.0, -0.5),
+            point(0.75, 0.5, 0.0),
+            point(0.75, -0.5, 0.0),
+            point(0.75, 0.0, 0.5),
+            point(0.75, 0.0, -0.5),
+        ]);
+        runtime.mesh.face_area_vectors.extend([
+            point(0.0, 1.0, 0.0),
+            point(0.0, -1.0, 0.0),
+            point(0.0, 0.0, 1.0),
+            point(0.0, 0.0, -1.0),
+            point(0.0, 1.0, 0.0),
+            point(0.0, -1.0, 0.0),
+            point(0.0, 0.0, 1.0),
+            point(0.0, 0.0, -1.0),
+        ]);
+        runtime.mesh.patches.push(SolverRuntimePatchRange {
+            name: "frontAndBack".to_string(),
+            patch_type: "empty".to_string(),
+            start_face: 3,
+            faces: 8,
+        });
+        runtime
+    }
+
     fn three_cell_line_mesh() -> SolverRuntimeMeshData {
         SolverRuntimeMeshData {
             points: 0,
@@ -12493,6 +12719,19 @@ mod tests {
                 },
             ],
         }
+    }
+
+    fn two_cell_fields_with_empty_sides() -> InitialFieldSet {
+        let mut fields = two_cell_fields();
+        for field in &mut fields.fields {
+            field.boundary_patches.push(FieldBoundaryPatch {
+                name: "frontAndBack".to_string(),
+                patch_type: Some("empty".to_string()),
+                inlet_value: None,
+                value: None,
+            });
+        }
+        fields
     }
 
     fn two_cell_fields_with_pressure_inlet_outlet_velocity() -> InitialFieldSet {

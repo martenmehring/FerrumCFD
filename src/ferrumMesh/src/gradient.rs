@@ -147,6 +147,9 @@ pub(super) fn scalar_gradient_with_geometry_and_addressing(
     }
     match scheme {
         LaminarSimpleGradientScheme::GaussLinear => Ok(gradient),
+        LaminarSimpleGradientScheme::LeastSquares => Err(invalid_input(
+            "leastSquares gradient requires the scheme-aware dispatcher".to_string(),
+        )),
         LaminarSimpleGradientScheme::CellLimitedGaussLinear(coefficient) => {
             limit_scalar_gradient_with_addressing(
                 mesh,
@@ -592,6 +595,23 @@ pub(super) fn vector_component_gradients_with_addressing(
 const WLS_BASIS_INACTIVE_SQUARED: f64 = 64.0 * f64::EPSILON;
 const WLS_BASIS_ACTIVE_SQUARED: f64 = 256.0 * f64::EPSILON;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WlsSquaredMagnitudeBand {
+    Inactive,
+    Ambiguous,
+    Active,
+}
+
+fn wls_squared_magnitude_band(value: f64) -> WlsSquaredMagnitudeBand {
+    if !value.is_finite() || value >= WLS_BASIS_ACTIVE_SQUARED {
+        WlsSquaredMagnitudeBand::Active
+    } else if value > WLS_BASIS_INACTIVE_SQUARED {
+        WlsSquaredMagnitudeBand::Ambiguous
+    } else {
+        WlsSquaredMagnitudeBand::Inactive
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WlsIntrinsicDimension {
     One,
@@ -641,12 +661,24 @@ struct WlsFaceCoefficient {
     role: WlsFaceRole,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum WlsVectorConstraint {
+    Symmetry { unit_normal: Point3 },
+    Wedge { rotation: WlsRotation },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WlsRotation {
+    vector: Point3,
+    cosine: f64,
+    inverse_one_plus_cosine: f64,
+}
+
 /// Immutable weighted least-squares reconstruction geometry.
 ///
-/// This is deliberately private to the SIMPLE implementation until the
-/// explicit scheme-selection and boundary-delta wiring lands in the next
-/// package. Construction is fallible and never changes the existing Gauss
-/// path.
+/// This remains private to the SIMPLE implementation. Construction is
+/// fallible, solve-local, and only selected by the explicit `leastSquares`
+/// scheme; the existing Gauss path does not build or consume this geometry.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 pub(super) struct WeightedLeastSquaresGeometry {
@@ -655,6 +687,7 @@ pub(super) struct WeightedLeastSquaresGeometry {
     face_coefficients: Vec<WlsFaceCoefficient>,
     wedge_vector_basis: Option<WlsIntrinsicBasis>,
     wedge_vector_face_coefficients: Option<Vec<WlsFaceCoefficient>>,
+    vector_constraints: Vec<Option<WlsVectorConstraint>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -736,6 +769,7 @@ impl WeightedLeastSquaresGeometry {
     ) -> Result<Self> {
         wls_validate_structural_lengths(mesh, scalar_geometry, face_addressing)?;
         let roles = wls_face_roles(mesh, face_addressing)?;
+        wls_non_empty_wedge_patch_count(mesh)?;
         let (basis, wedge_vector_basis) = wls_intrinsic_bases(mesh, face_addressing, &roles)?;
         let samples = wls_face_samples(mesh, scalar_geometry, face_addressing, &roles, basis)?;
         let face_coefficients =
@@ -745,6 +779,7 @@ impl WeightedLeastSquaresGeometry {
                 wls_face_coefficients(mesh, face_addressing, vector_basis, &samples, true)
             })
             .transpose()?;
+        let vector_constraints = wls_vector_constraints(mesh, &roles)?;
 
         Ok(Self {
             cells: mesh.cells,
@@ -752,11 +787,12 @@ impl WeightedLeastSquaresGeometry {
             face_coefficients,
             wedge_vector_basis,
             wedge_vector_face_coefficients,
+            vector_constraints,
         })
     }
 
     #[cfg(test)]
-    fn storage_identity(&self) -> [usize; 6] {
+    fn storage_identity(&self) -> [usize; 9] {
         let vector = self.wedge_vector_face_coefficients.as_ref();
         [
             self.face_coefficients.as_ptr() as usize,
@@ -765,6 +801,9 @@ impl WeightedLeastSquaresGeometry {
             vector.map_or(0, |coefficients| coefficients.as_ptr() as usize),
             vector.map_or(0, Vec::len),
             vector.map_or(0, Vec::capacity),
+            self.vector_constraints.as_ptr() as usize,
+            self.vector_constraints.len(),
+            self.vector_constraints.capacity(),
         ]
     }
 }
@@ -892,6 +931,426 @@ fn wls_face_roles(
     Ok(roles)
 }
 
+fn wls_vector_constraints(
+    mesh: &SolverRuntimeMeshData,
+    roles: &[Option<WlsFaceRole>],
+) -> Result<Vec<Option<WlsVectorConstraint>>> {
+    let mut constraints = wls_try_filled_vec(mesh.faces, None)?;
+    let mut patch_constraints = wls_try_filled_vec(mesh.patches.len(), None)?;
+    let wedge_patch_count = wls_non_empty_wedge_patch_count(mesh)?;
+    let mut wedge_patches = wls_try_vec(wedge_patch_count)?;
+    for (patch_index, patch) in mesh.patches.iter().enumerate() {
+        if patch.faces == 0 {
+            continue;
+        }
+        let constraint = match patch.patch_type.as_str() {
+            "symmetryPlane" => Some(WlsVectorConstraint::Symmetry {
+                unit_normal: wls_patch_average_unit_normal(mesh, patch_index)?,
+            }),
+            "wedge" => {
+                let patch_normal = wls_patch_average_unit_normal(mesh, patch_index)?;
+                let centre_normal = wls_coordinate_plane_normal(patch_normal, patch_index)?;
+                let rotation = wls_rotation_between(centre_normal, patch_normal, patch_index)?;
+                wedge_patches.push((patch_index, centre_normal, rotation));
+                Some(WlsVectorConstraint::Wedge { rotation })
+            }
+            _ => None,
+        };
+        patch_constraints[patch_index] = constraint;
+    }
+    wls_validate_wedge_pair(mesh, &wedge_patches)?;
+
+    for (patch_index, patch) in mesh.patches.iter().enumerate() {
+        let Some(constraint) = patch_constraints[patch_index] else {
+            continue;
+        };
+        let end = patch
+            .start_face
+            .checked_add(patch.faces)
+            .ok_or(crate::MeshError::OutOfMemory)?;
+        for (face, slot) in constraints
+            .iter_mut()
+            .enumerate()
+            .take(end)
+            .skip(patch.start_face)
+        {
+            let expected_role = match constraint {
+                WlsVectorConstraint::Symmetry { .. } => WlsFaceRole::SymmetryBoundary,
+                WlsVectorConstraint::Wedge { .. } => WlsFaceRole::WedgeBoundary,
+            };
+            if roles.get(face).copied().flatten() != Some(expected_role) {
+                return Err(invalid_input(format!(
+                    "weighted least-squares constraint metadata disagrees with face {face} role"
+                )));
+            }
+            *slot = Some(constraint);
+        }
+    }
+    Ok(constraints)
+}
+
+fn wls_non_empty_wedge_patch_count(mesh: &SolverRuntimeMeshData) -> Result<usize> {
+    let count = mesh
+        .patches
+        .iter()
+        .filter(|patch| patch.patch_type == "wedge" && patch.faces != 0)
+        .count();
+    if count != 0 && count != 2 {
+        return Err(invalid_input(format!(
+            "weighted least-squares wedge topology requires exactly two non-empty wedge patches, got {count}"
+        )));
+    }
+    Ok(count)
+}
+
+fn wls_patch_average_unit_normal(
+    mesh: &SolverRuntimeMeshData,
+    patch_index: usize,
+) -> Result<Point3> {
+    let patch = &mesh.patches[patch_index];
+    if patch.faces == 0 {
+        return Err(invalid_input(format!(
+            "weighted least-squares constraint patch {patch_index} '{}' has no faces",
+            patch.name
+        )));
+    }
+    let end = patch
+        .start_face
+        .checked_add(patch.faces)
+        .ok_or(crate::MeshError::OutOfMemory)?;
+    let mut normals = wls_try_vec(patch.faces)?;
+    for face in patch.start_face..end {
+        let unit = wls_normalize_oriented(mesh.face_area_vectors[face], || {
+            format!("weighted least-squares constraint patch {patch_index} face {face} normal")
+        })?;
+        normals.push((unit, face));
+    }
+    normals.sort_unstable_by(|(left, left_face), (right, right_face)| {
+        left.x
+            .total_cmp(&right.x)
+            .then_with(|| left.y.total_cmp(&right.y))
+            .then_with(|| left.z.total_cmp(&right.z))
+            .then_with(|| left_face.cmp(right_face))
+    });
+    let mut x = WlsCompensatedScalar::ZERO;
+    let mut y = WlsCompensatedScalar::ZERO;
+    let mut z = WlsCompensatedScalar::ZERO;
+    for (normal, _) in &normals {
+        x.add(normal.x, patch_index, "normal x")?;
+        y.add(normal.y, patch_index, "normal y")?;
+        z.add(normal.z, patch_index, "normal z")?;
+    }
+    let average = wls_normalize_oriented(
+        Point3 {
+            x: x.value(patch_index, "normal x")?,
+            y: y.value(patch_index, "normal y")?,
+            z: z.value(patch_index, "normal z")?,
+        },
+        || {
+            format!(
+                "weighted least-squares constraint patch {patch_index} '{}' average normal",
+                patch.name
+            )
+        },
+    )?;
+    for (normal, face) in normals {
+        let mismatch = wls_checked_delta(normal, average, || {
+            format!("weighted least-squares constraint patch {patch_index} face {face} planarity")
+        })?;
+        let mismatch_squared = wls_checked_dot(mismatch, mismatch, || {
+            format!(
+                "weighted least-squares constraint patch {patch_index} face {face} planarity error"
+            )
+        })?;
+        match wls_squared_magnitude_band(mismatch_squared) {
+            WlsSquaredMagnitudeBand::Active => {
+                return Err(invalid_input(format!(
+                    "weighted least-squares constraint patch {patch_index} face {face} is non-planar"
+                )));
+            }
+            WlsSquaredMagnitudeBand::Ambiguous => {
+                return Err(invalid_input(format!(
+                    "weighted least-squares constraint patch {patch_index} face {face} planarity is numerically ambiguous"
+                )));
+            }
+            WlsSquaredMagnitudeBand::Inactive => {}
+        }
+    }
+    Ok(average)
+}
+
+fn wls_coordinate_plane_normal(normal: Point3, patch_index: usize) -> Result<Point3> {
+    let components = [normal.x, normal.y, normal.z]
+        .map(|component| component.signum() * (component.abs() - 0.5).max(0.0));
+    let inferred = wls_normalize_oriented(
+        Point3 {
+            x: components[0],
+            y: components[1],
+            z: components[2],
+        },
+        || format!("weighted least-squares wedge patch {patch_index} centre-plane normal"),
+    )?;
+    let components = [inferred.x, inferred.y, inferred.z];
+    let mut dominant = 0usize;
+    for index in 1..3 {
+        if components[index].abs() > components[dominant].abs() {
+            dominant = index;
+        }
+    }
+    let off_axis_squared = components
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != dominant)
+        .map(|(_, component)| component * component)
+        .sum::<f64>();
+    if !off_axis_squared.is_finite() {
+        return Err(invalid_input(format!(
+            "weighted least-squares wedge patch {patch_index} centre-plane alignment is non-finite"
+        )));
+    }
+    match wls_squared_magnitude_band(off_axis_squared) {
+        WlsSquaredMagnitudeBand::Active => {
+            return Err(invalid_input(format!(
+                "weighted least-squares wedge patch {patch_index} centre plane does not align with a coordinate plane"
+            )));
+        }
+        WlsSquaredMagnitudeBand::Ambiguous => {
+            return Err(invalid_input(format!(
+                "weighted least-squares wedge patch {patch_index} centre-plane alignment is numerically ambiguous"
+            )));
+        }
+        WlsSquaredMagnitudeBand::Inactive => {}
+    }
+    let sign = if components[dominant].is_sign_negative() {
+        -1.0
+    } else {
+        1.0
+    };
+    Ok(match dominant {
+        0 => Point3 {
+            x: sign,
+            y: 0.0,
+            z: 0.0,
+        },
+        1 => Point3 {
+            x: 0.0,
+            y: sign,
+            z: 0.0,
+        },
+        _ => Point3 {
+            x: 0.0,
+            y: 0.0,
+            z: sign,
+        },
+    })
+}
+
+fn wls_rotation_between(from: Point3, to: Point3, patch_index: usize) -> Result<WlsRotation> {
+    let cosine = wls_checked_dot(from, to, || {
+        format!("weighted least-squares wedge patch {patch_index} rotation cosine")
+    })?;
+    let vector = wls_checked_cross(from, to, || {
+        format!("weighted least-squares wedge patch {patch_index} rotation vector")
+    })?;
+    let sine_squared = wls_checked_dot(vector, vector, || {
+        format!("weighted least-squares wedge patch {patch_index} squared rotation sine")
+    })?;
+    match wls_squared_magnitude_band(sine_squared) {
+        WlsSquaredMagnitudeBand::Inactive => {
+            return Err(invalid_input(format!(
+                "weighted least-squares wedge patch {patch_index} plane aligns with its coordinate centre plane"
+            )));
+        }
+        WlsSquaredMagnitudeBand::Ambiguous => {
+            return Err(invalid_input(format!(
+                "weighted least-squares wedge patch {patch_index} rotation is numerically ambiguous"
+            )));
+        }
+        WlsSquaredMagnitudeBand::Active => {}
+    }
+    if !cosine.is_finite() || cosine <= 0.0 {
+        return Err(invalid_input(format!(
+            "weighted least-squares wedge patch {patch_index} rotation must have a finite positive cosine"
+        )));
+    }
+    let unit_identity_error = (cosine * cosine + sine_squared - 1.0).abs();
+    match wls_squared_magnitude_band(unit_identity_error) {
+        WlsSquaredMagnitudeBand::Active => {
+            return Err(invalid_input(format!(
+                "weighted least-squares wedge patch {patch_index} rotation violates the unit-vector identity"
+            )));
+        }
+        WlsSquaredMagnitudeBand::Ambiguous => {
+            return Err(invalid_input(format!(
+                "weighted least-squares wedge patch {patch_index} unit-vector identity is numerically ambiguous"
+            )));
+        }
+        WlsSquaredMagnitudeBand::Inactive => {}
+    }
+    let inverse_one_plus_cosine = 1.0 / (1.0 + cosine);
+    if !inverse_one_plus_cosine.is_finite() {
+        return Err(invalid_input(format!(
+            "weighted least-squares wedge patch {patch_index} rotation denominator is invalid"
+        )));
+    }
+    let rotation = WlsRotation {
+        vector,
+        cosine,
+        inverse_one_plus_cosine,
+    };
+    let mapped_delta = rotation.delta(from, patch_index)?;
+    let mapped = wls_checked_add(from, mapped_delta, || {
+        format!("weighted least-squares wedge patch {patch_index} mapped centre-plane normal")
+    })?;
+    let mismatch = wls_checked_delta(mapped, to, || {
+        format!("weighted least-squares wedge patch {patch_index} rotation verification")
+    })?;
+    let mismatch_squared = wls_checked_dot(mismatch, mismatch, || {
+        format!("weighted least-squares wedge patch {patch_index} squared rotation mismatch")
+    })?;
+    match wls_squared_magnitude_band(mismatch_squared) {
+        WlsSquaredMagnitudeBand::Active => {
+            return Err(invalid_input(format!(
+                "weighted least-squares wedge patch {patch_index} rotation does not map the centre-plane normal"
+            )));
+        }
+        WlsSquaredMagnitudeBand::Ambiguous => {
+            return Err(invalid_input(format!(
+                "weighted least-squares wedge patch {patch_index} rotation mapping is numerically ambiguous"
+            )));
+        }
+        WlsSquaredMagnitudeBand::Inactive => {}
+    }
+    Ok(rotation)
+}
+
+impl WlsRotation {
+    fn delta(self, value: Point3, patch_index: usize) -> Result<Point3> {
+        wls_require_finite_point(value, || {
+            format!("weighted least-squares wedge patch {patch_index} vector value")
+        })?;
+        let sine_squared = wls_checked_dot(self.vector, self.vector, || {
+            format!("weighted least-squares wedge patch {patch_index} squared rotation sine")
+        })?;
+        let vector_component = wls_checked_dot(self.vector, value, || {
+            format!("weighted least-squares wedge patch {patch_index} rotation projection")
+        })?;
+        let mut delta = wls_checked_cross(self.vector, value, || {
+            format!("weighted least-squares wedge patch {patch_index} rotation cross contribution")
+        })?;
+        wls_add_scaled_point(
+            &mut delta,
+            self.vector,
+            vector_component * self.inverse_one_plus_cosine,
+            usize::MAX,
+            patch_index,
+        )?;
+        wls_add_scaled_point(
+            &mut delta,
+            value,
+            -sine_squared * self.inverse_one_plus_cosine,
+            usize::MAX,
+            patch_index,
+        )?;
+        wls_require_finite_point(delta, || {
+            format!("weighted least-squares wedge patch {patch_index} vector delta")
+        })
+    }
+}
+
+fn wls_validate_wedge_pair(
+    mesh: &SolverRuntimeMeshData,
+    wedge_patches: &[(usize, Point3, WlsRotation)],
+) -> Result<()> {
+    if wedge_patches.is_empty() {
+        return Ok(());
+    }
+    if wedge_patches.len() != 2 {
+        return Err(invalid_input(format!(
+            "weighted least-squares wedge topology requires exactly two non-empty wedge patches, got {}",
+            wedge_patches.len()
+        )));
+    }
+    let (first_index, first_centre, first_rotation) = wedge_patches[0];
+    let (second_index, second_centre, second_rotation) = wedge_patches[1];
+    let centre_sum = wls_checked_add(first_centre, second_centre, || {
+        format!(
+            "weighted least-squares wedge patches {first_index} and {second_index} centre-plane symmetry"
+        )
+    })?;
+    let centre_error = wls_checked_dot(centre_sum, centre_sum, || {
+        format!(
+            "weighted least-squares wedge patches {first_index} and {second_index} squared centre-plane symmetry error"
+        )
+    })?;
+    let vector_sum = wls_checked_add(first_rotation.vector, second_rotation.vector, || {
+        format!(
+            "weighted least-squares wedge patches {first_index} and {second_index} rotation symmetry"
+        )
+    })?;
+    let vector_error = wls_checked_dot(vector_sum, vector_sum, || {
+        format!(
+            "weighted least-squares wedge patches {first_index} and {second_index} squared rotation-vector symmetry error"
+        )
+    })?;
+    let cosine_error = first_rotation.cosine - second_rotation.cosine;
+    wls_require_pair_error(centre_error, first_index, second_index, "centre-plane")?;
+    wls_require_pair_error(vector_error, first_index, second_index, "rotation-vector")?;
+    wls_require_pair_error(
+        cosine_error * cosine_error,
+        first_index,
+        second_index,
+        "rotation-cosine",
+    )?;
+    let first_owners = wls_wedge_patch_owners(mesh, first_index)?;
+    let second_owners = wls_wedge_patch_owners(mesh, second_index)?;
+    if first_owners != second_owners {
+        return Err(invalid_input(format!(
+            "weighted least-squares wedge patches {first_index} and {second_index} do not cover the same owner cells"
+        )));
+    }
+    Ok(())
+}
+
+fn wls_require_pair_error(
+    squared_error: f64,
+    first_patch: usize,
+    second_patch: usize,
+    property: &str,
+) -> Result<()> {
+    match wls_squared_magnitude_band(squared_error) {
+        WlsSquaredMagnitudeBand::Active => {
+            return Err(invalid_input(format!(
+                "weighted least-squares wedge patches {first_patch} and {second_patch} {property} values are not symmetric"
+            )));
+        }
+        WlsSquaredMagnitudeBand::Ambiguous => {
+            return Err(invalid_input(format!(
+                "weighted least-squares wedge patches {first_patch} and {second_patch} {property} symmetry is numerically ambiguous"
+            )));
+        }
+        WlsSquaredMagnitudeBand::Inactive => {}
+    }
+    Ok(())
+}
+
+fn wls_wedge_patch_owners(mesh: &SolverRuntimeMeshData, patch_index: usize) -> Result<Vec<usize>> {
+    let patch = &mesh.patches[patch_index];
+    let end = patch
+        .start_face
+        .checked_add(patch.faces)
+        .ok_or(crate::MeshError::OutOfMemory)?;
+    let mut owners = wls_try_vec(patch.faces)?;
+    owners.extend_from_slice(&mesh.owner[patch.start_face..end]);
+    owners.sort_unstable();
+    if owners.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(invalid_input(format!(
+            "weighted least-squares wedge patch {patch_index} contains more than one face for an owner cell"
+        )));
+    }
+    Ok(owners)
+}
+
 fn wls_intrinsic_bases(
     mesh: &SolverRuntimeMeshData,
     face_addressing: &CompactSimpleFaceAddressing,
@@ -954,16 +1413,7 @@ fn wls_intrinsic_bases(
     }
 
     let expected = if has_wedge {
-        let wedge_patch_count = mesh
-            .patches
-            .iter()
-            .filter(|patch| patch.patch_type == "wedge" && patch.faces != 0)
-            .count();
-        if wedge_patch_count != 2 {
-            return Err(invalid_input(format!(
-                "weighted least-squares wedge topology requires exactly two non-empty wedge patches, got {wedge_patch_count}"
-            )));
-        }
+        wls_non_empty_wedge_patch_count(mesh)?;
         let wedge_normal_rank = wls_direction_rank(&mut wedge_normals, "wedge constraint normals")?;
         if wedge_normal_rank != 2 {
             return Err(invalid_input(format!(
@@ -1663,6 +2113,282 @@ pub(super) fn weighted_least_squares_vector_component_gradients_from_deltas(
     Ok(gradients)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) fn scalar_gradient_with_scheme_and_addressing(
+    mesh: &SolverRuntimeMeshData,
+    scalar_geometry: &ScalarGradientGeometry,
+    weighted_least_squares: Option<&WeightedLeastSquaresGeometry>,
+    face_addressing: &CompactSimpleFaceAddressing,
+    values: &[f64],
+    boundary: &[ScalarFaceTreatment],
+    scheme: LaminarSimpleGradientScheme,
+) -> Result<Vec<Point3>> {
+    match scheme {
+        LaminarSimpleGradientScheme::LeastSquares => {
+            let geometry = weighted_least_squares.ok_or_else(|| {
+                invalid_input(
+                    "leastSquares gradient was selected without cached geometry".to_string(),
+                )
+            })?;
+            let boundary_deltas = wls_scalar_boundary_deltas(
+                mesh,
+                scalar_geometry,
+                geometry,
+                face_addressing,
+                values,
+                boundary,
+            )?;
+            weighted_least_squares_scalar_gradient_from_deltas(geometry, values, &boundary_deltas)
+        }
+        LaminarSimpleGradientScheme::GaussLinear
+        | LaminarSimpleGradientScheme::CellLimitedGaussLinear(_) => {
+            scalar_gradient_with_geometry_and_addressing(
+                mesh,
+                scalar_geometry,
+                face_addressing,
+                values,
+                boundary,
+                scheme,
+            )
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn vector_component_gradients_with_scheme_and_addressing(
+    mesh: &SolverRuntimeMeshData,
+    scalar_geometry: &ScalarGradientGeometry,
+    weighted_least_squares: Option<&WeightedLeastSquaresGeometry>,
+    face_addressing: &CompactSimpleFaceAddressing,
+    values: &[Point3],
+    boundary: &[VectorFaceTreatment],
+    flux: &[f64],
+    scheme: LaminarSimpleGradientScheme,
+) -> Result<[Vec<Point3>; 3]> {
+    match scheme {
+        LaminarSimpleGradientScheme::LeastSquares => {
+            let geometry = weighted_least_squares.ok_or_else(|| {
+                invalid_input(
+                    "leastSquares vector gradient was selected without cached geometry".to_string(),
+                )
+            })?;
+            let boundary_deltas =
+                wls_vector_boundary_deltas(mesh, geometry, values, boundary, flux)?;
+            weighted_least_squares_vector_component_gradients_from_deltas(
+                geometry,
+                values,
+                &boundary_deltas,
+            )
+        }
+        LaminarSimpleGradientScheme::GaussLinear
+        | LaminarSimpleGradientScheme::CellLimitedGaussLinear(_) => {
+            vector_component_gradients_with_addressing(
+                mesh,
+                scalar_geometry,
+                face_addressing,
+                values,
+                boundary,
+                scheme,
+            )
+        }
+    }
+}
+
+fn wls_scalar_boundary_deltas(
+    mesh: &SolverRuntimeMeshData,
+    scalar_geometry: &ScalarGradientGeometry,
+    geometry: &WeightedLeastSquaresGeometry,
+    face_addressing: &CompactSimpleFaceAddressing,
+    values: &[f64],
+    boundary: &[ScalarFaceTreatment],
+) -> Result<Vec<Option<f64>>> {
+    if values.len() != mesh.cells
+        || boundary.len() != mesh.faces
+        || scalar_geometry.boundary_normal_distances.len() != mesh.faces
+        || geometry.face_coefficients.len() != mesh.faces
+        || face_addressing.faces() != mesh.faces
+    {
+        return Err(invalid_input(
+            "leastSquares scalar boundary resolution does not match the runtime mesh".to_string(),
+        ));
+    }
+    let mut deltas = wls_try_filled_vec(mesh.faces, None)?;
+    for (face, coefficient) in geometry.face_coefficients.iter().copied().enumerate() {
+        if coefficient.neighbour_cell.is_some() || coefficient.role == WlsFaceRole::EmptyBoundary {
+            continue;
+        }
+        let owner = coefficient.owner_cell;
+        let delta = match coefficient.role {
+            WlsFaceRole::WedgeBoundary | WlsFaceRole::SymmetryBoundary => {
+                if !matches!(boundary[face], ScalarFaceTreatment::Constraint) {
+                    return Err(invalid_input(format!(
+                        "leastSquares scalar constraint face {face} requires a constraint boundary treatment"
+                    )));
+                }
+                0.0
+            }
+            WlsFaceRole::RegularBoundary => match boundary[face] {
+                ScalarFaceTreatment::FixedValue(value) => {
+                    wls_checked_subtraction(value, values[owner], || {
+                        format!("leastSquares scalar fixed-value face {face} delta")
+                    })?
+                }
+                ScalarFaceTreatment::FixedGradient(gradient) => {
+                    let distance = scalar_geometry.boundary_normal_distances[face].ok_or_else(
+                        || {
+                            invalid_input(format!(
+                                "leastSquares scalar fixed-gradient face {face} has no projected distance"
+                            ))
+                        },
+                    )?;
+                    let delta = gradient * distance;
+                    if !gradient.is_finite()
+                        || !distance.is_finite()
+                        || distance <= 0.0
+                        || !delta.is_finite()
+                    {
+                        return Err(invalid_input(format!(
+                            "leastSquares scalar fixed-gradient face {face} delta is invalid"
+                        )));
+                    }
+                    delta
+                }
+                ScalarFaceTreatment::ZeroGradient => 0.0,
+                ScalarFaceTreatment::InletOutlet(_) => {
+                    return Err(invalid_input(format!(
+                        "leastSquares scalar inletOutlet face {face} must be resolved against the current flux"
+                    )));
+                }
+                ScalarFaceTreatment::Constraint => {
+                    return Err(invalid_input(format!(
+                        "leastSquares regular scalar face {face} cannot use a constraint treatment"
+                    )));
+                }
+            },
+            WlsFaceRole::Internal | WlsFaceRole::EmptyBoundary => {
+                unreachable!("internal and empty faces were handled before scalar delta resolution")
+            }
+        };
+        if !delta.is_finite() {
+            return Err(invalid_input(format!(
+                "leastSquares scalar boundary face {face} delta must be finite"
+            )));
+        }
+        deltas[face] = Some(if delta == 0.0 { 0.0 } else { delta });
+    }
+    Ok(deltas)
+}
+
+fn wls_vector_boundary_deltas(
+    mesh: &SolverRuntimeMeshData,
+    geometry: &WeightedLeastSquaresGeometry,
+    values: &[Point3],
+    boundary: &[VectorFaceTreatment],
+    flux: &[f64],
+) -> Result<Vec<Option<Point3>>> {
+    if values.len() != mesh.cells
+        || boundary.len() != mesh.faces
+        || flux.len() != mesh.faces
+        || geometry.face_coefficients.len() != mesh.faces
+        || geometry.vector_constraints.len() != mesh.faces
+    {
+        return Err(invalid_input(
+            "leastSquares vector boundary resolution does not match the runtime mesh".to_string(),
+        ));
+    }
+    let mut deltas = wls_try_filled_vec(mesh.faces, None)?;
+    for (face, coefficient) in geometry.face_coefficients.iter().copied().enumerate() {
+        if coefficient.neighbour_cell.is_some() || coefficient.role == WlsFaceRole::EmptyBoundary {
+            continue;
+        }
+        let owner = coefficient.owner_cell;
+        let owner_value = values[owner];
+        wls_require_finite_point(owner_value, || {
+            format!("leastSquares vector owner value for face {face}")
+        })?;
+        let delta = match coefficient.role {
+            WlsFaceRole::RegularBoundary => match boundary[face] {
+                VectorFaceTreatment::FixedValue(value) => {
+                    wls_checked_delta(value, owner_value, || {
+                        format!("leastSquares vector fixed-value face {face} delta")
+                    })?
+                }
+                VectorFaceTreatment::InletOutlet(value) => {
+                    let decision_flux = flux[face];
+                    if !decision_flux.is_finite() {
+                        return Err(invalid_input(format!(
+                            "leastSquares vector inletOutlet face {face} has non-finite decision flux"
+                        )));
+                    }
+                    if decision_flux < 0.0 {
+                        wls_checked_delta(value, owner_value, || {
+                            format!("leastSquares vector inletOutlet face {face} delta")
+                        })?
+                    } else {
+                        zero()
+                    }
+                }
+                VectorFaceTreatment::ZeroGradient => zero(),
+                VectorFaceTreatment::Constraint => {
+                    return Err(invalid_input(format!(
+                        "leastSquares regular vector face {face} cannot use a constraint treatment"
+                    )));
+                }
+            },
+            WlsFaceRole::SymmetryBoundary => {
+                if !matches!(boundary[face], VectorFaceTreatment::Constraint) {
+                    return Err(invalid_input(format!(
+                        "leastSquares symmetry face {face} requires a constraint boundary treatment"
+                    )));
+                }
+                let WlsVectorConstraint::Symmetry { unit_normal } =
+                    geometry.vector_constraints[face].ok_or_else(|| {
+                        invalid_input(format!(
+                            "leastSquares symmetry face {face} has no cached normal"
+                        ))
+                    })?
+                else {
+                    return Err(invalid_input(format!(
+                        "leastSquares symmetry face {face} has mismatched constraint metadata"
+                    )));
+                };
+                let normal_component = wls_checked_dot(unit_normal, owner_value, || {
+                    format!("leastSquares symmetry face {face} normal component")
+                })?;
+                wls_scale_point(unit_normal, -normal_component, || {
+                    format!("leastSquares symmetry face {face} vector delta")
+                })?
+            }
+            WlsFaceRole::WedgeBoundary => {
+                if !matches!(boundary[face], VectorFaceTreatment::Constraint) {
+                    return Err(invalid_input(format!(
+                        "leastSquares wedge face {face} requires a constraint boundary treatment"
+                    )));
+                }
+                let WlsVectorConstraint::Wedge { rotation } = geometry.vector_constraints[face]
+                    .ok_or_else(|| {
+                        invalid_input(format!(
+                            "leastSquares wedge face {face} has no cached transform"
+                        ))
+                    })?
+                else {
+                    return Err(invalid_input(format!(
+                        "leastSquares wedge face {face} has mismatched constraint metadata"
+                    )));
+                };
+                rotation.delta(owner_value, face)?
+            }
+            WlsFaceRole::Internal | WlsFaceRole::EmptyBoundary => {
+                unreachable!("internal and empty faces were handled before vector delta resolution")
+            }
+        };
+        deltas[face] = Some(wls_require_finite_point(delta, || {
+            format!("leastSquares vector boundary face {face} delta")
+        })?);
+    }
+    Ok(deltas)
+}
+
 fn wls_validate_application_lengths(
     geometry: &WeightedLeastSquaresGeometry,
     cell_values: usize,
@@ -1782,9 +2508,9 @@ fn wls_face_displacement(
     let projected = wls_checked_dot(normal, raw, || {
         format!("weighted least-squares boundary face {face} normal projection")
     })?;
-    if projected == 0.0 {
+    if projected <= 0.0 {
         return Err(invalid_input(format!(
-            "weighted least-squares boundary face {face} has zero normal displacement"
+            "weighted least-squares boundary face {face} has non-positive normal displacement"
         )));
     }
     wls_scale_point(normal, projected, || {
@@ -2114,6 +2840,25 @@ fn wls_checked_delta(
     Ok(value)
 }
 
+fn wls_checked_add(
+    left: Point3,
+    right: Point3,
+    context: impl FnOnce() -> String,
+) -> Result<Point3> {
+    let value = Point3 {
+        x: left.x + right.x,
+        y: left.y + right.y,
+        z: left.z + right.z,
+    };
+    if !value.x.is_finite() || !value.y.is_finite() || !value.z.is_finite() {
+        return Err(invalid_input(format!(
+            "{} produced a non-finite component",
+            context()
+        )));
+    }
+    Ok(value)
+}
+
 fn wls_checked_subtraction(left: f64, right: f64, context: impl FnOnce() -> String) -> Result<f64> {
     let value = left - right;
     if !value.is_finite() {
@@ -2133,12 +2878,100 @@ fn wls_checked_dot(left: Point3, right: Point3, context: impl FnOnce() -> String
     Ok(value)
 }
 
+fn wls_checked_cross(
+    left: Point3,
+    right: Point3,
+    context: impl FnOnce() -> String,
+) -> Result<Point3> {
+    let value = Point3 {
+        x: left.y * right.z - left.z * right.y,
+        y: left.z * right.x - left.x * right.z,
+        z: left.x * right.y - left.y * right.x,
+    };
+    if !value.x.is_finite() || !value.y.is_finite() || !value.z.is_finite() {
+        return Err(invalid_input(format!("{} is non-finite", context())));
+    }
+    Ok(value)
+}
+
 fn wls_checked_magnitude(value: Point3, context: impl FnOnce() -> String) -> Result<f64> {
     let magnitude = value.x.hypot(value.y).hypot(value.z);
     if !magnitude.is_finite() {
         return Err(invalid_input(format!("{} is non-finite", context())));
     }
     Ok(magnitude)
+}
+
+fn wls_normalize_oriented(value: Point3, context: impl FnOnce() -> String) -> Result<Point3> {
+    let context = context();
+    wls_require_finite_point(value, || context.clone())?;
+    let scale = value.x.abs().max(value.y.abs()).max(value.z.abs());
+    if scale == 0.0 {
+        return Err(invalid_input(format!("{context} must be nonzero")));
+    }
+    let scaled = Point3 {
+        x: value.x / scale,
+        y: value.y / scale,
+        z: value.z / scale,
+    };
+    let magnitude = wls_checked_magnitude(scaled, || format!("{context} magnitude"))?;
+    if magnitude == 0.0 {
+        return Err(invalid_input(format!(
+            "{context} magnitude must be positive"
+        )));
+    }
+    let normalized = Point3 {
+        x: scaled.x / magnitude,
+        y: scaled.y / magnitude,
+        z: scaled.z / magnitude,
+    };
+    wls_require_finite_point(normalized, || format!("{context} unit vector"))
+}
+
+#[derive(Clone, Copy)]
+struct WlsCompensatedScalar {
+    sum: f64,
+    correction: f64,
+}
+
+impl WlsCompensatedScalar {
+    const ZERO: Self = Self {
+        sum: 0.0,
+        correction: 0.0,
+    };
+
+    fn add(&mut self, value: f64, patch: usize, component: &str) -> Result<()> {
+        let next = self.sum + value;
+        if !value.is_finite() || !next.is_finite() {
+            return Err(invalid_input(format!(
+                "weighted least-squares constraint patch {patch} {component} accumulation is non-finite"
+            )));
+        }
+        let compensation = if self.sum.abs() >= value.abs() {
+            (self.sum - next) + value
+        } else {
+            (value - next) + self.sum
+        };
+        let corrected = self.correction + compensation;
+        if !corrected.is_finite() {
+            return Err(invalid_input(format!(
+                "weighted least-squares constraint patch {patch} {component} compensation is non-finite"
+            )));
+        }
+        self.sum = next;
+        self.correction = corrected;
+        Ok(())
+    }
+
+    fn value(self, patch: usize, component: &str) -> Result<f64> {
+        let value = self.sum + self.correction;
+        if !value.is_finite() {
+            return Err(invalid_input(format!(
+                "weighted least-squares constraint patch {patch} corrected {component} is non-finite"
+            )));
+        }
+        Ok(value)
+    }
 }
 
 fn wls_scale_point(value: Point3, scale: f64, context: impl FnOnce() -> String) -> Result<Point3> {
@@ -2287,6 +3120,36 @@ mod weighted_least_squares_tests {
             face_centres,
             face_areas,
             patches,
+        )
+    }
+
+    fn one_cell_wedge(angle_radians: f64) -> SolverRuntimeMeshData {
+        let (sine, cosine) = angle_radians.sin_cos();
+        runtime_mesh(
+            vec![zero()],
+            vec![0; 6],
+            vec![None; 6],
+            vec![
+                point(0.0, 0.5, 0.0),
+                point(0.0, -0.5, 0.0),
+                point(0.0, 0.0, 0.5),
+                point(0.0, 0.0, -0.5),
+                point(0.5 * cosine, 0.5 * sine, 0.0),
+                point(-0.5 * cosine, 0.5 * sine, 0.0),
+            ],
+            vec![
+                point(0.0, 1.0, 0.0),
+                point(0.0, -1.0, 0.0),
+                point(0.0, 0.0, 1.0),
+                point(0.0, 0.0, -1.0),
+                point(cosine, sine, 0.0),
+                point(-cosine, sine, 0.0),
+            ],
+            vec![
+                patch("physical", "patch", 0, 4),
+                patch("wedgePlus", "wedge", 4, 1),
+                patch("wedgeMinus", "wedge", 5, 1),
+            ],
         )
     }
 
@@ -2742,7 +3605,10 @@ mod weighted_least_squares_tests {
         }
 
         let mut symmetry = one_cell_box(WlsIntrinsicDimension::Three);
-        symmetry.patches[0].patch_type = "symmetryPlane".to_string();
+        symmetry.patches = vec![
+            patch("symmetry", "symmetryPlane", 0, 1),
+            patch("physical", "patch", 1, 5),
+        ];
         let (_, _, symmetry_geometry) = build_geometry(&symmetry);
         assert_eq!(
             symmetry_geometry.basis.dimension,
@@ -2755,6 +3621,506 @@ mod weighted_least_squares_tests {
         )
         .expect("symmetry gradient");
         assert_point_bits(symmetry_gradient[0], zero());
+    }
+
+    #[test]
+    fn wls_boundary_deltas_follow_regular_empty_symmetry_and_wedge_contracts() {
+        let regular = one_cell_box(WlsIntrinsicDimension::Three);
+        let (addressing, scalar_geometry, geometry) = build_geometry(&regular);
+        let values = [2.0];
+        let mut scalar_boundary = vec![ScalarFaceTreatment::ZeroGradient; regular.faces];
+        scalar_boundary[0] = ScalarFaceTreatment::FixedValue(5.0);
+        let deltas = wls_scalar_boundary_deltas(
+            &regular,
+            &scalar_geometry,
+            &geometry,
+            &addressing,
+            &values,
+            &scalar_boundary,
+        )
+        .expect("fixed-value scalar deltas");
+        assert_eq!(
+            deltas[0].expect("fixed-value delta").to_bits(),
+            3.0f64.to_bits()
+        );
+        for delta in &deltas[1..] {
+            assert_eq!(
+                delta.expect("zero-gradient delta").to_bits(),
+                0.0f64.to_bits()
+            );
+        }
+
+        scalar_boundary[0] = ScalarFaceTreatment::FixedGradient(4.0);
+        let deltas = wls_scalar_boundary_deltas(
+            &regular,
+            &scalar_geometry,
+            &geometry,
+            &addressing,
+            &values,
+            &scalar_boundary,
+        )
+        .expect("fixed-gradient scalar deltas");
+        assert_eq!(
+            deltas[0].expect("fixed-gradient delta").to_bits(),
+            2.0f64.to_bits()
+        );
+        scalar_boundary[0] = ScalarFaceTreatment::InletOutlet(5.0);
+        assert!(
+            wls_scalar_boundary_deltas(
+                &regular,
+                &scalar_geometry,
+                &geometry,
+                &addressing,
+                &values,
+                &scalar_boundary,
+            )
+            .expect_err("unresolved scalar inletOutlet must fail")
+            .to_string()
+            .contains("must be resolved against the current flux")
+        );
+        scalar_boundary[0] = ScalarFaceTreatment::Constraint;
+        assert!(
+            wls_scalar_boundary_deltas(
+                &regular,
+                &scalar_geometry,
+                &geometry,
+                &addressing,
+                &values,
+                &scalar_boundary,
+            )
+            .expect_err("regular scalar constraint must fail")
+            .to_string()
+            .contains("regular scalar face")
+        );
+
+        let empty = one_cell_box(WlsIntrinsicDimension::Two);
+        let (addressing, scalar_geometry, geometry) = build_geometry(&empty);
+        let deltas = wls_scalar_boundary_deltas(
+            &empty,
+            &scalar_geometry,
+            &geometry,
+            &addressing,
+            &[1.0],
+            &vec![ScalarFaceTreatment::Constraint; empty.faces],
+        )
+        .expect_err("regular faces cannot masquerade as constraints");
+        assert!(deltas.to_string().contains("regular scalar face"));
+        let mut empty_boundary = vec![ScalarFaceTreatment::ZeroGradient; empty.faces];
+        empty_boundary[4] = ScalarFaceTreatment::Constraint;
+        empty_boundary[5] = ScalarFaceTreatment::Constraint;
+        let deltas = wls_scalar_boundary_deltas(
+            &empty,
+            &scalar_geometry,
+            &geometry,
+            &addressing,
+            &[1.0],
+            &empty_boundary,
+        )
+        .expect("empty scalar slots");
+        assert!(deltas[4].is_none());
+        assert!(deltas[5].is_none());
+
+        let vector_values = [point(1.0, 2.0, 3.0)];
+        let mut vector_boundary = vec![VectorFaceTreatment::ZeroGradient; regular.faces];
+        vector_boundary[0] = VectorFaceTreatment::FixedValue(point(4.0, 6.0, 8.0));
+        let mut flux = vec![0.0; regular.faces];
+        let deltas = wls_vector_boundary_deltas(
+            &regular,
+            &build_geometry(&regular).2,
+            &vector_values,
+            &vector_boundary,
+            &flux,
+        )
+        .expect("fixed-value vector deltas");
+        assert_point_bits(
+            deltas[0].expect("fixed-value vector delta"),
+            point(3.0, 4.0, 5.0),
+        );
+
+        vector_boundary[0] = VectorFaceTreatment::InletOutlet(point(4.0, 6.0, 8.0));
+        flux[0] = -f64::from_bits(1);
+        let regular_geometry = build_geometry(&regular).2;
+        let deltas = wls_vector_boundary_deltas(
+            &regular,
+            &regular_geometry,
+            &vector_values,
+            &vector_boundary,
+            &flux,
+        )
+        .expect("negative inlet flux");
+        assert_point_bits(deltas[0].expect("inlet delta"), point(3.0, 4.0, 5.0));
+        for outlet_flux in [-0.0, 0.0] {
+            flux[0] = outlet_flux;
+            let deltas = wls_vector_boundary_deltas(
+                &regular,
+                &regular_geometry,
+                &vector_values,
+                &vector_boundary,
+                &flux,
+            )
+            .expect("non-negative outlet flux");
+            assert_point_bits(deltas[0].expect("outlet delta"), zero());
+        }
+        flux[0] = f64::NAN;
+        assert!(
+            wls_vector_boundary_deltas(
+                &regular,
+                &regular_geometry,
+                &vector_values,
+                &vector_boundary,
+                &flux,
+            )
+            .expect_err("non-finite inletOutlet flux must fail")
+            .to_string()
+            .contains("non-finite decision flux")
+        );
+
+        let mut symmetry = one_cell_box(WlsIntrinsicDimension::Three);
+        let inverse_root_two = 0.5f64.sqrt();
+        symmetry.face_area_vectors[0] = point(inverse_root_two, inverse_root_two, 0.0);
+        symmetry.face_centres[0] = point(0.5 * inverse_root_two, 0.5 * inverse_root_two, 0.0);
+        symmetry.patches = vec![
+            patch("symmetry", "symmetryPlane", 0, 1),
+            patch("physical", "patch", 1, 5),
+        ];
+        let (_, _, symmetry_geometry) = build_geometry(&symmetry);
+        let mut symmetry_boundary = vec![VectorFaceTreatment::ZeroGradient; symmetry.faces];
+        symmetry_boundary[0] = VectorFaceTreatment::Constraint;
+        let deltas = wls_vector_boundary_deltas(
+            &symmetry,
+            &symmetry_geometry,
+            &[point(1.0, 0.0, 2.0)],
+            &symmetry_boundary,
+            &vec![0.0; symmetry.faces],
+        )
+        .expect("symmetry vector delta");
+        assert_point_close(
+            deltas[0].expect("symmetry delta"),
+            point(-0.5, -0.5, 0.0),
+            4.0 * f64::EPSILON,
+        );
+    }
+
+    #[test]
+    fn wls_wedge_rotation_matches_closed_oracles_and_is_scale_invariant() {
+        let angle = std::f64::consts::FRAC_PI_6;
+        let (sine, cosine) = angle.sin_cos();
+        let mesh = one_cell_wedge(angle);
+        let (_, scalar_geometry, geometry) = build_geometry(&mesh);
+        let owner_value = point(1.0, 2.0, 3.0);
+        let mut boundary = vec![VectorFaceTreatment::ZeroGradient; mesh.faces];
+        boundary[4] = VectorFaceTreatment::Constraint;
+        boundary[5] = VectorFaceTreatment::Constraint;
+        let deltas = wls_vector_boundary_deltas(
+            &mesh,
+            &geometry,
+            &[owner_value],
+            &boundary,
+            &vec![0.0; mesh.faces],
+        )
+        .expect("wedge vector deltas");
+        assert_point_close(
+            deltas[4].expect("plus wedge delta"),
+            point(cosine - 1.0 - 2.0 * sine, sine + 2.0 * (cosine - 1.0), 0.0),
+            8.0 * f64::EPSILON,
+        );
+        assert_point_close(
+            deltas[5].expect("minus wedge delta"),
+            point(cosine - 1.0 + 2.0 * sine, -sine + 2.0 * (cosine - 1.0), 0.0),
+            8.0 * f64::EPSILON,
+        );
+
+        for (face, centre_normal, patch_normal) in [
+            (4, point(1.0, 0.0, 0.0), point(cosine, sine, 0.0)),
+            (5, point(-1.0, 0.0, 0.0), point(-cosine, sine, 0.0)),
+        ] {
+            let WlsVectorConstraint::Wedge { rotation } =
+                geometry.vector_constraints[face].expect("wedge transform")
+            else {
+                panic!("face {face} must carry a wedge transform");
+            };
+            let mapped = wls_checked_add(
+                centre_normal,
+                rotation.delta(centre_normal, face).expect("normal delta"),
+                || "mapped normal".to_string(),
+            )
+            .expect("mapped normal sum");
+            assert_point_close(mapped, patch_normal, 8.0 * f64::EPSILON);
+            let transformed = wls_checked_add(
+                owner_value,
+                rotation.delta(owner_value, face).expect("value delta"),
+                || "transformed value".to_string(),
+            )
+            .expect("transformed value sum");
+            assert!(
+                (wls_checked_magnitude(transformed, || "transformed norm".to_string())
+                    .expect("transformed norm")
+                    - wls_checked_magnitude(owner_value, || "owner norm".to_string())
+                        .expect("owner norm"))
+                .abs()
+                    <= 16.0 * f64::EPSILON
+            );
+            assert_point_close(
+                rotation
+                    .delta(point(0.0, 0.0, 4.0), face)
+                    .expect("axis delta"),
+                zero(),
+                8.0 * f64::EPSILON,
+            );
+        }
+
+        let mut scalar_boundary = vec![ScalarFaceTreatment::ZeroGradient; mesh.faces];
+        scalar_boundary[4] = ScalarFaceTreatment::Constraint;
+        scalar_boundary[5] = ScalarFaceTreatment::Constraint;
+        let addressing = CompactSimpleFaceAddressing::from_mesh(&mesh).expect("addressing");
+        let scalar_deltas = wls_scalar_boundary_deltas(
+            &mesh,
+            &scalar_geometry,
+            &geometry,
+            &addressing,
+            &[7.0],
+            &scalar_boundary,
+        )
+        .expect("wedge scalar deltas");
+        assert_eq!(
+            scalar_deltas[4].expect("plus scalar delta").to_bits(),
+            0.0f64.to_bits()
+        );
+        assert_eq!(
+            scalar_deltas[5].expect("minus scalar delta").to_bits(),
+            0.0f64.to_bits()
+        );
+
+        let mut scaled = mesh.clone();
+        for area in &mut scaled.face_area_vectors {
+            area.x *= 2.0f64.powi(500);
+            area.y *= 2.0f64.powi(500);
+            area.z *= 2.0f64.powi(500);
+        }
+        scaled.patches.swap(1, 2);
+        let (_, _, scaled_geometry) = build_geometry(&scaled);
+        let scaled_deltas = wls_vector_boundary_deltas(
+            &scaled,
+            &scaled_geometry,
+            &[owner_value],
+            &boundary,
+            &vec![0.0; scaled.faces],
+        )
+        .expect("scaled wedge vector deltas");
+        assert_point_bits(
+            scaled_deltas[4].expect("scaled plus delta"),
+            deltas[4].expect("reference plus delta"),
+        );
+        assert_point_bits(
+            scaled_deltas[5].expect("scaled minus delta"),
+            deltas[5].expect("reference minus delta"),
+        );
+    }
+
+    #[test]
+    fn wls_wedge_geometry_rejects_degenerate_nonplanar_and_asymmetric_pairs() {
+        let aligned = one_cell_wedge(0.0);
+        let addressing = CompactSimpleFaceAddressing::from_mesh(&aligned).expect("addressing");
+        let scalar_geometry = ScalarGradientGeometry::from_mesh(&aligned).expect("scalar geometry");
+        WeightedLeastSquaresGeometry::from_mesh(&aligned, &scalar_geometry, &addressing)
+            .expect_err("aligned wedge must fail");
+        assert!(
+            wls_rotation_between(point(1.0, 0.0, 0.0), point(1.0, 0.0, 0.0), 0,)
+                .expect_err("aligned wedge transform must fail")
+                .to_string()
+                .contains("aligns with its coordinate centre plane")
+        );
+
+        let angle = std::f64::consts::FRAC_PI_6;
+        let mut asymmetric = one_cell_wedge(angle);
+        let (other_sine, other_cosine) = (angle * 0.75).sin_cos();
+        asymmetric.face_area_vectors[5] = point(-other_cosine, other_sine, 0.0);
+        asymmetric.face_centres[5] = point(-0.5 * other_cosine, 0.5 * other_sine, 0.0);
+        let addressing = CompactSimpleFaceAddressing::from_mesh(&asymmetric).expect("addressing");
+        let scalar_geometry =
+            ScalarGradientGeometry::from_mesh(&asymmetric).expect("scalar geometry");
+        assert!(
+            WeightedLeastSquaresGeometry::from_mesh(&asymmetric, &scalar_geometry, &addressing,)
+                .expect_err("asymmetric wedge must fail")
+                .to_string()
+                .contains("not symmetric")
+        );
+
+        let mut nonplanar = one_cell_box(WlsIntrinsicDimension::Three);
+        nonplanar.face_area_vectors[0] = point(1.0, 0.0, 0.0);
+        nonplanar.face_area_vectors[1] = point(1.0, 1.0e-5, 0.0);
+        nonplanar.patches = vec![
+            patch("nonPlanar", "symmetryPlane", 0, 2),
+            patch("physical", "patch", 2, 4),
+        ];
+        assert!(
+            wls_patch_average_unit_normal(&nonplanar, 0)
+                .expect_err("non-planar patch must fail")
+                .to_string()
+                .contains("non-planar")
+        );
+        nonplanar.face_area_vectors[0] = zero();
+        assert!(
+            wls_patch_average_unit_normal(&nonplanar, 0)
+                .expect_err("zero patch normal must fail")
+                .to_string()
+                .contains("must be nonzero")
+        );
+        nonplanar.face_area_vectors[0] = point(f64::NAN, 0.0, 0.0);
+        assert!(
+            wls_patch_average_unit_normal(&nonplanar, 0)
+                .expect_err("non-finite patch normal must fail")
+                .to_string()
+                .contains("finite components")
+        );
+
+        let mut misoriented = one_cell_box(WlsIntrinsicDimension::Three);
+        misoriented.face_area_vectors[0] = point(-1.0, 0.0, 0.0);
+        let addressing = CompactSimpleFaceAddressing::from_mesh(&misoriented).expect("addressing");
+        let scalar_geometry =
+            ScalarGradientGeometry::from_mesh(&misoriented).expect("scalar geometry");
+        assert!(
+            WeightedLeastSquaresGeometry::from_mesh(&misoriented, &scalar_geometry, &addressing,)
+                .expect_err("non-positive boundary displacement must fail")
+                .to_string()
+                .contains("non-positive normal displacement")
+        );
+
+        let diagonal =
+            wls_normalize_oriented(point(0.8, 0.6, 0.0), || "diagonal normal".to_string())
+                .expect("diagonal unit normal");
+        assert!(
+            wls_coordinate_plane_normal(diagonal, 7)
+                .expect_err("diagonal centre plane must fail")
+                .to_string()
+                .contains("does not align with a coordinate plane")
+        );
+
+        let mut with_empty_metadata = one_cell_wedge(angle);
+        with_empty_metadata.patches.push(patch(
+            "unusedWedge",
+            "wedge",
+            with_empty_metadata.faces,
+            0,
+        ));
+        build_geometry(&with_empty_metadata);
+
+        let mut three_wedges = one_cell_wedge(angle);
+        three_wedges.patches = vec![
+            patch("physical", "patch", 0, 3),
+            patch("thirdWedge", "wedge", 3, 1),
+            patch("wedgePlus", "wedge", 4, 1),
+            patch("wedgeMinus", "wedge", 5, 1),
+        ];
+        let three_addressing =
+            CompactSimpleFaceAddressing::from_mesh(&three_wedges).expect("addressing");
+        let three_scalar_geometry =
+            ScalarGradientGeometry::from_mesh(&three_wedges).expect("scalar geometry");
+        assert!(
+            WeightedLeastSquaresGeometry::from_mesh(
+                &three_wedges,
+                &three_scalar_geometry,
+                &three_addressing,
+            )
+            .expect_err("three wedge patches must fail at the production constructor preflight")
+            .to_string()
+            .contains("got 3")
+        );
+
+        let (sine, cosine) = angle.sin_cos();
+        let first = WlsRotation {
+            vector: point(0.0, 0.0, sine),
+            cosine,
+            inverse_one_plus_cosine: 1.0 / (1.0 + cosine),
+        };
+        let second = WlsRotation {
+            vector: point(0.0, 0.0, -sine),
+            cosine,
+            inverse_one_plus_cosine: 1.0 / (1.0 + cosine),
+        };
+        let owner_mesh = runtime_mesh(
+            vec![zero(), point(1.0, 0.0, 0.0)],
+            vec![0, 1, 1, 0],
+            vec![None; 4],
+            vec![zero(); 4],
+            vec![point(1.0, 0.0, 0.0); 4],
+            vec![
+                patch("first", "wedge", 0, 2),
+                patch("second", "wedge", 2, 2),
+            ],
+        );
+        wls_validate_wedge_pair(
+            &owner_mesh,
+            &[
+                (0, point(1.0, 0.0, 0.0), first),
+                (1, point(-1.0, 0.0, 0.0), second),
+            ],
+        )
+        .expect("owner signatures may use different face order");
+        let distinct_owner_mesh = runtime_mesh(
+            vec![zero(), point(1.0, 0.0, 0.0), point(2.0, 0.0, 0.0)],
+            vec![0, 1, 2, 0],
+            vec![None; 4],
+            vec![zero(); 4],
+            vec![point(1.0, 0.0, 0.0); 4],
+            vec![
+                patch("first", "wedge", 0, 2),
+                patch("second", "wedge", 2, 2),
+            ],
+        );
+        assert!(
+            wls_validate_wedge_pair(
+                &distinct_owner_mesh,
+                &[
+                    (0, point(1.0, 0.0, 0.0), first),
+                    (1, point(-1.0, 0.0, 0.0), second),
+                ],
+            )
+            .expect_err("different unique wedge owner sets must fail")
+            .to_string()
+            .contains("do not cover the same owner cells")
+        );
+        let mut duplicate_owner = owner_mesh.clone();
+        duplicate_owner.owner[2] = 0;
+        assert!(
+            wls_validate_wedge_pair(
+                &duplicate_owner,
+                &[
+                    (0, point(1.0, 0.0, 0.0), first),
+                    (1, point(-1.0, 0.0, 0.0), second),
+                ],
+            )
+            .expect_err("duplicate wedge owner must fail")
+            .to_string()
+            .contains("more than one face for an owner cell")
+        );
+    }
+
+    #[test]
+    fn wls_squared_magnitude_guard_bands_have_exact_boundaries() {
+        let above_inactive = f64::from_bits(WLS_BASIS_INACTIVE_SQUARED.to_bits() + 1);
+        let below_active = f64::from_bits(WLS_BASIS_ACTIVE_SQUARED.to_bits() - 1);
+
+        assert_eq!(
+            wls_squared_magnitude_band(WLS_BASIS_INACTIVE_SQUARED),
+            WlsSquaredMagnitudeBand::Inactive
+        );
+        assert_eq!(
+            wls_squared_magnitude_band(above_inactive),
+            WlsSquaredMagnitudeBand::Ambiguous
+        );
+        assert_eq!(
+            wls_squared_magnitude_band(below_active),
+            WlsSquaredMagnitudeBand::Ambiguous
+        );
+        assert_eq!(
+            wls_squared_magnitude_band(WLS_BASIS_ACTIVE_SQUARED),
+            WlsSquaredMagnitudeBand::Active
+        );
+        assert_eq!(
+            wls_squared_magnitude_band(f64::NAN),
+            WlsSquaredMagnitudeBand::Active
+        );
     }
 
     #[test]
