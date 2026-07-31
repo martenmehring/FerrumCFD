@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use crate::fields::{FieldFile, FieldValueSummary, InitialFieldSet};
-use crate::linear::gamg::NormalizedL1GamgSolveControls;
+use crate::linear::gamg::{NormalizedL1GamgSolveControls, OPENFOAM_RELATIVE_TOLERANCE_SMALL};
 use crate::linear::{
     BiCgStabOptions, CgPreconditioner, ConjugateGradientOptions, CsrMatrix, CsrSparsityPattern,
     GamgAgglomerator, GamgFacePairWeight, GamgKernelTiming, GamgOptions, GamgSolveControls,
@@ -1684,21 +1684,12 @@ struct ScalarSolveControls {
 }
 
 // OpenFOAM Foundation's solver-performance convergence check treats relTol as
-// enabled only above `small` for double precision. The established Ferrum GAMG
-// normalized-L1 contract intentionally remains active for every positive
-// relTol to preserve its bit-for-bit solve lifecycle. Unifying that legacy
-// exception requires a separately measured GAMG contract change.
-const OPENFOAM_RELATIVE_TOLERANCE_SMALL: f64 = 1.0e-15;
-
+// enabled only strictly above `small` for double precision.
 fn linear_relative_tolerance_is_active(
-    solver: LaminarSimpleLinearSolver,
+    _solver: LaminarSimpleLinearSolver,
     relative_tolerance: f64,
 ) -> bool {
-    if solver == LaminarSimpleLinearSolver::Gamg {
-        relative_tolerance > 0.0
-    } else {
-        relative_tolerance > OPENFOAM_RELATIVE_TOLERANCE_SMALL
-    }
+    relative_tolerance > OPENFOAM_RELATIVE_TOLERANCE_SMALL
 }
 
 fn effective_normalized_tolerance_and_reason(
@@ -2347,10 +2338,17 @@ fn solve_scalar_system_with_workspaces(
             let workspace = gamg_workspace.ok_or_else(|| {
                 invalid_input("GAMG solve requires a matching hierarchy workspace".to_string())
             })?;
-            let relative_solver_tolerance = strict_l2_tolerance_for_l1_limit(
-                gamg_options.relative_tolerance * initial_l1_residual_norm,
-                component_count,
-            );
+            let relative_solver_tolerance = if linear_relative_tolerance_is_active(
+                LaminarSimpleLinearSolver::Gamg,
+                gamg_options.relative_tolerance,
+            ) {
+                strict_l2_tolerance_for_l1_limit(
+                    gamg_options.relative_tolerance * initial_l1_residual_norm,
+                    component_count,
+                )
+            } else {
+                0.0
+            };
             let solve_controls = NormalizedL1GamgSolveControls {
                 normalization_factor: normalisation_factor,
                 tolerance: controls.tolerance,
@@ -2562,7 +2560,7 @@ fn ldu_l1_residual_normalisation_factor(
             "LDU L1 residual normalisation factor is not finite".to_string(),
         ));
     }
-    Ok(factor.max(1.0e-20))
+    Ok(factor + OPENFOAM_RELATIVE_TOLERANCE_SMALL)
 }
 
 fn l1_norm(values: &[f64]) -> f64 {
@@ -9166,6 +9164,30 @@ mod tests {
     }
 
     #[test]
+    fn openfoam_residual_normalisation_adds_small_without_flooring() {
+        let matrix = crate::linear::CsrMatrix::from_rows(vec![vec![(0, 1.0)]], 1).expect("matrix");
+        let solution = [0.0];
+        let matrix_solution = [0.0];
+
+        for raw_factor in [0.0, 0.5e-20, 1.0e-12] {
+            let factor = super::ldu_l1_residual_normalisation_factor(
+                &matrix,
+                &[raw_factor],
+                &solution,
+                &matrix_solution,
+            )
+            .expect("normalisation factor");
+            let expected = raw_factor + 1.0e-20;
+
+            assert_eq!(
+                factor.to_bits(),
+                expected.to_bits(),
+                "raw factor {raw_factor:e}"
+            );
+        }
+    }
+
+    #[test]
     fn ldu_l1_limit_is_conservatively_translated_to_a_strict_l2_limit() {
         let tolerance = super::strict_l2_tolerance_for_l1_limit(1.0, 4.0);
 
@@ -9302,14 +9324,16 @@ mod tests {
     }
 
     #[test]
-    fn gamg_preserves_any_positive_relative_tolerance_while_non_gamg_uses_openfoam_small() {
+    fn every_linear_solver_uses_the_strict_openfoam_relative_tolerance_boundary() {
+        assert_eq!(
+            super::OPENFOAM_RELATIVE_TOLERANCE_SMALL.to_bits(),
+            1.0e-20_f64.to_bits()
+        );
         let below_openfoam_small = super::OPENFOAM_RELATIVE_TOLERANCE_SMALL.next_down();
+        let above_openfoam_small = super::OPENFOAM_RELATIVE_TOLERANCE_SMALL.next_up();
 
-        assert!(super::linear_relative_tolerance_is_active(
-            LaminarSimpleLinearSolver::Gamg,
-            below_openfoam_small
-        ));
         for solver in [
+            LaminarSimpleLinearSolver::Gamg,
             LaminarSimpleLinearSolver::BiCgStab,
             LaminarSimpleLinearSolver::Cg,
             LaminarSimpleLinearSolver::GaussSeidel,
@@ -9321,6 +9345,14 @@ mod tests {
                 solver,
                 below_openfoam_small
             ));
+            assert!(!super::linear_relative_tolerance_is_active(
+                solver,
+                super::OPENFOAM_RELATIVE_TOLERANCE_SMALL
+            ));
+            assert!(super::linear_relative_tolerance_is_active(
+                solver,
+                above_openfoam_small
+            ));
         }
         assert!(!super::linear_relative_tolerance_is_active(
             LaminarSimpleLinearSolver::Gamg,
@@ -9330,22 +9362,22 @@ mod tests {
             super::effective_normalized_tolerance_and_reason(
                 LaminarSimpleLinearSolver::Gamg,
                 0.0,
-                below_openfoam_small,
-                1.0,
-            ),
-            (
-                below_openfoam_small,
-                super::LinearSolveStopReason::RelativeTolerance,
-            )
-        );
-        assert_eq!(
-            super::effective_normalized_tolerance_and_reason(
-                LaminarSimpleLinearSolver::Cg,
-                0.0,
-                below_openfoam_small,
+                super::OPENFOAM_RELATIVE_TOLERANCE_SMALL,
                 1.0,
             ),
             (0.0, super::LinearSolveStopReason::AbsoluteTolerance)
+        );
+        assert_eq!(
+            super::effective_normalized_tolerance_and_reason(
+                LaminarSimpleLinearSolver::Gamg,
+                0.0,
+                above_openfoam_small,
+                1.0,
+            ),
+            (
+                above_openfoam_small,
+                super::LinearSolveStopReason::RelativeTolerance,
+            )
         );
     }
 

@@ -613,10 +613,11 @@ execution also requires `system/fvSchemes` and
 Absent `tolerance` and `maxIter` entries use the OpenFOAM 13
 `lduMatrix::solver` defaults (`1e-6` and `1000`). All current scalar linear
 solvers accept a finite, non-negative `relTol` and use the strict normalized-L1
-target `max(tolerance, relTol * initialNormalizedResidual)`. Non-GAMG solvers
-activate the relative criterion only above OpenFOAM's `SMALL` boundary
-(`1e-15`); the established GAMG compatibility contract uses every positive
-`relTol`. This is a static user control whose effective target is recomputed
+target `max(tolerance, relTol * initialNormalizedResidual)`. Every solver
+activates the relative criterion only for `relTol > 1e-20`, matching the strict
+OpenFOAM Foundation 13 `SolverPerformance::small_` boundary. The LDU
+normalisation factor likewise adds `1e-20` to the accumulated factor instead of
+flooring it. This is a static user control whose effective target is recomputed
 per solve, not an autonomous adaptive controller. A non-zero `minIter` outside
 GAMG and `smoothSolver nSweeps` other than `1` remain explicitly unsupported.
 The pressure bridge now follows the OpenFOAM shape more closely: it applies

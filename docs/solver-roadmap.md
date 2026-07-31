@@ -1750,9 +1750,12 @@ The immediate sequence is:
       time by `14.85%`; host-load dispersion forbids extrapolating those
       percentages to other cases. This is not a reopening of the rejected
       LDU-addressed symmetric Gauss-Seidel experiment;
-   3. **F-CYL-PCG-NL1:** make non-GAMG PCG evaluate the public normalized-L1
-      residual directly on each convergence check and reuse the already
-      written residual. Preserve strict absolute/relative boundaries,
+   3. **F-CYL-PCG-NL1:** the semantic prerequisite now uses the exact OpenFOAM
+      Foundation 13 `relTol > 1e-20` boundary for every scalar solver and adds
+      `1e-20` to the LDU residual-normalisation factor. Next, make non-GAMG PCG
+      evaluate the public normalized-L1 residual directly on each convergence
+      check and reuse the already written residual. Preserve strict
+      absolute/relative boundaries,
       zero-iteration initial convergence, exact iteration-count/max-iteration
       lifecycle, L2 telemetry, breakdown behavior, final acceptance, and
       existing outer SIMPLE bounds. This is not the rejected C8
