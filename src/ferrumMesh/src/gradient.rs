@@ -4,9 +4,8 @@ use crate::{Point3, Result};
 use super::compact_faces::CompactSimpleFaceAddressing;
 use super::{
     LaminarSimpleGradientScheme, ScalarFaceTreatment, VectorFaceTreatment,
-    boundary_normal_distance, checked_delta, checked_dot, checked_magnitude,
-    face_scalar_value_with_addressing, invalid_input, require_finite, require_finite_point,
-    scalar_component_boundary, split_components, zero,
+    boundary_normal_distance, checked_delta, checked_dot, checked_magnitude, component_value,
+    face_scalar_value_with_addressing, invalid_input, require_finite, require_finite_point, zero,
 };
 
 pub(super) struct ScalarGradientGeometry {
@@ -17,8 +16,8 @@ pub(super) struct ScalarGradientGeometry {
 
 impl ScalarGradientGeometry {
     pub(super) fn from_mesh(mesh: &SolverRuntimeMeshData) -> Result<Self> {
-        let mut owner_weights = Vec::with_capacity(mesh.faces);
-        let mut boundary_normal_distances = Vec::with_capacity(mesh.faces);
+        let mut owner_weights = wls_try_vec(mesh.faces)?;
+        let mut boundary_normal_distances = wls_try_vec(mesh.faces)?;
         for face_index in 0..mesh.faces {
             let owner = mesh.owner[face_index];
             if let Some(neighbour) = mesh.neighbour[face_index] {
@@ -38,20 +37,15 @@ impl ScalarGradientGeometry {
             }
         }
 
-        let inverse_cell_volumes = mesh
-            .cell_volumes
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(cell, volume)| {
-                if !volume.is_finite() || volume <= f64::EPSILON {
-                    return Err(invalid_input(format!(
-                        "scalar gradient cell {cell} has non-positive or non-finite volume {volume}"
-                    )));
-                }
-                Ok(1.0 / volume)
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let mut inverse_cell_volumes = wls_try_vec(mesh.cells)?;
+        for (cell, volume) in mesh.cell_volumes.iter().copied().enumerate() {
+            if !volume.is_finite() || volume <= f64::EPSILON {
+                return Err(invalid_input(format!(
+                    "scalar gradient cell {cell} has non-positive or non-finite volume {volume}"
+                )));
+            }
+            inverse_cell_volumes.push(1.0 / volume);
+        }
 
         Ok(Self {
             owner_weights,
@@ -98,7 +92,7 @@ pub(super) fn scalar_gradient_with_geometry_and_addressing(
             )));
         }
     }
-    let mut gradient = vec![zero(); mesh.cells];
+    let mut gradient = wls_try_filled_vec(mesh.cells, zero())?;
     if face_addressing.faces() != mesh.faces {
         return Err(invalid_input(
             "compact face addressing does not match the runtime mesh".to_string(),
@@ -337,8 +331,10 @@ pub(super) fn limit_scalar_gradient_with_addressing(
 
     let cell_face_adjacency = face_addressing.limiter_cell_adjacency()?;
 
-    let mut minima = values.to_vec();
-    let mut maxima = values.to_vec();
+    let mut minima = wls_try_vec(values.len())?;
+    minima.extend_from_slice(values);
+    let mut maxima = wls_try_vec(values.len())?;
+    maxima.extend_from_slice(values);
     for face_index in 0..mesh.faces {
         let owner = face_addressing.owner(face_index);
         if let Some(neighbour) = face_addressing.neighbour(face_index) {
@@ -563,33 +559,72 @@ pub(super) fn vector_component_gradients_with_addressing(
     boundary: &[VectorFaceTreatment],
     scheme: LaminarSimpleGradientScheme,
 ) -> Result<[Vec<Point3>; 3]> {
-    let components = split_components(velocity);
-    Ok([
-        scalar_gradient_with_geometry_and_addressing(
-            mesh,
-            scalar_gradient_geometry,
-            face_addressing,
-            &components[0],
-            &scalar_component_boundary(boundary, 0),
-            scheme,
-        )?,
-        scalar_gradient_with_geometry_and_addressing(
-            mesh,
-            scalar_gradient_geometry,
-            face_addressing,
-            &components[1],
-            &scalar_component_boundary(boundary, 1),
-            scheme,
-        )?,
-        scalar_gradient_with_geometry_and_addressing(
-            mesh,
-            scalar_gradient_geometry,
-            face_addressing,
-            &components[2],
-            &scalar_component_boundary(boundary, 2),
-            scheme,
-        )?,
-    ])
+    let components = gradient_try_split_components(velocity)?;
+    let boundary_x = gradient_try_scalar_component_boundary(boundary, 0)?;
+    let gradient_x = scalar_gradient_with_geometry_and_addressing(
+        mesh,
+        scalar_gradient_geometry,
+        face_addressing,
+        &components[0],
+        &boundary_x,
+        scheme,
+    )?;
+    drop(boundary_x);
+
+    let boundary_y = gradient_try_scalar_component_boundary(boundary, 1)?;
+    let gradient_y = scalar_gradient_with_geometry_and_addressing(
+        mesh,
+        scalar_gradient_geometry,
+        face_addressing,
+        &components[1],
+        &boundary_y,
+        scheme,
+    )?;
+    drop(boundary_y);
+
+    let boundary_z = gradient_try_scalar_component_boundary(boundary, 2)?;
+    let gradient_z = scalar_gradient_with_geometry_and_addressing(
+        mesh,
+        scalar_gradient_geometry,
+        face_addressing,
+        &components[2],
+        &boundary_z,
+        scheme,
+    )?;
+
+    Ok([gradient_x, gradient_y, gradient_z])
+}
+
+fn gradient_try_split_components(values: &[Point3]) -> Result<[Vec<f64>; 3]> {
+    let mut x = wls_try_vec(values.len())?;
+    let mut y = wls_try_vec(values.len())?;
+    let mut z = wls_try_vec(values.len())?;
+    for value in values {
+        x.push(value.x);
+        y.push(value.y);
+        z.push(value.z);
+    }
+    Ok([x, y, z])
+}
+
+fn gradient_try_scalar_component_boundary(
+    boundary: &[VectorFaceTreatment],
+    component: usize,
+) -> Result<Vec<ScalarFaceTreatment>> {
+    let mut treatments = wls_try_vec(boundary.len())?;
+    for treatment in boundary {
+        treatments.push(match treatment {
+            VectorFaceTreatment::FixedValue(value) => {
+                ScalarFaceTreatment::FixedValue(component_value(*value, component))
+            }
+            VectorFaceTreatment::InletOutlet(value) => {
+                ScalarFaceTreatment::InletOutlet(component_value(*value, component))
+            }
+            VectorFaceTreatment::ZeroGradient => ScalarFaceTreatment::ZeroGradient,
+            VectorFaceTreatment::Constraint => ScalarFaceTreatment::Constraint,
+        });
+    }
+    Ok(treatments)
 }
 
 const WLS_BASIS_INACTIVE_SQUARED: f64 = 64.0 * f64::EPSILON;

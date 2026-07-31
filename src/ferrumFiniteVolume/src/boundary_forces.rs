@@ -72,6 +72,45 @@ pub struct WallForceCoefficients {
     pub reference_dynamic_pressure: f64,
 }
 
+/// Cell-centred rows of the velocity-gradient tensor.
+///
+/// `grad_ux`, `grad_uy`, and `grad_uz` contain `grad(Ux)`, `grad(Uy)`, and
+/// `grad(Uz)`. Therefore `G[i][j] = dUi/dxj`.
+#[derive(Clone, Copy, Debug)]
+pub struct CellVelocityGradientComponents<'a> {
+    pub grad_ux: &'a [Point3],
+    pub grad_uy: &'a [Point3],
+    pub grad_uz: &'a [Point3],
+}
+
+/// Deterministic force and traction contribution for one selected wall face.
+///
+/// Every force and traction uses the force-on-body sign convention. The
+/// pressure field value remains in its input units; `resolved_dynamic_pressure`
+/// is pressure minus the selected gauge reference after applying the
+/// kinematic-to-dynamic scale.
+#[derive(Clone, Copy, Debug)]
+pub struct WallFaceForceContribution {
+    pub face_index: usize,
+    pub owner_cell: usize,
+    pub area_vector: Point3,
+    pub boundary_pressure: f64,
+    pub resolved_dynamic_pressure: f64,
+    pub pressure_traction_on_body: Point3,
+    pub viscous_traction_on_body: Point3,
+    pub wall_shear_traction_on_body: Point3,
+    pub pressure_force_on_body: Point3,
+    pub viscous_force_on_body: Point3,
+    pub total_force_on_body: Point3,
+}
+
+/// Aggregate coefficients plus deterministic per-face reconstructed loads.
+#[derive(Clone, Debug)]
+pub struct ResolvedWallForceReport {
+    pub coefficients: WallForceCoefficients,
+    pub faces: Vec<WallFaceForceContribution>,
+}
+
 /// Integrates pressure and laminar viscous forces exerted by the fluid on a
 /// stationary no-slip body.
 ///
@@ -130,51 +169,141 @@ pub fn integrate_stationary_no_slip_zero_gradient_pressure_wall_forces(
 
     let pressure_force = pressure_force.total();
     let viscous_force = viscous_force.total();
-    let total_force = pressure_force + viscous_force;
-    if !pressure_force.is_finite() || !viscous_force.is_finite() || !total_force.is_finite() {
-        return Err(invalid(
-            "wall-force accumulation exceeded the finite numeric range",
-        ));
-    }
+    wall_force_coefficients_from_totals(
+        pressure_force,
+        viscous_force,
+        patch_names.len(),
+        &validated,
+        &options,
+    )
+}
 
-    let reference_dynamic_pressure =
-        (0.5 * options.density * options.reference_speed) * options.reference_speed;
-    if !reference_dynamic_pressure.is_finite() || reference_dynamic_pressure <= 0.0 {
-        return Err(invalid(
-            "wall-force reference dynamic pressure must be positive and finite",
-        ));
-    }
-    let force_denominator = reference_dynamic_pressure * validated.reference_area;
-    if !force_denominator.is_finite() || force_denominator <= 0.0 {
-        return Err(invalid(
-            "wall-force coefficient denominator must be positive and finite",
-        ));
-    }
-    let drag = directional_coefficients(
-        pressure_force,
-        viscous_force,
-        validated.drag_direction,
-        force_denominator,
+/// Integrates stationary no-slip wall forces from a reconstructed cell-centred
+/// velocity-gradient tensor.
+///
+/// Pressure follows the encoded `zeroGradient` contract exactly: the boundary
+/// value is the selected face owner's cell pressure. Let `G_p` be the supplied
+/// owner-cell tensor, `n` the unit normal out of the fluid, `d_n` the projected
+/// owner-to-face distance, and `s = -U_p / d_n`. The face tensor is corrected
+/// only in its wall-normal derivative:
+///
+/// `G_f = G_p + (s - G_p n) (x) n`.
+///
+/// The viscous traction exerted by the fluid on the body is
+///
+/// `-mu [G_f + transpose(G_f) - 2/3 trace(G_f) I] n`.
+///
+/// The existing one-sided API remains available as a compatibility and
+/// regression baseline. This reconstructed API visits faces deterministically
+/// in `patch_names` order and then increasing global face index.
+pub fn integrate_stationary_no_slip_zero_gradient_pressure_wall_forces_with_reconstructed_gradient(
+    mesh: &SolverRuntimeMeshData,
+    cell_velocity: &[Point3],
+    cell_pressure: &[f64],
+    cell_velocity_gradients: CellVelocityGradientComponents<'_>,
+    patch_names: &[&str],
+    options: NoSlipWallForceOptions,
+) -> Result<ResolvedWallForceReport> {
+    let validated =
+        validate_common_request(mesh, cell_velocity, cell_pressure, patch_names, &options)?;
+    validate_velocity_gradients(mesh, cell_velocity_gradients)?;
+    let pressure_scale = match options.pressure_kind {
+        PressureFieldKind::Kinematic => options.density,
+        PressureFieldKind::Dynamic => 1.0,
+    };
+
+    let mut faces = try_wall_face_contributions(validated.selected_faces)?;
+    let mut pressure_force = CompensatedVec3::default();
+    let mut viscous_force = CompensatedVec3::default();
+    visit_selected_faces(
+        mesh,
+        patch_names,
+        |face, owner, area_vector, normal, distance| {
+            let owner_velocity = Vec3::from(cell_velocity[owner]);
+            let owner_gradient = VelocityGradient::from_components(cell_velocity_gradients, owner);
+            let wall_normal_derivative = (owner_velocity * -1.0) / distance;
+            let gradient_times_normal = owner_gradient.times(normal);
+            let normal_correction = wall_normal_derivative - gradient_times_normal;
+            let transpose_gradient_times_normal = owner_gradient.transpose_times(normal);
+            let trace = owner_gradient.trace();
+            let normal_scalar = normal_correction.dot(normal) / 3.0 - (2.0 / 3.0) * trace;
+            if !wall_normal_derivative.is_finite()
+                || !gradient_times_normal.is_finite()
+                || !normal_correction.is_finite()
+                || !transpose_gradient_times_normal.is_finite()
+                || !trace.is_finite()
+                || !normal_scalar.is_finite()
+            {
+                return Err(invalid(format!(
+                    "wall-force face {} reconstructed gradient exceeds the finite numeric range",
+                    face
+                )));
+            }
+
+            let fluid_viscous_traction =
+                (wall_normal_derivative + transpose_gradient_times_normal + normal * normal_scalar)
+                    * options.dynamic_viscosity;
+            let viscous_traction_on_body = fluid_viscous_traction * -1.0;
+            let wall_shear_traction_on_body =
+                viscous_traction_on_body - normal * viscous_traction_on_body.dot(normal);
+            let area = area_vector.magnitude();
+            let viscous_force_on_body = fluid_viscous_traction * -area;
+
+            let boundary_pressure = cell_pressure[owner];
+            let resolved_dynamic_pressure = scaled_pressure_difference(
+                boundary_pressure,
+                validated.pressure_reference,
+                pressure_scale,
+            );
+            let pressure_traction_on_body = normal * resolved_dynamic_pressure;
+            let pressure_force_on_body = area_vector * resolved_dynamic_pressure;
+            let total_force_on_body = pressure_force_on_body + viscous_force_on_body;
+
+            if !resolved_dynamic_pressure.is_finite()
+                || !pressure_traction_on_body.is_finite()
+                || !fluid_viscous_traction.is_finite()
+                || !viscous_traction_on_body.is_finite()
+                || !wall_shear_traction_on_body.is_finite()
+                || !pressure_force_on_body.is_finite()
+                || !viscous_force_on_body.is_finite()
+                || !total_force_on_body.is_finite()
+            {
+                return Err(invalid(format!(
+                    "wall-force face {} reconstructed contribution exceeds the finite numeric range",
+                    face
+                )));
+            }
+
+            pressure_force.add(pressure_force_on_body);
+            viscous_force.add(viscous_force_on_body);
+            faces.push(WallFaceForceContribution {
+                face_index: face,
+                owner_cell: owner,
+                area_vector: area_vector.into(),
+                boundary_pressure,
+                resolved_dynamic_pressure,
+                pressure_traction_on_body: pressure_traction_on_body.into(),
+                viscous_traction_on_body: viscous_traction_on_body.into(),
+                wall_shear_traction_on_body: wall_shear_traction_on_body.into(),
+                pressure_force_on_body: pressure_force_on_body.into(),
+                viscous_force_on_body: viscous_force_on_body.into(),
+                total_force_on_body: total_force_on_body.into(),
+            });
+            Ok(())
+        },
     )?;
-    let lift = directional_coefficients(
-        pressure_force,
-        viscous_force,
-        validated.lift_direction,
-        force_denominator,
+    debug_assert_eq!(faces.len(), validated.selected_faces);
+
+    let coefficients = wall_force_coefficients_from_totals(
+        pressure_force.total(),
+        viscous_force.total(),
+        patch_names.len(),
+        &validated,
+        &options,
     )?;
-    Ok(WallForceCoefficients {
-        pressure_force: pressure_force.into(),
-        viscous_force: viscous_force.into(),
-        total_force: total_force.into(),
-        drag,
-        lift,
-        selected_patches: patch_names.len(),
-        selected_faces: validated.selected_faces,
-        selected_area: validated.selected_area,
-        area_vector_sum: validated.area_vector_sum.into(),
-        resolved_pressure_reference: pressure_reference,
-        resolved_reference_area: validated.reference_area,
-        reference_dynamic_pressure,
+    Ok(ResolvedWallForceReport {
+        coefficients,
+        faces,
     })
 }
 
@@ -189,6 +318,49 @@ struct ValidatedRequest {
 }
 
 fn validate_request(
+    mesh: &SolverRuntimeMeshData,
+    cell_velocity: &[Point3],
+    cell_pressure: &[f64],
+    patch_names: &[&str],
+    options: &NoSlipWallForceOptions,
+) -> Result<ValidatedRequest> {
+    let validated =
+        validate_common_request(mesh, cell_velocity, cell_pressure, patch_names, options)?;
+    let pressure_scale = match options.pressure_kind {
+        PressureFieldKind::Kinematic => options.density,
+        PressureFieldKind::Dynamic => 1.0,
+    };
+    visit_selected_faces(
+        mesh,
+        patch_names,
+        |face, owner, area_vector, normal, distance| {
+            let velocity = Vec3::from(cell_velocity[owner]);
+            let trial_pressure = scaled_pressure_difference(
+                cell_pressure[owner],
+                validated.pressure_reference,
+                pressure_scale,
+            );
+            let trial_derivative = (velocity * -1.0) / distance;
+            let trial_traction = (trial_derivative + normal * (trial_derivative.dot(normal) / 3.0))
+                * options.dynamic_viscosity;
+            let pressure_force = area_vector * trial_pressure;
+            let viscous_force = trial_traction * -area_vector.magnitude();
+            if !trial_pressure.is_finite()
+                || !pressure_force.is_finite()
+                || !viscous_force.is_finite()
+            {
+                return Err(invalid(format!(
+                    "wall-force face {} contribution exceeds the finite numeric range",
+                    face
+                )));
+            }
+            Ok(())
+        },
+    )?;
+    Ok(validated)
+}
+
+fn validate_common_request(
     mesh: &SolverRuntimeMeshData,
     cell_velocity: &[Point3],
     cell_pressure: &[f64],
@@ -321,37 +493,6 @@ fn validate_request(
             "wall-force resolved pressure reference is not finite",
         ));
     }
-    let pressure_scale = match options.pressure_kind {
-        PressureFieldKind::Kinematic => options.density,
-        PressureFieldKind::Dynamic => 1.0,
-    };
-    visit_selected_faces(
-        mesh,
-        patch_names,
-        |face, owner, area_vector, normal, distance| {
-            let velocity = Vec3::from(cell_velocity[owner]);
-            let trial_pressure = scaled_pressure_difference(
-                cell_pressure[owner],
-                pressure_reference,
-                pressure_scale,
-            );
-            let trial_derivative = (velocity * -1.0) / distance;
-            let trial_traction = (trial_derivative + normal * (trial_derivative.dot(normal) / 3.0))
-                * options.dynamic_viscosity;
-            let pressure_force = area_vector * trial_pressure;
-            let viscous_force = trial_traction * -area_vector.magnitude();
-            if !trial_pressure.is_finite()
-                || !pressure_force.is_finite()
-                || !viscous_force.is_finite()
-            {
-                return Err(invalid(format!(
-                    "wall-force face {} contribution exceeds the finite numeric range",
-                    face
-                )));
-            }
-            Ok(())
-        },
-    )?;
 
     Ok(ValidatedRequest {
         selected_faces,
@@ -361,6 +502,98 @@ fn validate_request(
         reference_area,
         drag_direction,
         lift_direction,
+    })
+}
+
+fn validate_velocity_gradients(
+    mesh: &SolverRuntimeMeshData,
+    gradients: CellVelocityGradientComponents<'_>,
+) -> Result<()> {
+    for (label, values) in [
+        ("grad(Ux)", gradients.grad_ux),
+        ("grad(Uy)", gradients.grad_uy),
+        ("grad(Uz)", gradients.grad_uz),
+    ] {
+        if values.len() != mesh.cells {
+            return Err(invalid(format!(
+                "wall-force {} has {} values, expected {} mesh cells",
+                label,
+                values.len(),
+                mesh.cells
+            )));
+        }
+        for (cell, value) in values.iter().copied().enumerate() {
+            if !Vec3::from(value).is_finite() {
+                return Err(invalid(format!(
+                    "wall-force {} cell {} is not finite",
+                    label, cell
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn try_wall_face_contributions(capacity: usize) -> Result<Vec<WallFaceForceContribution>> {
+    let mut faces = Vec::new();
+    faces
+        .try_reserve_exact(capacity)
+        .map_err(|_| MeshError::OutOfMemory)?;
+    Ok(faces)
+}
+
+fn wall_force_coefficients_from_totals(
+    pressure_force: Vec3,
+    viscous_force: Vec3,
+    selected_patches: usize,
+    validated: &ValidatedRequest,
+    options: &NoSlipWallForceOptions,
+) -> Result<WallForceCoefficients> {
+    let total_force = pressure_force + viscous_force;
+    if !pressure_force.is_finite() || !viscous_force.is_finite() || !total_force.is_finite() {
+        return Err(invalid(
+            "wall-force accumulation exceeded the finite numeric range",
+        ));
+    }
+
+    let reference_dynamic_pressure =
+        (0.5 * options.density * options.reference_speed) * options.reference_speed;
+    if !reference_dynamic_pressure.is_finite() || reference_dynamic_pressure <= 0.0 {
+        return Err(invalid(
+            "wall-force reference dynamic pressure must be positive and finite",
+        ));
+    }
+    let force_denominator = reference_dynamic_pressure * validated.reference_area;
+    if !force_denominator.is_finite() || force_denominator <= 0.0 {
+        return Err(invalid(
+            "wall-force coefficient denominator must be positive and finite",
+        ));
+    }
+    let drag = directional_coefficients(
+        pressure_force,
+        viscous_force,
+        validated.drag_direction,
+        force_denominator,
+    )?;
+    let lift = directional_coefficients(
+        pressure_force,
+        viscous_force,
+        validated.lift_direction,
+        force_denominator,
+    )?;
+    Ok(WallForceCoefficients {
+        pressure_force: pressure_force.into(),
+        viscous_force: viscous_force.into(),
+        total_force: total_force.into(),
+        drag,
+        lift,
+        selected_patches,
+        selected_faces: validated.selected_faces,
+        selected_area: validated.selected_area,
+        area_vector_sum: validated.area_vector_sum.into(),
+        resolved_pressure_reference: validated.pressure_reference,
+        resolved_reference_area: validated.reference_area,
+        reference_dynamic_pressure,
     })
 }
 
@@ -644,6 +877,43 @@ impl CompensatedVec3 {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct VelocityGradient {
+    rows: [Vec3; 3],
+}
+
+impl VelocityGradient {
+    fn from_components(components: CellVelocityGradientComponents<'_>, cell: usize) -> Self {
+        Self {
+            rows: [
+                Vec3::from(components.grad_ux[cell]),
+                Vec3::from(components.grad_uy[cell]),
+                Vec3::from(components.grad_uz[cell]),
+            ],
+        }
+    }
+
+    fn times(self, vector: Vec3) -> Vec3 {
+        Vec3 {
+            x: self.rows[0].dot(vector),
+            y: self.rows[1].dot(vector),
+            z: self.rows[2].dot(vector),
+        }
+    }
+
+    fn transpose_times(self, vector: Vec3) -> Vec3 {
+        Vec3 {
+            x: self.rows[0].x * vector.x + self.rows[1].x * vector.y + self.rows[2].x * vector.z,
+            y: self.rows[0].y * vector.x + self.rows[1].y * vector.y + self.rows[2].y * vector.z,
+            z: self.rows[0].z * vector.x + self.rows[1].z * vector.y + self.rows[2].z * vector.z,
+        }
+    }
+
+    fn trace(self) -> f64 {
+        self.rows[0].x + self.rows[1].y + self.rows[2].z
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct Vec3 {
     x: f64,
@@ -751,8 +1021,11 @@ mod tests {
     use ferrum_mesh::runtime::{SolverRuntimeMeshData, SolverRuntimePatchRange};
 
     use super::{
-        NoSlipWallForceOptions, PressureFieldKind, PressureReference, ReferenceArea,
+        CellVelocityGradientComponents, CompensatedVec3, MeshError, NoSlipWallForceOptions,
+        PressureFieldKind, PressureReference, ReferenceArea, Vec3,
         integrate_stationary_no_slip_zero_gradient_pressure_wall_forces as integrate_stationary_no_slip_wall_forces,
+        integrate_stationary_no_slip_zero_gradient_pressure_wall_forces_with_reconstructed_gradient as integrate_reconstructed_wall_forces,
+        try_wall_face_contributions,
     };
 
     fn point(x: f64, y: f64, z: f64) -> Point3 {
@@ -769,6 +1042,18 @@ mod tests {
             reference_area: ReferenceArea::Explicit(1.0),
             drag_direction: point(1.0, 0.0, 0.0),
             lift_direction: point(0.0, 1.0, 0.0),
+        }
+    }
+
+    fn zero_gradients(cells: usize) -> [Vec<Point3>; 3] {
+        std::array::from_fn(|_| vec![point(0.0, 0.0, 0.0); cells])
+    }
+
+    fn gradient_components(gradients: &[Vec<Point3>; 3]) -> CellVelocityGradientComponents<'_> {
+        CellVelocityGradientComponents {
+            grad_ux: &gradients[0],
+            grad_uy: &gradients[1],
+            grad_uz: &gradients[2],
         }
     }
 
@@ -883,6 +1168,47 @@ mod tests {
             (actual - expected).abs() <= 1.0e-12,
             "expected {expected:.16e}, got {actual:.16e}"
         );
+    }
+
+    fn assert_point_bits_equal(actual: Point3, expected: Point3) {
+        assert_eq!(actual.x.to_bits(), expected.x.to_bits());
+        assert_eq!(actual.y.to_bits(), expected.y.to_bits());
+        assert_eq!(actual.z.to_bits(), expected.z.to_bits());
+    }
+
+    fn assert_coefficients_bits_equal(
+        actual: &super::WallForceCoefficients,
+        expected: &super::WallForceCoefficients,
+    ) {
+        assert_point_bits_equal(actual.pressure_force, expected.pressure_force);
+        assert_point_bits_equal(actual.viscous_force, expected.viscous_force);
+        assert_point_bits_equal(actual.total_force, expected.total_force);
+        for (actual, expected) in [
+            (actual.drag.pressure, expected.drag.pressure),
+            (actual.drag.viscous, expected.drag.viscous),
+            (actual.drag.total, expected.drag.total),
+            (actual.lift.pressure, expected.lift.pressure),
+            (actual.lift.viscous, expected.lift.viscous),
+            (actual.lift.total, expected.lift.total),
+            (actual.selected_area, expected.selected_area),
+            (
+                actual.resolved_pressure_reference,
+                expected.resolved_pressure_reference,
+            ),
+            (
+                actual.resolved_reference_area,
+                expected.resolved_reference_area,
+            ),
+            (
+                actual.reference_dynamic_pressure,
+                expected.reference_dynamic_pressure,
+            ),
+        ] {
+            assert_eq!(actual.to_bits(), expected.to_bits());
+        }
+        assert_point_bits_equal(actual.area_vector_sum, expected.area_vector_sum);
+        assert_eq!(actual.selected_patches, expected.selected_patches);
+        assert_eq!(actual.selected_faces, expected.selected_faces);
     }
 
     #[test]
@@ -1035,6 +1361,352 @@ mod tests {
         .expect("Couette traction");
         assert_close(report.viscous_force.x, 3.0);
         assert_close(report.drag.viscous, 3.0);
+    }
+
+    #[test]
+    fn reconstructed_zero_gradient_is_bit_identical_to_legacy_couette_aggregate() {
+        let mesh = boundary_mesh(
+            "wall",
+            vec![0],
+            vec![point(0.0, 1.0, 0.0)],
+            vec![point(0.0, 2.0, 0.0)],
+        );
+        let velocity = [point(3.0, 0.0, 0.0)];
+        let pressure = [2.0];
+        let request = options(PressureFieldKind::Dynamic);
+        let legacy = integrate_stationary_no_slip_wall_forces(
+            &mesh,
+            &velocity,
+            &pressure,
+            &["body"],
+            request,
+        )
+        .expect("legacy Couette force");
+        let gradients = zero_gradients(mesh.cells);
+        let reconstructed = integrate_reconstructed_wall_forces(
+            &mesh,
+            &velocity,
+            &pressure,
+            gradient_components(&gradients),
+            &["body"],
+            request,
+        )
+        .expect("reconstructed Couette force");
+
+        assert_coefficients_bits_equal(&reconstructed.coefficients, &legacy);
+        assert_eq!(reconstructed.faces.len(), 1);
+        let face = reconstructed.faces[0];
+        assert_eq!(face.face_index, 0);
+        assert_eq!(face.owner_cell, 0);
+        assert_eq!(face.boundary_pressure.to_bits(), pressure[0].to_bits());
+        assert_eq!(
+            face.viscous_force_on_body.x.to_bits(),
+            legacy.viscous_force.x.to_bits()
+        );
+        assert_close(face.viscous_force_on_body.y, legacy.viscous_force.y);
+        assert_close(face.viscous_force_on_body.z, legacy.viscous_force.z);
+        assert_close(face.wall_shear_traction_on_body.x, 1.5);
+        assert_close(face.wall_shear_traction_on_body.y, 0.0);
+        assert_close(face.wall_shear_traction_on_body.z, 0.0);
+    }
+
+    #[test]
+    fn reconstructed_full_tensor_matches_off_diagonal_trace_oracle() {
+        let mesh = boundary_mesh(
+            "wall",
+            vec![0],
+            vec![point(1.0, 0.0, 0.0)],
+            vec![point(2.0, 0.0, 0.0)],
+        );
+        let gradients = [
+            vec![point(1.0, 2.0, 3.0)],
+            vec![point(4.0, 5.0, 6.0)],
+            vec![point(7.0, 8.0, 9.0)],
+        ];
+        let report = integrate_reconstructed_wall_forces(
+            &mesh,
+            &[point(0.0, 0.0, 0.0)],
+            &[0.0],
+            gradient_components(&gradients),
+            &["body"],
+            options(PressureFieldKind::Dynamic),
+        )
+        .expect("full tensor traction");
+        let face = report.faces[0];
+
+        assert_close(face.viscous_traction_on_body.x, 14.0 / 3.0);
+        assert_close(face.viscous_traction_on_body.y, -1.0);
+        assert_close(face.viscous_traction_on_body.z, -1.5);
+        assert_close(face.wall_shear_traction_on_body.x, 0.0);
+        assert_close(face.wall_shear_traction_on_body.y, -1.0);
+        assert_close(face.wall_shear_traction_on_body.z, -1.5);
+        assert_close(face.viscous_force_on_body.x, 28.0 / 3.0);
+        assert_close(face.viscous_force_on_body.y, -2.0);
+        assert_close(face.viscous_force_on_body.z, -3.0);
+        assert_close(face.wall_shear_traction_on_body.x, 0.0);
+    }
+
+    #[test]
+    fn reconstructed_rigid_rotation_and_isotropic_expansion_have_zero_deviatoric_traction() {
+        let mesh = boundary_mesh(
+            "wall",
+            vec![0],
+            vec![point(1.0, 0.0, 0.0)],
+            vec![point(1.0, 0.0, 0.0)],
+        );
+        let rotation = [
+            vec![point(0.0, -2.0, 0.0)],
+            vec![point(2.0, 0.0, 0.0)],
+            vec![point(0.0, 0.0, 0.0)],
+        ];
+        let rotation_report = integrate_reconstructed_wall_forces(
+            &mesh,
+            &[point(0.0, -2.0, 0.0)],
+            &[0.0],
+            gradient_components(&rotation),
+            &["body"],
+            options(PressureFieldKind::Dynamic),
+        )
+        .expect("rigid rotation traction");
+        assert_close(rotation_report.faces[0].viscous_force_on_body.x, 0.0);
+        assert_close(rotation_report.faces[0].viscous_force_on_body.y, 0.0);
+        assert_close(rotation_report.faces[0].viscous_force_on_body.z, 0.0);
+
+        let expansion = [
+            vec![point(3.0, 0.0, 0.0)],
+            vec![point(0.0, 3.0, 0.0)],
+            vec![point(0.0, 0.0, 3.0)],
+        ];
+        let expansion_report = integrate_reconstructed_wall_forces(
+            &mesh,
+            &[point(-3.0, 0.0, 0.0)],
+            &[0.0],
+            gradient_components(&expansion),
+            &["body"],
+            options(PressureFieldKind::Dynamic),
+        )
+        .expect("isotropic expansion traction");
+        assert_close(expansion_report.faces[0].viscous_force_on_body.x, 0.0);
+        assert_close(expansion_report.faces[0].viscous_force_on_body.y, 0.0);
+        assert_close(expansion_report.faces[0].viscous_force_on_body.z, 0.0);
+    }
+
+    #[test]
+    fn reconstructed_face_order_gauge_and_aggregate_are_deterministic() {
+        let mut mesh = boundary_mesh(
+            "wall",
+            vec![0, 1, 2, 3],
+            vec![
+                point(1.0, 0.0, 0.0),
+                point(-1.0, 0.0, 0.0),
+                point(0.0, 1.0, 0.0),
+                point(0.0, -1.0, 0.0),
+            ],
+            vec![
+                point(1.0, 0.0, 0.0),
+                point(-1.0, 0.0, 0.0),
+                point(0.0, 1.0, 0.0),
+                point(0.0, -1.0, 0.0),
+            ],
+        );
+        mesh.patches = vec![
+            SolverRuntimePatchRange {
+                name: "first".to_string(),
+                patch_type: "wall".to_string(),
+                start_face: 0,
+                faces: 2,
+            },
+            SolverRuntimePatchRange {
+                name: "second".to_string(),
+                patch_type: "wall".to_string(),
+                start_face: 2,
+                faces: 2,
+            },
+        ];
+        let velocity = vec![
+            point(1.0, 2.0, 0.5),
+            point(2.0, -1.0, -0.25),
+            point(-1.0, 3.0, 0.75),
+            point(4.0, -2.0, -0.5),
+        ];
+        let pressure = [1.0, 4.0, 2.0, 3.0];
+        let shifted = pressure.map(|value| value + 11.0);
+        let gradients = [
+            vec![
+                point(0.2, 0.1, 0.0),
+                point(-0.3, 0.4, 0.0),
+                point(0.5, -0.2, 0.0),
+                point(-0.1, -0.6, 0.0),
+            ],
+            vec![
+                point(0.7, -0.1, 0.0),
+                point(0.2, 0.3, 0.0),
+                point(-0.4, 0.6, 0.0),
+                point(0.8, -0.2, 0.0),
+            ],
+            vec![
+                point(0.1, 0.0, -0.2),
+                point(-0.2, 0.0, 0.3),
+                point(0.3, 0.0, -0.4),
+                point(-0.4, 0.0, 0.5),
+            ],
+        ];
+        let mut request = options(PressureFieldKind::Dynamic);
+        request.pressure_reference = PressureReference::AreaVectorBalancedMean {
+            relative_area_vector_imbalance_tolerance: 1.0e-12,
+        };
+
+        let baseline = integrate_reconstructed_wall_forces(
+            &mesh,
+            &velocity,
+            &pressure,
+            gradient_components(&gradients),
+            &["second", "first"],
+            request,
+        )
+        .expect("ordered reconstructed loads");
+        let repeated = integrate_reconstructed_wall_forces(
+            &mesh,
+            &velocity,
+            &pressure,
+            gradient_components(&gradients),
+            &["second", "first"],
+            request,
+        )
+        .expect("repeated ordered reconstructed loads");
+        let gauge_shifted = integrate_reconstructed_wall_forces(
+            &mesh,
+            &velocity,
+            &shifted,
+            gradient_components(&gradients),
+            &["second", "first"],
+            request,
+        )
+        .expect("gauge-shifted reconstructed loads");
+
+        assert_eq!(
+            baseline
+                .faces
+                .iter()
+                .map(|face| face.face_index)
+                .collect::<Vec<_>>(),
+            [2, 3, 0, 1]
+        );
+        for (first, second) in baseline.faces.iter().zip(&repeated.faces) {
+            assert_eq!(
+                first.resolved_dynamic_pressure.to_bits(),
+                second.resolved_dynamic_pressure.to_bits()
+            );
+            assert_point_bits_equal(first.total_force_on_body, second.total_force_on_body);
+        }
+        assert!(
+            baseline.faces.iter().any(|face| {
+                face.viscous_force_on_body.x != 0.0
+                    || face.viscous_force_on_body.y != 0.0
+                    || face.viscous_force_on_body.z != 0.0
+            }),
+            "the aggregate proof must exercise nonzero viscous loads"
+        );
+        assert!(
+            baseline.faces.windows(2).any(|pair| {
+                pair[0].viscous_force_on_body.x.to_bits()
+                    != pair[1].viscous_force_on_body.x.to_bits()
+                    || pair[0].viscous_force_on_body.y.to_bits()
+                        != pair[1].viscous_force_on_body.y.to_bits()
+                    || pair[0].viscous_force_on_body.z.to_bits()
+                        != pair[1].viscous_force_on_body.z.to_bits()
+            }),
+            "the aggregate proof must exercise distinct per-face viscous loads"
+        );
+        assert_point_bits_equal(
+            baseline.coefficients.pressure_force,
+            gauge_shifted.coefficients.pressure_force,
+        );
+        assert_point_bits_equal(
+            baseline.coefficients.total_force,
+            gauge_shifted.coefficients.total_force,
+        );
+
+        let mut pressure_sum = CompensatedVec3::default();
+        let mut viscous_sum = CompensatedVec3::default();
+        for face in &baseline.faces {
+            pressure_sum.add(Vec3::from(face.pressure_force_on_body));
+            viscous_sum.add(Vec3::from(face.viscous_force_on_body));
+        }
+        assert_point_bits_equal(
+            pressure_sum.total().into(),
+            baseline.coefficients.pressure_force,
+        );
+        assert_point_bits_equal(
+            viscous_sum.total().into(),
+            baseline.coefficients.viscous_force,
+        );
+    }
+
+    #[test]
+    fn reconstructed_gradient_validation_and_allocation_fail_closed_without_caps() {
+        let mesh = boundary_mesh(
+            "wall",
+            vec![0],
+            vec![point(1.0, 0.0, 0.0)],
+            vec![point(1.0, 0.0, 0.0)],
+        );
+        let gradients = zero_gradients(mesh.cells);
+        let short = CellVelocityGradientComponents {
+            grad_ux: &[],
+            grad_uy: &gradients[1],
+            grad_uz: &gradients[2],
+        };
+        let short_error = integrate_reconstructed_wall_forces(
+            &mesh,
+            &[point(0.0, 0.0, 0.0)],
+            &[0.0],
+            short,
+            &["body"],
+            options(PressureFieldKind::Dynamic),
+        )
+        .expect_err("short gradient must fail");
+        assert!(short_error.to_string().contains("grad(Ux)"));
+
+        let non_finite = [
+            vec![point(f64::NAN, 0.0, 0.0)],
+            gradients[1].clone(),
+            gradients[2].clone(),
+        ];
+        let finite_error = integrate_reconstructed_wall_forces(
+            &mesh,
+            &[point(0.0, 0.0, 0.0)],
+            &[0.0],
+            gradient_components(&non_finite),
+            &["body"],
+            options(PressureFieldKind::Dynamic),
+        )
+        .expect_err("non-finite gradient must fail");
+        assert!(finite_error.to_string().contains("is not finite"));
+
+        let allocation_error =
+            try_wall_face_contributions(usize::MAX).expect_err("capacity overflow must fail");
+        assert!(matches!(allocation_error, MeshError::OutOfMemory));
+
+        let large = [
+            vec![point(1.0e200, 2.0e200, 0.0)],
+            vec![point(0.0, -1.0e200, 0.0)],
+            vec![point(0.0, 0.0, 5.0e199)],
+        ];
+        let mut scaled = options(PressureFieldKind::Dynamic);
+        scaled.dynamic_viscosity = 1.0e-200;
+        let accepted = integrate_reconstructed_wall_forces(
+            &mesh,
+            &[point(0.0, 0.0, 0.0)],
+            &[0.0],
+            gradient_components(&large),
+            &["body"],
+            scaled,
+        )
+        .expect("large finite gradient must not be magnitude-capped");
+        assert_close(accepted.faces[0].viscous_force_on_body.x, -1.0 / 3.0);
+        assert_close(accepted.faces[0].viscous_force_on_body.y, -2.0);
+        assert_close(accepted.faces[0].viscous_force_on_body.z, 0.0);
     }
 
     #[test]
