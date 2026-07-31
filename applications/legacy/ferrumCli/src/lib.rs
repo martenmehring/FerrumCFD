@@ -33,13 +33,13 @@ use ferrum_mesh::flow::{
     ContinuitySummary, FaceFluxDiagnosticSummary, FlowBoundarySummary, FlowOperatorSummary,
     LaminarSimpleConvectionScheme, LaminarSimpleFieldSummary, LaminarSimpleGradientScheme,
     LaminarSimpleInterpolationScheme, LaminarSimpleIterationSummary, LaminarSimpleLaplacianScheme,
-    LaminarSimpleLinearSolver, LaminarSimpleOptions, LaminarSimplePreconditioner,
-    LaminarSimpleReport, LaminarSimpleResidualControlSummary, LaminarSimpleSchemes,
-    LaminarSimpleSnGradScheme, LaminarSimpleStopReason, LinearSolveConvergenceSummary,
-    LinearSolveSummary, MatrixDiagnosticSummary, PressureAssemblyDiagnostics,
-    ScalarDiagnosticSummary, VectorDiagnosticSummary, solve_laminar_simple,
-    solve_laminar_simple_profiled_pcg, solve_laminar_simple_profiled_pcg_with_observer,
-    solve_laminar_simple_with_observer,
+    LaminarSimpleLinearSolver, LaminarSimpleMomentumExecution, LaminarSimpleOptions,
+    LaminarSimplePreconditioner, LaminarSimpleReport, LaminarSimpleResidualControlSummary,
+    LaminarSimpleSchemes, LaminarSimpleSnGradScheme, LaminarSimpleStopReason,
+    LinearSolveConvergenceSummary, LinearSolveSummary, MatrixDiagnosticSummary,
+    PressureAssemblyDiagnostics, ScalarDiagnosticSummary, VectorDiagnosticSummary,
+    solve_laminar_simple, solve_laminar_simple_profiled_pcg,
+    solve_laminar_simple_profiled_pcg_with_observer, solve_laminar_simple_with_observer,
 };
 use ferrum_mesh::foam::{FoamWriteOptions, write_openfoam_case_with_options};
 use ferrum_mesh::geometry::{GeometrySummary, summarize_case_geometry};
@@ -786,7 +786,8 @@ fn run_laminar_simple_solve(
     }
 
     println!(
-        "incompressibleFluid solve: backend=cpu linearSolver={} momentumLinearSolver={} momentumPreconditioner={} momentumRelTol={} pressureLinearSolver={} pressurePreconditioner={} pressureRelTol={} divPhiU=\"{}\" gradP=\"{}\" gradU=\"{}\" laplacian=\"{}\" snGrad=\"{}\" interpolation=\"{}\" pRefCell={} pRefValue={} nonOrthogonalCorrectors={} consistent={} stopReason={} cells={} faces={} simpleIterations={} minSimpleIterations={} converged={} residualControl={} initialContinuityL2={} finalContinuityL2={} momentumInitialResidual={} momentumFinalResidual={} momentumResidualNorm={} pressureInitialResidual={} pressureFinalResidual={} pressureResidualNorm={} momentumLinearIterations={} pressureLinearIterations={} wallClockSeconds={:.6}",
+        "incompressibleFluid solve: backend=cpu momentumExecution={} linearSolver={} momentumLinearSolver={} momentumPreconditioner={} momentumRelTol={} pressureLinearSolver={} pressurePreconditioner={} pressureRelTol={} divPhiU=\"{}\" gradP=\"{}\" gradU=\"{}\" laplacian=\"{}\" snGrad=\"{}\" interpolation=\"{}\" pRefCell={} pRefValue={} nonOrthogonalCorrectors={} consistent={} stopReason={} cells={} faces={} simpleIterations={} minSimpleIterations={} converged={} residualControl={} initialContinuityL2={} finalContinuityL2={} momentumInitialResidual={} momentumFinalResidual={} momentumResidualNorm={} pressureInitialResidual={} pressureFinalResidual={} pressureResidualNorm={} momentumLinearIterations={} pressureLinearIterations={} wallClockSeconds={:.6}",
+        options.momentum_execution,
         options.linear_solver,
         options.momentum_linear_solver,
         options.momentum_preconditioner,
@@ -2130,6 +2131,9 @@ fn resolve_laminar_simple_options(
         dynamic_viscosity,
         linear_solver,
         momentum_linear_solver,
+        momentum_execution: solve
+            .momentum_execution
+            .unwrap_or(LaminarSimpleMomentumExecution::Serial),
         pressure_linear_solver,
         momentum_preconditioner,
         pressure_preconditioner,
@@ -4289,6 +4293,13 @@ fn write_json_laminar_simple_options(
     write_json_string_field(
         writer,
         4,
+        "momentumExecution",
+        &options.momentum_execution.to_string(),
+    )?;
+    writeln!(writer, ",")?;
+    write_json_string_field(
+        writer,
+        4,
         "momentumPreconditioner",
         &options.momentum_preconditioner.to_string(),
     )?;
@@ -5551,6 +5562,11 @@ fn write_laminar_simple_report_markdown(
         writer,
         "| Momentum linear solver | {} |",
         options.momentum_linear_solver
+    )?;
+    writeln!(
+        writer,
+        "| Momentum execution | {} |",
+        options.momentum_execution
     )?;
     writeln!(
         writer,
@@ -7944,6 +7960,7 @@ struct LaminarSimpleSolveArgs {
     dynamic_viscosity: Option<f64>,
     linear_solver: Option<LaminarSimpleLinearSolver>,
     momentum_linear_solver: Option<LaminarSimpleLinearSolver>,
+    momentum_execution: Option<LaminarSimpleMomentumExecution>,
     pressure_linear_solver: Option<LaminarSimpleLinearSolver>,
     momentum_preconditioner: Option<LaminarSimplePreconditioner>,
     pressure_preconditioner: Option<LaminarSimplePreconditioner>,
@@ -8051,6 +8068,7 @@ fn parse_solver_args_for_invocation(
     let mut linear_solve_option_seen = false;
     let mut laminar_linear_solver = None;
     let mut momentum_linear_solver = None;
+    let mut momentum_execution = None;
     let mut pressure_linear_solver = None;
     let mut momentum_preconditioner = None;
     let mut pressure_preconditioner = None;
@@ -8198,6 +8216,14 @@ fn parse_solver_args_for_invocation(
                         .to_string()
                 })?;
                 momentum_linear_solver = Some(parse_laminar_simple_linear_solver(value)?);
+                laminar_simple_option_seen = true;
+                index += 2;
+            }
+            "--momentumExecution" | "--momentum-execution" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--momentumExecution requires 'serial' or 'parallel-components'".to_string()
+                })?;
+                momentum_execution = Some(parse_laminar_simple_momentum_execution(value)?);
                 laminar_simple_option_seen = true;
                 index += 2;
             }
@@ -8564,6 +8590,7 @@ fn parse_solver_args_for_invocation(
             dynamic_viscosity,
             linear_solver: laminar_linear_solver,
             momentum_linear_solver,
+            momentum_execution,
             pressure_linear_solver,
             momentum_preconditioner,
             pressure_preconditioner,
@@ -8658,6 +8685,18 @@ fn parse_laminar_simple_linear_solver(value: &str) -> Result<LaminarSimpleLinear
 
 fn parse_laminar_simple_preconditioner(value: &str) -> Result<LaminarSimplePreconditioner, String> {
     parse_openfoam_laminar_preconditioner(value)
+}
+
+fn parse_laminar_simple_momentum_execution(
+    value: &str,
+) -> Result<LaminarSimpleMomentumExecution, String> {
+    match value {
+        "serial" => Ok(LaminarSimpleMomentumExecution::Serial),
+        "parallel-components" => Ok(LaminarSimpleMomentumExecution::ParallelComponents),
+        other => Err(format!(
+            "invalid --momentumExecution value '{other}'; expected 'serial' or 'parallel-components'"
+        )),
+    }
 }
 
 fn parse_bool_value(value: &str) -> Option<bool> {
@@ -8956,6 +8995,7 @@ fn print_ferrum_run_usage() {
     println!("  --mu <Pa.s>                      override case dynamic viscosity");
     println!("  --linearSolver <name>            override both equation solvers");
     println!("  --momentumLinearSolver <name>    override the U solver");
+    println!("  --momentumExecution <mode>       serial or parallel-components U solves");
     println!("  --pressureLinearSolver <name>    override the p solver");
     println!("  --momentumPreconditioner <name>  override the U preconditioner");
     println!("  --pressurePreconditioner <name>  override the p preconditioner");
@@ -9066,8 +9106,9 @@ mod tests {
     use ferrum_mesh::control::ControlDict;
     use ferrum_mesh::flow::{
         LaminarSimpleConvectionScheme, LaminarSimpleGradientScheme, LaminarSimpleLaplacianScheme,
-        LaminarSimpleLinearSolver, LaminarSimplePreconditioner, LaminarSimpleSnGradScheme,
-        LaminarSimpleStopReason, LinearSolveConvergenceSummary, LinearSolveStopReason,
+        LaminarSimpleLinearSolver, LaminarSimpleMomentumExecution, LaminarSimplePreconditioner,
+        LaminarSimpleSnGradScheme, LaminarSimpleStopReason, LinearSolveConvergenceSummary,
+        LinearSolveStopReason,
     };
     use ferrum_mesh::linear::{
         GamgAgglomerator, GamgAggregateSizeBin, GamgHierarchyDiagnostics,
@@ -9351,6 +9392,8 @@ mod tests {
             "998.2".to_string(),
             "--mu".to_string(),
             "0.001002".to_string(),
+            "--momentumExecution".to_string(),
+            "parallel-components".to_string(),
             "--maxSimpleIterations".to_string(),
             "7".to_string(),
             "--minSimpleIterations".to_string(),
@@ -9385,6 +9428,10 @@ mod tests {
         assert_eq!(solve.dynamic_viscosity, Some(0.001002));
         assert_eq!(solve.linear_solver, None);
         assert_eq!(solve.momentum_linear_solver, None);
+        assert_eq!(
+            solve.momentum_execution,
+            Some(LaminarSimpleMomentumExecution::ParallelComponents)
+        );
         assert_eq!(solve.pressure_linear_solver, None);
         assert_eq!(solve.momentum_preconditioner, None);
         assert_eq!(solve.pressure_preconditioner, None);
@@ -9780,6 +9827,7 @@ mod tests {
         let csv = std::fs::read_to_string(base.join("residual.csv"))
             .expect("CSV report should be readable");
         assert!(json.contains("\"momentumLinearRelativeTolerance\": 0.125"));
+        assert!(json.contains("\"momentumExecution\": \"serial\""));
         assert!(json.contains("\"pressureLinearRelativeTolerance\": 1.25"));
         assert!(json.contains("\"profilePcg\": false"));
         assert!(!markdown.contains("## Pressure PCG Kernel Profile"));
@@ -9792,6 +9840,7 @@ mod tests {
         assert!(json.contains("\"effectiveNormalizedTolerance\": 0.125"));
         assert!(json.contains("\"stopReason\": \"RelativeTolerance\""));
         assert!(markdown.contains("| Momentum linear relative tolerance | 1.250000e-1 |"));
+        assert!(markdown.contains("| Momentum execution | serial |"));
         assert!(markdown.contains("| Pressure linear relative tolerance | 1.250000e0 |"));
         assert!(markdown.contains("| U solve diagnostics | p solve diagnostics |"));
         assert!(markdown.contains(
@@ -10924,6 +10973,54 @@ mod tests {
     }
 
     #[test]
+    fn parses_laminar_simple_momentum_execution_aliases_and_rejects_invalid_values() {
+        for flag in ["--momentumExecution", "--momentum-execution"] {
+            let parsed = parse_incompressible_fluid_args(&[
+                flag.to_string(),
+                "parallel-components".to_string(),
+            ])
+            .expect("parallel momentum execution should parse");
+            let solve = parsed
+                .laminar_simple_solve
+                .expect("laminar SIMPLE solve args");
+            assert_eq!(
+                solve.momentum_execution,
+                Some(LaminarSimpleMomentumExecution::ParallelComponents)
+            );
+        }
+
+        let parsed = parse_incompressible_fluid_args(&[
+            "--momentum-execution".to_string(),
+            "serial".to_string(),
+        ])
+        .expect("serial momentum execution should parse");
+        assert_eq!(
+            parsed
+                .laminar_simple_solve
+                .expect("laminar SIMPLE solve args")
+                .momentum_execution,
+            Some(LaminarSimpleMomentumExecution::Serial)
+        );
+
+        let missing = parse_incompressible_fluid_args(&["--momentumExecution".to_string()])
+            .expect_err("missing momentum execution value must fail");
+        assert_eq!(
+            missing,
+            "--momentumExecution requires 'serial' or 'parallel-components'"
+        );
+
+        let invalid = parse_incompressible_fluid_args(&[
+            "--momentumExecution".to_string(),
+            "parallel".to_string(),
+        ])
+        .expect_err("invalid momentum execution value must fail");
+        assert_eq!(
+            invalid,
+            "invalid --momentumExecution value 'parallel'; expected 'serial' or 'parallel-components'"
+        );
+    }
+
+    #[test]
     fn rejects_bicgstab_for_scalar_diffusion_generic_solver() {
         let args = vec![
             "--solveScalarDiffusion".to_string(),
@@ -11005,10 +11102,34 @@ mod tests {
             LaminarSimpleLinearSolver::SymGaussSeidel
         );
         assert_eq!(
+            options.momentum_execution,
+            LaminarSimpleMomentumExecution::Serial
+        );
+        assert_eq!(
             options.pressure_linear_solver,
             LaminarSimpleLinearSolver::Pcg
         );
         assert_eq!(options.max_simple_iterations, 100);
+    }
+
+    #[test]
+    fn laminar_simple_resolves_explicit_parallel_momentum_execution() {
+        let plan = laminar_simple_test_plan(1000.0, 0.001002);
+        let parsed = parse_incompressible_fluid_args(&[
+            "--momentumExecution".to_string(),
+            "parallel-components".to_string(),
+        ])
+        .expect("solver args should parse");
+        let solve = parsed
+            .laminar_simple_solve
+            .expect("laminar SIMPLE solve args");
+        let options = resolve_laminar_simple_options(&plan, &solve)
+            .expect("parallel momentum execution should resolve");
+
+        assert_eq!(
+            options.momentum_execution,
+            LaminarSimpleMomentumExecution::ParallelComponents
+        );
     }
 
     #[test]
@@ -11250,6 +11371,7 @@ mod tests {
             dynamic_viscosity: 0.001,
             linear_solver: LaminarSimpleLinearSolver::Cg,
             momentum_linear_solver: LaminarSimpleLinearSolver::Cg,
+            momentum_execution: LaminarSimpleMomentumExecution::Serial,
             pressure_linear_solver: LaminarSimpleLinearSolver::Cg,
             momentum_preconditioner: LaminarSimplePreconditioner::None,
             pressure_preconditioner: LaminarSimplePreconditioner::None,
