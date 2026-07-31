@@ -5,10 +5,10 @@ use crate::linear::gamg::{NormalizedL1GamgSolveControls, OPENFOAM_RELATIVE_TOLER
 use crate::linear::{
     BiCgStabOptions, CgPreconditioner, ConjugateGradientOptions, CsrMatrix, CsrSparsityPattern,
     GamgAgglomerator, GamgFacePairWeight, GamgKernelTiming, GamgOptions, GamgSolveControls,
-    GamgWorkspace, GaussSeidelOptions, IterativeSolveTermination, JacobiOptions, PcgKernelTiming,
-    PreconditionedConjugateGradientOptions, PreconditionedConjugateGradientWorkspace,
-    bicgstab_solve, conjugate_gradient_solve, gauss_seidel_solve, jacobi_solve, l2_norm,
-    preconditioned_conjugate_gradient_solve, symmetric_gauss_seidel_solve,
+    GamgWorkspace, GaussSeidelOptions, IterativeSolveTermination, JacobiOptions,
+    NormalizedL1PcgSolveControls, PcgKernelTiming, PreconditionedConjugateGradientWorkspace,
+    PreparedPcgInitialTiming, PreparedPcgResidual, bicgstab_solve, conjugate_gradient_solve,
+    gauss_seidel_solve, jacobi_solve, l2_norm, symmetric_gauss_seidel_solve,
 };
 use crate::runtime::{SolverRuntimeData, SolverRuntimeMeshData};
 use crate::solver_state::SolverStateFieldKind;
@@ -2241,16 +2241,61 @@ fn solve_scalar_system_with_workspaces(
         residual,
     } = scalar_workspace;
     let initial_values = initial.unwrap_or(zero_initial);
-    matrix.matvec_into(initial_values, matrix_product)?;
-    let normalisation_factor =
-        ldu_l1_residual_normalisation_factor(matrix, rhs, initial_values, matrix_product)?;
-    for ((residual_value, source), matrix_value) in
-        residual.iter_mut().zip(rhs).zip(matrix_product.iter())
-    {
-        *residual_value = source - matrix_value;
-    }
-    let initial_residual_norm = l2_norm(residual);
-    let initial_l1_residual_norm = l1_norm(residual);
+    let (
+        normalisation_factor,
+        initial_residual_norm,
+        initial_l1_residual_norm,
+        prepared_pcg_residual,
+        prepared_pcg_timing,
+    ) = if controls.solver == LaminarSimpleLinearSolver::Pcg {
+        let profile_prepared_pcg = controls.profile_pcg;
+        let prepared_total_started = profile_prepared_pcg.then(Instant::now);
+        let prepared_matrix_vector_started = profile_prepared_pcg.then(Instant::now);
+        matrix.matvec_into(initial_values, matrix_product)?;
+        let prepared_matrix_vector_seconds = prepared_matrix_vector_started
+            .map(|started| started.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
+        let normalisation_factor =
+            ldu_l1_residual_normalisation_factor(matrix, rhs, initial_values, matrix_product)?;
+        let prepared_residual_started = profile_prepared_pcg.then(Instant::now);
+        let prepared_residual =
+            PreparedPcgResidual::write_from_rhs_and_matrix_product(residual, rhs, matrix_product)?;
+        let prepared_vector_operation_seconds = prepared_residual_started
+            .map(|started| started.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
+        let prepared_pcg_timing = PreparedPcgInitialTiming {
+            total_seconds: prepared_total_started
+                .map(|started| started.elapsed().as_secs_f64())
+                .unwrap_or(0.0),
+            matrix_vector_seconds: prepared_matrix_vector_seconds,
+            vector_operation_seconds: prepared_vector_operation_seconds,
+        };
+        (
+            normalisation_factor,
+            prepared_residual.residual_squared().sqrt(),
+            prepared_residual.initial_l1_residual_norm(),
+            Some(prepared_residual),
+            prepared_pcg_timing,
+        )
+    } else {
+        matrix.matvec_into(initial_values, matrix_product)?;
+        let normalisation_factor =
+            ldu_l1_residual_normalisation_factor(matrix, rhs, initial_values, matrix_product)?;
+        for ((residual_value, source), matrix_value) in
+            residual.iter_mut().zip(rhs).zip(matrix_product.iter())
+        {
+            *residual_value = source - matrix_value;
+        }
+        let initial_residual_norm = l2_norm(residual);
+        let initial_l1_residual_norm = l1_norm(residual);
+        (
+            normalisation_factor,
+            initial_residual_norm,
+            initial_l1_residual_norm,
+            None::<PreparedPcgResidual<'_>>,
+            PreparedPcgInitialTiming::default(),
+        )
+    };
     let initial_normalized_residual_norm = initial_l1_residual_norm / normalisation_factor;
     let (effective_normalized_tolerance, dominant_tolerance_reason) =
         effective_normalized_tolerance_and_reason(
@@ -2269,7 +2314,10 @@ fn solve_scalar_system_with_workspaces(
     } else {
         initial_normalized_residual_norm < effective_normalized_tolerance
     };
-    if initially_converged && gamg_min_iterations == 0 {
+    if initially_converged
+        && gamg_min_iterations == 0
+        && controls.solver != LaminarSimpleLinearSolver::Pcg
+    {
         return Ok(ScalarSolveReport {
             solution: initial_values.to_vec(),
             iterations: 0,
@@ -2410,32 +2458,67 @@ fn solve_scalar_system_with_workspaces(
             None,
         ),
         LaminarSimpleLinearSolver::Pcg => {
-            let pcg_options = PreconditionedConjugateGradientOptions {
+            let pcg_controls = NormalizedL1PcgSolveControls {
                 max_iterations: controls.max_iterations,
-                tolerance: solver_tolerance,
+                normalization_factor: normalisation_factor,
+                tolerance: controls.tolerance,
+                relative_tolerance: controls.relative_tolerance,
                 preconditioner: map_cg_preconditioner(controls.preconditioner),
             };
+            let prepared_residual = prepared_pcg_residual.ok_or_else(|| {
+                invalid_input("PCG solve requires a prepared initial residual".to_string())
+            })?;
             if controls.profile_pcg {
                 if let Some(workspace) = pcg_workspace {
-                    let profiled = workspace.solve_profiled(matrix, rhs, initial, pcg_options)?;
+                    let profiled = workspace.solve_normalized_l1_prepared_profiled(
+                        matrix,
+                        rhs,
+                        initial,
+                        prepared_residual,
+                        prepared_pcg_timing,
+                        pcg_controls,
+                    )?;
                     (profiled.report, Some(profiled.timing), None)
                 } else {
                     let mut workspace = PreconditionedConjugateGradientWorkspace::new(
                         matrix,
-                        pcg_options.preconditioner,
+                        pcg_controls.preconditioner,
                     )?;
-                    let profiled = workspace.solve_profiled(matrix, rhs, initial, pcg_options)?;
+                    let profiled = workspace.solve_normalized_l1_prepared_profiled(
+                        matrix,
+                        rhs,
+                        initial,
+                        prepared_residual,
+                        prepared_pcg_timing,
+                        pcg_controls,
+                    )?;
                     (profiled.report, Some(profiled.timing), None)
                 }
             } else if let Some(workspace) = pcg_workspace {
                 (
-                    workspace.solve(matrix, rhs, initial, pcg_options)?,
+                    workspace.solve_normalized_l1_prepared(
+                        matrix,
+                        rhs,
+                        initial,
+                        prepared_residual,
+                        pcg_controls,
+                    )?,
                     None,
                     None,
                 )
             } else {
+                let mut workspace = PreconditionedConjugateGradientWorkspace::new(
+                    matrix,
+                    pcg_controls.preconditioner,
+                )?;
                 (
-                    preconditioned_conjugate_gradient_solve(matrix, rhs, initial, pcg_options)?,
+                    workspace.solve_normalized_l1_prepared(
+                        matrix,
+                        rhs,
+                        initial,
+                        prepared_residual,
+                        pcg_controls,
+                    )?,
                     None,
                     None,
                 )
@@ -6140,8 +6223,9 @@ mod tests {
     use crate::fields::{FieldBoundaryPatch, FieldFile, FieldValueSummary, InitialFieldSet};
     use crate::linear::{
         CgPreconditioner, CsrMatrix, GamgAgglomerator, GamgOptions, GamgWorkspace,
-        IterativeSolveTermination, PreconditionedConjugateGradientOptions,
-        PreconditionedConjugateGradientWorkspace,
+        IterativeSolveTermination, NormalizedL1PcgSolveControls,
+        PreconditionedConjugateGradientOptions, PreconditionedConjugateGradientWorkspace,
+        PreparedPcgInitialTiming, PreparedPcgResidual,
     };
     use crate::runtime::{
         SolverRuntimeData, SolverRuntimeFieldBuffer, SolverRuntimeMeshData, SolverRuntimePatchRange,
@@ -9287,6 +9371,102 @@ mod tests {
                 2.0f64.to_bits()
             );
         }
+    }
+
+    #[test]
+    fn pcg_flow_entrypoint_reuses_prepared_residual_and_matches_direct_profiled_solve() {
+        let matrix =
+            CsrMatrix::from_rows(vec![vec![(0, 4.0), (1, 1.0)], vec![(0, 1.0), (1, 3.0)]], 2)
+                .expect("flow PCG matrix");
+        let rhs = [1.0, 2.0];
+        let initial = [0.0, 0.0];
+        let matrix_product = matrix.matvec(&initial).expect("initial matrix product");
+        let normalization_factor =
+            super::ldu_l1_residual_normalisation_factor(&matrix, &rhs, &initial, &matrix_product)
+                .expect("normalization factor");
+        let tolerance = (0.75 / normalization_factor).next_up();
+
+        let mut scalar_workspace = super::ScalarSolveWorkspace::new(2);
+        let mut flow_workspace =
+            PreconditionedConjugateGradientWorkspace::new(&matrix, CgPreconditioner::None)
+                .expect("flow PCG workspace");
+        let flow_report = super::solve_scalar_system_with_workspaces(
+            &matrix,
+            &rhs,
+            Some(&initial),
+            super::ScalarSolveControls {
+                solver: LaminarSimpleLinearSolver::Pcg,
+                preconditioner: LaminarSimplePreconditioner::None,
+                tolerance,
+                relative_tolerance: 0.0,
+                max_iterations: 2,
+                gamg_options: None,
+                profile_gamg: false,
+                profile_pcg: true,
+            },
+            &mut scalar_workspace,
+            Some(&mut flow_workspace),
+            None,
+        )
+        .expect("flow prepared PCG solve");
+
+        let mut direct_workspace =
+            PreconditionedConjugateGradientWorkspace::new(&matrix, CgPreconditioner::None)
+                .expect("direct PCG workspace");
+        let mut direct_prepared_values = vec![0.0; rhs.len()];
+        let direct_prepared_residual = PreparedPcgResidual::write_from_rhs_and_matrix_product(
+            &mut direct_prepared_values,
+            &rhs,
+            &matrix_product,
+        )
+        .expect("direct prepared residual");
+        let direct = direct_workspace
+            .solve_normalized_l1_prepared_profiled(
+                &matrix,
+                &rhs,
+                Some(&initial),
+                direct_prepared_residual,
+                PreparedPcgInitialTiming::default(),
+                NormalizedL1PcgSolveControls {
+                    max_iterations: 2,
+                    normalization_factor,
+                    tolerance,
+                    relative_tolerance: 0.0,
+                    preconditioner: CgPreconditioner::None,
+                },
+            )
+            .expect("direct prepared PCG solve");
+
+        assert_eq!(flow_report.iterations, direct.report.iterations);
+        assert_eq!(flow_report.termination, direct.report.termination);
+        assert_eq!(
+            flow_report.residual_norm.to_bits(),
+            direct.report.residual_norm.to_bits()
+        );
+        assert_eq!(
+            flow_report
+                .solution
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            direct
+                .report
+                .solution
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        let timing = flow_report.pcg_timing.expect("flow PCG timing");
+        assert_eq!(
+            timing.matrix_vector_products,
+            flow_report.iterations + 1,
+            "the prepared flow matvec must be counted once without a duplicate initial A*x"
+        );
+        assert_eq!(timing.preconditioner_applications, flow_report.iterations);
+        assert_eq!(
+            direct.timing.matrix_vector_products,
+            direct.report.iterations + 1
+        );
     }
 
     #[test]
