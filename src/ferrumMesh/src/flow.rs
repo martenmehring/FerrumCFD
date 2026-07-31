@@ -1022,16 +1022,18 @@ fn solve_laminar_simple_driven(
             driver(iteration, &mut phi_hby_a, Some(&coupling_pressure_boundary));
         }
         let phi_hby_a_before_adjust_summary = summarize_face_fluxes(&runtime.mesh, &phi_hby_a);
-        let adjust_phi_summary = adjust_phi_hby_a(
+        let adjust_phi_summary = adjust_phi_hby_a_with_pressure_geometry(
             &runtime.mesh,
+            &mesh_cache.pressure_geometry,
             &velocity_boundary,
             &coupling_pressure_boundary,
             &mut phi_hby_a,
         )?;
         let phi_hby_a_after_adjust_summary = summarize_face_fluxes(&runtime.mesh, &phi_hby_a);
         if options.simple_consistent {
-            let consistent_phi_correction = consistent_phi_hby_a_pressure_correction(
+            let consistent_phi_correction = consistent_phi_hby_a_pressure_correction_with_geometry(
                 &runtime.mesh,
+                &mesh_cache.pressure_geometry,
                 &pressure,
                 &coupling_pressure_boundary,
                 &r_au,
@@ -1092,8 +1094,9 @@ fn solve_laminar_simple_driven(
             stop_reason = Some(LaminarSimpleStopReason::SolverInvalidState);
             break;
         }
-        let constrained_pressure_boundary = constrained_pressure_treatments(
+        let constrained_pressure_boundary = constrained_pressure_treatments_with_geometry(
             &runtime.mesh,
+            &mesh_cache.pressure_geometry,
             &coupling_pressure_boundary,
             &velocity_boundary,
             &predicted_velocity,
@@ -1135,20 +1138,22 @@ fn solve_laminar_simple_driven(
                 .as_ref()
                 .map(|report: &ScalarSolveReport| report.solution.as_slice())
                 .unwrap_or(&pressure);
-            let pressure_equation_flux =
-                if apply_non_orthogonal_correction && options.non_orthogonal_correctors > 0 {
-                    let non_orthogonal_flux = non_orthogonal_pressure_flux_correction(
-                        &runtime.mesh,
-                        &mesh_cache.scalar_gradient,
-                        initial_pressure,
-                        &r_at_u,
-                        &constrained_pressure_boundary,
-                        options.schemes.grad_p,
-                    )?;
-                    add_face_fluxes(&phi_hby_a, &non_orthogonal_flux)?
-                } else {
-                    phi_hby_a.clone()
-                };
+            let pressure_equation_flux = if apply_non_orthogonal_correction
+                && options.non_orthogonal_correctors > 0
+            {
+                let non_orthogonal_flux = non_orthogonal_pressure_flux_correction_with_geometry(
+                    &runtime.mesh,
+                    &mesh_cache.pressure_geometry,
+                    &mesh_cache.scalar_gradient,
+                    initial_pressure,
+                    &r_at_u,
+                    &constrained_pressure_boundary,
+                    options.schemes.grad_p,
+                )?;
+                add_face_fluxes(&phi_hby_a, &non_orthogonal_flux)?
+            } else {
+                phi_hby_a.clone()
+            };
             pressure_equation_flux_summary =
                 summarize_face_fluxes(&runtime.mesh, &pressure_equation_flux);
             let pressure_source = pressure_correction_source(
@@ -1156,9 +1161,10 @@ fn solve_laminar_simple_driven(
                 &net_cell_flux(&runtime.mesh, &pressure_equation_flux)?,
             )?;
             pressure_source_summary = summarize_scalars(&pressure_source);
-            assemble_variable_scalar_component_system_into(
+            assemble_variable_scalar_component_system_into_with_pressure_geometry(
                 &runtime.mesh,
                 &mesh_cache.momentum,
+                &mesh_cache.pressure_geometry,
                 &r_at_u,
                 &pressure_source,
                 &constrained_pressure_boundary,
@@ -1357,8 +1363,9 @@ fn solve_laminar_simple_driven(
         let corrected_velocity =
             velocity_from_hby_a(&runtime.mesh, &hby_a, &corrected_pressure_gradient, &r_at_u)?;
 
-        let pressure_flux = pressure_equation_flux(
+        let pressure_flux = pressure_equation_flux_with_geometry(
             &runtime.mesh,
+            &mesh_cache.pressure_geometry,
             pressure_solution,
             &r_at_u,
             &constrained_pressure_boundary,
@@ -1788,9 +1795,22 @@ struct ScalarGradientGeometry {
     inverse_cell_volumes: Vec<f64>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PressureFaceGeometry {
+    area_magnitude: f64,
+    projected_distance: f64,
+    centre_distance: f64,
+    non_orthogonal_area_vector: Point3,
+}
+
+struct PressureGeometryCache {
+    faces: Vec<PressureFaceGeometry>,
+}
+
 struct LaminarSimpleMeshCache {
     momentum: MomentumCsrPattern,
     scalar_gradient: ScalarGradientGeometry,
+    pressure_geometry: PressureGeometryCache,
     gamg_face_area_weights: Vec<GamgFacePairWeight>,
 }
 
@@ -1799,8 +1819,53 @@ impl LaminarSimpleMeshCache {
         Ok(Self {
             momentum: MomentumCsrPattern::from_mesh(mesh)?,
             scalar_gradient: ScalarGradientGeometry::from_mesh(mesh)?,
+            pressure_geometry: PressureGeometryCache::from_mesh(mesh),
             gamg_face_area_weights: gamg_face_area_pair_weights(mesh)?,
         })
+    }
+}
+
+impl PressureGeometryCache {
+    fn from_mesh(mesh: &SolverRuntimeMeshData) -> Self {
+        let mut faces = Vec::with_capacity(mesh.faces);
+        for face_index in 0..mesh.faces {
+            let owner = mesh.owner[face_index];
+            let from = mesh.cell_centres[owner];
+            let to = mesh.neighbour[face_index]
+                .map(|neighbour| mesh.cell_centres[neighbour])
+                .unwrap_or(mesh.face_centres[face_index]);
+            let area_vector = mesh.face_area_vectors[face_index];
+            let area_magnitude = magnitude(area_vector);
+            let delta = Point3 {
+                x: to.x - from.x,
+                y: to.y - from.y,
+                z: to.z - from.z,
+            };
+            let projected_distance = (dot(delta, area_vector) / area_magnitude).abs();
+            let centre_distance = distance(from, to);
+            let direction = Point3 {
+                x: (to.x - from.x) / centre_distance,
+                y: (to.y - from.y) / centre_distance,
+                z: (to.z - from.z) / centre_distance,
+            };
+            let orthogonal_area = dot(area_vector, direction);
+            let non_orthogonal_area_vector = Point3 {
+                x: area_vector.x - orthogonal_area * direction.x,
+                y: area_vector.y - orthogonal_area * direction.y,
+                z: area_vector.z - orthogonal_area * direction.z,
+            };
+            faces.push(PressureFaceGeometry {
+                area_magnitude,
+                projected_distance,
+                centre_distance,
+                non_orthogonal_area_vector,
+            });
+        }
+        Self { faces }
+    }
+
+    fn face(&self, face_index: usize) -> PressureFaceGeometry {
+        self.faces[face_index]
     }
 }
 
@@ -3427,13 +3492,15 @@ fn assemble_variable_scalar_component_system(
     boundary: &[ScalarFaceTreatment],
 ) -> Result<ScalarComponentSystem> {
     let pattern = MomentumCsrPattern::from_mesh(mesh)?;
+    let pressure_geometry = PressureGeometryCache::from_mesh(mesh);
     let mut system = ScalarComponentSystem {
         matrix: CsrMatrix::from_pattern(&pattern.sparsity, vec![0.0; pattern.sparsity.nnz()])?,
         rhs: vec![0.0; mesh.cells],
     };
-    assemble_variable_scalar_component_system_into(
+    assemble_variable_scalar_component_system_into_with_pressure_geometry(
         mesh,
         &pattern,
+        &pressure_geometry,
         cell_diffusivity,
         volumetric_source,
         boundary,
@@ -3442,9 +3509,10 @@ fn assemble_variable_scalar_component_system(
     Ok(system)
 }
 
-fn assemble_variable_scalar_component_system_into(
+fn assemble_variable_scalar_component_system_into_with_pressure_geometry(
     mesh: &SolverRuntimeMeshData,
     pattern: &MomentumCsrPattern,
+    pressure_geometry: &PressureGeometryCache,
     cell_diffusivity: &[f64],
     volumetric_source: &[f64],
     boundary: &[ScalarFaceTreatment],
@@ -3491,8 +3559,8 @@ fn assemble_variable_scalar_component_system_into(
     for (face_index, treatment) in boundary.iter().enumerate() {
         let owner = mesh.owner[face_index];
         if let Some(neighbour) = mesh.neighbour[face_index] {
-            let coefficient = variable_face_diffusion_coefficient(
-                mesh,
+            let coefficient = cached_variable_face_diffusion_coefficient(
+                pressure_geometry,
                 cell_diffusivity,
                 owner,
                 Some(neighbour),
@@ -3516,8 +3584,8 @@ fn assemble_variable_scalar_component_system_into(
 
         match *treatment {
             ScalarFaceTreatment::FixedValue(value) => {
-                let coefficient = variable_face_diffusion_coefficient(
-                    mesh,
+                let coefficient = cached_variable_face_diffusion_coefficient(
+                    pressure_geometry,
                     cell_diffusivity,
                     owner,
                     None,
@@ -3531,8 +3599,8 @@ fn assemble_variable_scalar_component_system_into(
                 system.rhs[owner] += coefficient * value;
             }
             ScalarFaceTreatment::InletOutlet(value) => {
-                let coefficient = variable_face_diffusion_coefficient(
-                    mesh,
+                let coefficient = cached_variable_face_diffusion_coefficient(
+                    pressure_geometry,
                     cell_diffusivity,
                     owner,
                     None,
@@ -3546,8 +3614,8 @@ fn assemble_variable_scalar_component_system_into(
                 system.rhs[owner] += coefficient * value;
             }
             ScalarFaceTreatment::FixedGradient(gradient) => {
-                let flux = fixed_gradient_pressure_flux(
-                    mesh,
+                let flux = cached_fixed_gradient_pressure_flux(
+                    pressure_geometry,
                     cell_diffusivity,
                     owner,
                     face_index,
@@ -3561,6 +3629,27 @@ fn assemble_variable_scalar_component_system_into(
 
     system.matrix.validate_values()?;
     Ok(())
+}
+
+#[cfg(test)]
+fn assemble_variable_scalar_component_system_into(
+    mesh: &SolverRuntimeMeshData,
+    pattern: &MomentumCsrPattern,
+    cell_diffusivity: &[f64],
+    volumetric_source: &[f64],
+    boundary: &[ScalarFaceTreatment],
+    system: &mut ScalarComponentSystem,
+) -> Result<()> {
+    let pressure_geometry = PressureGeometryCache::from_mesh(mesh);
+    assemble_variable_scalar_component_system_into_with_pressure_geometry(
+        mesh,
+        pattern,
+        &pressure_geometry,
+        cell_diffusivity,
+        volumetric_source,
+        boundary,
+        system,
+    )
 }
 
 fn compute_face_flux(
@@ -3591,8 +3680,9 @@ fn compute_phi_hby_a(
     compute_face_flux(mesh, hby_a, velocity_boundary)
 }
 
-fn pressure_correction_flux(
+fn pressure_correction_flux_with_geometry(
     mesh: &SolverRuntimeMeshData,
+    pressure_geometry: &PressureGeometryCache,
     pressure_correction: &[f64],
     r_au: &[f64],
     boundary: &[ScalarFaceTreatment],
@@ -3624,8 +3714,8 @@ fn pressure_correction_flux(
     for (face_index, treatment) in boundary.iter().enumerate() {
         let owner = mesh.owner[face_index];
         if let Some(neighbour) = mesh.neighbour[face_index] {
-            let coefficient = variable_face_diffusion_coefficient(
-                mesh,
+            let coefficient = cached_variable_face_diffusion_coefficient(
+                pressure_geometry,
                 r_au,
                 owner,
                 Some(neighbour),
@@ -3638,18 +3728,33 @@ fn pressure_correction_flux(
 
         match *treatment {
             ScalarFaceTreatment::FixedValue(value) => {
-                let coefficient =
-                    variable_face_diffusion_coefficient(mesh, r_au, owner, None, face_index)?;
+                let coefficient = cached_variable_face_diffusion_coefficient(
+                    pressure_geometry,
+                    r_au,
+                    owner,
+                    None,
+                    face_index,
+                )?;
                 flux[face_index] = coefficient * (pressure_correction[owner] - value);
             }
             ScalarFaceTreatment::InletOutlet(value) => {
-                let coefficient =
-                    variable_face_diffusion_coefficient(mesh, r_au, owner, None, face_index)?;
+                let coefficient = cached_variable_face_diffusion_coefficient(
+                    pressure_geometry,
+                    r_au,
+                    owner,
+                    None,
+                    face_index,
+                )?;
                 flux[face_index] = coefficient * (pressure_correction[owner] - value);
             }
             ScalarFaceTreatment::FixedGradient(gradient) => {
-                flux[face_index] =
-                    fixed_gradient_pressure_flux(mesh, r_au, owner, face_index, gradient)?;
+                flux[face_index] = cached_fixed_gradient_pressure_flux(
+                    pressure_geometry,
+                    r_au,
+                    owner,
+                    face_index,
+                    gradient,
+                )?;
             }
             ScalarFaceTreatment::ZeroGradient | ScalarFaceTreatment::Constraint => {}
         }
@@ -3657,20 +3762,52 @@ fn pressure_correction_flux(
     Ok(flux)
 }
 
+#[cfg(test)]
+fn pressure_correction_flux(
+    mesh: &SolverRuntimeMeshData,
+    pressure_correction: &[f64],
+    r_au: &[f64],
+    boundary: &[ScalarFaceTreatment],
+) -> Result<Vec<f64>> {
+    let pressure_geometry = PressureGeometryCache::from_mesh(mesh);
+    pressure_correction_flux_with_geometry(
+        mesh,
+        &pressure_geometry,
+        pressure_correction,
+        r_au,
+        boundary,
+    )
+}
+
+fn pressure_equation_flux_with_geometry(
+    mesh: &SolverRuntimeMeshData,
+    pressure_geometry: &PressureGeometryCache,
+    pressure: &[f64],
+    r_au: &[f64],
+    boundary: &[ScalarFaceTreatment],
+) -> Result<Vec<f64>> {
+    Ok(
+        pressure_correction_flux_with_geometry(mesh, pressure_geometry, pressure, r_au, boundary)?
+            .into_iter()
+            .map(|flux| -flux)
+            .collect(),
+    )
+}
+
+#[cfg(test)]
 fn pressure_equation_flux(
     mesh: &SolverRuntimeMeshData,
     pressure: &[f64],
     r_au: &[f64],
     boundary: &[ScalarFaceTreatment],
 ) -> Result<Vec<f64>> {
-    Ok(pressure_correction_flux(mesh, pressure, r_au, boundary)?
-        .into_iter()
-        .map(|flux| -flux)
-        .collect())
+    let pressure_geometry = PressureGeometryCache::from_mesh(mesh);
+    pressure_equation_flux_with_geometry(mesh, &pressure_geometry, pressure, r_au, boundary)
 }
 
-fn consistent_phi_hby_a_pressure_correction(
+fn consistent_phi_hby_a_pressure_correction_with_geometry(
     mesh: &SolverRuntimeMeshData,
+    pressure_geometry: &PressureGeometryCache,
     pressure: &[f64],
     boundary: &[ScalarFaceTreatment],
     r_au: &[f64],
@@ -3695,14 +3832,42 @@ fn consistent_phi_hby_a_pressure_correction(
         delta.push(value.max(0.0));
     }
 
-    Ok(pressure_correction_flux(mesh, pressure, &delta, boundary)?
+    Ok(
+        pressure_correction_flux_with_geometry(
+            mesh,
+            pressure_geometry,
+            pressure,
+            &delta,
+            boundary,
+        )?
         .into_iter()
         .map(|flux| -flux)
-        .collect())
+        .collect(),
+    )
 }
 
-fn non_orthogonal_pressure_flux_correction(
+#[cfg(test)]
+fn consistent_phi_hby_a_pressure_correction(
     mesh: &SolverRuntimeMeshData,
+    pressure: &[f64],
+    boundary: &[ScalarFaceTreatment],
+    r_au: &[f64],
+    r_at_u: &[f64],
+) -> Result<Vec<f64>> {
+    let pressure_geometry = PressureGeometryCache::from_mesh(mesh);
+    consistent_phi_hby_a_pressure_correction_with_geometry(
+        mesh,
+        &pressure_geometry,
+        pressure,
+        boundary,
+        r_au,
+        r_at_u,
+    )
+}
+
+fn non_orthogonal_pressure_flux_correction_with_geometry(
+    mesh: &SolverRuntimeMeshData,
+    pressure_geometry: &PressureGeometryCache,
     scalar_gradient_geometry: &ScalarGradientGeometry,
     pressure: &[f64],
     r_at_u: &[f64],
@@ -3745,12 +3910,8 @@ fn non_orthogonal_pressure_flux_correction(
         if let Some(neighbour) = mesh.neighbour[face_index] {
             let diffusivity = 0.5 * (r_at_u[owner] + r_at_u[neighbour]);
             let face_gradient = average(pressure_gradient[owner], pressure_gradient[neighbour]);
-            let non_orthogonal_area = non_orthogonal_area_vector(
-                mesh.face_area_vectors[face_index],
-                mesh.cell_centres[owner],
-                mesh.cell_centres[neighbour],
-                face_index,
-            )?;
+            let non_orthogonal_area =
+                cached_non_orthogonal_area_vector(pressure_geometry, face_index)?;
             flux[face_index] = -diffusivity * dot(face_gradient, non_orthogonal_area);
             continue;
         }
@@ -3761,41 +3922,47 @@ fn non_orthogonal_pressure_flux_correction(
                 | ScalarFaceTreatment::FixedGradient(_)
                 | ScalarFaceTreatment::InletOutlet(_)
         ) {
-            let non_orthogonal_area = non_orthogonal_area_vector(
-                mesh.face_area_vectors[face_index],
-                mesh.cell_centres[owner],
-                mesh.face_centres[face_index],
-                face_index,
-            )?;
+            let non_orthogonal_area =
+                cached_non_orthogonal_area_vector(pressure_geometry, face_index)?;
             flux[face_index] = -r_at_u[owner] * dot(pressure_gradient[owner], non_orthogonal_area);
         }
     }
     Ok(flux)
 }
 
-fn non_orthogonal_area_vector(
-    area_vector: Point3,
-    from: Point3,
-    to: Point3,
+#[cfg(test)]
+fn non_orthogonal_pressure_flux_correction(
+    mesh: &SolverRuntimeMeshData,
+    scalar_gradient_geometry: &ScalarGradientGeometry,
+    pressure: &[f64],
+    r_at_u: &[f64],
+    boundary: &[ScalarFaceTreatment],
+    gradient_scheme: LaminarSimpleGradientScheme,
+) -> Result<Vec<f64>> {
+    let pressure_geometry = PressureGeometryCache::from_mesh(mesh);
+    non_orthogonal_pressure_flux_correction_with_geometry(
+        mesh,
+        &pressure_geometry,
+        scalar_gradient_geometry,
+        pressure,
+        r_at_u,
+        boundary,
+        gradient_scheme,
+    )
+}
+
+fn cached_non_orthogonal_area_vector(
+    pressure_geometry: &PressureGeometryCache,
     face_index: usize,
 ) -> Result<Point3> {
-    let distance = distance(from, to);
+    let geometry = pressure_geometry.face(face_index);
+    let distance = geometry.centre_distance;
     if !distance.is_finite() || distance <= f64::EPSILON {
         return Err(invalid_input(format!(
             "face {face_index} has non-positive non-orthogonal correction distance {distance}"
         )));
     }
-    let direction = Point3 {
-        x: (to.x - from.x) / distance,
-        y: (to.y - from.y) / distance,
-        z: (to.z - from.z) / distance,
-    };
-    let orthogonal_area = dot(area_vector, direction);
-    Ok(Point3 {
-        x: area_vector.x - orthogonal_area * direction.x,
-        y: area_vector.y - orthogonal_area * direction.y,
-        z: area_vector.z - orthogonal_area * direction.z,
-    })
+    Ok(geometry.non_orthogonal_area_vector)
 }
 
 fn add_face_fluxes(left: &[f64], right: &[f64]) -> Result<Vec<f64>> {
@@ -4144,8 +4311,9 @@ fn pressure_correction_source(mesh: &SolverRuntimeMeshData, net_flux: &[f64]) ->
         .collect())
 }
 
-fn adjust_phi_hby_a(
+fn adjust_phi_hby_a_with_pressure_geometry(
     mesh: &SolverRuntimeMeshData,
+    pressure_geometry: &PressureGeometryCache,
     velocity_boundary: &[VectorFaceTreatment],
     pressure_boundary: &[ScalarFaceTreatment],
     phi_hby_a: &mut [f64],
@@ -4179,7 +4347,7 @@ fn adjust_phi_hby_a(
         {
             continue;
         }
-        let area = magnitude(mesh.face_area_vectors[face_index]);
+        let area = pressure_geometry.face(face_index).area_magnitude;
         if area.is_finite() && area > f64::EPSILON {
             adjustable_area += area;
             adjusted_faces += 1;
@@ -4204,7 +4372,7 @@ fn adjust_phi_hby_a(
         {
             continue;
         }
-        let area = magnitude(mesh.face_area_vectors[face_index]);
+        let area = pressure_geometry.face(face_index).area_magnitude;
         if area.is_finite() && area > f64::EPSILON {
             phi_hby_a[face_index] += -global_flux_before * area / adjustable_area;
         }
@@ -4215,6 +4383,23 @@ fn adjust_phi_hby_a(
         global_flux_after: boundary_global_flux(mesh, phi_hby_a),
         adjusted_faces,
     })
+}
+
+#[cfg(test)]
+fn adjust_phi_hby_a(
+    mesh: &SolverRuntimeMeshData,
+    velocity_boundary: &[VectorFaceTreatment],
+    pressure_boundary: &[ScalarFaceTreatment],
+    phi_hby_a: &mut [f64],
+) -> Result<AdjustPhiSummary> {
+    let pressure_geometry = PressureGeometryCache::from_mesh(mesh);
+    adjust_phi_hby_a_with_pressure_geometry(
+        mesh,
+        &pressure_geometry,
+        velocity_boundary,
+        pressure_boundary,
+        phi_hby_a,
+    )
 }
 
 fn is_adjustable_pressure_open_face(
@@ -4698,8 +4883,9 @@ fn scalar_face_treatments(
     Ok(treatments)
 }
 
-fn constrained_pressure_treatments(
+fn constrained_pressure_treatments_with_geometry(
     mesh: &SolverRuntimeMeshData,
+    pressure_geometry: &PressureGeometryCache,
     pressure_boundary: &[ScalarFaceTreatment],
     velocity_boundary: &[VectorFaceTreatment],
     velocity: &[Point3],
@@ -4731,7 +4917,7 @@ fn constrained_pressure_treatments(
             continue;
         }
         let owner = mesh.owner[face_index];
-        let area = magnitude(mesh.face_area_vectors[face_index]);
+        let area = pressure_geometry.face(face_index).area_magnitude;
         let face_r_au = r_au[owner];
         if !area.is_finite() || area <= f64::EPSILON {
             return Err(invalid_input(format!(
@@ -4760,6 +4946,27 @@ fn constrained_pressure_treatments(
         constrained[face_index] = ScalarFaceTreatment::FixedGradient(gradient);
     }
     Ok(constrained)
+}
+
+#[cfg(test)]
+fn constrained_pressure_treatments(
+    mesh: &SolverRuntimeMeshData,
+    pressure_boundary: &[ScalarFaceTreatment],
+    velocity_boundary: &[VectorFaceTreatment],
+    velocity: &[Point3],
+    phi_hby_a: &[f64],
+    r_au: &[f64],
+) -> Result<Vec<ScalarFaceTreatment>> {
+    let pressure_geometry = PressureGeometryCache::from_mesh(mesh);
+    constrained_pressure_treatments_with_geometry(
+        mesh,
+        &pressure_geometry,
+        pressure_boundary,
+        velocity_boundary,
+        velocity,
+        phi_hby_a,
+        r_au,
+    )
 }
 
 fn is_pressure_gradient_constrained_boundary(
@@ -6068,8 +6275,8 @@ fn face_diffusion_coefficient(
     Ok(diffusivity * area / projected_distance)
 }
 
-fn variable_face_diffusion_coefficient(
-    mesh: &SolverRuntimeMeshData,
+fn cached_variable_face_diffusion_coefficient(
+    pressure_geometry: &PressureGeometryCache,
     cell_diffusivity: &[f64],
     owner: usize,
     neighbour: Option<usize>,
@@ -6080,22 +6287,24 @@ fn variable_face_diffusion_coefficient(
     } else {
         cell_diffusivity[owner]
     };
-    let to = if let Some(neighbour) = neighbour {
-        mesh.cell_centres[neighbour]
-    } else {
-        mesh.face_centres[face_index]
-    };
-    face_diffusion_coefficient(
-        diffusivity,
-        mesh.face_area_vectors[face_index],
-        mesh.cell_centres[owner],
-        to,
-        face_index,
-    )
+    let geometry = pressure_geometry.face(face_index);
+    let area = geometry.area_magnitude;
+    if !area.is_finite() || area <= f64::EPSILON {
+        return Err(invalid_input(format!(
+            "face {face_index} has non-positive area magnitude {area}"
+        )));
+    }
+    let projected_distance = geometry.projected_distance;
+    if !projected_distance.is_finite() || projected_distance <= f64::EPSILON {
+        return Err(invalid_input(format!(
+            "face {face_index} has non-positive projected diffusion distance {projected_distance}"
+        )));
+    }
+    Ok(diffusivity * area / projected_distance)
 }
 
-fn fixed_gradient_pressure_flux(
-    mesh: &SolverRuntimeMeshData,
+fn cached_fixed_gradient_pressure_flux(
+    pressure_geometry: &PressureGeometryCache,
     cell_diffusivity: &[f64],
     owner: usize,
     face_index: usize,
@@ -6106,7 +6315,7 @@ fn fixed_gradient_pressure_flux(
             "fixed-gradient pressure face {face_index} has non-finite gradient {gradient}"
         )));
     }
-    let area = magnitude(mesh.face_area_vectors[face_index]);
+    let area = pressure_geometry.face(face_index).area_magnitude;
     if !area.is_finite() || area <= f64::EPSILON {
         return Err(invalid_input(format!(
             "fixed-gradient pressure face {face_index} has non-positive area magnitude {area}"
@@ -7271,6 +7480,330 @@ mod tests {
         assert_eq!(workspace.matrix.values().as_ptr(), values);
         assert_eq!(workspace.matrix.values(), expected.matrix.values());
         assert_eq!(workspace.rhs, expected.rhs);
+    }
+
+    #[test]
+    fn pressure_geometry_cache_matches_orthogonal_and_skewed_bit_oracles() {
+        for skewed in [false, true] {
+            let mut runtime = two_cell_runtime();
+            if skewed {
+                runtime.mesh.face_centres[0] = point(0.5, 0.125, -0.0625);
+                runtime.mesh.face_area_vectors[0] = point(1.25, 0.5, -0.25);
+                runtime.mesh.cell_centres[1] = point(0.75, 0.25, -0.125);
+            }
+            let pressure_geometry = super::PressureGeometryCache::from_mesh(&runtime.mesh);
+            let cell_diffusivity = [1.25, 2.75];
+
+            for face_index in 0..runtime.mesh.faces {
+                let owner = runtime.mesh.owner[face_index];
+                let to = runtime.mesh.neighbour[face_index]
+                    .map(|neighbour| runtime.mesh.cell_centres[neighbour])
+                    .unwrap_or(runtime.mesh.face_centres[face_index]);
+                let from = runtime.mesh.cell_centres[owner];
+                let area_vector = runtime.mesh.face_area_vectors[face_index];
+                let area = super::magnitude(area_vector);
+                let delta = point(to.x - from.x, to.y - from.y, to.z - from.z);
+                let projected_distance = (super::dot(delta, area_vector) / area).abs();
+                let centre_distance = super::distance(from, to);
+                let direction = point(
+                    (to.x - from.x) / centre_distance,
+                    (to.y - from.y) / centre_distance,
+                    (to.z - from.z) / centre_distance,
+                );
+                let orthogonal_area = super::dot(area_vector, direction);
+                let non_orthogonal_area = point(
+                    area_vector.x - orthogonal_area * direction.x,
+                    area_vector.y - orthogonal_area * direction.y,
+                    area_vector.z - orthogonal_area * direction.z,
+                );
+                let cached = pressure_geometry.face(face_index);
+
+                assert_eq!(cached.area_magnitude.to_bits(), area.to_bits());
+                assert_eq!(
+                    cached.projected_distance.to_bits(),
+                    projected_distance.to_bits()
+                );
+                assert_eq!(cached.centre_distance.to_bits(), centre_distance.to_bits());
+                assert_eq!(
+                    cached.non_orthogonal_area_vector.x.to_bits(),
+                    non_orthogonal_area.x.to_bits()
+                );
+                assert_eq!(
+                    cached.non_orthogonal_area_vector.y.to_bits(),
+                    non_orthogonal_area.y.to_bits()
+                );
+                assert_eq!(
+                    cached.non_orthogonal_area_vector.z.to_bits(),
+                    non_orthogonal_area.z.to_bits()
+                );
+
+                let diffusivity = runtime.mesh.neighbour[face_index]
+                    .map(|neighbour| 0.5 * (cell_diffusivity[owner] + cell_diffusivity[neighbour]))
+                    .unwrap_or(cell_diffusivity[owner]);
+                let oracle =
+                    face_diffusion_coefficient(diffusivity, area_vector, from, to, face_index)
+                        .expect("uncached diffusion oracle");
+                let actual = super::cached_variable_face_diffusion_coefficient(
+                    &pressure_geometry,
+                    &cell_diffusivity,
+                    owner,
+                    runtime.mesh.neighbour[face_index],
+                    face_index,
+                )
+                .expect("cached pressure diffusion coefficient");
+                assert_eq!(actual.to_bits(), oracle.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn pressure_geometry_cache_keeps_boundary_validation_lazy_and_ordered() {
+        let mut runtime = two_cell_runtime();
+        let invalid_boundary_face = runtime.mesh.internal_faces;
+        runtime.mesh.face_area_vectors[invalid_boundary_face] = point(0.0, 1.0, 0.0);
+        let pressure_geometry = super::PressureGeometryCache::from_mesh(&runtime.mesh);
+        let pattern = MomentumCsrPattern::from_mesh(&runtime.mesh).expect("pressure CSR pattern");
+        let mut workspace = super::ScalarComponentSystem {
+            matrix: CsrMatrix::from_pattern(&pattern.sparsity, vec![0.0; pattern.sparsity.nnz()])
+                .expect("pressure matrix"),
+            rhs: vec![0.0; runtime.mesh.cells],
+        };
+        let source = [0.0, 0.0];
+        let diffusivity = [1.0, 1.0];
+
+        for unused in [
+            ScalarFaceTreatment::ZeroGradient,
+            ScalarFaceTreatment::Constraint,
+        ] {
+            let mut boundary = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
+            boundary[invalid_boundary_face] = unused;
+            super::assemble_variable_scalar_component_system_into_with_pressure_geometry(
+                &runtime.mesh,
+                &pattern,
+                &pressure_geometry,
+                &diffusivity,
+                &source,
+                &boundary,
+                &mut workspace,
+            )
+            .expect("unused invalid boundary geometry remains lazy");
+        }
+
+        let mut inlet_outlet = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
+        inlet_outlet[invalid_boundary_face] = ScalarFaceTreatment::InletOutlet(3.0);
+        let mut outflow = vec![0.0; runtime.mesh.faces];
+        outflow[invalid_boundary_face] = 1.0;
+        let resolved = super::resolve_pressure_inlet_outlet(&inlet_outlet, &outflow)
+            .expect("outflow inletOutlet resolution");
+        super::assemble_variable_scalar_component_system_into_with_pressure_geometry(
+            &runtime.mesh,
+            &pattern,
+            &pressure_geometry,
+            &diffusivity,
+            &source,
+            &resolved,
+            &mut workspace,
+        )
+        .expect("inletOutlet outflow does not consume invalid geometry");
+
+        let mut fixed_value = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
+        fixed_value[invalid_boundary_face] = ScalarFaceTreatment::FixedValue(0.0);
+        let error = super::assemble_variable_scalar_component_system_into_with_pressure_geometry(
+            &runtime.mesh,
+            &pattern,
+            &pressure_geometry,
+            &diffusivity,
+            &source,
+            &fixed_value,
+            &mut workspace,
+        )
+        .expect_err("active pressure diffusion must validate projected distance");
+        assert_eq!(
+            error.to_string(),
+            format!("face {invalid_boundary_face} has non-positive projected diffusion distance 0")
+        );
+
+        runtime.mesh.face_area_vectors[invalid_boundary_face] = zero();
+        let zero_area_geometry = super::PressureGeometryCache::from_mesh(&runtime.mesh);
+        let gradient_error = super::cached_fixed_gradient_pressure_flux(
+            &zero_area_geometry,
+            &diffusivity,
+            runtime.mesh.owner[invalid_boundary_face],
+            invalid_boundary_face,
+            f64::NAN,
+        )
+        .expect_err("gradient validation must precede cached area validation");
+        assert_eq!(
+            gradient_error.to_string(),
+            format!(
+                "fixed-gradient pressure face {invalid_boundary_face} has non-finite gradient NaN"
+            )
+        );
+    }
+
+    #[test]
+    fn pressure_geometry_cache_preserves_adjust_constrain_and_nonorth_error_order() {
+        let mut runtime = two_cell_runtime();
+        let boundary_face = runtime.mesh.internal_faces;
+        runtime.mesh.face_area_vectors[boundary_face] = zero();
+        let pressure_geometry = super::PressureGeometryCache::from_mesh(&runtime.mesh);
+        let mut phi = vec![0.0; runtime.mesh.faces];
+        phi[boundary_face] = 1.0;
+        let mut velocity_boundary = vec![VectorFaceTreatment::Constraint; runtime.mesh.faces];
+        velocity_boundary[boundary_face] = VectorFaceTreatment::ZeroGradient;
+        let mut pressure_boundary = vec![ScalarFaceTreatment::Constraint; runtime.mesh.faces];
+        pressure_boundary[boundary_face] = ScalarFaceTreatment::FixedValue(0.0);
+        let adjust = super::adjust_phi_hby_a_with_pressure_geometry(
+            &runtime.mesh,
+            &pressure_geometry,
+            &velocity_boundary,
+            &pressure_boundary,
+            &mut phi,
+        )
+        .expect("adjustPhi silently excludes invalid adjustable area");
+        assert_eq!(adjust.adjusted_faces, 0);
+        assert_eq!(phi[boundary_face].to_bits(), 1.0f64.to_bits());
+
+        pressure_boundary[boundary_face] = ScalarFaceTreatment::ZeroGradient;
+        velocity_boundary[boundary_face] = VectorFaceTreatment::FixedValue(zero());
+        let mut invalid_r_au = vec![1.0; runtime.mesh.cells];
+        invalid_r_au[runtime.mesh.owner[boundary_face]] = 0.0;
+        let constrain_error = super::constrained_pressure_treatments_with_geometry(
+            &runtime.mesh,
+            &pressure_geometry,
+            &pressure_boundary,
+            &velocity_boundary,
+            &[zero(); 2],
+            &phi,
+            &invalid_r_au,
+        )
+        .expect_err("constrainPressure area failure must precede rAU failure");
+        assert_eq!(
+            constrain_error.to_string(),
+            format!("fixedFluxPressure face {boundary_face} has non-positive area magnitude 0")
+        );
+
+        let mut valid_runtime = two_cell_runtime();
+        let scalar_gradient_geometry =
+            ScalarGradientGeometry::from_mesh(&valid_runtime.mesh).expect("gradient geometry");
+        valid_runtime.mesh.cell_centres[1] = valid_runtime.mesh.cell_centres[0];
+        let coincident_pressure_geometry =
+            super::PressureGeometryCache::from_mesh(&valid_runtime.mesh);
+        let boundary = vec![ScalarFaceTreatment::ZeroGradient; valid_runtime.mesh.faces];
+        let scalar_error = super::non_orthogonal_pressure_flux_correction_with_geometry(
+            &valid_runtime.mesh,
+            &coincident_pressure_geometry,
+            &scalar_gradient_geometry,
+            &[f64::NAN, 0.0],
+            &[1.0, 1.0],
+            &boundary,
+            LaminarSimpleGradientScheme::GaussLinear,
+        )
+        .expect_err("scalar-gradient validation precedes cached face distance");
+        assert_eq!(
+            scalar_error.to_string(),
+            "scalar gradient cell 0 value must be finite, got NaN"
+        );
+
+        let distance_error = super::non_orthogonal_pressure_flux_correction_with_geometry(
+            &valid_runtime.mesh,
+            &coincident_pressure_geometry,
+            &scalar_gradient_geometry,
+            &[1.0, 0.0],
+            &[1.0, 1.0],
+            &boundary,
+            LaminarSimpleGradientScheme::GaussLinear,
+        )
+        .expect_err("finite scalar gradient reaches cached centre-distance validation");
+        assert_eq!(
+            distance_error.to_string(),
+            "face 0 has non-positive non-orthogonal correction distance 0"
+        );
+    }
+
+    #[test]
+    fn pressure_geometry_cache_reuses_storage_for_ten_coefficients_and_refreshes_per_mesh() {
+        let mut runtime = two_cell_runtime();
+        let pattern = MomentumCsrPattern::from_mesh(&runtime.mesh).expect("pressure CSR pattern");
+        let pressure_geometry = super::PressureGeometryCache::from_mesh(&runtime.mesh);
+        let geometry_pointer = pressure_geometry.faces.as_ptr();
+        let geometry_capacity = pressure_geometry.faces.capacity();
+        let mut workspace = super::ScalarComponentSystem {
+            matrix: CsrMatrix::from_pattern(&pattern.sparsity, vec![0.0; pattern.sparsity.nnz()])
+                .expect("pressure matrix"),
+            rhs: vec![0.0; runtime.mesh.cells],
+        };
+        let values_pointer = workspace.matrix.values().as_ptr();
+        let boundary = vec![
+            ScalarFaceTreatment::ZeroGradient,
+            ScalarFaceTreatment::FixedValue(0.0),
+            ScalarFaceTreatment::FixedGradient(0.25),
+        ];
+
+        for lifecycle in 0..10 {
+            let scale = lifecycle as f64 + 1.0;
+            super::assemble_variable_scalar_component_system_into_with_pressure_geometry(
+                &runtime.mesh,
+                &pattern,
+                &pressure_geometry,
+                &[scale, scale + 0.5],
+                &[0.25 * scale, -0.125 * scale],
+                &boundary,
+                &mut workspace,
+            )
+            .expect("cached pressure assembly lifecycle");
+            assert_eq!(pressure_geometry.faces.as_ptr(), geometry_pointer);
+            assert_eq!(pressure_geometry.faces.capacity(), geometry_capacity);
+            assert_eq!(workspace.matrix.values().as_ptr(), values_pointer);
+        }
+
+        let original = pressure_geometry.face(0);
+        runtime.mesh.face_area_vectors[0] = point(2.0, 0.5, 0.0);
+        let refreshed = super::PressureGeometryCache::from_mesh(&runtime.mesh);
+        assert_eq!(
+            pressure_geometry.face(0).area_magnitude.to_bits(),
+            original.area_magnitude.to_bits()
+        );
+        assert_eq!(
+            refreshed.face(0).area_magnitude.to_bits(),
+            super::magnitude(runtime.mesh.face_area_vectors[0]).to_bits()
+        );
+        assert_ne!(
+            refreshed.face(0).area_magnitude.to_bits(),
+            original.area_magnitude.to_bits()
+        );
+    }
+
+    #[test]
+    fn public_pressure_geometry_path_runs_zero_one_and_two_correctors() {
+        let fields = two_cell_fields();
+        let mut reports = Vec::new();
+        for correctors in 0..=2 {
+            let mut runtime = two_cell_runtime();
+            runtime.mesh.face_centres[0] = point(0.5, 0.05, 0.0);
+            runtime.mesh.face_area_vectors[0] = point(1.0, 0.25, 0.0);
+            runtime.mesh.cell_centres[1] = point(0.75, 0.1, 0.0);
+            let mut options = minimal_laminar_options();
+            options.max_simple_iterations = 1;
+            options.non_orthogonal_correctors = correctors;
+
+            let report = solve_laminar_simple(&mut runtime, &fields, &options)
+                .expect("public skewed SIMPLE solve with cached pressure geometry");
+            assert_eq!(report.simple_iterations, 1);
+            assert_eq!(report.history[0].pressure_linear_solves, correctors + 1);
+            assert!(
+                report
+                    .final_pressure
+                    .iter()
+                    .chain(report.final_phi.iter())
+                    .all(|value| value.is_finite())
+            );
+            assert!(report.final_velocity.iter().all(|value| {
+                value.x.is_finite() && value.y.is_finite() && value.z.is_finite()
+            }));
+            reports.push(report);
+        }
+        assert_eq!(reports.len(), 3);
     }
 
     #[test]
