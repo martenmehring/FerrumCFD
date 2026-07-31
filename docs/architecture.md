@@ -434,7 +434,9 @@ unsupported constraint geometry. `empty`, paired `wedge`, and
 non-consuming initial-gradient probe reuses the same boundary resolution,
 initial face flux, cache, and production dispatchers so cellwise validation can
 be performed without exposing coefficient internals or changing the one-shot
-solver lifecycle.
+solver lifecycle. WLS distance vectors and boundary constraints consume the
+final polygon/polyhedron centroids, so cross-engine gradient evidence is bound
+to the exact geometry commit as well as the reconstruction implementation.
 
 Basic structural validation belongs in the preflight. Examples include missing
 standard `fvSchemes` sections, missing `default` entries, missing
@@ -455,9 +457,16 @@ conductivity, membrane permeance, or another coefficient.
 
 ## Mesh Geometry Direction
 
-The first geometry pass derives face centres, oriented face area vectors,
-approximate cell centres, cell volumes, and boundary area from
-`constant/polyMesh`. These values are now summarized by `checkFerrumMesh`.
+The production geometry pass derives each polygon face centre from a signed,
+normal-projected triangle-fan first moment and derives each cell centre and
+signed volume from oriented face-pyramid first moments. Compensated
+relative-coordinate accumulation keeps those constructions stable under
+translation. A provisional average of incident exact face centres is used only
+to orient faces and choose a local moment origin; it is never exposed as the
+final cell centre. Solver geometry fails closed for non-finite or zero-area
+faces and non-finite or non-positive oriented cell volumes. It does not clip or
+cap any finite geometry value. These independently authored Safe-Rust geometry
+arrays are summarized by `checkFerrumMesh` and feed all runtime operators.
 
 This is still a geometry foundation, not a full quality checker. Future checks
 should add non-orthogonality, skewness, aspect ratio, wedge validity, `empty`

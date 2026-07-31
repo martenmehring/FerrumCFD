@@ -366,6 +366,21 @@ non-orthogonal correction. Public `0/1/2`-corrector gates cover open/closed
 pressure systems on orthogonal/skewed meshes without fallback. The remaining
 evidence sequence is:
 
+Item 1 is gated by **F-MESH-POLY-CENTROIDS**, implemented by this leaf. The
+first frozen direct matrix exposed that the legacy arithmetic vertex and
+incident-face means displaced the finite annular-wedge cell centres even
+though the WLS and wedge boundary contracts agreed cross-engine. The geometry
+pass now uses compensated signed, normal-projected polygon first moments for
+face centres and compensated oriented face-pyramid volume/first moments for
+cell volumes and centroids. The provisional incident-face average may select
+orientation and a local moment origin only; it is not a reported cell centre.
+Analytic trapezoid and annular-wedge oracles,
+translation/scale/face-order/orientation invariance, finite/positive runtime
+geometry, fallible allocation, and no finite-magnitude clipping or cap gate
+the implementation. After the exact merged commit/tree, freeze the replacement
+four-fixture protocol before generating results and rerun the direct cellwise
+Foundation 13 matrix without loosening analytic or cross-engine thresholds.
+
 1. run the direct cellwise Ferrum/OpenFOAM Foundation 13 gradient matrix from
    one hashed mesh and one manufactured field set. Keep all OpenFOAM cases,
    launchers, binaries, and raw artifacts outside the repository; record only
@@ -1788,15 +1803,22 @@ The immediate sequence is:
       for Channel (`9/9`), and `0.969953` for Cylinder (`8/9`). Therefore the
       parallel mode remains opt-in, no 30-pair escalation was warranted, and no
       default or general-speed claim is accepted;
-   6. **F-CYL-SPATIAL-ACCURACY (active; WLS implementation and production
-      propagation completed):** weighted least-squares scalar/vector kernels,
-      constraint semantics, production dispatch, and the public
-      open/closed-pressure-system and orthogonal/skewed `0/1/2`-corrector
-      matrix are complete. The next leaf is the external direct cellwise
-      Foundation 13 gradient proof;
-      reconstructed wall traction, three-mesh observed-order/Richardson/GCI,
-      and the final same-mesh parity/performance refresh still follow before
-      any general higher-accuracy or speed claim.
+   6. **F-CYL-SPATIAL-ACCURACY (active; WLS implementation, production
+      propagation, and exact-centroid prerequisite implemented; external proof
+      pending):** weighted
+      least-squares scalar/vector kernels, constraint semantics, production
+      dispatch, and the public open/closed-pressure-system and
+      orthogonal/skewed `0/1/2`-corrector matrix are complete. The first frozen
+      external proof failed correctly because the legacy arithmetic-centre
+      approximation displaced the finite annular-wedge geometry; that run is
+      rejected evidence and is not a basis for threshold relaxation.
+      **F-MESH-POLY-CENTROIDS** supplies signed projected polygon centroids and
+      oriented face-pyramid cell volumes/centroids in independently authored
+      Safe Rust. Once merged, the next leaf is a newly frozen rerun of the
+      external direct cellwise Foundation 13 gradient proof. Reconstructed wall
+      traction, three-mesh observed-order/Richardson/GCI, and the final
+      same-mesh parity/performance refresh still follow before any general
+      higher-accuracy or speed claim.
 
    The executed per-leaf protocols, fixed-work budgets, input hashes, and
    results are recorded above and in external hashed artifacts; they must not be
