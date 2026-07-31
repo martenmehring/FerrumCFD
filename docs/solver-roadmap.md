@@ -421,10 +421,10 @@ Current status:
 - historical OpenFOAM `simpleFoam`: `4.21 s` solver execution and `7.85 s`
   driver wall time in the matched 100-step rerun; do not use this as current
   `foamRun` performance data;
-- CPU pressure PCG has a full CSR IC(0) incomplete-Cholesky path. The current
-  `DIC` and `FDIC` dictionary names are compatibility aliases to that IC(0)
-  implementation, not exact OpenFOAM DIC/FDIC algorithm parity. A true
-  face-LDU DIC/FDIC leaf is planned below;
+- CPU pressure PCG retains the full CSR IC(0) incomplete-Cholesky path behind
+  `ic0`/`incompleteCholesky` and now has distinct face-LDU `DIC` and `FDIC`
+  paths. Those paths independently implement the OpenFOAM Foundation 13
+  mathematical recurrence in safe Rust; they are not aliases or copied C++;
 - CG/PCG breakdown tests are scale-relative rather than absolute
   `f64::EPSILON` cutoffs, so valid small SI-scaled pressure systems are not
   terminated prematurely;
@@ -1726,16 +1726,30 @@ The immediate sequence is:
       matrix-vector products `26.441%`, factor refresh `1.492%`, and other work
       `0.425%`. This phase ranking selects the preconditioner application path
       for point 2; it does not establish an end-to-end performance change;
-   2. **F-CYL-DIC-FDIC:** add true symmetric face-LDU `DIC` and `FDIC`
-      preconditioners while preserving the existing full CSR IC(0) path behind
-      `ic0`/`incompleteCholesky`. Match the OpenFOAM Foundation 13 mathematical
-      contract: one owner/neighbour coefficient per internal face, the
-      diagonal DIC recurrence, reciprocal preconditioned diagonal, and
-      deterministic forward/reverse face sweeps. `FDIC` uses the same
-      recurrence with cached face multipliers. Implement this independently in
-      safe Rust with explicit finite, positive-pivot, allocation, ordering, and
-      failure gates. This is not a reopening of the rejected LDU-addressed
-      symmetric Gauss-Seidel experiment;
+   2. **F-CYL-DIC-FDIC (completed implementation and fixed-work diagnostic):**
+      true symmetric face-LDU `DIC` and `FDIC` preconditioners preserve the
+      existing full CSR IC(0) path behind `ic0`/`incompleteCholesky`. The
+      independently written safe-Rust implementation matches the OpenFOAM
+      Foundation 13 mathematical contract: one owner/neighbour coefficient per
+      internal face, the diagonal DIC recurrence, reciprocal preconditioned
+      diagonal, and deterministic forward/reverse face sweeps. `FDIC` uses the
+      same recurrence with cached face multipliers. Explicit finite,
+      positive-pivot, allocation, ordering, symmetry, and repairable
+      failure-state gates remain Ferrum-specific safeguards. On the unchanged
+      official 5,388-cell Cylinder case, Linux/WSL ext4, Rust `1.94.0`,
+      `target-cpu=native`, pinned serial CPU `2`, two warmups and nine
+      alternating measured rounds, all three paths executed exactly 25,323
+      pressure iterations, 25,723 matrix-vector products, and 25,323
+      preconditioner applications over 200 fixed SIMPLE steps. Against IC(0),
+      the paired median DIC/IC(0) ratio was `0.842742` for internal PCG time
+      and `0.955675` for total solver time; the paired median FDIC/IC(0) ratio
+      was `0.763531` for internal PCG time and `0.851455` for total solver
+      time. DIC/FDIC final `U`/`p` were bit-identical on Cylinder, Pipe, and
+      Channel semantic gates. The accepted narrow claim is therefore that
+      FDIC reduced this fixed-work Cylinder PCG time by `23.65%` and solver
+      time by `14.85%`; host-load dispersion forbids extrapolating those
+      percentages to other cases. This is not a reopening of the rejected
+      LDU-addressed symmetric Gauss-Seidel experiment;
    3. **F-CYL-PCG-NL1:** make non-GAMG PCG evaluate the public normalized-L1
       residual directly on each convergence check and reuse the already
       written residual. Preserve strict absolute/relative boundaries,

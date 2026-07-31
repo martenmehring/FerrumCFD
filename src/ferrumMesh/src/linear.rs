@@ -41,6 +41,8 @@ pub struct LinearSolverCapabilities {
     pub cpu_gamg: bool,
     pub cpu_diagonal_preconditioner: bool,
     pub cpu_incomplete_cholesky_preconditioner: bool,
+    pub cpu_dic_preconditioner: bool,
+    pub cpu_fdic_preconditioner: bool,
     pub gpu_linear_solvers: bool,
 }
 
@@ -69,6 +71,8 @@ pub enum CgPreconditioner {
     None,
     Diagonal,
     IncompleteCholesky,
+    Dic,
+    Fdic,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -368,6 +372,8 @@ pub fn linear_solver_capabilities() -> LinearSolverCapabilities {
         cpu_gamg: true,
         cpu_diagonal_preconditioner: true,
         cpu_incomplete_cholesky_preconditioner: true,
+        cpu_dic_preconditioner: true,
+        cpu_fdic_preconditioner: true,
         gpu_linear_solvers: false,
     }
 }
@@ -750,6 +756,7 @@ pub struct PreconditionedConjugateGradientWorkspace {
     sparsity: CsrSparsityPattern,
     preconditioner_kind: CgPreconditioner,
     preconditioner: ReusablePreconditioner,
+    face_ldu_preconditioner: Option<FaceLduPreconditioner>,
     residual: Vec<f64>,
     preconditioned_residual: Vec<f64>,
     direction: Vec<f64>,
@@ -767,10 +774,29 @@ impl PreconditionedConjugateGradientWorkspace {
             )));
         }
         let rows = matrix.rows();
+        let preconditioner_kind = preconditioner;
+        let (preconditioner, face_ldu_preconditioner) = match preconditioner_kind {
+            CgPreconditioner::Dic => (
+                ReusablePreconditioner::None,
+                Some(FaceLduPreconditioner::new(
+                    matrix,
+                    FaceLduPreconditionerKind::Dic,
+                )?),
+            ),
+            CgPreconditioner::Fdic => (
+                ReusablePreconditioner::None,
+                Some(FaceLduPreconditioner::new(
+                    matrix,
+                    FaceLduPreconditionerKind::Fdic,
+                )?),
+            ),
+            preconditioner => (ReusablePreconditioner::new(matrix, preconditioner)?, None),
+        };
         Ok(Self {
             sparsity: matrix.sparsity_pattern(),
-            preconditioner_kind: preconditioner,
-            preconditioner: ReusablePreconditioner::new(matrix, preconditioner)?,
+            preconditioner_kind,
+            preconditioner,
+            face_ldu_preconditioner,
             residual: vec![0.0; rows],
             preconditioned_residual: vec![0.0; rows],
             direction: vec![0.0; rows],
@@ -831,7 +857,11 @@ impl PreconditionedConjugateGradientWorkspace {
         }
 
         let preconditioner_update_started = profile_start::<PROFILE>();
-        self.preconditioner.update(matrix)?;
+        if let Some(preconditioner) = &mut self.face_ldu_preconditioner {
+            preconditioner.refactor(matrix)?;
+        } else {
+            self.preconditioner.update(matrix)?;
+        }
         timing.preconditioner_update_seconds += profile_elapsed(preconditioner_update_started);
         let solution_setup_started = profile_start::<PROFILE>();
         let mut solution = initial
@@ -868,11 +898,15 @@ impl PreconditionedConjugateGradientWorkspace {
         }
 
         let preconditioner_application_started = profile_start::<PROFILE>();
-        self.preconditioner.apply_into(
-            &self.residual,
-            &mut self.preconditioner_scratch,
-            &mut self.preconditioned_residual,
-        )?;
+        if let Some(preconditioner) = &self.face_ldu_preconditioner {
+            preconditioner.apply_into(&self.residual, &mut self.preconditioned_residual)?;
+        } else {
+            self.preconditioner.apply_into(
+                &self.residual,
+                &mut self.preconditioner_scratch,
+                &mut self.preconditioned_residual,
+            )?;
+        }
         timing.preconditioner_application_seconds +=
             profile_elapsed(preconditioner_application_started);
         if PROFILE {
@@ -961,11 +995,15 @@ impl PreconditionedConjugateGradientWorkspace {
             }
 
             let preconditioner_application_started = profile_start::<PROFILE>();
-            self.preconditioner.apply_into(
-                &self.residual,
-                &mut self.preconditioner_scratch,
-                &mut self.preconditioned_residual,
-            )?;
+            if let Some(preconditioner) = &self.face_ldu_preconditioner {
+                preconditioner.apply_into(&self.residual, &mut self.preconditioned_residual)?;
+            } else {
+                self.preconditioner.apply_into(
+                    &self.residual,
+                    &mut self.preconditioner_scratch,
+                    &mut self.preconditioned_residual,
+                )?;
+            }
             timing.preconditioner_application_seconds +=
                 profile_elapsed(preconditioner_application_started);
             if PROFILE {
@@ -1178,6 +1216,7 @@ enum BuiltPreconditioner {
     None,
     Diagonal(Vec<f64>),
     IncompleteCholesky(Box<IncompleteCholeskyPreconditioner>),
+    FaceLdu(Box<FaceLduPreconditioner>),
 }
 
 impl BuiltPreconditioner {
@@ -1206,6 +1245,14 @@ impl BuiltPreconditioner {
             CgPreconditioner::IncompleteCholesky => Ok(Self::IncompleteCholesky(Box::new(
                 IncompleteCholeskyPreconditioner::build(matrix)?,
             ))),
+            CgPreconditioner::Dic => Ok(Self::FaceLdu(Box::new(FaceLduPreconditioner::build(
+                matrix,
+                FaceLduPreconditionerKind::Dic,
+            )?))),
+            CgPreconditioner::Fdic => Ok(Self::FaceLdu(Box::new(FaceLduPreconditioner::build(
+                matrix,
+                FaceLduPreconditionerKind::Fdic,
+            )?))),
         }
     }
 
@@ -1218,6 +1265,7 @@ impl BuiltPreconditioner {
                 .map(|(value, inverse)| value * inverse)
                 .collect()),
             Self::IncompleteCholesky(preconditioner) => preconditioner.apply(residual),
+            Self::FaceLdu(preconditioner) => preconditioner.apply(residual),
         }
     }
 }
@@ -1241,6 +1289,9 @@ impl ReusablePreconditioner {
             }),
             CgPreconditioner::IncompleteCholesky => Ok(Self::IncompleteCholesky(
                 IncompleteCholeskyPreconditioner::new(matrix)?,
+            )),
+            CgPreconditioner::Dic | CgPreconditioner::Fdic => Err(invalid_input(
+                "DIC and FDIC reusable state is owned by the PCG face-LDU workspace".to_string(),
             )),
         }
     }
@@ -1296,6 +1347,319 @@ impl ReusablePreconditioner {
                 preconditioner.apply_into(residual, scratch, output)
             }
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FaceLduPreconditionerKind {
+    Dic,
+    Fdic,
+}
+
+struct SymmetricFaceLduPattern {
+    sparsity: CsrSparsityPattern,
+    diagonal_slots: Vec<usize>,
+    lower_addr: Vec<usize>,
+    upper_addr: Vec<usize>,
+    owner_start: Vec<usize>,
+    lower_matrix_slots: Vec<usize>,
+    upper_matrix_slots: Vec<usize>,
+}
+
+impl SymmetricFaceLduPattern {
+    fn new(matrix: &CsrMatrix) -> Result<Self> {
+        if matrix.rows != matrix.cols {
+            return Err(invalid_input(format!(
+                "symmetric face-LDU preconditioner requires a square matrix, got {}x{}",
+                matrix.rows, matrix.cols
+            )));
+        }
+
+        let mut row_slots = Vec::with_capacity(matrix.rows);
+        for row in 0..matrix.rows {
+            let mut slots = BTreeMap::new();
+            for entry in matrix.row_offsets[row]..matrix.row_offsets[row + 1] {
+                let column = matrix.col_indices[entry];
+                if slots.insert(column, entry).is_some() {
+                    return Err(invalid_input(format!(
+                        "symmetric face-LDU preconditioner row {row} has duplicate column {column}"
+                    )));
+                }
+            }
+            if !slots.contains_key(&row) {
+                return Err(invalid_input(format!(
+                    "symmetric face-LDU preconditioner row {row} has no diagonal entry"
+                )));
+            }
+            row_slots.push(slots);
+        }
+
+        for (row, slots) in row_slots.iter().enumerate() {
+            for &column in slots.keys() {
+                if row != column && !row_slots[column].contains_key(&row) {
+                    return Err(invalid_input(format!(
+                        "symmetric face-LDU preconditioner entry ({row},{column}) has no transpose entry ({column},{row})"
+                    )));
+                }
+            }
+        }
+
+        let diagonal_slots = row_slots
+            .iter()
+            .enumerate()
+            .map(|(row, slots)| {
+                slots.get(&row).copied().ok_or_else(|| {
+                    invalid_input(format!(
+                        "symmetric face-LDU preconditioner row {row} has no diagonal entry"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut lower_addr = Vec::new();
+        let mut upper_addr = Vec::new();
+        let mut owner_start = Vec::with_capacity(matrix.rows + 1);
+        let mut lower_matrix_slots = Vec::new();
+        let mut upper_matrix_slots = Vec::new();
+        for lower in 0..matrix.rows {
+            owner_start.push(lower_addr.len());
+            for (&upper, &upper_slot) in &row_slots[lower] {
+                if upper <= lower {
+                    continue;
+                }
+                let lower_slot = row_slots[upper].get(&lower).copied().ok_or_else(|| {
+                    invalid_input(format!(
+                        "symmetric face-LDU preconditioner entry ({lower},{upper}) has no transpose entry ({upper},{lower})"
+                    ))
+                })?;
+                lower_addr.push(lower);
+                upper_addr.push(upper);
+                upper_matrix_slots.push(upper_slot);
+                lower_matrix_slots.push(lower_slot);
+            }
+        }
+        owner_start.push(lower_addr.len());
+
+        Ok(Self {
+            sparsity: matrix.sparsity_pattern(),
+            diagonal_slots,
+            lower_addr,
+            upper_addr,
+            owner_start,
+            lower_matrix_slots,
+            upper_matrix_slots,
+        })
+    }
+}
+
+struct FaceLduPreconditioner {
+    kind: FaceLduPreconditionerKind,
+    pattern: SymmetricFaceLduPattern,
+    upper_coefficients: Vec<f64>,
+    reciprocal_diagonal: Vec<f64>,
+    fdic_upper_scaled_by_upper_diagonal: Vec<f64>,
+    fdic_upper_scaled_by_lower_diagonal: Vec<f64>,
+    valid: bool,
+}
+
+impl FaceLduPreconditioner {
+    fn build(matrix: &CsrMatrix, kind: FaceLduPreconditionerKind) -> Result<Self> {
+        let mut preconditioner = Self::new(matrix, kind)?;
+        preconditioner.refactor(matrix)?;
+        Ok(preconditioner)
+    }
+
+    fn new(matrix: &CsrMatrix, kind: FaceLduPreconditionerKind) -> Result<Self> {
+        let pattern = SymmetricFaceLduPattern::new(matrix)?;
+        let faces = pattern.upper_addr.len();
+        let cells = pattern.diagonal_slots.len();
+        let (fdic_upper_scaled_by_upper_diagonal, fdic_upper_scaled_by_lower_diagonal) =
+            if kind == FaceLduPreconditionerKind::Fdic {
+                (vec![0.0; faces], vec![0.0; faces])
+            } else {
+                (Vec::new(), Vec::new())
+            };
+        Ok(Self {
+            kind,
+            pattern,
+            upper_coefficients: vec![0.0; faces],
+            reciprocal_diagonal: vec![0.0; cells],
+            fdic_upper_scaled_by_upper_diagonal,
+            fdic_upper_scaled_by_lower_diagonal,
+            valid: false,
+        })
+    }
+
+    fn refactor(&mut self, matrix: &CsrMatrix) -> Result<()> {
+        self.valid = false;
+        if !matrix.shares_sparsity_with(&self.pattern.sparsity) {
+            return Err(invalid_input(
+                "symmetric face-LDU preconditioner does not match matrix sparsity".to_string(),
+            ));
+        }
+
+        for (cell, (&slot, diagonal)) in self
+            .pattern
+            .diagonal_slots
+            .iter()
+            .zip(&mut self.reciprocal_diagonal)
+            .enumerate()
+        {
+            let value = matrix.values[slot];
+            if !value.is_finite() || value <= 0.0 {
+                return Err(invalid_input(format!(
+                    "symmetric face-LDU preconditioner cell {cell} has invalid diagonal pivot {value}"
+                )));
+            }
+            *diagonal = value;
+        }
+
+        for face in 0..self.pattern.upper_addr.len() {
+            let upper_value = matrix.values[self.pattern.upper_matrix_slots[face]];
+            let lower_value = matrix.values[self.pattern.lower_matrix_slots[face]];
+            if !upper_value.is_finite() || !lower_value.is_finite() {
+                return Err(invalid_input(format!(
+                    "symmetric face-LDU preconditioner face {face} has non-finite coefficients upper={upper_value} lower={lower_value}"
+                )));
+            }
+            if upper_value.to_bits() != lower_value.to_bits() {
+                let lower = self.pattern.lower_addr[face];
+                let upper = self.pattern.upper_addr[face];
+                return Err(invalid_input(format!(
+                    "symmetric face-LDU preconditioner requires bitwise symmetric coefficients; A[{lower},{upper}]={upper_value} differs from A[{upper},{lower}]={lower_value}"
+                )));
+            }
+            self.upper_coefficients[face] = upper_value;
+        }
+
+        for lower in 0..self.pattern.diagonal_slots.len() {
+            for face in self.pattern.owner_start[lower]..self.pattern.owner_start[lower + 1] {
+                debug_assert_eq!(self.pattern.lower_addr[face], lower);
+                let upper = self.pattern.upper_addr[face];
+                let pivot = self.reciprocal_diagonal[lower];
+                if !pivot.is_finite() || pivot <= 0.0 {
+                    return Err(invalid_input(format!(
+                        "symmetric face-LDU preconditioner cell {lower} has invalid DIC pivot {pivot}"
+                    )));
+                }
+                let coefficient = self.upper_coefficients[face];
+                let square = coefficient * coefficient;
+                if !square.is_finite() {
+                    return Err(invalid_input(format!(
+                        "symmetric face-LDU preconditioner face {face} coefficient square is not finite"
+                    )));
+                }
+                let contribution = square / pivot;
+                if !contribution.is_finite() {
+                    return Err(invalid_input(format!(
+                        "symmetric face-LDU preconditioner face {face} diagonal contribution is not finite"
+                    )));
+                }
+                let updated = self.reciprocal_diagonal[upper] - contribution;
+                if !updated.is_finite() || updated <= 0.0 {
+                    return Err(invalid_input(format!(
+                        "symmetric face-LDU preconditioner cell {upper} has non-positive DIC pivot {updated}"
+                    )));
+                }
+                self.reciprocal_diagonal[upper] = updated;
+            }
+        }
+
+        for (cell, diagonal) in self.reciprocal_diagonal.iter_mut().enumerate() {
+            if !diagonal.is_finite() || *diagonal <= 0.0 {
+                return Err(invalid_input(format!(
+                    "symmetric face-LDU preconditioner cell {cell} has invalid DIC pivot {diagonal}"
+                )));
+            }
+            let reciprocal = 1.0 / *diagonal;
+            if !reciprocal.is_finite() || reciprocal <= 0.0 {
+                return Err(invalid_input(format!(
+                    "symmetric face-LDU preconditioner cell {cell} reciprocal pivot is invalid for value {diagonal}"
+                )));
+            }
+            *diagonal = reciprocal;
+        }
+
+        if self.kind == FaceLduPreconditionerKind::Fdic {
+            for face in 0..self.pattern.upper_addr.len() {
+                let lower = self.pattern.lower_addr[face];
+                let upper = self.pattern.upper_addr[face];
+                let coefficient = self.upper_coefficients[face];
+                let upper_scaled = self.reciprocal_diagonal[upper] * coefficient;
+                let lower_scaled = self.reciprocal_diagonal[lower] * coefficient;
+                if !upper_scaled.is_finite() || !lower_scaled.is_finite() {
+                    return Err(invalid_input(format!(
+                        "symmetric face-LDU FDIC face {face} cached multiplier is not finite"
+                    )));
+                }
+                self.fdic_upper_scaled_by_upper_diagonal[face] = upper_scaled;
+                self.fdic_upper_scaled_by_lower_diagonal[face] = lower_scaled;
+            }
+        }
+
+        self.valid = true;
+        Ok(())
+    }
+
+    fn apply(&self, residual: &[f64]) -> Result<Vec<f64>> {
+        let mut output = vec![0.0; residual.len()];
+        self.apply_into(residual, &mut output)?;
+        Ok(output)
+    }
+
+    fn apply_into(&self, residual: &[f64], output: &mut [f64]) -> Result<()> {
+        if !self.valid {
+            return Err(invalid_input(
+                "symmetric face-LDU preconditioner has no valid numerical factorization"
+                    .to_string(),
+            ));
+        }
+        if residual.len() != self.reciprocal_diagonal.len() || output.len() != residual.len() {
+            return Err(invalid_input(format!(
+                "symmetric face-LDU apply expected {} entries, got residual={} output={}",
+                self.reciprocal_diagonal.len(),
+                residual.len(),
+                output.len()
+            )));
+        }
+
+        for ((output, residual), reciprocal) in output
+            .iter_mut()
+            .zip(residual)
+            .zip(&self.reciprocal_diagonal)
+        {
+            *output = reciprocal * residual;
+        }
+        match self.kind {
+            FaceLduPreconditionerKind::Dic => {
+                for face in 0..self.pattern.upper_addr.len() {
+                    let lower = self.pattern.lower_addr[face];
+                    let upper = self.pattern.upper_addr[face];
+                    output[upper] -= self.reciprocal_diagonal[upper]
+                        * self.upper_coefficients[face]
+                        * output[lower];
+                }
+                for face in (0..self.pattern.upper_addr.len()).rev() {
+                    let lower = self.pattern.lower_addr[face];
+                    let upper = self.pattern.upper_addr[face];
+                    output[lower] -= self.reciprocal_diagonal[lower]
+                        * self.upper_coefficients[face]
+                        * output[upper];
+                }
+            }
+            FaceLduPreconditionerKind::Fdic => {
+                for face in 0..self.pattern.upper_addr.len() {
+                    let lower = self.pattern.lower_addr[face];
+                    let upper = self.pattern.upper_addr[face];
+                    output[upper] -= self.fdic_upper_scaled_by_upper_diagonal[face] * output[lower];
+                }
+                for face in (0..self.pattern.upper_addr.len()).rev() {
+                    let lower = self.pattern.lower_addr[face];
+                    let upper = self.pattern.upper_addr[face];
+                    output[lower] -= self.fdic_upper_scaled_by_lower_diagonal[face] * output[upper];
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1686,12 +2050,13 @@ mod tests {
 
     use super::{
         BiCgStabOptions, CgPreconditioner, ConjugateGradientOptions, CsrMatrix, CsrSparsityPattern,
-        GaussSeidelOptions, IncompleteCholeskyPreconditioner, IterativeSolveTermination,
-        JacobiOptions, PreconditionedConjugateGradientOptions,
-        PreconditionedConjugateGradientWorkspace, ReusablePreconditioner, bicgstab_solve,
-        conjugate_gradient_solve, csr_diagonal_slots, gauss_seidel_solve, gauss_seidel_sweep,
-        gauss_seidel_sweep_with_cached_diagonal, jacobi_solve,
-        preconditioned_conjugate_gradient_solve, residual, symmetric_gauss_seidel_solve,
+        FaceLduPreconditioner, FaceLduPreconditionerKind, GaussSeidelOptions,
+        IncompleteCholeskyPreconditioner, IterativeSolveTermination, JacobiOptions,
+        PreconditionedConjugateGradientOptions, PreconditionedConjugateGradientWorkspace,
+        ReusablePreconditioner, bicgstab_solve, conjugate_gradient_solve, csr_diagonal_slots,
+        gauss_seidel_solve, gauss_seidel_sweep, gauss_seidel_sweep_with_cached_diagonal,
+        jacobi_solve, preconditioned_conjugate_gradient_solve, residual,
+        symmetric_gauss_seidel_solve,
     };
 
     #[test]
@@ -1955,6 +2320,339 @@ mod tests {
         assert_eq!(report.iterations, 1);
         assert_close(&report.solution, &[2.0, 3.0], 1.0e-14);
         assert!(report.residual_norm <= 1.0e-12);
+    }
+
+    #[test]
+    fn dic_and_fdic_match_hand_derived_face_ldu_oracle_bit_for_bit() {
+        let matrix = dic_oracle_matrix();
+        let dic =
+            FaceLduPreconditioner::build(&matrix, FaceLduPreconditionerKind::Dic).expect("DIC");
+        let fdic =
+            FaceLduPreconditioner::build(&matrix, FaceLduPreconditionerKind::Fdic).expect("FDIC");
+
+        assert_eq!(dic.pattern.lower_addr, [0, 1]);
+        assert_eq!(dic.pattern.upper_addr, [1, 2]);
+        assert_eq!(dic.pattern.owner_start, [0, 1, 2, 2]);
+        assert_close(
+            &dic.reciprocal_diagonal,
+            &[1.0 / 4.0, 4.0 / 15.0, 15.0 / 41.0],
+            1.0e-15,
+        );
+        assert_close(
+            &fdic.fdic_upper_scaled_by_upper_diagonal,
+            &[-4.0 / 15.0, -15.0 / 41.0],
+            1.0e-15,
+        );
+        assert_close(
+            &fdic.fdic_upper_scaled_by_lower_diagonal,
+            &[-1.0 / 4.0, -4.0 / 15.0],
+            1.0e-15,
+        );
+
+        let residual = [1.0, 2.0, 3.0];
+        let dic_output = dic.apply(&residual).expect("DIC application");
+        let fdic_output = fdic.apply(&residual).expect("FDIC application");
+        assert_close(
+            &dic_output,
+            &[20.0 / 41.0, 39.0 / 41.0, 54.0 / 41.0],
+            1.0e-15,
+        );
+        assert_eq!(
+            dic_output
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            fdic_output
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn capabilities_advertise_distinct_dic_fdic_and_ic0_preconditioners() {
+        let capabilities = super::linear_solver_capabilities();
+        assert!(capabilities.cpu_incomplete_cholesky_preconditioner);
+        assert!(capabilities.cpu_dic_preconditioner);
+        assert!(capabilities.cpu_fdic_preconditioner);
+    }
+
+    #[test]
+    fn face_ldu_structure_is_canonical_and_rejects_ambiguous_csr() {
+        let unordered = CsrMatrix::from_rows(
+            vec![
+                vec![(1, -1.0), (0, 4.0)],
+                vec![(2, -1.0), (1, 4.0), (0, -1.0)],
+                vec![(2, 3.0), (1, -1.0)],
+            ],
+            3,
+        )
+        .expect("unordered symmetric matrix");
+        let canonical = FaceLduPreconditioner::new(&unordered, FaceLduPreconditionerKind::Dic)
+            .expect("canonical face-LDU pattern");
+        assert_eq!(canonical.pattern.diagonal_slots, [1, 3, 5]);
+        assert_eq!(canonical.pattern.lower_addr, [0, 1]);
+        assert_eq!(canonical.pattern.upper_addr, [1, 2]);
+        assert_eq!(canonical.pattern.owner_start, [0, 1, 2, 2]);
+
+        let non_square =
+            CsrMatrix::new(1, 2, vec![0, 1], vec![0], vec![1.0]).expect("non-square matrix");
+        let error = FaceLduPreconditioner::new(&non_square, FaceLduPreconditionerKind::Dic)
+            .err()
+            .expect("non-square face-LDU must fail");
+        assert!(error.to_string().contains("requires a square matrix"));
+
+        let duplicate = CsrMatrix::new(1, 1, vec![0, 2], vec![0, 0], vec![1.0, 1.0])
+            .expect("duplicate-column CSR");
+        let error = FaceLduPreconditioner::new(&duplicate, FaceLduPreconditionerKind::Dic)
+            .err()
+            .expect("duplicate face-LDU column must fail");
+        assert!(error.to_string().contains("duplicate column 0"));
+
+        let missing_diagonal =
+            CsrMatrix::new(2, 2, vec![0, 1, 3], vec![1, 0, 1], vec![-1.0, -1.0, 2.0])
+                .expect("CSR without first diagonal");
+        let error = FaceLduPreconditioner::new(&missing_diagonal, FaceLduPreconditionerKind::Dic)
+            .err()
+            .expect("missing face-LDU diagonal must fail");
+        assert!(error.to_string().contains("row 0 has no diagonal entry"));
+
+        let missing_transpose =
+            CsrMatrix::new(2, 2, vec![0, 2, 3], vec![0, 1, 1], vec![2.0, -1.0, 2.0])
+                .expect("CSR without transpose");
+        let error = FaceLduPreconditioner::new(&missing_transpose, FaceLduPreconditionerKind::Dic)
+            .err()
+            .expect("missing face-LDU transpose must fail");
+        assert!(error.to_string().contains("has no transpose entry"));
+    }
+
+    #[test]
+    fn face_ldu_numeric_failures_are_fail_closed_and_recoverable() {
+        let matrix = dic_oracle_matrix();
+        let pattern = matrix.sparsity_pattern();
+        let asymmetric =
+            CsrMatrix::from_pattern(&pattern, vec![4.0, -1.0, -2.0, 4.0, -1.0, -1.0, 3.0])
+                .expect("asymmetric values");
+        let mut non_finite =
+            CsrMatrix::from_pattern(&pattern, matrix.values().to_vec()).expect("shared matrix");
+        non_finite.values_mut()[1] = f64::NAN;
+        for kind in [CgPreconditioner::Dic, CgPreconditioner::Fdic] {
+            let mut workspace = PreconditionedConjugateGradientWorkspace::new(&matrix, kind)
+                .expect("face-LDU workspace");
+            let options = PreconditionedConjugateGradientOptions {
+                max_iterations: 8,
+                tolerance: 1.0e-12,
+                preconditioner: kind,
+            };
+
+            let error = workspace
+                .solve(&asymmetric, &[1.0, 0.0, 1.0], None, options)
+                .expect_err("bitwise asymmetric matrix must fail");
+            assert!(error.to_string().contains("bitwise symmetric"));
+            assert!(
+                !workspace
+                    .face_ldu_preconditioner
+                    .as_ref()
+                    .expect("face-LDU state")
+                    .valid
+            );
+
+            let recovered = workspace
+                .solve(&matrix, &[1.0, 0.0, 1.0], None, options)
+                .expect("valid retry after failed refactor");
+            assert!(recovered.converged);
+            assert!(
+                workspace
+                    .face_ldu_preconditioner
+                    .as_ref()
+                    .expect("face-LDU state")
+                    .valid
+            );
+
+            let error = workspace
+                .solve(&non_finite, &[1.0, 0.0, 1.0], None, options)
+                .expect_err("non-finite face coefficient must fail");
+            assert!(error.to_string().contains("non-finite coefficients"));
+            assert!(
+                !workspace
+                    .face_ldu_preconditioner
+                    .as_ref()
+                    .expect("face-LDU state")
+                    .valid
+            );
+
+            let recovered = workspace
+                .solve(&matrix, &[1.0, 0.0, 1.0], None, options)
+                .expect("valid retry after non-finite refactor");
+            assert!(recovered.converged);
+        }
+
+        let indefinite =
+            CsrMatrix::from_rows(vec![vec![(0, 1.0), (1, 2.0)], vec![(0, 2.0), (1, 1.0)]], 2)
+                .expect("indefinite symmetric matrix");
+        let error = FaceLduPreconditioner::build(&indefinite, FaceLduPreconditionerKind::Dic)
+            .err()
+            .expect("non-positive DIC pivot must fail");
+        assert!(error.to_string().contains("non-positive DIC pivot"));
+
+        let reciprocal_overflow = CsrMatrix::from_rows(vec![vec![(0, f64::from_bits(1))]], 1)
+            .expect("subnormal diagonal");
+        let error =
+            FaceLduPreconditioner::build(&reciprocal_overflow, FaceLduPreconditionerKind::Dic)
+                .err()
+                .expect("non-finite reciprocal must fail");
+        assert!(error.to_string().contains("reciprocal pivot is invalid"));
+
+        let square_overflow = CsrMatrix::from_rows(
+            vec![
+                vec![(0, f64::MAX), (1, f64::MAX)],
+                vec![(0, f64::MAX), (1, f64::MAX)],
+            ],
+            2,
+        )
+        .expect("finite overflowing matrix");
+        let error = FaceLduPreconditioner::build(&square_overflow, FaceLduPreconditionerKind::Fdic)
+            .err()
+            .expect("coefficient-square overflow must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("coefficient square is not finite")
+        );
+    }
+
+    #[test]
+    fn reusable_dic_and_fdic_keep_allocations_stable_for_ten_lifecycles() {
+        let first_matrix = dic_oracle_matrix();
+        let pattern = first_matrix.sparsity_pattern();
+        let exact = [1.0, -0.5, 2.0];
+
+        for kind in [CgPreconditioner::Dic, CgPreconditioner::Fdic] {
+            let mut workspace = PreconditionedConjugateGradientWorkspace::new(&first_matrix, kind)
+                .expect("face-LDU PCG workspace");
+            let pointers = face_ldu_workspace_pointers(&workspace);
+            for lifecycle in 0..10 {
+                let shift = lifecycle as f64 * 0.125;
+                let matrix = CsrMatrix::from_pattern(
+                    &pattern,
+                    vec![
+                        4.0 + shift,
+                        -1.0,
+                        -1.0,
+                        4.0 + shift,
+                        -1.0,
+                        -1.0,
+                        3.0 + shift,
+                    ],
+                )
+                .expect("shared lifecycle matrix");
+                let rhs = matrix.matvec(&exact).expect("manufactured rhs");
+                let options = PreconditionedConjugateGradientOptions {
+                    max_iterations: 16,
+                    tolerance: 1.0e-12,
+                    preconditioner: kind,
+                };
+                let reused = workspace
+                    .solve(&matrix, &rhs, None, options)
+                    .expect("reused face-LDU solve");
+                let fresh = preconditioned_conjugate_gradient_solve(&matrix, &rhs, None, options)
+                    .expect("fresh face-LDU solve");
+                assert!(reused.converged);
+                assert_eq!(reused.iterations, fresh.iterations);
+                assert_eq!(
+                    reused.residual_norm.to_bits(),
+                    fresh.residual_norm.to_bits()
+                );
+                assert_eq!(
+                    reused
+                        .solution
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    fresh
+                        .solution
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(face_ldu_workspace_pointers(&workspace), pointers);
+            }
+        }
+    }
+
+    #[test]
+    fn dic_and_fdic_profiled_and_plain_pcg_are_bit_identical() {
+        let matrix = dic_oracle_matrix();
+        let rhs = [1.0, 0.0, 1.0];
+        for kind in [CgPreconditioner::Dic, CgPreconditioner::Fdic] {
+            let options = PreconditionedConjugateGradientOptions {
+                max_iterations: 16,
+                tolerance: 1.0e-12,
+                preconditioner: kind,
+            };
+            let mut plain_workspace = PreconditionedConjugateGradientWorkspace::new(&matrix, kind)
+                .expect("plain face-LDU workspace");
+            let mut profiled_workspace =
+                PreconditionedConjugateGradientWorkspace::new(&matrix, kind)
+                    .expect("profiled face-LDU workspace");
+            let plain = plain_workspace
+                .solve(&matrix, &rhs, None, options)
+                .expect("plain face-LDU PCG");
+            let profiled = profiled_workspace
+                .solve_profiled(&matrix, &rhs, None, options)
+                .expect("profiled face-LDU PCG");
+
+            assert!(plain.converged);
+            assert_eq!(plain.iterations, profiled.report.iterations);
+            assert_eq!(plain.termination, profiled.report.termination);
+            assert_eq!(
+                plain.residual_norm.to_bits(),
+                profiled.report.residual_norm.to_bits()
+            );
+            assert_eq!(
+                plain
+                    .solution
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                profiled
+                    .report
+                    .solution
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                profiled.timing.matrix_vector_products,
+                profiled.report.iterations + 1
+            );
+            assert_eq!(
+                profiled.timing.preconditioner_applications,
+                profiled.report.iterations
+            );
+        }
+    }
+
+    #[test]
+    fn built_dic_and_fdic_precondition_bicgstab_on_symmetric_matrix() {
+        let matrix = dic_oracle_matrix();
+        let exact = [1.0, -0.5, 2.0];
+        let rhs = matrix.matvec(&exact).expect("manufactured rhs");
+        for kind in [CgPreconditioner::Dic, CgPreconditioner::Fdic] {
+            let report = bicgstab_solve(
+                &matrix,
+                &rhs,
+                None,
+                BiCgStabOptions {
+                    max_iterations: 16,
+                    tolerance: 1.0e-12,
+                    preconditioner: kind,
+                },
+            )
+            .expect("built face-LDU BiCGStab solve");
+            assert!(report.converged);
+            assert_close(&report.solution, &exact, 1.0e-11);
+        }
     }
 
     #[test]
@@ -2383,6 +3081,45 @@ mod tests {
     fn median(samples: &mut [f64]) -> f64 {
         samples.sort_by(f64::total_cmp);
         samples[samples.len() / 2]
+    }
+
+    fn dic_oracle_matrix() -> CsrMatrix {
+        CsrMatrix::new(
+            3,
+            3,
+            vec![0, 2, 5, 7],
+            vec![0, 1, 0, 1, 2, 1, 2],
+            vec![4.0, -1.0, -1.0, 4.0, -1.0, -1.0, 3.0],
+        )
+        .expect("DIC oracle matrix")
+    }
+
+    fn face_ldu_workspace_pointers(
+        workspace: &PreconditionedConjugateGradientWorkspace,
+    ) -> [usize; 17] {
+        let preconditioner = workspace
+            .face_ldu_preconditioner
+            .as_ref()
+            .expect("face-LDU preconditioner");
+        [
+            preconditioner.pattern.sparsity.row_offsets.as_ptr() as usize,
+            preconditioner.pattern.sparsity.col_indices.as_ptr() as usize,
+            preconditioner.pattern.diagonal_slots.as_ptr() as usize,
+            preconditioner.pattern.lower_addr.as_ptr() as usize,
+            preconditioner.pattern.upper_addr.as_ptr() as usize,
+            preconditioner.pattern.owner_start.as_ptr() as usize,
+            preconditioner.pattern.lower_matrix_slots.as_ptr() as usize,
+            preconditioner.pattern.upper_matrix_slots.as_ptr() as usize,
+            preconditioner.upper_coefficients.as_ptr() as usize,
+            preconditioner.reciprocal_diagonal.as_ptr() as usize,
+            preconditioner.fdic_upper_scaled_by_upper_diagonal.as_ptr() as usize,
+            preconditioner.fdic_upper_scaled_by_lower_diagonal.as_ptr() as usize,
+            workspace.residual.as_ptr() as usize,
+            workspace.preconditioned_residual.as_ptr() as usize,
+            workspace.direction.as_ptr() as usize,
+            workspace.matrix_direction.as_ptr() as usize,
+            workspace.preconditioner_scratch.as_ptr() as usize,
+        ]
     }
 
     fn poisson_grid(nx: usize, ny: usize) -> CsrMatrix {
