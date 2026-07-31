@@ -10,9 +10,10 @@ use std::time::Instant;
 
 use case::{InitCaseOptions, init_case};
 use ferrum_finite_volume::boundary_forces::{
-    MAX_RELATIVE_AREA_VECTOR_IMBALANCE_TOLERANCE, NoSlipWallForceOptions, PressureFieldKind,
-    PressureReference, ReferenceArea, WallForceCoefficients,
-    integrate_stationary_no_slip_zero_gradient_pressure_wall_forces,
+    CellVelocityGradientComponents, MAX_RELATIVE_AREA_VECTOR_IMBALANCE_TOLERANCE,
+    NoSlipWallForceOptions, PressureFieldKind, PressureReference, ReferenceArea,
+    WallForceCoefficients,
+    integrate_stationary_no_slip_zero_gradient_pressure_wall_forces_with_reconstructed_gradient,
 };
 use ferrum_finite_volume::continuity::{NormalizedContinuity, normalize_steady_continuity};
 use ferrum_mesh::Point3;
@@ -38,8 +39,9 @@ use ferrum_mesh::flow::{
     LaminarSimpleSchemes, LaminarSimpleSnGradScheme, LaminarSimpleStopReason,
     LinearSolveConvergenceSummary, LinearSolveSummary, MatrixDiagnosticSummary,
     PressureAssemblyDiagnostics, ScalarDiagnosticSummary, VectorDiagnosticSummary,
-    solve_laminar_simple, solve_laminar_simple_profiled_pcg,
-    solve_laminar_simple_profiled_pcg_with_observer, solve_laminar_simple_with_observer,
+    reconstruct_laminar_gradients_from_fields, solve_laminar_simple,
+    solve_laminar_simple_profiled_pcg, solve_laminar_simple_profiled_pcg_with_observer,
+    solve_laminar_simple_with_observer,
 };
 use ferrum_mesh::foam::{FoamWriteOptions, write_openfoam_case_with_options};
 use ferrum_mesh::geometry::{GeometrySummary, summarize_case_geometry};
@@ -72,6 +74,11 @@ const FERRUM_DEFAULT_LDU_TOLERANCE: f64 = 1.0e-6;
 const FERRUM_DEFAULT_LDU_MAX_ITERATIONS: usize = 1_000;
 const FERRUM_MAX_CASE_LDU_MAX_ITERATIONS: usize = FERRUM_DEFAULT_LDU_MAX_ITERATIONS;
 const FERRUM_MAX_CASE_SIMPLE_ITERATIONS: usize = 10_000;
+const WALL_FORCE_TRACTION_METHOD: &str = "reconstructedGradientFullDeviatoric";
+const WALL_FORCE_TRACTION_METHOD_VERSION: usize = 1;
+const WALL_FORCE_FORCE_CONVENTION: &str = "fluidOnBody";
+const WALL_FORCE_AREA_VECTOR_ORIENTATION: &str = "outwardFromFluid";
+const WALL_FORCE_PRESSURE_FACE_TREATMENT: &str = "zeroGradientOwner";
 
 pub fn run_ferrum() -> i32 {
     let args = env::args().skip(1).collect::<Vec<_>>();
@@ -783,6 +790,7 @@ fn run_laminar_simple_solve(
     }
     if let Some(wall_forces) = &post_processing.wall_forces {
         print_wall_force_coefficients(wall_forces);
+        print_wall_force_method(wall_forces);
     }
 
     println!(
@@ -1228,16 +1236,32 @@ fn build_laminar_simple_post_processing(
     let wall_forces = solve
         .wall_forces
         .as_ref()
-        .map(|request| {
+        .map(|request| -> Result<WallForceReport, String> {
             let patch_names = request
                 .patch_names
                 .iter()
                 .map(String::as_str)
                 .collect::<Vec<_>>();
-            integrate_stationary_no_slip_zero_gradient_pressure_wall_forces(
+            let gradients = reconstruct_laminar_gradients_from_fields(
+                &plan.runtime_data,
+                &plan.initial_fields,
+                &report.final_velocity,
+                &report.final_pressure,
+                options.schemes,
+            )
+            .map_err(|error| {
+                format!("could not reconstruct final fields for selected wall forces ({error})")
+            })?;
+            let resolved =
+                integrate_stationary_no_slip_zero_gradient_pressure_wall_forces_with_reconstructed_gradient(
                 &plan.runtime_data.mesh,
                 &report.final_velocity,
                 &report.final_pressure,
+                CellVelocityGradientComponents {
+                    grad_ux: &gradients.velocity_component_gradients[0],
+                    grad_uy: &gradients.velocity_component_gradients[1],
+                    grad_uz: &gradients.velocity_component_gradients[2],
+                },
                 &patch_names,
                 NoSlipWallForceOptions {
                     pressure_kind: PressureFieldKind::Kinematic,
@@ -1261,12 +1285,13 @@ fn build_laminar_simple_post_processing(
                     },
                 },
             )
-            .map(|coefficients| WallForceReport {
+            .map_err(|error| format!("could not integrate selected wall forces ({error})"))?;
+            Ok(WallForceReport {
                 patch_names: request.patch_names.clone(),
                 reference_speed: request.reference_speed,
-                coefficients,
+                velocity_gradient_scheme: options.schemes.grad_u,
+                coefficients: resolved.coefficients,
             })
-            .map_err(|error| format!("could not integrate selected wall forces ({error})"))
         })
         .transpose()?;
 
@@ -1374,6 +1399,18 @@ fn print_wall_force_coefficients(report: &WallForceReport) {
         format_scientific(value.lift.total),
         format_scientific(value.resolved_reference_area),
         format_scientific(report.reference_speed),
+    );
+}
+
+fn print_wall_force_method(report: &WallForceReport) {
+    println!(
+        "incompressibleFluid wallForceMethod: tractionMethod={} tractionMethodVersion={} forceConvention={} faceAreaVectorOrientation={} pressureFaceTreatment={} gradU=\"{}\"",
+        WALL_FORCE_TRACTION_METHOD,
+        WALL_FORCE_TRACTION_METHOD_VERSION,
+        WALL_FORCE_FORCE_CONVENTION,
+        WALL_FORCE_AREA_VECTOR_ORIENTATION,
+        WALL_FORCE_PRESSURE_FACE_TREATMENT,
+        report.velocity_gradient_scheme,
     );
 }
 
@@ -4626,6 +4663,28 @@ fn write_json_wall_forces(
     write_json_key(writer, 4, "pressureReference")?;
     write_json_string(writer, "areaVectorBalancedMean")?;
     writeln!(writer, ",")?;
+    write_json_key(writer, 4, "tractionMethod")?;
+    write_json_string(writer, WALL_FORCE_TRACTION_METHOD)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(
+        writer,
+        4,
+        "tractionMethodVersion",
+        WALL_FORCE_TRACTION_METHOD_VERSION,
+    )?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "forceConvention")?;
+    write_json_string(writer, WALL_FORCE_FORCE_CONVENTION)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "faceAreaVectorOrientation")?;
+    write_json_string(writer, WALL_FORCE_AREA_VECTOR_ORIENTATION)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "pressureFaceTreatment")?;
+    write_json_string(writer, WALL_FORCE_PRESSURE_FACE_TREATMENT)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "velocityGradientScheme")?;
+    write_json_string(writer, &report.velocity_gradient_scheme.to_string())?;
+    writeln!(writer, ",")?;
     write_json_key(writer, 4, "resolvedPressureReference")?;
     write_json_optional_number(writer, Some(value.resolved_pressure_reference))?;
     writeln!(writer, ",")?;
@@ -5890,6 +5949,28 @@ fn write_laminar_simple_report_markdown(
         writeln!(writer, "| Selected faces | {} |", value.selected_faces)?;
         writeln!(writer, "| Pressure field kind | kinematic |")?;
         writeln!(writer, "| Pressure reference | area-vector balanced mean |")?;
+        writeln!(writer, "| Traction method | {WALL_FORCE_TRACTION_METHOD} |")?;
+        writeln!(
+            writer,
+            "| Traction method version | {WALL_FORCE_TRACTION_METHOD_VERSION} |"
+        )?;
+        writeln!(
+            writer,
+            "| Force convention | {WALL_FORCE_FORCE_CONVENTION} |"
+        )?;
+        writeln!(
+            writer,
+            "| Face area-vector orientation | {WALL_FORCE_AREA_VECTOR_ORIENTATION} |"
+        )?;
+        writeln!(
+            writer,
+            "| Pressure face treatment | {WALL_FORCE_PRESSURE_FACE_TREATMENT} |"
+        )?;
+        writeln!(
+            writer,
+            "| Velocity gradient scheme | {} |",
+            wall_forces.velocity_gradient_scheme
+        )?;
         writeln!(
             writer,
             "| Selected area | {} |",
@@ -8010,6 +8091,7 @@ struct ContinuityErrorsReport {
 struct WallForceReport {
     patch_names: Vec<String>,
     reference_speed: f64,
+    velocity_gradient_scheme: LaminarSimpleGradientScheme,
     coefficients: WallForceCoefficients,
 }
 
@@ -10547,6 +10629,7 @@ mod tests {
             wall_forces: Some(WallForceReport {
                 patch_names: vec!["cylinder".to_string()],
                 reference_speed: 0.015,
+                velocity_gradient_scheme: LaminarSimpleGradientScheme::CellLimitedGaussLinear(1.0),
                 coefficients: WallForceCoefficients {
                     pressure_force: ferrum_mesh::Point3 {
                         x: 1.0,
@@ -10744,6 +10827,27 @@ mod tests {
             .expect("missing deltaT must preserve the existing solve contract");
 
         assert!(post.continuity_errors.is_none());
+        assert!(post.wall_forces.is_none());
+    }
+
+    #[test]
+    fn no_wall_force_request_does_not_reconstruct_invalid_final_fields() {
+        let mut plan = laminar_simple_test_plan(1000.0, 0.001);
+        plan.run.delta_t = None;
+        let solve = parse_incompressible_fluid_args(&[])
+            .expect("default incompressible args")
+            .laminar_simple_solve
+            .expect("incompressible solve");
+        assert!(solve.wall_forces.is_none());
+        let options = minimal_laminar_simple_options_for_estimate();
+        let mut report = output_test_report();
+        report.final_velocity.clear();
+        report.final_pressure.clear();
+
+        let post = build_laminar_simple_post_processing(&plan, &solve, &options, &report)
+            .expect("no wall-force request must not reconstruct invalid final fields");
+
+        assert!(post.wall_forces.is_none());
     }
 
     #[test]
@@ -10792,11 +10896,23 @@ mod tests {
         assert!(json.contains("\"cumulativeGlobal\": -0.00000000375"));
         assert!(json.contains("\"wallForces\""));
         assert!(json.contains("\"pressureFieldKind\": \"kinematic\""));
+        assert!(json.contains("\"tractionMethod\": \"reconstructedGradientFullDeviatoric\""));
+        assert!(json.contains("\"tractionMethodVersion\": 1"));
+        assert!(json.contains("\"forceConvention\": \"fluidOnBody\""));
+        assert!(json.contains("\"faceAreaVectorOrientation\": \"outwardFromFluid\""));
+        assert!(json.contains("\"pressureFaceTreatment\": \"zeroGradientOwner\""));
+        assert!(json.contains("\"velocityGradientScheme\": \"cellLimited Gauss linear 1\""));
         assert!(json.contains("\"selectedFaces\": 16"));
         assert!(json.contains("\"total\": 6"));
         assert!(markdown.contains("- Schema version: `3`"));
         assert!(markdown.contains("## Continuity errors"));
         assert!(markdown.contains("## Wall forces"));
+        assert!(markdown.contains("| Traction method | reconstructedGradientFullDeviatoric |"));
+        assert!(markdown.contains("| Traction method version | 1 |"));
+        assert!(markdown.contains("| Force convention | fluidOnBody |"));
+        assert!(markdown.contains("| Face area-vector orientation | outwardFromFluid |"));
+        assert!(markdown.contains("| Pressure face treatment | zeroGradientOwner |"));
+        assert!(markdown.contains("| Velocity gradient scheme | cellLimited Gauss linear 1 |"));
         assert!(
             markdown
                 .contains("| Drag pressure/viscous/total | 4.000000e0 / 2.000000e0 / 6.000000e0 |")

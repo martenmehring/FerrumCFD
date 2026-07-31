@@ -656,6 +656,24 @@ solve, pressure-coupling setup, pressure assembly/solve, field correction,
 finalization, and remaining solver work. These timings measure the executable
 solver only; they never include Cargo compilation.
 
+Wall-force reporting is opt-in and does not add gradient-reconstruction work to
+the normal solve path. Supply `--wallForcePatches`,
+`--forceReferenceSpeed`, and `--forceReferenceArea` together:
+
+```console
+ferrumRun -solver incompressibleFluid -case tutorials/incompressibleFluid/cylinder/ferrum/case --wallForcePatches cylinder --forceReferenceSpeed 0.015 --forceReferenceArea 1e-6 --solveReportJson target/cylinder.json --solveReportMarkdown target/cylinder.md
+```
+
+Every selected patch must use `U` type `noSlip` and `p` type
+`zeroGradient`. After the solve, Ferrum reconstructs the final velocity
+gradient with the active `grad(U)` scheme and integrates wall-face owner
+pressure plus the full deviatoric Newtonian viscous traction. Reported forces
+use the force exerted by the fluid on the body; face area vectors point outward
+from the fluid. The existing `wallForces` summary remains stable, and a
+separate `wallForceMethod` line plus additive JSON/Markdown fields record the
+traction method, method version, sign convention, face orientation,
+zero-gradient owner-pressure treatment, and velocity-gradient scheme.
+
 Pressure-PCG kernel timing is disabled by default. With pressure `PCG`,
 `--profilePcg` enables diagnostic timing for total PCG work, selected
 preconditioner update/application, matrix-vector products, and vector
