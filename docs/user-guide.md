@@ -760,11 +760,11 @@ non-negative `relTol`. For every linear solve the authoritative normalized-L1
 target is
 `max(tolerance, relTol * initialNormalizedResidual)`, and convergence requires
 the final normalized residual to be strictly smaller than that target. As in
-OpenFOAM, non-GAMG solvers activate the relative criterion only for
-`relTol > 1e-15`; the established GAMG compatibility contract activates it for
-every `relTol > 0`. `relTol` is not capped at one. GAMG derives conservative
-internal L2 controls for both normalized-L1 limits and rechecks the strict
-normalized-L1 criterion before reporting convergence.
+OpenFOAM Foundation 13, every solver activates the relative criterion only for
+`relTol > 1e-20`. The LDU normalisation factor adds `1e-20` to its accumulated
+value. `relTol` is not capped at one. GAMG derives conservative internal L2
+controls for both normalized-L1 limits and rechecks the strict normalized-L1
+criterion before reporting convergence.
 
 The configured `relTol` is a static, user-bounded case control. It remains
 active in the accepting steady SIMPLE iteration; Ferrum does not invent a

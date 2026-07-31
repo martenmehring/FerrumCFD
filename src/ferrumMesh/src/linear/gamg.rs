@@ -14,6 +14,7 @@ use crate::Result;
 const MAX_LEVELS: usize = 50;
 const COARSEST_MAX_ITERATIONS: usize = 1_000;
 const SCALE_STABILISER: f64 = 1.0e-300;
+pub(crate) const OPENFOAM_RELATIVE_TOLERANCE_SMALL: f64 = 1.0e-20;
 /// Caps dense coarsest storage at 512 KiB and its cubic factorisation at
 /// roughly 17 million elimination steps, keeping both costs predictable.
 const MAX_DENSE_COARSEST_CELLS: usize = 256;
@@ -2298,7 +2299,7 @@ fn normalized_l1_has_converged(
     controls: NormalizedL1GamgSolveControls,
 ) -> bool {
     current_l1 / controls.normalization_factor < controls.tolerance
-        || (controls.relative_tolerance > 0.0
+        || (controls.relative_tolerance > OPENFOAM_RELATIVE_TOLERANCE_SMALL
             && current_l1 / controls.normalization_factor
                 < controls.relative_tolerance * (initial_l1 / controls.normalization_factor))
 }
@@ -3808,6 +3809,88 @@ mod tests {
         assert!(two_cycle_solution_bits.is_some());
         assert_eq!(equality_legs, 4);
         assert_eq!(equality_comparisons, 3);
+    }
+
+    #[test]
+    fn normalized_l1_entrypoint_uses_strict_openfoam_reltol_small_boundary() {
+        assert_eq!(
+            super::OPENFOAM_RELATIVE_TOLERANCE_SMALL.to_bits(),
+            1.0e-20_f64.to_bits()
+        );
+        let matrix = CsrMatrix::from_rows(
+            vec![vec![(0, 2.0), (1, -1.0)], vec![(0, -1.0), (1, 2.0)]],
+            2,
+        )
+        .expect("two-cell matrix");
+        let rhs = [1.0, 1.0];
+        let options = GamgOptions {
+            max_iterations: 2,
+            min_iterations: 0,
+            n_cells_in_coarsest_level: 1,
+            n_post_sweeps: 0,
+            n_finest_sweeps: 0,
+            scale_correction: false,
+            direct_solve_coarsest: true,
+            ..GamgOptions::default()
+        };
+        let solve_controls = |relative_tolerance| NormalizedL1GamgSolveControls {
+            normalization_factor: 1.0,
+            tolerance: 0.0,
+            relative_tolerance,
+            l2_controls: super::GamgSolveControls {
+                max_iterations: 2,
+                min_iterations: 0,
+                tolerance: 0.0,
+                relative_tolerance: 0.0,
+            },
+        };
+
+        let mut equality_workspace =
+            GamgWorkspace::new(&matrix, options).expect("equality workspace");
+        let equality = equality_workspace
+            .solve_normalized_l1_with_controls_profiled(
+                &matrix,
+                &rhs,
+                None,
+                solve_controls(super::OPENFOAM_RELATIVE_TOLERANCE_SMALL),
+            )
+            .expect("equality solve");
+        assert_eq!(equality.report.iterations, 2);
+        assert!(!equality.report.converged);
+        assert_eq!(
+            equality.report.termination,
+            super::IterativeSolveTermination::MaxIterations
+        );
+        assert_eq!(equality.report.residual_norm.to_bits(), 0.0f64.to_bits());
+        assert_eq!(equality.timing.v_cycles, 2);
+        assert_eq!(equality.timing.finest_residual_evaluations, 3);
+
+        let mut active_workspace = GamgWorkspace::new(&matrix, options).expect("active workspace");
+        let active = active_workspace
+            .solve_normalized_l1_with_controls_profiled(
+                &matrix,
+                &rhs,
+                None,
+                solve_controls(super::OPENFOAM_RELATIVE_TOLERANCE_SMALL.next_up()),
+            )
+            .expect("next-up solve");
+        assert_eq!(active.report.iterations, 1);
+        assert!(active.report.converged);
+        assert_eq!(
+            active.report.termination,
+            super::IterativeSolveTermination::Converged
+        );
+        assert_eq!(active.report.residual_norm.to_bits(), 0.0f64.to_bits());
+        assert_eq!(active.timing.v_cycles, 1);
+        assert_eq!(active.timing.finest_residual_evaluations, 2);
+        for (left, right) in equality
+            .report
+            .solution
+            .iter()
+            .zip(active.report.solution.iter())
+        {
+            assert_eq!(left.to_bits(), right.to_bits());
+        }
     }
 
     #[test]
