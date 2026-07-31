@@ -382,7 +382,10 @@ The evidence sequence is:
    traction from reconstructed `grad(U)`, while preserving pressure-gauge,
    orientation, and area contracts. The production CLI reconstructs only when
    wall forces are requested and records the method, sign, pressure-face
-   treatment, area-vector orientation, and active `grad(U)` scheme;
+   treatment, area-vector orientation, and active `grad(U)` scheme. The
+   optional versioned per-face CSV bridge retains the exact core visit order
+   and round-trip pressure, traction, wall-shear, and force values without
+   changing the normal solve or aggregate report paths;
 2. run at least three geometrically similar meshes and report observed order,
    Richardson extrapolation, and GCI for `Cd`, fields, wall pressure, and wall
    shear, with iterative error demonstrably below spatial error;
@@ -1835,9 +1838,13 @@ The immediate sequence is:
       force-on-body, finite-value, allocation, and deterministic face-order
       contracts. The CLI bridge is opt-in, leaves the normal solver hot path
       unchanged, and records exact method provenance in console, JSON, and
-      Markdown reports. Three-mesh observed-order/Richardson/GCI and the final
-      same-mesh Foundation 13 parity/performance refresh remain open before any
-      general higher-accuracy or speed claim.
+      Markdown reports. The additive `wallFaceLoadsCsv` audit path now exports
+      the retained core face contributions with round-trip values, exact
+      patch/face ordering, complete units and method provenance, compensated
+      aggregate parity, and safe output confinement. Three-mesh
+      observed-order/Richardson/GCI and the final same-mesh Foundation 13
+      parity/performance refresh remain open before any general higher-accuracy
+      or speed claim.
 
    The executed per-leaf protocols, fixed-work budgets, input hashes, and
    results are recorded above and in external hashed artifacts; they must not be
