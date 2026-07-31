@@ -117,6 +117,106 @@ pub struct PcgKernelTiming {
     pub preconditioner_applications: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NormalizedL1PcgSolveControls {
+    pub(crate) max_iterations: usize,
+    pub(crate) normalization_factor: f64,
+    pub(crate) tolerance: f64,
+    pub(crate) relative_tolerance: f64,
+    pub(crate) preconditioner: CgPreconditioner,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PreparedPcgResidual<'a> {
+    values: &'a [f64],
+    initial_l1_residual_norm: f64,
+    residual_squared: f64,
+}
+
+impl<'a> PreparedPcgResidual<'a> {
+    pub(crate) fn write_from_rhs_and_matrix_product(
+        values: &'a mut [f64],
+        rhs: &[f64],
+        matrix_product: &[f64],
+    ) -> Result<Self> {
+        if values.len() != rhs.len() || matrix_product.len() != rhs.len() {
+            return Err(invalid_input(format!(
+                "prepared PCG residual length mismatch: residual={} rhs={} matrix-product={}",
+                values.len(),
+                rhs.len(),
+                matrix_product.len()
+            )));
+        }
+
+        let mut initial_l1_residual_norm = 0.0;
+        let mut residual_squared = 0.0;
+        for (index, ((value, source), matrix_value)) in
+            values.iter_mut().zip(rhs).zip(matrix_product).enumerate()
+        {
+            let residual = source - matrix_value;
+            if !residual.is_finite() {
+                return Err(invalid_input(format!(
+                    "prepared PCG residual entry {index} is not finite"
+                )));
+            }
+            *value = residual;
+            initial_l1_residual_norm += residual.abs();
+            residual_squared += residual * residual;
+            if !initial_l1_residual_norm.is_finite() || !residual_squared.is_finite() {
+                return Err(invalid_input(
+                    "prepared PCG residual aggregates are not finite".to_string(),
+                ));
+            }
+        }
+
+        Ok(Self {
+            values,
+            initial_l1_residual_norm,
+            residual_squared,
+        })
+    }
+
+    #[cfg(test)]
+    fn from_values_for_test(values: &'a [f64]) -> Result<Self> {
+        let mut initial_l1_residual_norm = 0.0;
+        let mut residual_squared = 0.0;
+        for (index, value) in values.iter().copied().enumerate() {
+            if !value.is_finite() {
+                return Err(invalid_input(format!(
+                    "prepared PCG residual entry {index} is not finite"
+                )));
+            }
+            initial_l1_residual_norm += value.abs();
+            residual_squared += value * value;
+            if !initial_l1_residual_norm.is_finite() || !residual_squared.is_finite() {
+                return Err(invalid_input(
+                    "prepared PCG residual aggregates are not finite".to_string(),
+                ));
+            }
+        }
+        Ok(Self {
+            values,
+            initial_l1_residual_norm,
+            residual_squared,
+        })
+    }
+
+    pub(crate) fn initial_l1_residual_norm(self) -> f64 {
+        self.initial_l1_residual_norm
+    }
+
+    pub(crate) fn residual_squared(self) -> f64 {
+        self.residual_squared
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PreparedPcgInitialTiming {
+    pub(crate) total_seconds: f64,
+    pub(crate) matrix_vector_seconds: f64,
+    pub(crate) vector_operation_seconds: f64,
+}
+
 #[derive(Clone, Debug)]
 pub struct ProfiledIterativeSolveReport {
     pub report: IterativeSolveReport,
@@ -1047,6 +1147,292 @@ impl PreconditionedConjugateGradientWorkspace {
         Ok(IterativeSolveReport {
             solution,
             iterations: options.max_iterations,
+            residual_norm,
+            converged: false,
+            termination: IterativeSolveTermination::MaxIterations,
+        })
+    }
+
+    pub(crate) fn solve_normalized_l1_prepared(
+        &mut self,
+        matrix: &CsrMatrix,
+        rhs: &[f64],
+        initial: Option<&[f64]>,
+        prepared_residual: PreparedPcgResidual<'_>,
+        controls: NormalizedL1PcgSolveControls,
+    ) -> Result<IterativeSolveReport> {
+        let mut timing = PcgKernelTiming::default();
+        self.solve_normalized_l1_prepared_internal::<false>(
+            matrix,
+            rhs,
+            initial,
+            prepared_residual,
+            controls,
+            &mut timing,
+        )
+    }
+
+    pub(crate) fn solve_normalized_l1_prepared_profiled(
+        &mut self,
+        matrix: &CsrMatrix,
+        rhs: &[f64],
+        initial: Option<&[f64]>,
+        prepared_residual: PreparedPcgResidual<'_>,
+        prepared_timing: PreparedPcgInitialTiming,
+        controls: NormalizedL1PcgSolveControls,
+    ) -> Result<ProfiledIterativeSolveReport> {
+        validate_prepared_pcg_initial_timing(prepared_timing)?;
+        let started = Instant::now();
+        let mut timing = PcgKernelTiming {
+            total_seconds: prepared_timing.total_seconds,
+            matrix_vector_seconds: prepared_timing.matrix_vector_seconds,
+            vector_operation_seconds: prepared_timing.vector_operation_seconds,
+            matrix_vector_products: 1,
+            ..PcgKernelTiming::default()
+        };
+        let report = self.solve_normalized_l1_prepared_internal::<true>(
+            matrix,
+            rhs,
+            initial,
+            prepared_residual,
+            controls,
+            &mut timing,
+        )?;
+        timing.total_seconds += started.elapsed().as_secs_f64();
+        let accounted_seconds = timing.preconditioner_update_seconds
+            + timing.matrix_vector_seconds
+            + timing.preconditioner_application_seconds
+            + timing.vector_operation_seconds;
+        timing.other_seconds = (timing.total_seconds - accounted_seconds).max(0.0);
+        Ok(ProfiledIterativeSolveReport { report, timing })
+    }
+
+    fn solve_normalized_l1_prepared_internal<const PROFILE: bool>(
+        &mut self,
+        matrix: &CsrMatrix,
+        rhs: &[f64],
+        initial: Option<&[f64]>,
+        prepared_residual: PreparedPcgResidual<'_>,
+        controls: NormalizedL1PcgSolveControls,
+        timing: &mut PcgKernelTiming,
+    ) -> Result<IterativeSolveReport> {
+        validate_normalized_l1_pcg_call(
+            matrix,
+            rhs,
+            initial,
+            prepared_residual,
+            controls,
+            self.preconditioner_kind,
+            &self.sparsity,
+        )?;
+
+        let solution_setup_started = profile_start::<PROFILE>();
+        let mut solution = initial
+            .map(|values| values.to_vec())
+            .unwrap_or_else(|| vec![0.0; rhs.len()]);
+        timing.vector_operation_seconds += profile_elapsed(solution_setup_started);
+
+        let residual_copy_started = profile_start::<PROFILE>();
+        for (destination, source) in self
+            .residual
+            .iter_mut()
+            .zip(prepared_residual.values.iter().copied())
+        {
+            *destination = source;
+        }
+        let initial_l1_residual_norm = prepared_residual.initial_l1_residual_norm;
+        let mut residual_squared = prepared_residual.residual_squared;
+        let mut current_l1_residual_norm = initial_l1_residual_norm;
+        let mut residual_norm = residual_squared.sqrt();
+        timing.vector_operation_seconds += profile_elapsed(residual_copy_started);
+
+        if normalized_l1_pcg_has_converged(
+            current_l1_residual_norm,
+            initial_l1_residual_norm,
+            controls,
+        ) {
+            return Ok(IterativeSolveReport {
+                solution,
+                iterations: 0,
+                residual_norm,
+                converged: true,
+                termination: IterativeSolveTermination::Converged,
+            });
+        }
+        if controls.max_iterations == 0 {
+            return Ok(IterativeSolveReport {
+                solution,
+                iterations: 0,
+                residual_norm,
+                converged: false,
+                termination: IterativeSolveTermination::MaxIterations,
+            });
+        }
+
+        let preconditioner_update_started = profile_start::<PROFILE>();
+        if let Some(preconditioner) = &mut self.face_ldu_preconditioner {
+            preconditioner.refactor(matrix)?;
+        } else {
+            self.preconditioner.update(matrix)?;
+        }
+        timing.preconditioner_update_seconds += profile_elapsed(preconditioner_update_started);
+
+        let preconditioner_application_started = profile_start::<PROFILE>();
+        if let Some(preconditioner) = &self.face_ldu_preconditioner {
+            preconditioner.apply_into(&self.residual, &mut self.preconditioned_residual)?;
+        } else {
+            self.preconditioner.apply_into(
+                &self.residual,
+                &mut self.preconditioner_scratch,
+                &mut self.preconditioned_residual,
+            )?;
+        }
+        timing.preconditioner_application_seconds +=
+            profile_elapsed(preconditioner_application_started);
+        if PROFILE {
+            timing.preconditioner_applications += 1;
+        }
+
+        let residual_product_started = profile_start::<PROFILE>();
+        let mut residual_product = dot(&self.residual, &self.preconditioned_residual);
+        timing.vector_operation_seconds += profile_elapsed(residual_product_started);
+        if !residual_product.is_finite() {
+            return Err(invalid_input(
+                "preconditioned conjugate-gradient residual product is not finite".to_string(),
+            ));
+        }
+        let singularity_check_started = profile_start::<PROFILE>();
+        let residual_product_is_singular = dot_product_is_singular(
+            residual_product,
+            &self.residual,
+            &self.preconditioned_residual,
+        );
+        timing.vector_operation_seconds += profile_elapsed(singularity_check_started);
+        if residual_product_is_singular {
+            return Ok(IterativeSolveReport {
+                solution,
+                iterations: 0,
+                residual_norm,
+                converged: false,
+                termination: IterativeSolveTermination::Breakdown,
+            });
+        }
+
+        let direction_setup_started = profile_start::<PROFILE>();
+        self.direction
+            .copy_from_slice(&self.preconditioned_residual);
+        timing.vector_operation_seconds += profile_elapsed(direction_setup_started);
+        for iteration in 1..=controls.max_iterations {
+            let matrix_vector_started = profile_start::<PROFILE>();
+            matrix.matvec_into(&self.direction, &mut self.matrix_direction)?;
+            timing.matrix_vector_seconds += profile_elapsed(matrix_vector_started);
+            if PROFILE {
+                timing.matrix_vector_products += 1;
+            }
+
+            let denominator_started = profile_start::<PROFILE>();
+            let denominator = dot(&self.direction, &self.matrix_direction);
+            timing.vector_operation_seconds += profile_elapsed(denominator_started);
+            if !denominator.is_finite() {
+                return Err(invalid_input(
+                    "preconditioned conjugate-gradient denominator is not finite; matrix is likely not SPD"
+                        .to_string(),
+                ));
+            }
+            let singularity_check_started = profile_start::<PROFILE>();
+            let denominator_is_singular =
+                dot_product_is_singular(denominator, &self.direction, &self.matrix_direction);
+            timing.vector_operation_seconds += profile_elapsed(singularity_check_started);
+            if denominator_is_singular {
+                return Ok(IterativeSolveReport {
+                    solution,
+                    iterations: iteration,
+                    residual_norm,
+                    converged: false,
+                    termination: IterativeSolveTermination::Breakdown,
+                });
+            }
+
+            let alpha = residual_product / denominator;
+            let solution_update_started = profile_start::<PROFILE>();
+            current_l1_residual_norm = 0.0;
+            residual_squared = 0.0;
+            for (row, solution_value) in solution.iter_mut().enumerate() {
+                *solution_value += alpha * self.direction[row];
+                self.residual[row] -= alpha * self.matrix_direction[row];
+                current_l1_residual_norm += self.residual[row].abs();
+                residual_squared += self.residual[row] * self.residual[row];
+            }
+            residual_norm = residual_squared.sqrt();
+            timing.vector_operation_seconds += profile_elapsed(solution_update_started);
+
+            if normalized_l1_pcg_has_converged(
+                current_l1_residual_norm,
+                initial_l1_residual_norm,
+                controls,
+            ) {
+                return Ok(IterativeSolveReport {
+                    solution,
+                    iterations: iteration,
+                    residual_norm,
+                    converged: true,
+                    termination: IterativeSolveTermination::Converged,
+                });
+            }
+
+            let preconditioner_application_started = profile_start::<PROFILE>();
+            if let Some(preconditioner) = &self.face_ldu_preconditioner {
+                preconditioner.apply_into(&self.residual, &mut self.preconditioned_residual)?;
+            } else {
+                self.preconditioner.apply_into(
+                    &self.residual,
+                    &mut self.preconditioner_scratch,
+                    &mut self.preconditioned_residual,
+                )?;
+            }
+            timing.preconditioner_application_seconds +=
+                profile_elapsed(preconditioner_application_started);
+            if PROFILE {
+                timing.preconditioner_applications += 1;
+            }
+
+            let residual_product_started = profile_start::<PROFILE>();
+            let next_residual_product = dot(&self.residual, &self.preconditioned_residual);
+            timing.vector_operation_seconds += profile_elapsed(residual_product_started);
+            if !next_residual_product.is_finite() {
+                return Err(invalid_input(
+                    "preconditioned conjugate-gradient residual product is not finite".to_string(),
+                ));
+            }
+            let singularity_check_started = profile_start::<PROFILE>();
+            let next_residual_product_is_singular = dot_product_is_singular(
+                next_residual_product,
+                &self.residual,
+                &self.preconditioned_residual,
+            );
+            timing.vector_operation_seconds += profile_elapsed(singularity_check_started);
+            if next_residual_product_is_singular {
+                return Ok(IterativeSolveReport {
+                    solution,
+                    iterations: iteration,
+                    residual_norm,
+                    converged: false,
+                    termination: IterativeSolveTermination::Breakdown,
+                });
+            }
+            let beta = next_residual_product / residual_product;
+            let direction_update_started = profile_start::<PROFILE>();
+            for row in 0..self.direction.len() {
+                self.direction[row] =
+                    self.preconditioned_residual[row] + beta * self.direction[row];
+            }
+            timing.vector_operation_seconds += profile_elapsed(direction_update_started);
+            residual_product = next_residual_product;
+        }
+
+        Ok(IterativeSolveReport {
+            solution,
+            iterations: controls.max_iterations,
             residual_norm,
             converged: false,
             termination: IterativeSolveTermination::MaxIterations,
@@ -2028,6 +2414,95 @@ fn validate_iterative_solve_input(
     Ok(())
 }
 
+fn validate_normalized_l1_pcg_call(
+    matrix: &CsrMatrix,
+    rhs: &[f64],
+    initial: Option<&[f64]>,
+    prepared_residual: PreparedPcgResidual<'_>,
+    controls: NormalizedL1PcgSolveControls,
+    workspace_preconditioner: CgPreconditioner,
+    workspace_sparsity: &CsrSparsityPattern,
+) -> Result<()> {
+    validate_iterative_solve_input(matrix, rhs, initial, controls.tolerance)?;
+    if !controls.normalization_factor.is_finite() || controls.normalization_factor <= 0.0 {
+        return Err(invalid_input(format!(
+            "PCG normalized-L1 factor must be finite and positive, got {}",
+            controls.normalization_factor
+        )));
+    }
+    if !controls.relative_tolerance.is_finite() || controls.relative_tolerance < 0.0 {
+        return Err(invalid_input(format!(
+            "PCG normalized-L1 relTol must be finite and non-negative, got {}",
+            controls.relative_tolerance
+        )));
+    }
+    if controls.preconditioner != workspace_preconditioner {
+        return Err(invalid_input(format!(
+            "PCG workspace preconditioner {:?} does not match requested {:?}",
+            workspace_preconditioner, controls.preconditioner
+        )));
+    }
+    if !matrix.shares_sparsity_with(workspace_sparsity) {
+        return Err(invalid_input(
+            "PCG workspace does not match matrix sparsity".to_string(),
+        ));
+    }
+    if prepared_residual.values.len() != matrix.rows {
+        return Err(invalid_input(format!(
+            "prepared PCG residual expected {} entries, got {}",
+            matrix.rows,
+            prepared_residual.values.len()
+        )));
+    }
+    if !prepared_residual.initial_l1_residual_norm.is_finite()
+        || prepared_residual.initial_l1_residual_norm < 0.0
+        || !prepared_residual.residual_squared.is_finite()
+        || prepared_residual.residual_squared < 0.0
+    {
+        return Err(invalid_input(
+            "prepared PCG residual aggregates must be finite and non-negative".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_prepared_pcg_initial_timing(timing: PreparedPcgInitialTiming) -> Result<()> {
+    for (name, value) in [
+        ("total", timing.total_seconds),
+        ("matrix-vector", timing.matrix_vector_seconds),
+        ("vector-operation", timing.vector_operation_seconds),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(invalid_input(format!(
+                "prepared PCG {name} timing must be finite and non-negative, got {value}"
+            )));
+        }
+    }
+    if timing.matrix_vector_seconds > timing.total_seconds
+        || timing.vector_operation_seconds > timing.total_seconds
+        || timing.matrix_vector_seconds + timing.vector_operation_seconds > timing.total_seconds
+    {
+        return Err(invalid_input(format!(
+            "prepared PCG accounted timing exceeds total: total={} matrix-vector={} vector-operation={}",
+            timing.total_seconds, timing.matrix_vector_seconds, timing.vector_operation_seconds
+        )));
+    }
+    Ok(())
+}
+
+fn normalized_l1_pcg_has_converged(
+    current_l1_residual_norm: f64,
+    initial_l1_residual_norm: f64,
+    controls: NormalizedL1PcgSolveControls,
+) -> bool {
+    let current_normalized_residual = current_l1_residual_norm / controls.normalization_factor;
+    let initial_normalized_residual = initial_l1_residual_norm / controls.normalization_factor;
+    current_normalized_residual < controls.tolerance
+        || (controls.relative_tolerance > gamg::OPENFOAM_RELATIVE_TOLERANCE_SMALL
+            && current_normalized_residual
+                < controls.relative_tolerance * initial_normalized_residual)
+}
+
 fn dot(left: &[f64], right: &[f64]) -> f64 {
     left.iter()
         .zip(right)
@@ -2052,7 +2527,8 @@ mod tests {
         BiCgStabOptions, CgPreconditioner, ConjugateGradientOptions, CsrMatrix, CsrSparsityPattern,
         FaceLduPreconditioner, FaceLduPreconditionerKind, GaussSeidelOptions,
         IncompleteCholeskyPreconditioner, IterativeSolveTermination, JacobiOptions,
-        PreconditionedConjugateGradientOptions, PreconditionedConjugateGradientWorkspace,
+        NormalizedL1PcgSolveControls, PreconditionedConjugateGradientOptions,
+        PreconditionedConjugateGradientWorkspace, PreparedPcgInitialTiming, PreparedPcgResidual,
         ReusablePreconditioner, bicgstab_solve, conjugate_gradient_solve, csr_diagonal_slots,
         gauss_seidel_solve, gauss_seidel_sweep, gauss_seidel_sweep_with_cached_diagonal,
         jacobi_solve, preconditioned_conjugate_gradient_solve, residual,
@@ -2320,6 +2796,535 @@ mod tests {
         assert_eq!(report.iterations, 1);
         assert_close(&report.solution, &[2.0, 3.0], 1.0e-14);
         assert!(report.residual_norm <= 1.0e-12);
+    }
+
+    #[test]
+    fn normalized_l1_pcg_uses_strict_absolute_and_relative_boundaries() {
+        let matrix =
+            CsrMatrix::from_rows(vec![vec![(0, 4.0), (1, 1.0)], vec![(0, 1.0), (1, 3.0)]], 2)
+                .expect("strict-boundary SPD matrix");
+        let rhs = [1.0, 2.0];
+        let prepared_values = prepared_residual(&matrix, &rhs, None);
+
+        let absolute_equal = solve_prepared_normalized_l1(
+            &matrix,
+            &rhs,
+            &prepared_values,
+            0.75,
+            0.0,
+            2,
+            CgPreconditioner::None,
+        );
+        let absolute_next = solve_prepared_normalized_l1(
+            &matrix,
+            &rhs,
+            &prepared_values,
+            0.75f64.next_up(),
+            0.0,
+            2,
+            CgPreconditioner::None,
+        );
+        assert!(absolute_equal.converged);
+        assert_eq!(
+            absolute_equal.iterations, 2,
+            "absolute equality must consume the second-iteration budget"
+        );
+        assert!(absolute_next.converged);
+        assert_eq!(absolute_next.iterations, 1);
+
+        let relative_equal = solve_prepared_normalized_l1(
+            &matrix,
+            &rhs,
+            &prepared_values,
+            0.0,
+            0.25,
+            2,
+            CgPreconditioner::None,
+        );
+        let relative_next = solve_prepared_normalized_l1(
+            &matrix,
+            &rhs,
+            &prepared_values,
+            0.0,
+            0.25f64.next_up(),
+            2,
+            CgPreconditioner::None,
+        );
+        assert!(relative_equal.converged);
+        assert_eq!(
+            relative_equal.iterations, 2,
+            "relative equality must consume the second-iteration budget"
+        );
+        assert!(relative_next.converged);
+        assert_eq!(relative_next.iterations, 1);
+    }
+
+    #[test]
+    fn normalized_l1_pcg_obeys_openfoam_reltol_small_and_does_not_cap_large_values() {
+        let small = super::gamg::OPENFOAM_RELATIVE_TOLERANCE_SMALL;
+        assert_eq!(small.to_bits(), 1.0e-20f64.to_bits());
+        let matrix = CsrMatrix::from_rows(vec![vec![(0, 1.0)], vec![(1, 2.0)]], 2).expect("matrix");
+        let rhs = [1.0, small];
+        let prepared_values = prepared_residual(&matrix, &rhs, None);
+
+        let equality = solve_prepared_normalized_l1(
+            &matrix,
+            &rhs,
+            &prepared_values,
+            0.0,
+            small,
+            2,
+            CgPreconditioner::None,
+        );
+        let next = solve_prepared_normalized_l1(
+            &matrix,
+            &rhs,
+            &prepared_values,
+            0.0,
+            small.next_up(),
+            2,
+            CgPreconditioner::None,
+        );
+        assert_eq!(
+            equality.iterations, 2,
+            "relTol equal to OpenFOAM small must remain inactive"
+        );
+        assert_eq!(
+            next.iterations, 1,
+            "relTol next_up from OpenFOAM small must be active"
+        );
+
+        let one = solve_prepared_normalized_l1(
+            &matrix,
+            &rhs,
+            &prepared_values,
+            0.0,
+            1.0,
+            2,
+            CgPreconditioner::None,
+        );
+        let next_after_one = solve_prepared_normalized_l1(
+            &matrix,
+            &rhs,
+            &prepared_values,
+            0.0,
+            1.0f64.next_up(),
+            2,
+            CgPreconditioner::None,
+        );
+        let greater_than_one = solve_prepared_normalized_l1(
+            &matrix,
+            &rhs,
+            &prepared_values,
+            0.0,
+            8.0,
+            2,
+            CgPreconditioner::None,
+        );
+        assert!(one.iterations > 0, "relative equality must remain strict");
+        assert_eq!(next_after_one.iterations, 0);
+        assert_eq!(
+            greater_than_one.iterations, 0,
+            "relTol above one must not be capped"
+        );
+    }
+
+    #[test]
+    fn normalized_l1_pcg_exact_zero_breakdown_and_profiled_counters_are_exact() {
+        let matrix =
+            CsrMatrix::from_rows(vec![vec![(0, 4.0), (1, 1.0)], vec![(0, 1.0), (1, 3.0)]], 2)
+                .expect("profile SPD matrix");
+        let invalid_diagonal_matrix =
+            CsrMatrix::from_pattern(&matrix.sparsity_pattern(), vec![0.0, 1.0, 1.0, 3.0])
+                .expect("shared-pattern zero-diagonal matrix");
+        let mut early_workspace =
+            PreconditionedConjugateGradientWorkspace::new(&matrix, CgPreconditioner::Diagonal)
+                .expect("early-return workspace");
+        let preconditioner_before = pcg_preconditioner_numeric_state(&early_workspace);
+        let initially_solved = early_workspace
+            .solve_normalized_l1_prepared_profiled(
+                &invalid_diagonal_matrix,
+                &[0.0, 0.0],
+                None,
+                prepared_pcg_residual_for_test(&[0.0, 0.0]),
+                PreparedPcgInitialTiming::default(),
+                normalized_controls(1.0e-12, 0.0, 2, CgPreconditioner::Diagonal),
+            )
+            .expect("initially solved system must not refactor an unused preconditioner");
+        assert!(initially_solved.report.converged);
+        assert_eq!(initially_solved.report.iterations, 0);
+        assert_eq!(initially_solved.timing.preconditioner_update_seconds, 0.0);
+        assert_eq!(initially_solved.timing.preconditioner_applications, 0);
+        assert_eq!(
+            pcg_preconditioner_numeric_state(&early_workspace),
+            preconditioner_before
+        );
+
+        let zero_budget_before = pcg_preconditioner_numeric_state(&early_workspace);
+        let invalid_diagonal_zero_budget = early_workspace
+            .solve_normalized_l1_prepared_profiled(
+                &invalid_diagonal_matrix,
+                &[1.0, 2.0],
+                None,
+                prepared_pcg_residual_for_test(&[1.0, 2.0]),
+                PreparedPcgInitialTiming::default(),
+                normalized_controls(0.0, 0.0, 0, CgPreconditioner::Diagonal),
+            )
+            .expect("zero budget must return before preconditioner refactor");
+        assert_eq!(
+            invalid_diagonal_zero_budget.report.termination,
+            IterativeSolveTermination::MaxIterations
+        );
+        assert_eq!(
+            invalid_diagonal_zero_budget
+                .timing
+                .preconditioner_update_seconds,
+            0.0
+        );
+        assert_eq!(
+            invalid_diagonal_zero_budget
+                .timing
+                .preconditioner_applications,
+            0
+        );
+        assert_eq!(
+            pcg_preconditioner_numeric_state(&early_workspace),
+            zero_budget_before
+        );
+
+        let mut zero_workspace =
+            PreconditionedConjugateGradientWorkspace::new(&matrix, CgPreconditioner::Diagonal)
+                .expect("zero workspace");
+        let zero = zero_workspace
+            .solve_normalized_l1_prepared_profiled(
+                &matrix,
+                &[0.0, 0.0],
+                None,
+                prepared_pcg_residual_for_test(&[0.0, 0.0]),
+                PreparedPcgInitialTiming {
+                    total_seconds: 0.003,
+                    matrix_vector_seconds: 0.001,
+                    vector_operation_seconds: 0.001,
+                },
+                normalized_controls(0.0, 0.0, 2, CgPreconditioner::Diagonal),
+            )
+            .expect("exact-zero breakdown report");
+        assert!(!zero.report.converged);
+        assert_eq!(zero.report.iterations, 0);
+        assert_eq!(zero.report.residual_norm.to_bits(), 0.0f64.to_bits());
+        assert_eq!(
+            zero.report.termination,
+            IterativeSolveTermination::Breakdown
+        );
+        assert_eq!(zero.timing.matrix_vector_products, 1);
+        assert_eq!(zero.timing.preconditioner_applications, 1);
+        assert!(zero.timing.total_seconds >= 0.003);
+        assert!(zero.timing.matrix_vector_seconds >= 0.001);
+        assert!(zero.timing.vector_operation_seconds >= 0.001);
+
+        let rhs = [1.0, 2.0];
+        let prepared_values = prepared_residual(&matrix, &rhs, None);
+        let recovered = zero_workspace
+            .solve_normalized_l1_prepared(
+                &matrix,
+                &rhs,
+                None,
+                prepared_pcg_residual_for_test(&prepared_values),
+                normalized_controls(1.0e-12, 0.0, 4, CgPreconditioner::Diagonal),
+            )
+            .expect("valid retry after exact-zero breakdown");
+        assert!(recovered.converged);
+
+        let mut zero_budget_workspace =
+            PreconditionedConjugateGradientWorkspace::new(&matrix, CgPreconditioner::None)
+                .expect("zero-budget workspace");
+        let zero_budget = zero_budget_workspace
+            .solve_normalized_l1_prepared_profiled(
+                &matrix,
+                &rhs,
+                None,
+                prepared_pcg_residual_for_test(&prepared_values),
+                PreparedPcgInitialTiming::default(),
+                normalized_controls(0.0, 0.0, 0, CgPreconditioner::None),
+            )
+            .expect("zero-budget profiled solve");
+        assert!(!zero_budget.report.converged);
+        assert_eq!(zero_budget.report.iterations, 0);
+        assert_eq!(
+            zero_budget.report.termination,
+            IterativeSolveTermination::MaxIterations
+        );
+        assert_eq!(zero_budget.timing.matrix_vector_products, 1);
+        assert_eq!(zero_budget.timing.preconditioner_applications, 0);
+
+        let mut workspace =
+            PreconditionedConjugateGradientWorkspace::new(&matrix, CgPreconditioner::None)
+                .expect("profile workspace");
+        let profiled = workspace
+            .solve_normalized_l1_prepared_profiled(
+                &matrix,
+                &rhs,
+                None,
+                prepared_pcg_residual_for_test(&prepared_values),
+                PreparedPcgInitialTiming {
+                    total_seconds: 0.003,
+                    matrix_vector_seconds: 0.001,
+                    vector_operation_seconds: 0.001,
+                },
+                normalized_controls(0.75f64.next_up(), 0.0, 2, CgPreconditioner::None),
+            )
+            .expect("profiled one-iteration solve");
+        assert_eq!(profiled.report.iterations, 1);
+        assert_eq!(
+            profiled.timing.matrix_vector_products,
+            profiled.report.iterations + 1
+        );
+        assert_eq!(
+            profiled.timing.preconditioner_applications,
+            profiled.report.iterations
+        );
+    }
+
+    #[test]
+    fn normalized_l1_pcg_plain_profiled_and_public_l2_paths_are_bit_identical() {
+        let matrix = dic_oracle_matrix();
+        let rhs = [1.0, 0.0, 1.0];
+        let prepared_values = prepared_residual(&matrix, &rhs, None);
+        for preconditioner in [
+            CgPreconditioner::None,
+            CgPreconditioner::Diagonal,
+            CgPreconditioner::IncompleteCholesky,
+            CgPreconditioner::Dic,
+            CgPreconditioner::Fdic,
+        ] {
+            let controls = normalized_controls(1.0e-12, 0.0, 16, preconditioner);
+            let mut plain_workspace =
+                PreconditionedConjugateGradientWorkspace::new(&matrix, preconditioner)
+                    .expect("plain normalized workspace");
+            let plain = plain_workspace
+                .solve_normalized_l1_prepared(
+                    &matrix,
+                    &rhs,
+                    None,
+                    prepared_pcg_residual_for_test(&prepared_values),
+                    controls,
+                )
+                .expect("plain normalized solve");
+            let mut profiled_workspace =
+                PreconditionedConjugateGradientWorkspace::new(&matrix, preconditioner)
+                    .expect("profiled normalized workspace");
+            let profiled = profiled_workspace
+                .solve_normalized_l1_prepared_profiled(
+                    &matrix,
+                    &rhs,
+                    None,
+                    prepared_pcg_residual_for_test(&prepared_values),
+                    PreparedPcgInitialTiming::default(),
+                    controls,
+                )
+                .expect("profiled normalized solve");
+            assert_reports_bit_identical(&plain, &profiled.report);
+            assert_eq!(
+                profiled.timing.matrix_vector_products,
+                profiled.report.iterations + 1
+            );
+            assert_eq!(
+                profiled.timing.preconditioner_applications,
+                profiled.report.iterations
+            );
+
+            let public_options = PreconditionedConjugateGradientOptions {
+                max_iterations: 16,
+                tolerance: 1.0e-12,
+                preconditioner,
+            };
+            let public_free =
+                preconditioned_conjugate_gradient_solve(&matrix, &rhs, None, public_options)
+                    .expect("public L2 free solve");
+            let mut public_workspace =
+                PreconditionedConjugateGradientWorkspace::new(&matrix, preconditioner)
+                    .expect("public L2 workspace");
+            let public_plain = public_workspace
+                .solve(&matrix, &rhs, None, public_options)
+                .expect("public L2 plain solve");
+            let public_profiled = public_workspace
+                .solve_profiled(&matrix, &rhs, None, public_options)
+                .expect("public L2 profiled solve");
+            assert_reports_bit_identical(&public_free, &public_plain);
+            assert_reports_bit_identical(&public_free, &public_profiled.report);
+        }
+    }
+
+    #[test]
+    fn normalized_l1_pcg_preserves_ten_coefficient_lifecycles_and_allocations() {
+        let first_matrix = dic_oracle_matrix();
+        let pattern = first_matrix.sparsity_pattern();
+        let exact = [1.0, -0.5, 2.0];
+        for preconditioner in [
+            CgPreconditioner::None,
+            CgPreconditioner::Diagonal,
+            CgPreconditioner::IncompleteCholesky,
+            CgPreconditioner::Dic,
+            CgPreconditioner::Fdic,
+        ] {
+            let mut workspace =
+                PreconditionedConjugateGradientWorkspace::new(&first_matrix, preconditioner)
+                    .expect("reusable normalized workspace");
+            let pointers = pcg_workspace_pointers(&workspace);
+            let untouched_state = pcg_workspace_numeric_state(&workspace);
+            let changed_matrix =
+                CsrMatrix::from_pattern(&pattern, vec![6.0, -1.0, -1.0, 6.0, -1.0, -1.0, 5.0])
+                    .expect("changed shared-pattern matrix");
+            let changed_rhs = changed_matrix.matvec(&exact).expect("changed rhs");
+            let changed_prepared = prepared_residual(&changed_matrix, &changed_rhs, None);
+            let invalid = NormalizedL1PcgSolveControls {
+                normalization_factor: 0.0,
+                ..normalized_controls(1.0e-12, 0.0, 16, preconditioner)
+            };
+            let error = workspace
+                .solve_normalized_l1_prepared(
+                    &changed_matrix,
+                    &changed_rhs,
+                    None,
+                    prepared_pcg_residual_for_test(&changed_prepared),
+                    invalid,
+                )
+                .expect_err("invalid controls must fail before workspace mutation");
+            assert!(
+                error
+                    .to_string()
+                    .contains("factor must be finite and positive")
+            );
+            assert_eq!(pcg_workspace_pointers(&workspace), pointers);
+            assert_eq!(pcg_workspace_numeric_state(&workspace), untouched_state);
+
+            for lifecycle in 0..10 {
+                let shift = lifecycle as f64 * 0.125;
+                let matrix = CsrMatrix::from_pattern(
+                    &pattern,
+                    vec![
+                        4.0 + shift,
+                        -1.0,
+                        -1.0,
+                        4.0 + shift,
+                        -1.0,
+                        -1.0,
+                        3.0 + shift,
+                    ],
+                )
+                .expect("lifecycle matrix");
+                let rhs = matrix.matvec(&exact).expect("manufactured lifecycle rhs");
+                let prepared_values = prepared_residual(&matrix, &rhs, None);
+                let report = workspace
+                    .solve_normalized_l1_prepared(
+                        &matrix,
+                        &rhs,
+                        None,
+                        prepared_pcg_residual_for_test(&prepared_values),
+                        normalized_controls(1.0e-12, 0.0, 16, preconditioner),
+                    )
+                    .expect("reused normalized solve");
+                assert!(report.converged, "{preconditioner:?} lifecycle {lifecycle}");
+                assert_close(&report.solution, &exact, 1.0e-11);
+                assert_eq!(pcg_workspace_pointers(&workspace), pointers);
+            }
+        }
+    }
+
+    #[test]
+    fn normalized_l1_pcg_factor_failures_are_recoverable_for_every_preconditioner() {
+        let matrix = dic_oracle_matrix();
+        let pattern = matrix.sparsity_pattern();
+        let rhs = [1.0, 0.0, 1.0];
+        let prepared_values = prepared_residual(&matrix, &rhs, None);
+        for preconditioner in [
+            CgPreconditioner::None,
+            CgPreconditioner::Diagonal,
+            CgPreconditioner::IncompleteCholesky,
+            CgPreconditioner::Dic,
+            CgPreconditioner::Fdic,
+        ] {
+            let mut workspace =
+                PreconditionedConjugateGradientWorkspace::new(&matrix, preconditioner)
+                    .expect("recovery workspace");
+            let controls = normalized_controls(1.0e-12, 0.0, 16, preconditioner);
+            let error = match preconditioner {
+                CgPreconditioner::None => {
+                    let pointers = pcg_workspace_pointers(&workspace);
+                    let numeric_state = pcg_workspace_numeric_state(&workspace);
+                    let error = PreparedPcgResidual::from_values_for_test(&[f64::NAN, 0.0, 1.0])
+                        .expect_err("non-finite prepared residual must fail in the builder");
+                    PreparedPcgResidual::from_values_for_test(&[f64::MAX, f64::MAX, 0.0])
+                        .expect_err("non-finite prepared aggregates must fail in the builder");
+                    assert_eq!(pcg_workspace_pointers(&workspace), pointers);
+                    assert_eq!(pcg_workspace_numeric_state(&workspace), numeric_state);
+                    error
+                }
+                CgPreconditioner::Diagonal => {
+                    let invalid = CsrMatrix::from_pattern(
+                        &pattern,
+                        vec![0.0, -1.0, -1.0, 4.0, -1.0, -1.0, 3.0],
+                    )
+                    .expect("zero-diagonal matrix");
+                    workspace
+                        .solve_normalized_l1_prepared(
+                            &invalid,
+                            &rhs,
+                            None,
+                            prepared_pcg_residual_for_test(&prepared_values),
+                            controls,
+                        )
+                        .expect_err("zero diagonal must fail")
+                }
+                CgPreconditioner::IncompleteCholesky => {
+                    let invalid = CsrMatrix::from_pattern(
+                        &pattern,
+                        vec![1.0, 2.0, 2.0, 1.0, -1.0, -1.0, 1.0],
+                    )
+                    .expect("indefinite IC0 matrix");
+                    workspace
+                        .solve_normalized_l1_prepared(
+                            &invalid,
+                            &rhs,
+                            None,
+                            prepared_pcg_residual_for_test(&prepared_values),
+                            controls,
+                        )
+                        .expect_err("IC0 pivot failure must fail")
+                }
+                CgPreconditioner::Dic | CgPreconditioner::Fdic => {
+                    let invalid = CsrMatrix::from_pattern(
+                        &pattern,
+                        vec![4.0, -1.0, -2.0, 4.0, -1.0, -1.0, 3.0],
+                    )
+                    .expect("asymmetric face-LDU matrix");
+                    workspace
+                        .solve_normalized_l1_prepared(
+                            &invalid,
+                            &rhs,
+                            None,
+                            prepared_pcg_residual_for_test(&prepared_values),
+                            controls,
+                        )
+                        .expect_err("face-LDU symmetry failure must fail")
+                }
+            };
+            assert!(
+                !error.to_string().is_empty(),
+                "{preconditioner:?} returned an empty failure"
+            );
+
+            let recovered = workspace
+                .solve_normalized_l1_prepared(
+                    &matrix,
+                    &rhs,
+                    None,
+                    prepared_pcg_residual_for_test(&prepared_values),
+                    controls,
+                )
+                .expect("valid retry after failed normalized solve");
+            assert!(recovered.converged, "{preconditioner:?} did not recover");
+        }
     }
 
     #[test]
@@ -3122,6 +4127,99 @@ mod tests {
         ]
     }
 
+    fn pcg_workspace_pointers(workspace: &PreconditionedConjugateGradientWorkspace) -> Vec<usize> {
+        let mut pointers = vec![
+            workspace.sparsity.row_offsets.as_ptr() as usize,
+            workspace.sparsity.col_indices.as_ptr() as usize,
+            workspace.residual.as_ptr() as usize,
+            workspace.preconditioned_residual.as_ptr() as usize,
+            workspace.direction.as_ptr() as usize,
+            workspace.matrix_direction.as_ptr() as usize,
+            workspace.preconditioner_scratch.as_ptr() as usize,
+        ];
+        match &workspace.preconditioner {
+            ReusablePreconditioner::None => {}
+            ReusablePreconditioner::Diagonal {
+                matrix_slots,
+                inverse,
+            } => {
+                pointers.push(matrix_slots.as_ptr() as usize);
+                pointers.push(inverse.as_ptr() as usize);
+            }
+            ReusablePreconditioner::IncompleteCholesky(preconditioner) => {
+                pointers.extend([
+                    preconditioner.lower_row_offsets.as_ptr() as usize,
+                    preconditioner.lower_columns.as_ptr() as usize,
+                    preconditioner.matrix_slots.as_ptr() as usize,
+                    preconditioner.diagonal_factor_slots.as_ptr() as usize,
+                    preconditioner.update_pairs.as_ptr() as usize,
+                    preconditioner.dependent_row_offsets.as_ptr() as usize,
+                    preconditioner.dependent_entries.as_ptr() as usize,
+                    preconditioner.factors.as_ptr() as usize,
+                ]);
+            }
+        }
+        if let Some(preconditioner) = &workspace.face_ldu_preconditioner {
+            pointers.extend([
+                preconditioner.pattern.diagonal_slots.as_ptr() as usize,
+                preconditioner.pattern.lower_addr.as_ptr() as usize,
+                preconditioner.pattern.upper_addr.as_ptr() as usize,
+                preconditioner.pattern.owner_start.as_ptr() as usize,
+                preconditioner.pattern.lower_matrix_slots.as_ptr() as usize,
+                preconditioner.pattern.upper_matrix_slots.as_ptr() as usize,
+                preconditioner.upper_coefficients.as_ptr() as usize,
+                preconditioner.reciprocal_diagonal.as_ptr() as usize,
+                preconditioner.fdic_upper_scaled_by_upper_diagonal.as_ptr() as usize,
+                preconditioner.fdic_upper_scaled_by_lower_diagonal.as_ptr() as usize,
+            ]);
+        }
+        pointers
+    }
+
+    fn pcg_workspace_numeric_state(
+        workspace: &PreconditionedConjugateGradientWorkspace,
+    ) -> Vec<u64> {
+        let mut state = workspace
+            .residual
+            .iter()
+            .chain(&workspace.preconditioned_residual)
+            .chain(&workspace.direction)
+            .chain(&workspace.matrix_direction)
+            .chain(&workspace.preconditioner_scratch)
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>();
+        state.extend(pcg_preconditioner_numeric_state(workspace));
+        state
+    }
+
+    fn pcg_preconditioner_numeric_state(
+        workspace: &PreconditionedConjugateGradientWorkspace,
+    ) -> Vec<u64> {
+        let mut state = Vec::new();
+        match &workspace.preconditioner {
+            ReusablePreconditioner::None => {}
+            ReusablePreconditioner::Diagonal { inverse, .. } => {
+                state.extend(inverse.iter().map(|value| value.to_bits()));
+            }
+            ReusablePreconditioner::IncompleteCholesky(preconditioner) => {
+                state.extend(preconditioner.factors.iter().map(|value| value.to_bits()));
+            }
+        }
+        if let Some(preconditioner) = &workspace.face_ldu_preconditioner {
+            state.extend(
+                preconditioner
+                    .upper_coefficients
+                    .iter()
+                    .chain(&preconditioner.reciprocal_diagonal)
+                    .chain(&preconditioner.fdic_upper_scaled_by_upper_diagonal)
+                    .chain(&preconditioner.fdic_upper_scaled_by_lower_diagonal)
+                    .map(|value| value.to_bits()),
+            );
+            state.push(u64::from(preconditioner.valid));
+        }
+        state
+    }
+
     fn poisson_grid(nx: usize, ny: usize) -> CsrMatrix {
         let cells = nx.checked_mul(ny).expect("Poisson grid size");
         let mut rows = Vec::with_capacity(cells);
@@ -3156,6 +4254,87 @@ mod tests {
             vec![2.0, -1.0, -1.0, 2.0, -1.0, -1.0, 2.0],
         )
         .expect("poisson matrix")
+    }
+
+    fn normalized_controls(
+        tolerance: f64,
+        relative_tolerance: f64,
+        max_iterations: usize,
+        preconditioner: CgPreconditioner,
+    ) -> NormalizedL1PcgSolveControls {
+        NormalizedL1PcgSolveControls {
+            max_iterations,
+            normalization_factor: 1.0,
+            tolerance,
+            relative_tolerance,
+            preconditioner,
+        }
+    }
+
+    fn prepared_residual(matrix: &CsrMatrix, rhs: &[f64], initial: Option<&[f64]>) -> Vec<f64> {
+        let zero = vec![0.0; matrix.cols()];
+        let initial = initial.unwrap_or(&zero);
+        let matrix_product = matrix.matvec(initial).expect("prepared matrix product");
+        rhs.iter()
+            .zip(matrix_product)
+            .map(|(source, matrix_value)| source - matrix_value)
+            .collect()
+    }
+
+    fn prepared_pcg_residual_for_test(values: &[f64]) -> PreparedPcgResidual<'_> {
+        PreparedPcgResidual::from_values_for_test(values).expect("finite prepared PCG residual")
+    }
+
+    fn solve_prepared_normalized_l1(
+        matrix: &CsrMatrix,
+        rhs: &[f64],
+        prepared_values: &[f64],
+        tolerance: f64,
+        relative_tolerance: f64,
+        max_iterations: usize,
+        preconditioner: CgPreconditioner,
+    ) -> super::IterativeSolveReport {
+        let mut workspace = PreconditionedConjugateGradientWorkspace::new(matrix, preconditioner)
+            .expect("normalized PCG workspace");
+        workspace
+            .solve_normalized_l1_prepared(
+                matrix,
+                rhs,
+                None,
+                prepared_pcg_residual_for_test(prepared_values),
+                normalized_controls(
+                    tolerance,
+                    relative_tolerance,
+                    max_iterations,
+                    preconditioner,
+                ),
+            )
+            .expect("normalized PCG solve")
+    }
+
+    fn assert_reports_bit_identical(
+        expected: &super::IterativeSolveReport,
+        actual: &super::IterativeSolveReport,
+    ) {
+        assert_eq!(actual.iterations, expected.iterations);
+        assert_eq!(actual.converged, expected.converged);
+        assert_eq!(actual.termination, expected.termination);
+        assert_eq!(
+            actual.residual_norm.to_bits(),
+            expected.residual_norm.to_bits()
+        );
+        assert_eq!(
+            actual
+                .solution
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .solution
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
     }
 
     fn assert_close(actual: &[f64], expected: &[f64], tolerance: f64) {
