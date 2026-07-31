@@ -14,6 +14,10 @@ use crate::runtime::{SolverRuntimeData, SolverRuntimeMeshData};
 use crate::solver_state::SolverStateFieldKind;
 use crate::{MeshError, Point3, Result};
 
+mod compact_faces;
+
+use compact_faces::CompactSimpleFaceAddressing;
+
 #[derive(Clone, Copy, Debug)]
 struct SimpleUpdateMetrics {
     velocity_change_l2: f64,
@@ -803,8 +807,17 @@ fn solve_laminar_simple_driven(
     let mut scalar_solve_workspace = ScalarSolveWorkspace::new(runtime.mesh.cells);
 
     let (mut velocity, mut pressure) = take_runtime_initial_fields(runtime)?;
-    let initial_phi = compute_face_flux(&runtime.mesh, &velocity, &velocity_boundary)?;
-    let initial_continuity = summarize_continuity(&net_cell_flux(&runtime.mesh, &initial_phi)?);
+    let initial_phi = compute_face_flux_with_addressing(
+        &runtime.mesh,
+        &mesh_cache.face_addressing,
+        &velocity,
+        &velocity_boundary,
+    )?;
+    let initial_continuity = summarize_continuity(&net_cell_flux_with_addressing(
+        &runtime.mesh,
+        &mesh_cache.face_addressing,
+        &initial_phi,
+    )?);
     checked_update_metrics(&velocity, &pressure, &initial_phi, initial_continuity).ok_or_else(
         || {
             invalid_input(
@@ -832,9 +845,10 @@ fn solve_laminar_simple_driven(
     let mut final_phi = surface_flux.clone();
     let initial_pressure_boundary =
         resolve_pressure_inlet_outlet(&pressure_boundary, &surface_flux)?;
-    let mut final_grad_p = scalar_gradient_with_geometry(
+    let mut final_grad_p = scalar_gradient_with_geometry_and_addressing(
         &runtime.mesh,
         &mesh_cache.scalar_gradient,
+        &mesh_cache.face_addressing,
         &pressure,
         &initial_pressure_boundary,
         options.schemes.grad_p,
@@ -863,12 +877,17 @@ fn solve_laminar_simple_driven(
         let previous_pressure = pressure.clone();
         let phi = surface_flux.clone();
         let carried_pressure_boundary = resolve_pressure_inlet_outlet(&pressure_boundary, &phi)?;
-        let continuity_before = summarize_continuity(&net_cell_flux(&runtime.mesh, &phi)?);
+        let continuity_before = summarize_continuity(&net_cell_flux_with_addressing(
+            &runtime.mesh,
+            &mesh_cache.face_addressing,
+            &phi,
+        )?);
         timing.iteration_setup_seconds += iteration_setup_started.elapsed().as_secs_f64();
         let operator_evaluation_started = Instant::now();
-        let grad_p = scalar_gradient_with_geometry(
+        let grad_p = scalar_gradient_with_geometry_and_addressing(
             &runtime.mesh,
             &mesh_cache.scalar_gradient,
+            &mesh_cache.face_addressing,
             &pressure,
             &carried_pressure_boundary,
             options.schemes.grad_p,
@@ -1010,7 +1029,12 @@ fn solve_laminar_simple_driven(
             r_au.clone()
         };
         let mut hby_a = hby_a_from_predicted_velocity(&predicted_velocity, &grad_p, &r_au)?;
-        let mut phi_hby_a = compute_phi_hby_a(&runtime.mesh, &hby_a, &velocity_boundary)?;
+        let mut phi_hby_a = compute_phi_hby_a_with_addressing(
+            &runtime.mesh,
+            &mesh_cache.face_addressing,
+            &hby_a,
+            &velocity_boundary,
+        )?;
         #[cfg(test)]
         if let Some(driver) = drive_pressure_boundary.as_deref_mut() {
             driver(iteration, &mut phi_hby_a, None);
@@ -1022,27 +1046,31 @@ fn solve_laminar_simple_driven(
             driver(iteration, &mut phi_hby_a, Some(&coupling_pressure_boundary));
         }
         let phi_hby_a_before_adjust_summary = summarize_face_fluxes(&runtime.mesh, &phi_hby_a);
-        let adjust_phi_summary = adjust_phi_hby_a_with_pressure_geometry(
+        let adjust_phi_summary = adjust_phi_hby_a_with_pressure_geometry_and_addressing(
             &runtime.mesh,
             &mesh_cache.pressure_geometry,
+            &mesh_cache.face_addressing,
             &velocity_boundary,
             &coupling_pressure_boundary,
             &mut phi_hby_a,
         )?;
         let phi_hby_a_after_adjust_summary = summarize_face_fluxes(&runtime.mesh, &phi_hby_a);
         if options.simple_consistent {
-            let consistent_phi_correction = consistent_phi_hby_a_pressure_correction_with_geometry(
-                &runtime.mesh,
-                &mesh_cache.pressure_geometry,
-                &pressure,
-                &coupling_pressure_boundary,
-                &r_au,
-                &r_at_u,
-            )?;
+            let consistent_phi_correction =
+                consistent_phi_hby_a_pressure_correction_with_geometry_and_addressing(
+                    &runtime.mesh,
+                    &mesh_cache.pressure_geometry,
+                    &mesh_cache.face_addressing,
+                    &pressure,
+                    &coupling_pressure_boundary,
+                    &r_au,
+                    &r_at_u,
+                )?;
             phi_hby_a = add_face_fluxes(&phi_hby_a, &consistent_phi_correction)?;
             hby_a = consistent_hby_a_from_base(&hby_a, &grad_p, &r_au, &r_at_u)?;
         }
-        let net_flux_star = net_cell_flux(&runtime.mesh, &phi_hby_a)?;
+        let net_flux_star =
+            net_cell_flux_with_addressing(&runtime.mesh, &mesh_cache.face_addressing, &phi_hby_a)?;
         let continuity_star = summarize_continuity(&net_flux_star);
         if !is_finite_continuity(continuity_star) {
             final_phi = phi;
@@ -1094,15 +1122,17 @@ fn solve_laminar_simple_driven(
             stop_reason = Some(LaminarSimpleStopReason::SolverInvalidState);
             break;
         }
-        let constrained_pressure_boundary = constrained_pressure_treatments_with_geometry(
-            &runtime.mesh,
-            &mesh_cache.pressure_geometry,
-            &coupling_pressure_boundary,
-            &velocity_boundary,
-            &predicted_velocity,
-            &phi_hby_a,
-            &r_at_u,
-        )?;
+        let constrained_pressure_boundary =
+            constrained_pressure_treatments_with_geometry_and_addressing(
+                &runtime.mesh,
+                &mesh_cache.pressure_geometry,
+                &mesh_cache.face_addressing,
+                &coupling_pressure_boundary,
+                &velocity_boundary,
+                &predicted_velocity,
+                &phi_hby_a,
+                &r_at_u,
+            )?;
         let mut pressure_report = None;
         let mut first_pressure_initial_normalized_residual_norm = None;
         let mut pressure_linear_iterations_this_simple = 0;
@@ -1138,33 +1168,39 @@ fn solve_laminar_simple_driven(
                 .as_ref()
                 .map(|report: &ScalarSolveReport| report.solution.as_slice())
                 .unwrap_or(&pressure);
-            let pressure_equation_flux = if apply_non_orthogonal_correction
-                && options.non_orthogonal_correctors > 0
-            {
-                let non_orthogonal_flux = non_orthogonal_pressure_flux_correction_with_geometry(
-                    &runtime.mesh,
-                    &mesh_cache.pressure_geometry,
-                    &mesh_cache.scalar_gradient,
-                    initial_pressure,
-                    &r_at_u,
-                    &constrained_pressure_boundary,
-                    options.schemes.grad_p,
-                )?;
-                add_face_fluxes(&phi_hby_a, &non_orthogonal_flux)?
-            } else {
-                phi_hby_a.clone()
-            };
+            let pressure_equation_flux =
+                if apply_non_orthogonal_correction && options.non_orthogonal_correctors > 0 {
+                    let non_orthogonal_flux =
+                        non_orthogonal_pressure_flux_correction_with_geometry_and_addressing(
+                            &runtime.mesh,
+                            &mesh_cache.pressure_geometry,
+                            &mesh_cache.scalar_gradient,
+                            &mesh_cache.face_addressing,
+                            initial_pressure,
+                            &r_at_u,
+                            &constrained_pressure_boundary,
+                            options.schemes.grad_p,
+                        )?;
+                    add_face_fluxes(&phi_hby_a, &non_orthogonal_flux)?
+                } else {
+                    phi_hby_a.clone()
+                };
             pressure_equation_flux_summary =
                 summarize_face_fluxes(&runtime.mesh, &pressure_equation_flux);
             let pressure_source = pressure_correction_source(
                 &runtime.mesh,
-                &net_cell_flux(&runtime.mesh, &pressure_equation_flux)?,
+                &net_cell_flux_with_addressing(
+                    &runtime.mesh,
+                    &mesh_cache.face_addressing,
+                    &pressure_equation_flux,
+                )?,
             )?;
             pressure_source_summary = summarize_scalars(&pressure_source);
-            assemble_variable_scalar_component_system_into_with_pressure_geometry(
+            assemble_variable_scalar_component_system_into_with_pressure_geometry_and_addressing(
                 &runtime.mesh,
                 &mesh_cache.momentum,
                 &mesh_cache.pressure_geometry,
+                &mesh_cache.face_addressing,
                 &r_at_u,
                 &pressure_source,
                 &constrained_pressure_boundary,
@@ -1353,9 +1389,10 @@ fn solve_laminar_simple_driven(
         for (value, delta) in corrected_pressure.iter_mut().zip(&pressure_delta) {
             *value += delta;
         }
-        let corrected_pressure_gradient = scalar_gradient_with_geometry(
+        let corrected_pressure_gradient = scalar_gradient_with_geometry_and_addressing(
             &runtime.mesh,
             &mesh_cache.scalar_gradient,
+            &mesh_cache.face_addressing,
             &corrected_pressure,
             &constrained_pressure_boundary,
             options.schemes.grad_p,
@@ -1363,9 +1400,10 @@ fn solve_laminar_simple_driven(
         let corrected_velocity =
             velocity_from_hby_a(&runtime.mesh, &hby_a, &corrected_pressure_gradient, &r_at_u)?;
 
-        let pressure_flux = pressure_equation_flux_with_geometry(
+        let pressure_flux = pressure_equation_flux_with_geometry_and_addressing(
             &runtime.mesh,
             &mesh_cache.pressure_geometry,
+            &mesh_cache.face_addressing,
             pressure_solution,
             &r_at_u,
             &constrained_pressure_boundary,
@@ -1384,8 +1422,11 @@ fn solve_laminar_simple_driven(
             pressure_flux: summarize_face_fluxes(&runtime.mesh, &pressure_flux),
             corrected_phi: summarize_face_fluxes(&runtime.mesh, &corrected_phi),
         };
-        let corrected_continuity =
-            summarize_continuity(&net_cell_flux(&runtime.mesh, &corrected_phi)?);
+        let corrected_continuity = summarize_continuity(&net_cell_flux_with_addressing(
+            &runtime.mesh,
+            &mesh_cache.face_addressing,
+            &corrected_phi,
+        )?);
         let pressure_correction_update_scale = 1.0;
         let candidate_update_metrics = pressure_solution_is_representable
             .then(|| {
@@ -1551,8 +1592,10 @@ fn solve_laminar_simple_driven(
     });
 
     let finalization_started = Instant::now();
-    let final_convection = vector_convection_divergence(
+    let final_convection = vector_convection_divergence_with_addressing(
         &runtime.mesh,
+        &mesh_cache.scalar_gradient,
+        &mesh_cache.face_addressing,
         &velocity,
         &velocity_boundary,
         &final_phi,
@@ -1812,15 +1855,26 @@ struct LaminarSimpleMeshCache {
     scalar_gradient: ScalarGradientGeometry,
     pressure_geometry: PressureGeometryCache,
     gamg_face_area_weights: Vec<GamgFacePairWeight>,
+    face_addressing: CompactSimpleFaceAddressing,
 }
 
 impl LaminarSimpleMeshCache {
     fn from_mesh(mesh: &SolverRuntimeMeshData) -> Result<Self> {
+        let momentum = MomentumCsrPattern::from_mesh(mesh)?;
+        let scalar_gradient = ScalarGradientGeometry::from_mesh(mesh)?;
+        let pressure_geometry = PressureGeometryCache::from_mesh(mesh);
+        let gamg_face_area_weights = gamg_face_area_pair_weights(mesh)?;
+        let face_addressing = CompactSimpleFaceAddressing::from_mesh(mesh)?;
+        debug_assert_eq!(
+            face_addressing.internal_faces().len() + face_addressing.boundary_faces().len(),
+            mesh.faces
+        );
         Ok(Self {
-            momentum: MomentumCsrPattern::from_mesh(mesh)?,
-            scalar_gradient: ScalarGradientGeometry::from_mesh(mesh)?,
-            pressure_geometry: PressureGeometryCache::from_mesh(mesh),
-            gamg_face_area_weights: gamg_face_area_pair_weights(mesh)?,
+            momentum,
+            scalar_gradient,
+            pressure_geometry,
+            gamg_face_area_weights,
+            face_addressing,
         })
     }
 }
@@ -2151,23 +2205,26 @@ fn assemble_momentum_equation(
             .div_phi_u
             .gradient_scheme(options.schemes.grad_u);
         Some([
-            scalar_gradient_with_geometry(
+            scalar_gradient_with_geometry_and_addressing(
                 mesh,
                 &mesh_cache.scalar_gradient,
+                &mesh_cache.face_addressing,
                 &old_components[0],
                 &scalar_component_boundary(velocity_boundary, 0),
                 gradient_scheme,
             )?,
-            scalar_gradient_with_geometry(
+            scalar_gradient_with_geometry_and_addressing(
                 mesh,
                 &mesh_cache.scalar_gradient,
+                &mesh_cache.face_addressing,
                 &old_components[1],
                 &scalar_component_boundary(velocity_boundary, 1),
                 gradient_scheme,
             )?,
-            scalar_gradient_with_geometry(
+            scalar_gradient_with_geometry_and_addressing(
                 mesh,
                 &mesh_cache.scalar_gradient,
+                &mesh_cache.face_addressing,
                 &old_components[2],
                 &scalar_component_boundary(velocity_boundary, 2),
                 gradient_scheme,
@@ -2185,8 +2242,9 @@ fn assemble_momentum_equation(
             .map(|value| -component_value(*value, component))
             .collect::<Vec<_>>();
         let boundary = scalar_component_boundary(velocity_boundary, component);
-        let mut system = assemble_momentum_component_system(
+        let mut system = assemble_momentum_component_system_with_addressing(
             mesh,
+            &mesh_cache.face_addressing,
             &mesh_cache.momentum,
             options.dynamic_viscosity,
             options.density,
@@ -3119,8 +3177,39 @@ fn component_name(component: usize) -> &'static str {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn assemble_momentum_component_system(
     mesh: &SolverRuntimeMeshData,
+    momentum_csr_pattern: &MomentumCsrPattern,
+    diffusivity: f64,
+    density: f64,
+    flux: &[f64],
+    volumetric_source: &[f64],
+    boundary: &[ScalarFaceTreatment],
+    old_values: &[f64],
+    old_gradient: Option<&[Point3]>,
+    convection_scheme: LaminarSimpleConvectionScheme,
+) -> Result<ScalarComponentSystem> {
+    let face_addressing = CompactSimpleFaceAddressing::from_mesh(mesh)?;
+    assemble_momentum_component_system_with_addressing(
+        mesh,
+        &face_addressing,
+        momentum_csr_pattern,
+        diffusivity,
+        density,
+        flux,
+        volumetric_source,
+        boundary,
+        old_values,
+        old_gradient,
+        convection_scheme,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assemble_momentum_component_system_with_addressing(
+    mesh: &SolverRuntimeMeshData,
+    face_addressing: &CompactSimpleFaceAddressing,
     momentum_csr_pattern: &MomentumCsrPattern,
     diffusivity: f64,
     density: f64,
@@ -3188,7 +3277,7 @@ fn assemble_momentum_component_system(
         .collect::<Vec<_>>();
 
     for (face_index, treatment) in boundary.iter().enumerate() {
-        let owner = mesh.owner[face_index];
+        let owner = face_addressing.owner(face_index);
         let mass_flux = density * flux[face_index];
         if !mass_flux.is_finite() {
             return Err(invalid_input(format!(
@@ -3196,7 +3285,7 @@ fn assemble_momentum_component_system(
             )));
         }
 
-        if let Some(neighbour) = mesh.neighbour[face_index] {
+        if let Some(neighbour) = face_addressing.neighbour(face_index) {
             let coefficient = face_diffusion_coefficient(
                 diffusivity,
                 mesh.face_area_vectors[face_index],
@@ -3312,7 +3401,7 @@ fn assemble_momentum_component_system(
     }
 
     if convection_scheme.is_bounded() {
-        let net_flux = net_cell_flux(mesh, flux)?;
+        let net_flux = net_cell_flux_with_addressing(mesh, face_addressing, flux)?;
         for (cell, cell_flux) in net_flux.into_iter().enumerate() {
             let correction = checked_product(
                 density,
@@ -3509,10 +3598,35 @@ fn assemble_variable_scalar_component_system(
     Ok(system)
 }
 
+#[cfg(test)]
 fn assemble_variable_scalar_component_system_into_with_pressure_geometry(
     mesh: &SolverRuntimeMeshData,
     pattern: &MomentumCsrPattern,
     pressure_geometry: &PressureGeometryCache,
+    cell_diffusivity: &[f64],
+    volumetric_source: &[f64],
+    boundary: &[ScalarFaceTreatment],
+    system: &mut ScalarComponentSystem,
+) -> Result<()> {
+    let face_addressing = CompactSimpleFaceAddressing::from_mesh(mesh)?;
+    assemble_variable_scalar_component_system_into_with_pressure_geometry_and_addressing(
+        mesh,
+        pattern,
+        pressure_geometry,
+        &face_addressing,
+        cell_diffusivity,
+        volumetric_source,
+        boundary,
+        system,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assemble_variable_scalar_component_system_into_with_pressure_geometry_and_addressing(
+    mesh: &SolverRuntimeMeshData,
+    pattern: &MomentumCsrPattern,
+    pressure_geometry: &PressureGeometryCache,
+    face_addressing: &CompactSimpleFaceAddressing,
     cell_diffusivity: &[f64],
     volumetric_source: &[f64],
     boundary: &[ScalarFaceTreatment],
@@ -3557,8 +3671,8 @@ fn assemble_variable_scalar_component_system_into_with_pressure_geometry(
         *rhs = source * volume;
     }
     for (face_index, treatment) in boundary.iter().enumerate() {
-        let owner = mesh.owner[face_index];
-        if let Some(neighbour) = mesh.neighbour[face_index] {
+        let owner = face_addressing.owner(face_index);
+        if let Some(neighbour) = face_addressing.neighbour(face_index) {
             let coefficient = cached_variable_face_diffusion_coefficient(
                 pressure_geometry,
                 cell_diffusivity,
@@ -3652,8 +3766,19 @@ fn assemble_variable_scalar_component_system_into(
     )
 }
 
+#[cfg(test)]
 fn compute_face_flux(
     mesh: &SolverRuntimeMeshData,
+    velocity: &[Point3],
+    boundary: &[VectorFaceTreatment],
+) -> Result<Vec<f64>> {
+    let face_addressing = CompactSimpleFaceAddressing::from_mesh(mesh)?;
+    compute_face_flux_with_addressing(mesh, &face_addressing, velocity, boundary)
+}
+
+fn compute_face_flux_with_addressing(
+    mesh: &SolverRuntimeMeshData,
+    face_addressing: &CompactSimpleFaceAddressing,
     velocity: &[Point3],
     boundary: &[VectorFaceTreatment],
 ) -> Result<Vec<f64>> {
@@ -3666,12 +3791,19 @@ fn compute_face_flux(
     }
     let mut flux = vec![0.0; mesh.faces];
     for (face_index, face_flux) in flux.iter_mut().enumerate() {
-        let face_velocity = face_vector_value(mesh, velocity, boundary, face_index);
+        let face_velocity = face_vector_value_with_addressing(
+            mesh,
+            face_addressing,
+            velocity,
+            boundary,
+            face_index,
+        );
         *face_flux = dot(face_velocity, mesh.face_area_vectors[face_index]);
     }
     Ok(flux)
 }
 
+#[cfg(test)]
 fn compute_phi_hby_a(
     mesh: &SolverRuntimeMeshData,
     hby_a: &[Point3],
@@ -3680,9 +3812,38 @@ fn compute_phi_hby_a(
     compute_face_flux(mesh, hby_a, velocity_boundary)
 }
 
+fn compute_phi_hby_a_with_addressing(
+    mesh: &SolverRuntimeMeshData,
+    face_addressing: &CompactSimpleFaceAddressing,
+    hby_a: &[Point3],
+    velocity_boundary: &[VectorFaceTreatment],
+) -> Result<Vec<f64>> {
+    compute_face_flux_with_addressing(mesh, face_addressing, hby_a, velocity_boundary)
+}
+
+#[cfg(test)]
 fn pressure_correction_flux_with_geometry(
     mesh: &SolverRuntimeMeshData,
     pressure_geometry: &PressureGeometryCache,
+    pressure_correction: &[f64],
+    r_au: &[f64],
+    boundary: &[ScalarFaceTreatment],
+) -> Result<Vec<f64>> {
+    let face_addressing = CompactSimpleFaceAddressing::from_mesh(mesh)?;
+    pressure_correction_flux_with_geometry_and_addressing(
+        mesh,
+        pressure_geometry,
+        &face_addressing,
+        pressure_correction,
+        r_au,
+        boundary,
+    )
+}
+
+fn pressure_correction_flux_with_geometry_and_addressing(
+    mesh: &SolverRuntimeMeshData,
+    pressure_geometry: &PressureGeometryCache,
+    face_addressing: &CompactSimpleFaceAddressing,
     pressure_correction: &[f64],
     r_au: &[f64],
     boundary: &[ScalarFaceTreatment],
@@ -3712,8 +3873,8 @@ fn pressure_correction_flux_with_geometry(
 
     let mut flux = vec![0.0; mesh.faces];
     for (face_index, treatment) in boundary.iter().enumerate() {
-        let owner = mesh.owner[face_index];
-        if let Some(neighbour) = mesh.neighbour[face_index] {
+        let owner = face_addressing.owner(face_index);
+        if let Some(neighbour) = face_addressing.neighbour(face_index) {
             let coefficient = cached_variable_face_diffusion_coefficient(
                 pressure_geometry,
                 r_au,
@@ -3779,6 +3940,7 @@ fn pressure_correction_flux(
     )
 }
 
+#[cfg(test)]
 fn pressure_equation_flux_with_geometry(
     mesh: &SolverRuntimeMeshData,
     pressure_geometry: &PressureGeometryCache,
@@ -3794,6 +3956,27 @@ fn pressure_equation_flux_with_geometry(
     )
 }
 
+fn pressure_equation_flux_with_geometry_and_addressing(
+    mesh: &SolverRuntimeMeshData,
+    pressure_geometry: &PressureGeometryCache,
+    face_addressing: &CompactSimpleFaceAddressing,
+    pressure: &[f64],
+    r_au: &[f64],
+    boundary: &[ScalarFaceTreatment],
+) -> Result<Vec<f64>> {
+    Ok(pressure_correction_flux_with_geometry_and_addressing(
+        mesh,
+        pressure_geometry,
+        face_addressing,
+        pressure,
+        r_au,
+        boundary,
+    )?
+    .into_iter()
+    .map(|flux| -flux)
+    .collect())
+}
+
 #[cfg(test)]
 fn pressure_equation_flux(
     mesh: &SolverRuntimeMeshData,
@@ -3805,6 +3988,7 @@ fn pressure_equation_flux(
     pressure_equation_flux_with_geometry(mesh, &pressure_geometry, pressure, r_au, boundary)
 }
 
+#[cfg(test)]
 fn consistent_phi_hby_a_pressure_correction_with_geometry(
     mesh: &SolverRuntimeMeshData,
     pressure_geometry: &PressureGeometryCache,
@@ -3846,6 +4030,47 @@ fn consistent_phi_hby_a_pressure_correction_with_geometry(
     )
 }
 
+fn consistent_phi_hby_a_pressure_correction_with_geometry_and_addressing(
+    mesh: &SolverRuntimeMeshData,
+    pressure_geometry: &PressureGeometryCache,
+    face_addressing: &CompactSimpleFaceAddressing,
+    pressure: &[f64],
+    boundary: &[ScalarFaceTreatment],
+    r_au: &[f64],
+    r_at_u: &[f64],
+) -> Result<Vec<f64>> {
+    if r_au.len() != mesh.cells || r_at_u.len() != mesh.cells {
+        return Err(invalid_input(format!(
+            "consistent SIMPLE rAU/rAtU expected {} cell values, got rAU={} rAtU={}",
+            mesh.cells,
+            r_au.len(),
+            r_at_u.len()
+        )));
+    }
+    let mut delta = Vec::with_capacity(mesh.cells);
+    for (cell, (r_au, r_at_u)) in r_au.iter().zip(r_at_u).enumerate() {
+        let value = r_at_u - r_au;
+        if !value.is_finite() || value < -f64::EPSILON {
+            return Err(invalid_input(format!(
+                "consistent SIMPLE rAtU-rAU for cell {cell} must be non-negative and finite, got {value}"
+            )));
+        }
+        delta.push(value.max(0.0));
+    }
+
+    Ok(pressure_correction_flux_with_geometry_and_addressing(
+        mesh,
+        pressure_geometry,
+        face_addressing,
+        pressure,
+        &delta,
+        boundary,
+    )?
+    .into_iter()
+    .map(|flux| -flux)
+    .collect())
+}
+
 #[cfg(test)]
 fn consistent_phi_hby_a_pressure_correction(
     mesh: &SolverRuntimeMeshData,
@@ -3865,10 +4090,35 @@ fn consistent_phi_hby_a_pressure_correction(
     )
 }
 
+#[cfg(test)]
 fn non_orthogonal_pressure_flux_correction_with_geometry(
     mesh: &SolverRuntimeMeshData,
     pressure_geometry: &PressureGeometryCache,
     scalar_gradient_geometry: &ScalarGradientGeometry,
+    pressure: &[f64],
+    r_at_u: &[f64],
+    boundary: &[ScalarFaceTreatment],
+    gradient_scheme: LaminarSimpleGradientScheme,
+) -> Result<Vec<f64>> {
+    let face_addressing = CompactSimpleFaceAddressing::from_mesh(mesh)?;
+    non_orthogonal_pressure_flux_correction_with_geometry_and_addressing(
+        mesh,
+        pressure_geometry,
+        scalar_gradient_geometry,
+        &face_addressing,
+        pressure,
+        r_at_u,
+        boundary,
+        gradient_scheme,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn non_orthogonal_pressure_flux_correction_with_geometry_and_addressing(
+    mesh: &SolverRuntimeMeshData,
+    pressure_geometry: &PressureGeometryCache,
+    scalar_gradient_geometry: &ScalarGradientGeometry,
+    face_addressing: &CompactSimpleFaceAddressing,
     pressure: &[f64],
     r_at_u: &[f64],
     boundary: &[ScalarFaceTreatment],
@@ -3897,17 +4147,18 @@ fn non_orthogonal_pressure_flux_correction_with_geometry(
         )));
     }
 
-    let pressure_gradient = scalar_gradient_with_geometry(
+    let pressure_gradient = scalar_gradient_with_geometry_and_addressing(
         mesh,
         scalar_gradient_geometry,
+        face_addressing,
         pressure,
         boundary,
         gradient_scheme,
     )?;
     let mut flux = vec![0.0; mesh.faces];
     for (face_index, treatment) in boundary.iter().enumerate() {
-        let owner = mesh.owner[face_index];
-        if let Some(neighbour) = mesh.neighbour[face_index] {
+        let owner = face_addressing.owner(face_index);
+        if let Some(neighbour) = face_addressing.neighbour(face_index) {
             let diffusivity = 0.5 * (r_at_u[owner] + r_at_u[neighbour]);
             let face_gradient = average(pressure_gradient[owner], pressure_gradient[neighbour]);
             let non_orthogonal_area =
@@ -4002,6 +4253,7 @@ fn corrected_pressure_equation_flux(
     subtract_face_fluxes(pressure_equation_flux, pressure_flux)
 }
 
+#[cfg(test)]
 fn scalar_gradient(
     mesh: &SolverRuntimeMeshData,
     values: &[f64],
@@ -4009,12 +4261,40 @@ fn scalar_gradient(
     scheme: LaminarSimpleGradientScheme,
 ) -> Result<Vec<Point3>> {
     let geometry = ScalarGradientGeometry::from_mesh(mesh)?;
-    scalar_gradient_with_geometry(mesh, &geometry, values, boundary, scheme)
+    let face_addressing = CompactSimpleFaceAddressing::from_mesh(mesh)?;
+    scalar_gradient_with_geometry_and_addressing(
+        mesh,
+        &geometry,
+        &face_addressing,
+        values,
+        boundary,
+        scheme,
+    )
 }
 
+#[cfg(test)]
 fn scalar_gradient_with_geometry(
     mesh: &SolverRuntimeMeshData,
     geometry: &ScalarGradientGeometry,
+    values: &[f64],
+    boundary: &[ScalarFaceTreatment],
+    scheme: LaminarSimpleGradientScheme,
+) -> Result<Vec<Point3>> {
+    let face_addressing = CompactSimpleFaceAddressing::from_mesh(mesh)?;
+    scalar_gradient_with_geometry_and_addressing(
+        mesh,
+        geometry,
+        &face_addressing,
+        values,
+        boundary,
+        scheme,
+    )
+}
+
+fn scalar_gradient_with_geometry_and_addressing(
+    mesh: &SolverRuntimeMeshData,
+    geometry: &ScalarGradientGeometry,
+    face_addressing: &CompactSimpleFaceAddressing,
     values: &[f64],
     boundary: &[ScalarFaceTreatment],
     scheme: LaminarSimpleGradientScheme,
@@ -4049,9 +4329,20 @@ fn scalar_gradient_with_geometry(
         }
     }
     let mut gradient = vec![zero(); mesh.cells];
+    if face_addressing.faces() != mesh.faces {
+        return Err(invalid_input(
+            "compact face addressing does not match the runtime mesh".to_string(),
+        ));
+    }
     for face_index in 0..mesh.faces {
-        let owner = mesh.owner[face_index];
-        let face_value = cached_face_scalar_value(mesh, geometry, values, boundary, face_index)?;
+        let owner = face_addressing.owner(face_index);
+        let face_value = cached_face_scalar_value_with_addressing(
+            geometry,
+            face_addressing,
+            values,
+            boundary,
+            face_index,
+        )?;
         let area = mesh.face_area_vectors[face_index];
         add_scalar_gradient_contribution(
             &mut gradient[owner],
@@ -4060,7 +4351,7 @@ fn scalar_gradient_with_geometry(
             face_index,
             owner,
         )?;
-        if let Some(neighbour) = mesh.neighbour[face_index] {
+        if let Some(neighbour) = face_addressing.neighbour(face_index) {
             add_scalar_gradient_contribution(
                 &mut gradient[neighbour],
                 area,
@@ -4087,20 +4378,27 @@ fn scalar_gradient_with_geometry(
     match scheme {
         LaminarSimpleGradientScheme::GaussLinear => Ok(gradient),
         LaminarSimpleGradientScheme::CellLimitedGaussLinear(coefficient) => {
-            limit_scalar_gradient(mesh, values, boundary, gradient, coefficient)
+            limit_scalar_gradient_with_addressing(
+                mesh,
+                face_addressing,
+                values,
+                boundary,
+                gradient,
+                coefficient,
+            )
         }
     }
 }
 
-fn cached_face_scalar_value(
-    mesh: &SolverRuntimeMeshData,
+fn cached_face_scalar_value_with_addressing(
     geometry: &ScalarGradientGeometry,
+    face_addressing: &CompactSimpleFaceAddressing,
     values: &[f64],
     boundary: &[ScalarFaceTreatment],
     face_index: usize,
 ) -> Result<f64> {
-    let owner = mesh.owner[face_index];
-    let value = if let Some(neighbour) = mesh.neighbour[face_index] {
+    let owner = face_addressing.owner(face_index);
+    let value = if let Some(neighbour) = face_addressing.neighbour(face_index) {
         let weight = geometry.owner_weights[face_index].ok_or_else(|| {
             invalid_input(format!(
                 "internal face {face_index} has no cached interpolation weight"
@@ -4178,8 +4476,34 @@ fn add_scalar_gradient_contribution(
     Ok(())
 }
 
+#[cfg(test)]
 fn vector_convection_divergence(
     mesh: &SolverRuntimeMeshData,
+    velocity: &[Point3],
+    boundary: &[VectorFaceTreatment],
+    flux: &[f64],
+    scheme: LaminarSimpleConvectionScheme,
+    gradient_scheme: LaminarSimpleGradientScheme,
+) -> Result<Vec<Point3>> {
+    let scalar_gradient_geometry = ScalarGradientGeometry::from_mesh(mesh)?;
+    let face_addressing = CompactSimpleFaceAddressing::from_mesh(mesh)?;
+    vector_convection_divergence_with_addressing(
+        mesh,
+        &scalar_gradient_geometry,
+        &face_addressing,
+        velocity,
+        boundary,
+        flux,
+        scheme,
+        gradient_scheme,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn vector_convection_divergence_with_addressing(
+    mesh: &SolverRuntimeMeshData,
+    scalar_gradient_geometry: &ScalarGradientGeometry,
+    face_addressing: &CompactSimpleFaceAddressing,
     velocity: &[Point3],
     boundary: &[VectorFaceTreatment],
     flux: &[f64],
@@ -4194,8 +4518,10 @@ fn vector_convection_divergence(
         )));
     }
     let gradients = if scheme.uses_linear_upwind() {
-        Some(vector_component_gradients(
+        Some(vector_component_gradients_with_addressing(
             mesh,
+            scalar_gradient_geometry,
+            face_addressing,
             velocity,
             boundary,
             scheme.gradient_scheme(gradient_scheme),
@@ -4210,9 +4536,10 @@ fn vector_convection_divergence(
                 "convection face {face_index} flux must be finite, got {phi}"
             )));
         }
-        let owner = mesh.owner[face_index];
-        let face_velocity = convection_face_vector_value(
+        let owner = face_addressing.owner(face_index);
+        let face_velocity = convection_face_vector_value_with_addressing(
             mesh,
+            face_addressing,
             velocity,
             boundary,
             face_index,
@@ -4221,12 +4548,12 @@ fn vector_convection_divergence(
             gradients.as_ref(),
         );
         add_scaled(&mut divergence[owner], face_velocity, phi);
-        if let Some(neighbour) = mesh.neighbour[face_index] {
+        if let Some(neighbour) = face_addressing.neighbour(face_index) {
             add_scaled(&mut divergence[neighbour], face_velocity, -phi);
         }
     }
     if scheme.is_bounded() {
-        let net_flux = net_cell_flux(mesh, flux)?;
+        let net_flux = net_cell_flux_with_addressing(mesh, face_addressing, flux)?;
         for cell in 0..mesh.cells {
             divergence[cell].x -= checked_product(
                 net_flux[cell],
@@ -4256,7 +4583,17 @@ fn vector_convection_divergence(
     Ok(divergence)
 }
 
+#[cfg(test)]
 fn net_cell_flux(mesh: &SolverRuntimeMeshData, flux: &[f64]) -> Result<Vec<f64>> {
+    let face_addressing = CompactSimpleFaceAddressing::from_mesh(mesh)?;
+    net_cell_flux_with_addressing(mesh, &face_addressing, flux)
+}
+
+fn net_cell_flux_with_addressing(
+    mesh: &SolverRuntimeMeshData,
+    face_addressing: &CompactSimpleFaceAddressing,
+    flux: &[f64],
+) -> Result<Vec<f64>> {
     if flux.len() != mesh.faces {
         return Err(invalid_input(format!(
             "flux has {} values, expected {} mesh faces",
@@ -4271,14 +4608,14 @@ fn net_cell_flux(mesh: &SolverRuntimeMeshData, flux: &[f64]) -> Result<Vec<f64>>
                 "face {face_index} flux must be finite, got {phi}"
             )));
         }
-        let owner = mesh.owner[face_index];
+        let owner = face_addressing.owner(face_index);
         net[owner] += phi;
         if !net[owner].is_finite() {
             return Err(invalid_input(format!(
                 "cell {owner} net flux overflowed at face {face_index}"
             )));
         }
-        if let Some(neighbour) = mesh.neighbour[face_index] {
+        if let Some(neighbour) = face_addressing.neighbour(face_index) {
             net[neighbour] -= phi;
             if !net[neighbour].is_finite() {
                 return Err(invalid_input(format!(
@@ -4311,9 +4648,29 @@ fn pressure_correction_source(mesh: &SolverRuntimeMeshData, net_flux: &[f64]) ->
         .collect())
 }
 
+#[cfg(test)]
 fn adjust_phi_hby_a_with_pressure_geometry(
     mesh: &SolverRuntimeMeshData,
     pressure_geometry: &PressureGeometryCache,
+    velocity_boundary: &[VectorFaceTreatment],
+    pressure_boundary: &[ScalarFaceTreatment],
+    phi_hby_a: &mut [f64],
+) -> Result<AdjustPhiSummary> {
+    let face_addressing = CompactSimpleFaceAddressing::from_mesh(mesh)?;
+    adjust_phi_hby_a_with_pressure_geometry_and_addressing(
+        mesh,
+        pressure_geometry,
+        &face_addressing,
+        velocity_boundary,
+        pressure_boundary,
+        phi_hby_a,
+    )
+}
+
+fn adjust_phi_hby_a_with_pressure_geometry_and_addressing(
+    mesh: &SolverRuntimeMeshData,
+    pressure_geometry: &PressureGeometryCache,
+    face_addressing: &CompactSimpleFaceAddressing,
     velocity_boundary: &[VectorFaceTreatment],
     pressure_boundary: &[ScalarFaceTreatment],
     phi_hby_a: &mut [f64],
@@ -4328,7 +4685,7 @@ fn adjust_phi_hby_a_with_pressure_geometry(
         )));
     }
 
-    let global_flux_before = boundary_global_flux(mesh, phi_hby_a);
+    let global_flux_before = boundary_global_flux_with_addressing(face_addressing, phi_hby_a);
     if !global_flux_before.is_finite() {
         return Err(invalid_input(format!(
             "adjustPhi global flux must be finite, got {global_flux_before}"
@@ -4337,14 +4694,12 @@ fn adjust_phi_hby_a_with_pressure_geometry(
 
     let mut adjustable_area = 0.0;
     let mut adjusted_faces = 0;
-    for face_index in 0..mesh.faces {
-        if mesh.neighbour[face_index].is_some()
-            || !is_adjustable_pressure_open_face(
-                velocity_boundary[face_index],
-                pressure_boundary[face_index],
-                phi_hby_a[face_index],
-            )
-        {
+    for &face_index in face_addressing.boundary_faces() {
+        if !is_adjustable_pressure_open_face(
+            velocity_boundary[face_index],
+            pressure_boundary[face_index],
+            phi_hby_a[face_index],
+        ) {
             continue;
         }
         let area = pressure_geometry.face(face_index).area_magnitude;
@@ -4362,14 +4717,12 @@ fn adjust_phi_hby_a_with_pressure_geometry(
         });
     }
 
-    for face_index in 0..mesh.faces {
-        if mesh.neighbour[face_index].is_some()
-            || !is_adjustable_pressure_open_face(
-                velocity_boundary[face_index],
-                pressure_boundary[face_index],
-                phi_hby_a[face_index],
-            )
-        {
+    for &face_index in face_addressing.boundary_faces() {
+        if !is_adjustable_pressure_open_face(
+            velocity_boundary[face_index],
+            pressure_boundary[face_index],
+            phi_hby_a[face_index],
+        ) {
             continue;
         }
         let area = pressure_geometry.face(face_index).area_magnitude;
@@ -4380,7 +4733,7 @@ fn adjust_phi_hby_a_with_pressure_geometry(
 
     Ok(AdjustPhiSummary {
         global_flux_before,
-        global_flux_after: boundary_global_flux(mesh, phi_hby_a),
+        global_flux_after: boundary_global_flux_with_addressing(face_addressing, phi_hby_a),
         adjusted_faces,
     })
 }
@@ -4413,12 +4766,13 @@ fn is_adjustable_pressure_open_face(
     ) && matches!(pressure, ScalarFaceTreatment::FixedValue(_))
 }
 
-fn boundary_global_flux(mesh: &SolverRuntimeMeshData, flux: &[f64]) -> f64 {
+fn boundary_global_flux_with_addressing(
+    face_addressing: &CompactSimpleFaceAddressing,
+    flux: &[f64],
+) -> f64 {
     let mut global_flux = 0.0;
-    for (face_index, value) in flux.iter().copied().enumerate() {
-        if mesh.neighbour[face_index].is_none() {
-            global_flux += value;
-        }
+    for &face_index in face_addressing.boundary_faces() {
+        global_flux += flux[face_index];
     }
     global_flux
 }
@@ -4883,9 +5237,34 @@ fn scalar_face_treatments(
     Ok(treatments)
 }
 
+#[cfg(test)]
 fn constrained_pressure_treatments_with_geometry(
     mesh: &SolverRuntimeMeshData,
     pressure_geometry: &PressureGeometryCache,
+    pressure_boundary: &[ScalarFaceTreatment],
+    velocity_boundary: &[VectorFaceTreatment],
+    velocity: &[Point3],
+    phi_hby_a: &[f64],
+    r_au: &[f64],
+) -> Result<Vec<ScalarFaceTreatment>> {
+    let face_addressing = CompactSimpleFaceAddressing::from_mesh(mesh)?;
+    constrained_pressure_treatments_with_geometry_and_addressing(
+        mesh,
+        pressure_geometry,
+        &face_addressing,
+        pressure_boundary,
+        velocity_boundary,
+        velocity,
+        phi_hby_a,
+        r_au,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn constrained_pressure_treatments_with_geometry_and_addressing(
+    mesh: &SolverRuntimeMeshData,
+    pressure_geometry: &PressureGeometryCache,
+    face_addressing: &CompactSimpleFaceAddressing,
     pressure_boundary: &[ScalarFaceTreatment],
     velocity_boundary: &[VectorFaceTreatment],
     velocity: &[Point3],
@@ -4905,10 +5284,7 @@ fn constrained_pressure_treatments_with_geometry(
     }
 
     let mut constrained = pressure_boundary.to_vec();
-    for face_index in 0..mesh.faces {
-        if mesh.neighbour[face_index].is_some() {
-            continue;
-        }
+    for &face_index in face_addressing.boundary_faces() {
         if !is_pressure_gradient_constrained_boundary(
             pressure_boundary[face_index],
             velocity_boundary[face_index],
@@ -4916,7 +5292,7 @@ fn constrained_pressure_treatments_with_geometry(
         ) {
             continue;
         }
-        let owner = mesh.owner[face_index];
+        let owner = face_addressing.owner(face_index);
         let area = pressure_geometry.face(face_index).area_magnitude;
         let face_r_au = r_au[owner];
         if !area.is_finite() || area <= f64::EPSILON {
@@ -4929,8 +5305,9 @@ fn constrained_pressure_treatments_with_geometry(
                 "fixedFluxPressure face {face_index} has invalid rAU {face_r_au}"
             )));
         }
-        let u_flux = prescribed_boundary_velocity_flux(
+        let u_flux = prescribed_boundary_velocity_flux_with_addressing(
             mesh,
+            face_addressing,
             velocity,
             velocity_boundary,
             face_index,
@@ -4938,7 +5315,13 @@ fn constrained_pressure_treatments_with_geometry(
         )
         .unwrap_or_else(|| {
             dot(
-                face_vector_value(mesh, velocity, velocity_boundary, face_index),
+                face_vector_value_with_addressing(
+                    mesh,
+                    face_addressing,
+                    velocity,
+                    velocity_boundary,
+                    face_index,
+                ),
                 mesh.face_area_vectors[face_index],
             )
         });
@@ -4990,8 +5373,9 @@ fn prescribed_velocity_boundary_is_active(velocity: VectorFaceTreatment, flux: f
     }
 }
 
-fn prescribed_boundary_velocity_flux(
+fn prescribed_boundary_velocity_flux_with_addressing(
     mesh: &SolverRuntimeMeshData,
+    face_addressing: &CompactSimpleFaceAddressing,
     velocity: &[Point3],
     boundary: &[VectorFaceTreatment],
     face_index: usize,
@@ -5004,7 +5388,7 @@ fn prescribed_boundary_velocity_flux(
         | VectorFaceTreatment::ZeroGradient
         | VectorFaceTreatment::Constraint => return None,
     };
-    if mesh.neighbour[face_index].is_some() {
+    if face_addressing.neighbour(face_index).is_some() {
         return None;
     }
     if velocity.len() != mesh.cells {
@@ -5405,14 +5789,15 @@ fn find_field<'a>(
     Ok(field)
 }
 
-fn face_vector_value(
+fn face_vector_value_with_addressing(
     mesh: &SolverRuntimeMeshData,
+    face_addressing: &CompactSimpleFaceAddressing,
     velocity: &[Point3],
     boundary: &[VectorFaceTreatment],
     face_index: usize,
 ) -> Point3 {
-    let owner = mesh.owner[face_index];
-    if let Some(neighbour) = mesh.neighbour[face_index] {
+    let owner = face_addressing.owner(face_index);
+    if let Some(neighbour) = face_addressing.neighbour(face_index) {
         return average(velocity[owner], velocity[neighbour]);
     }
     match boundary[face_index] {
@@ -5429,6 +5814,7 @@ fn face_vector_value(
     }
 }
 
+#[cfg(test)]
 fn upwind_face_vector_value(
     mesh: &SolverRuntimeMeshData,
     velocity: &[Point3],
@@ -5453,8 +5839,34 @@ fn upwind_face_vector_value(
     }
 }
 
-fn convection_face_vector_value(
+fn upwind_face_vector_value_with_addressing(
+    face_addressing: &CompactSimpleFaceAddressing,
+    velocity: &[Point3],
+    boundary: &[VectorFaceTreatment],
+    face_index: usize,
+    flux: f64,
+) -> Point3 {
+    let owner = face_addressing.owner(face_index);
+    if let Some(neighbour) = face_addressing.neighbour(face_index) {
+        return if flux >= 0.0 {
+            velocity[owner]
+        } else {
+            velocity[neighbour]
+        };
+    }
+    match boundary[face_index] {
+        VectorFaceTreatment::FixedValue(value) if flux < 0.0 => value,
+        VectorFaceTreatment::FixedValue(_) => velocity[owner],
+        VectorFaceTreatment::InletOutlet(value) if flux < 0.0 => value,
+        VectorFaceTreatment::InletOutlet(_) => velocity[owner],
+        VectorFaceTreatment::ZeroGradient | VectorFaceTreatment::Constraint => velocity[owner],
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn convection_face_vector_value_with_addressing(
     mesh: &SolverRuntimeMeshData,
+    face_addressing: &CompactSimpleFaceAddressing,
     velocity: &[Point3],
     boundary: &[VectorFaceTreatment],
     face_index: usize,
@@ -5462,7 +5874,13 @@ fn convection_face_vector_value(
     scheme: LaminarSimpleConvectionScheme,
     gradients: Option<&[Vec<Point3>; 3]>,
 ) -> Point3 {
-    let upwind = upwind_face_vector_value(mesh, velocity, boundary, face_index, flux);
+    let upwind = upwind_face_vector_value_with_addressing(
+        face_addressing,
+        velocity,
+        boundary,
+        face_index,
+        flux,
+    );
     if !scheme.uses_linear_upwind() {
         return upwind;
     }
@@ -5470,8 +5888,8 @@ fn convection_face_vector_value(
         return upwind;
     };
 
-    let owner = mesh.owner[face_index];
-    let upwind_cell = if let Some(neighbour) = mesh.neighbour[face_index] {
+    let owner = face_addressing.owner(face_index);
+    let upwind_cell = if let Some(neighbour) = face_addressing.neighbour(face_index) {
         if flux >= 0.0 { owner } else { neighbour }
     } else if flux < 0.0 {
         return upwind;
@@ -5493,6 +5911,7 @@ fn convection_face_vector_value(
     }
 }
 
+#[cfg(test)]
 fn face_scalar_value(
     mesh: &SolverRuntimeMeshData,
     values: &[f64],
@@ -5501,6 +5920,55 @@ fn face_scalar_value(
 ) -> Result<f64> {
     let owner = mesh.owner[face_index];
     if let Some(neighbour) = mesh.neighbour[face_index] {
+        let weight = gauss_linear_owner_weight(mesh, owner, neighbour, face_index)?;
+        let owner_part = checked_product(
+            weight,
+            values[owner],
+            format!("internal face {face_index} owner interpolation"),
+        )?;
+        let neighbour_part = checked_product(
+            1.0 - weight,
+            values[neighbour],
+            format!("internal face {face_index} neighbour interpolation"),
+        )?;
+        return require_finite(
+            owner_part + neighbour_part,
+            format!("internal face {face_index} interpolated value"),
+        );
+    }
+    let value = match boundary[face_index] {
+        ScalarFaceTreatment::FixedValue(value) => value,
+        ScalarFaceTreatment::FixedGradient(gradient) => {
+            let distance = boundary_normal_distance(mesh, owner, face_index);
+            require_finite(
+                distance,
+                format!("boundary face {face_index} normal distance"),
+            )?;
+            let increment = checked_product(
+                gradient,
+                distance,
+                format!("boundary face {face_index} fixed-gradient extrapolation"),
+            )?;
+            require_finite(
+                values[owner] + increment,
+                format!("boundary face {face_index} fixed-gradient value"),
+            )?
+        }
+        ScalarFaceTreatment::InletOutlet(value) => value,
+        ScalarFaceTreatment::ZeroGradient | ScalarFaceTreatment::Constraint => values[owner],
+    };
+    require_finite(value, format!("boundary face {face_index} effective value"))
+}
+
+fn face_scalar_value_with_addressing(
+    mesh: &SolverRuntimeMeshData,
+    face_addressing: &CompactSimpleFaceAddressing,
+    values: &[f64],
+    boundary: &[ScalarFaceTreatment],
+    face_index: usize,
+) -> Result<f64> {
+    let owner = face_addressing.owner(face_index);
+    if let Some(neighbour) = face_addressing.neighbour(face_index) {
         let weight = gauss_linear_owner_weight(mesh, owner, neighbour, face_index)?;
         let owner_part = checked_product(
             weight,
@@ -5610,8 +6078,28 @@ fn gauss_linear_owner_weight(
     Ok(weight)
 }
 
+#[cfg(test)]
 fn limit_scalar_gradient(
     mesh: &SolverRuntimeMeshData,
+    values: &[f64],
+    boundary: &[ScalarFaceTreatment],
+    gradient: Vec<Point3>,
+    coefficient: f64,
+) -> Result<Vec<Point3>> {
+    let face_addressing = CompactSimpleFaceAddressing::from_mesh(mesh)?;
+    limit_scalar_gradient_with_addressing(
+        mesh,
+        &face_addressing,
+        values,
+        boundary,
+        gradient,
+        coefficient,
+    )
+}
+
+fn limit_scalar_gradient_with_addressing(
+    mesh: &SolverRuntimeMeshData,
+    face_addressing: &CompactSimpleFaceAddressing,
     values: &[f64],
     boundary: &[ScalarFaceTreatment],
     mut gradient: Vec<Point3>,
@@ -5626,19 +6114,25 @@ fn limit_scalar_gradient(
         return Ok(gradient);
     }
 
-    let cell_faces = cell_face_adjacency(mesh)?;
+    let cell_face_adjacency = face_addressing.limiter_cell_adjacency()?;
 
     let mut minima = values.to_vec();
     let mut maxima = values.to_vec();
     for face_index in 0..mesh.faces {
-        let owner = mesh.owner[face_index];
-        if let Some(neighbour) = mesh.neighbour[face_index] {
+        let owner = face_addressing.owner(face_index);
+        if let Some(neighbour) = face_addressing.neighbour(face_index) {
             minima[owner] = minima[owner].min(values[neighbour]);
             maxima[owner] = maxima[owner].max(values[neighbour]);
             minima[neighbour] = minima[neighbour].min(values[owner]);
             maxima[neighbour] = maxima[neighbour].max(values[owner]);
         } else {
-            let boundary_value = face_scalar_value(mesh, values, boundary, face_index)?;
+            let boundary_value = face_scalar_value_with_addressing(
+                mesh,
+                face_addressing,
+                values,
+                boundary,
+                face_index,
+            )?;
             minima[owner] = minima[owner].min(boundary_value);
             maxima[owner] = maxima[owner].max(boundary_value);
         }
@@ -5672,7 +6166,7 @@ fn limit_scalar_gradient(
             limiter_require_cell_finite(minimum_delta - widening, cell, "widened minimum delta")?;
         let mut limiter: f64 = 1.0;
 
-        for &face_index in &cell_faces[cell] {
+        for &face_index in cell_face_adjacency.cell_faces(cell) {
             let delta = limiter_checked_face_delta(
                 mesh.face_centres[face_index],
                 mesh.cell_centres[cell],
@@ -5840,6 +6334,7 @@ fn limiter_checked_cell_scale(value: &mut Point3, factor: f64, cell: usize) -> R
     Ok(())
 }
 
+#[cfg(test)]
 fn cell_face_adjacency(mesh: &SolverRuntimeMeshData) -> Result<Vec<Vec<usize>>> {
     if mesh.owner.len() != mesh.faces || mesh.neighbour.len() != mesh.faces {
         return Err(invalid_input(format!(
@@ -5968,28 +6463,36 @@ fn split_components(values: &[Point3]) -> [Vec<f64>; 3] {
     [x, y, z]
 }
 
-fn vector_component_gradients(
+fn vector_component_gradients_with_addressing(
     mesh: &SolverRuntimeMeshData,
+    scalar_gradient_geometry: &ScalarGradientGeometry,
+    face_addressing: &CompactSimpleFaceAddressing,
     velocity: &[Point3],
     boundary: &[VectorFaceTreatment],
     scheme: LaminarSimpleGradientScheme,
 ) -> Result<[Vec<Point3>; 3]> {
     let components = split_components(velocity);
     Ok([
-        scalar_gradient(
+        scalar_gradient_with_geometry_and_addressing(
             mesh,
+            scalar_gradient_geometry,
+            face_addressing,
             &components[0],
             &scalar_component_boundary(boundary, 0),
             scheme,
         )?,
-        scalar_gradient(
+        scalar_gradient_with_geometry_and_addressing(
             mesh,
+            scalar_gradient_geometry,
+            face_addressing,
             &components[1],
             &scalar_component_boundary(boundary, 1),
             scheme,
         )?,
-        scalar_gradient(
+        scalar_gradient_with_geometry_and_addressing(
             mesh,
+            scalar_gradient_geometry,
+            face_addressing,
             &components[2],
             &scalar_component_boundary(boundary, 2),
             scheme,
@@ -7804,6 +8307,205 @@ mod tests {
             reports.push(report);
         }
         assert_eq!(reports.len(), 3);
+    }
+
+    #[test]
+    fn compact_face_cache_matches_runtime_and_legacy_cell_face_oracles() {
+        let runtime = two_cell_runtime();
+        let cache = LaminarSimpleMeshCache::from_mesh(&runtime.mesh).expect("SIMPLE mesh cache");
+        let addressing = &cache.face_addressing;
+        let legacy = cell_face_adjacency(&runtime.mesh).expect("legacy adjacency oracle");
+
+        assert_eq!(addressing.faces(), runtime.mesh.faces);
+        for face_index in 0..runtime.mesh.faces {
+            assert_eq!(addressing.owner(face_index), runtime.mesh.owner[face_index]);
+            assert_eq!(
+                addressing.neighbour(face_index),
+                runtime.mesh.neighbour[face_index]
+            );
+        }
+        assert_eq!(
+            addressing.internal_faces(),
+            runtime
+                .mesh
+                .neighbour
+                .iter()
+                .enumerate()
+                .filter_map(|(face, neighbour)| neighbour.map(|_| face))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            addressing.boundary_faces(),
+            runtime
+                .mesh
+                .neighbour
+                .iter()
+                .enumerate()
+                .filter_map(|(face, neighbour)| neighbour.is_none().then_some(face))
+                .collect::<Vec<_>>()
+        );
+        assert!(!addressing.limiter_adjacency_initialized());
+        let compact = addressing
+            .limiter_cell_adjacency()
+            .expect("lazy compact cell adjacency");
+        for (cell, expected) in legacy.iter().enumerate() {
+            assert_eq!(compact.cell_faces(cell), expected);
+        }
+        assert!(addressing.limiter_adjacency_initialized());
+    }
+
+    #[test]
+    fn compact_face_cache_keeps_self_neighbour_failure_limiter_lazy() {
+        let mut runtime = two_cell_runtime();
+        runtime.mesh.neighbour[0] = Some(runtime.mesh.owner[0]);
+        let addressing =
+            super::CompactSimpleFaceAddressing::from_mesh(&runtime.mesh).expect("addressing");
+        let values = [1.0, 2.0];
+        let boundary = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
+        let gradient = vec![point(0.5, 0.0, 0.0); runtime.mesh.cells];
+
+        assert!(!addressing.limiter_adjacency_initialized());
+        let unchanged = super::limit_scalar_gradient_with_addressing(
+            &runtime.mesh,
+            &addressing,
+            &values,
+            &boundary,
+            gradient.clone(),
+            0.0,
+        )
+        .expect("zero limiter coefficient must not consume topology validation");
+        for (actual, expected) in unchanged.iter().zip(&gradient) {
+            assert_eq!(actual.x.to_bits(), expected.x.to_bits());
+            assert_eq!(actual.y.to_bits(), expected.y.to_bits());
+            assert_eq!(actual.z.to_bits(), expected.z.to_bits());
+        }
+        assert!(!addressing.limiter_adjacency_initialized());
+
+        let error = super::limit_scalar_gradient_with_addressing(
+            &runtime.mesh,
+            &addressing,
+            &values,
+            &boundary,
+            gradient.clone(),
+            1.0,
+        )
+        .expect_err("nonzero limiter coefficient consumes topology validation");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "face 0 has identical owner and neighbour cell {}",
+                runtime.mesh.owner[0]
+            )
+        );
+        assert!(!addressing.limiter_adjacency_initialized());
+        let retry = super::limit_scalar_gradient_with_addressing(
+            &runtime.mesh,
+            &addressing,
+            &values,
+            &boundary,
+            gradient,
+            1.0,
+        )
+        .expect_err("failed lazy initialization must be retryable");
+        assert_eq!(retry.to_string(), error.to_string());
+        assert!(!addressing.limiter_adjacency_initialized());
+    }
+
+    #[test]
+    fn compact_face_cache_reuses_all_storage_for_ten_limiter_lifecycles() {
+        let runtime = two_cell_runtime();
+        let cache = LaminarSimpleMeshCache::from_mesh(&runtime.mesh).expect("SIMPLE mesh cache");
+        let storage_identity = cache.face_addressing.storage_identity();
+        let values = [1.0, 2.0];
+        let boundary = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
+
+        let gauss = super::scalar_gradient_with_geometry_and_addressing(
+            &runtime.mesh,
+            &cache.scalar_gradient,
+            &cache.face_addressing,
+            &values,
+            &boundary,
+            LaminarSimpleGradientScheme::GaussLinear,
+        )
+        .expect("Gauss gradient must not initialize limiter adjacency");
+        assert!(gauss.iter().all(|value| value.x.is_finite()));
+        assert!(!cache.face_addressing.limiter_adjacency_initialized());
+        let zero = super::scalar_gradient_with_geometry_and_addressing(
+            &runtime.mesh,
+            &cache.scalar_gradient,
+            &cache.face_addressing,
+            &values,
+            &boundary,
+            LaminarSimpleGradientScheme::CellLimitedGaussLinear(0.0),
+        )
+        .expect("zero limiter must not initialize limiter adjacency");
+        assert!(zero.iter().all(|value| value.x.is_finite()));
+        assert!(!cache.face_addressing.limiter_adjacency_initialized());
+
+        let mut adjacency_identity = None;
+        for lifecycle in 0..10 {
+            let coefficient = (lifecycle + 1) as f64 / 10.0;
+            let actual = super::scalar_gradient_with_geometry_and_addressing(
+                &runtime.mesh,
+                &cache.scalar_gradient,
+                &cache.face_addressing,
+                &values,
+                &boundary,
+                LaminarSimpleGradientScheme::CellLimitedGaussLinear(coefficient),
+            )
+            .expect("cached cell-limited gradient");
+            let oracle = super::scalar_gradient_with_geometry(
+                &runtime.mesh,
+                &cache.scalar_gradient,
+                &values,
+                &boundary,
+                LaminarSimpleGradientScheme::CellLimitedGaussLinear(coefficient),
+            )
+            .expect("independent compact-addressing oracle");
+
+            for (actual, expected) in actual.iter().zip(&oracle) {
+                assert_eq!(actual.x.to_bits(), expected.x.to_bits());
+                assert_eq!(actual.y.to_bits(), expected.y.to_bits());
+                assert_eq!(actual.z.to_bits(), expected.z.to_bits());
+            }
+            assert_eq!(cache.face_addressing.storage_identity(), storage_identity);
+            let current_adjacency_identity = cache
+                .face_addressing
+                .limiter_cell_adjacency()
+                .expect("initialized limiter adjacency")
+                .storage_identity();
+            if let Some(expected) = adjacency_identity {
+                assert_eq!(current_adjacency_identity, expected);
+            } else {
+                adjacency_identity = Some(current_adjacency_identity);
+            }
+        }
+        assert!(cache.face_addressing.limiter_adjacency_initialized());
+    }
+
+    #[test]
+    fn public_compact_face_path_runs_zero_one_and_two_correctors() {
+        let fields = two_cell_fields();
+        for correctors in 0..=2 {
+            let mut runtime = two_cell_runtime();
+            let mut options = minimal_laminar_options();
+            options.max_simple_iterations = 1;
+            options.non_orthogonal_correctors = correctors;
+            options.schemes.grad_p = LaminarSimpleGradientScheme::CellLimitedGaussLinear(1.0);
+            options.schemes.grad_u = LaminarSimpleGradientScheme::CellLimitedGaussLinear(1.0);
+
+            let report = solve_laminar_simple(&mut runtime, &fields, &options)
+                .expect("public SIMPLE solve with compact face addressing");
+            assert_eq!(report.simple_iterations, 1);
+            assert_eq!(report.history[0].pressure_linear_solves, correctors + 1);
+            assert!(
+                report
+                    .final_pressure
+                    .iter()
+                    .chain(report.final_phi.iter())
+                    .all(|value| value.is_finite())
+            );
+        }
     }
 
     #[test]
