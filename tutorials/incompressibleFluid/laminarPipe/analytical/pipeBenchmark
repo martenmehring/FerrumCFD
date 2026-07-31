@@ -37,7 +37,7 @@ flowReference
 {
     meanVelocity [0 1 -1 0 0 0 0] 0.02;
     inletVelocityProfile parabolicFullyDeveloped;
-    inletVelocityScale [0 0 0 0 0 0 0] 0.97745440097270619;
+    inletVelocityScale [0 0 0 0 0 0 0] 0.98608362730213373;
     reynolds [0 0 0 0 0 0 0] 398.48303393213575;
     pressureLossModel HagenPoiseuille;
     expectedDeltaP [1 -1 -2 0 0 0 0] 1.6032;

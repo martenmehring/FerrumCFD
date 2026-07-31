@@ -134,10 +134,15 @@ pub fn summarize_poly_mesh_quality(
 ) -> Result<PolyMeshQualitySummary> {
     validate_poly_mesh_for_quality(mesh)?;
     let face_geometry = compute_face_geometry(mesh)?;
-    let cell_centres = compute_cell_centres(mesh, &face_geometry)?;
-    let oriented_area_vectors = orient_face_area_vectors(mesh, &face_geometry, &cell_centres)?;
-    let signed_cell_volumes =
-        compute_signed_cell_volumes(mesh, &face_geometry, &cell_centres, &oriented_area_vectors)?;
+    let provisional_cell_centres = compute_provisional_cell_centres(mesh, &face_geometry)?;
+    let oriented_area_vectors =
+        orient_face_area_vectors(mesh, &face_geometry, &provisional_cell_centres)?;
+    let (cell_centres, signed_cell_volumes) = compute_cell_geometry(
+        mesh,
+        &face_geometry,
+        &provisional_cell_centres,
+        &oriented_area_vectors,
+    )?;
 
     let mut problematic_faces = fallible_flags(mesh.faces.len())?;
     let mut non_finite_faces = fallible_flags(mesh.faces.len())?;
@@ -403,14 +408,40 @@ pub fn compute_poly_mesh_geometry(mesh: &PolyMesh) -> Result<PolyMeshGeometry> {
 }
 
 pub(crate) fn compute_solver_runtime_geometry(mesh: &PolyMesh) -> Result<PolyMeshGeometry> {
-    compute_poly_mesh_geometry_with_volume_validation(mesh, |cell_index, volume| {
-        if !volume.is_finite() || volume <= 0.0 {
+    let geometry =
+        compute_poly_mesh_geometry_with_volume_validation(mesh, |cell_index, volume| {
+            if !volume.is_finite() || volume <= 0.0 {
+                return Err(MeshError::InvalidInput(format!(
+                    "cell {cell_index} has invalid oriented volume {volume}"
+                )));
+            }
+            Ok(())
+        })?;
+
+    for (face, (centre, area_vector)) in geometry
+        .face_centres
+        .iter()
+        .zip(&geometry.face_area_vectors)
+        .enumerate()
+    {
+        let centre = Vec3::from(*centre);
+        let area_vector = Vec3::from(*area_vector);
+        let area = area_vector.stable_mag();
+        if !centre.is_finite() || !area_vector.is_finite() || !area.is_finite() || area <= 0.0 {
             return Err(MeshError::InvalidInput(format!(
-                "cell {cell_index} has invalid oriented volume {volume}"
+                "face {face} has invalid area geometry"
             )));
         }
-        Ok(())
-    })
+    }
+    for (cell, centre) in geometry.cell_centres.iter().copied().enumerate() {
+        if !Vec3::from(centre).is_finite() {
+            return Err(MeshError::InvalidInput(format!(
+                "cell {cell} has invalid volume centroid"
+            )));
+        }
+    }
+
+    Ok(geometry)
 }
 
 fn compute_poly_mesh_geometry_with_volume_validation(
@@ -419,52 +450,117 @@ fn compute_poly_mesh_geometry_with_volume_validation(
 ) -> Result<PolyMeshGeometry> {
     mesh.validate()?;
     let face_geometry = compute_face_geometry(mesh)?;
-    let cell_centres = compute_cell_centres(mesh, &face_geometry)?;
-    let oriented_area_vectors = orient_face_area_vectors(mesh, &face_geometry, &cell_centres)?;
-
-    let cell_volumes =
-        compute_signed_cell_volumes(mesh, &face_geometry, &cell_centres, &oriented_area_vectors)?;
+    let provisional_cell_centres = compute_provisional_cell_centres(mesh, &face_geometry)?;
+    let oriented_area_vectors =
+        orient_face_area_vectors(mesh, &face_geometry, &provisional_cell_centres)?;
+    let (cell_centres, cell_volumes) = compute_cell_geometry(
+        mesh,
+        &face_geometry,
+        &provisional_cell_centres,
+        &oriented_area_vectors,
+    )?;
 
     for (cell_index, volume) in cell_volumes.iter().copied().enumerate() {
         validate_volume(cell_index, volume)?;
     }
     let non_positive_cell_volumes = cell_volumes.iter().filter(|volume| **volume <= 0.0).count();
 
+    let mut face_centres = Vec::new();
+    face_centres
+        .try_reserve_exact(face_geometry.len())
+        .map_err(|_| MeshError::OutOfMemory)?;
+    let mut face_area_vectors = Vec::new();
+    face_area_vectors
+        .try_reserve_exact(oriented_area_vectors.len())
+        .map_err(|_| MeshError::OutOfMemory)?;
+    for (face, area_vector) in face_geometry.iter().zip(oriented_area_vectors) {
+        face_centres.push(Point3::from(face.centre));
+        face_area_vectors.push(Point3::from(area_vector));
+    }
+
+    let mut output_cell_centres = Vec::new();
+    output_cell_centres
+        .try_reserve_exact(cell_centres.len())
+        .map_err(|_| MeshError::OutOfMemory)?;
+    let mut output_cell_volumes = Vec::new();
+    output_cell_volumes
+        .try_reserve_exact(cell_volumes.len())
+        .map_err(|_| MeshError::OutOfMemory)?;
+    for (centre, volume) in cell_centres.into_iter().zip(cell_volumes) {
+        output_cell_centres.push(Point3::from(centre));
+        output_cell_volumes.push(volume.abs());
+    }
+
     Ok(PolyMeshGeometry {
-        face_centres: face_geometry
-            .iter()
-            .map(|face| Point3::from(face.centre))
-            .collect(),
-        face_area_vectors: oriented_area_vectors
-            .into_iter()
-            .map(Point3::from)
-            .collect(),
-        cell_centres: cell_centres.into_iter().map(Point3::from).collect(),
-        cell_volumes: cell_volumes.into_iter().map(f64::abs).collect(),
+        face_centres,
+        face_area_vectors,
+        cell_centres: output_cell_centres,
+        cell_volumes: output_cell_volumes,
         non_positive_cell_volumes,
     })
 }
 
-fn compute_signed_cell_volumes(
+fn compute_cell_geometry(
     mesh: &PolyMesh,
     face_geometry: &[FaceGeometry],
-    cell_centres: &[Vec3],
+    provisional_cell_centres: &[Vec3],
     oriented_area_vectors: &[Vec3],
-) -> Result<Vec<f64>> {
-    let mut cell_volumes = fallible_filled(mesh.cell_count(), 0.0_f64)?;
+) -> Result<(Vec<Vec3>, Vec<f64>)> {
+    let mut accumulators = fallible_filled(mesh.cell_count(), CellMomentAccumulator::default())?;
+
     for (face_index, face) in face_geometry.iter().enumerate() {
         let owner = mesh.owner[face_index];
-        let owner_centre = cell_centres[owner];
-        cell_volumes[owner] +=
-            oriented_area_vectors[face_index].dot(face.centre - owner_centre) / 3.0;
+        accumulate_face_pyramid(
+            face.centre,
+            provisional_cell_centres[owner],
+            oriented_area_vectors[face_index],
+            &mut accumulators[owner],
+        );
 
         if let Some(&neighbour) = mesh.neighbour.get(face_index) {
-            let neighbour_centre = cell_centres[neighbour];
-            cell_volumes[neighbour] +=
-                (-oriented_area_vectors[face_index]).dot(face.centre - neighbour_centre) / 3.0;
+            accumulate_face_pyramid(
+                face.centre,
+                provisional_cell_centres[neighbour],
+                -oriented_area_vectors[face_index],
+                &mut accumulators[neighbour],
+            );
         }
     }
-    Ok(cell_volumes)
+
+    let mut cell_centres = Vec::new();
+    cell_centres
+        .try_reserve_exact(mesh.cell_count())
+        .map_err(|_| MeshError::OutOfMemory)?;
+    let mut cell_volumes = Vec::new();
+    cell_volumes
+        .try_reserve_exact(mesh.cell_count())
+        .map_err(|_| MeshError::OutOfMemory)?;
+    for (reference, accumulator) in provisional_cell_centres.iter().copied().zip(accumulators) {
+        let pyramid_volume = accumulator.pyramid_volume.value();
+        let volume = pyramid_volume / 3.0;
+        let centre = if pyramid_volume == 0.0 {
+            reference
+        } else {
+            reference + accumulator.relative_moment.value() / pyramid_volume
+        };
+        cell_centres.push(centre);
+        cell_volumes.push(volume);
+    }
+    Ok((cell_centres, cell_volumes))
+}
+
+fn accumulate_face_pyramid(
+    face_centre: Vec3,
+    cell_reference: Vec3,
+    outward_area_vector: Vec3,
+    accumulator: &mut CellMomentAccumulator,
+) {
+    let centre_offset = face_centre - cell_reference;
+    let pyramid_volume = outward_area_vector.dot(centre_offset);
+    accumulator.pyramid_volume.add(pyramid_volume);
+    accumulator
+        .relative_moment
+        .add_scaled(centre_offset, 0.75 * pyramid_volume);
 }
 
 fn fallible_flags(len: usize) -> Result<Vec<bool>> {
@@ -640,25 +736,22 @@ fn compute_face_geometry(mesh: &PolyMesh) -> Result<Vec<FaceGeometry>> {
             })?);
         }
 
-        result.push(FaceGeometry {
-            centre: average_point(&points),
-            area_vector: polygon_area_vector(&points),
-        });
+        result.push(polygon_face_geometry(&points));
     }
     Ok(result)
 }
 
-fn compute_cell_centres(mesh: &PolyMesh, faces: &[FaceGeometry]) -> Result<Vec<Vec3>> {
-    let mut sums = fallible_filled(mesh.cell_count(), Vec3::default())?;
+fn compute_provisional_cell_centres(mesh: &PolyMesh, faces: &[FaceGeometry]) -> Result<Vec<Vec3>> {
+    let mut sums = fallible_filled(mesh.cell_count(), CompensatedVec3::default())?;
     let mut counts = fallible_filled(mesh.cell_count(), 0usize)?;
 
     for (face_index, face) in faces.iter().enumerate() {
         let owner = mesh.owner[face_index];
-        sums[owner] += face.centre;
+        sums[owner].add(face.centre);
         counts[owner] += 1;
 
         if let Some(&neighbour) = mesh.neighbour.get(face_index) {
-            sums[neighbour] += face.centre;
+            sums[neighbour].add(face.centre);
             counts[neighbour] += 1;
         }
     }
@@ -667,13 +760,13 @@ fn compute_cell_centres(mesh: &PolyMesh, faces: &[FaceGeometry]) -> Result<Vec<V
     centres
         .try_reserve_exact(mesh.cell_count())
         .map_err(|_| MeshError::OutOfMemory)?;
-    centres.extend(sums.into_iter().zip(counts).map(|(sum, count)| {
-        if count == 0 {
+    for (sum, count) in sums.into_iter().zip(counts) {
+        centres.push(if count == 0 {
             Vec3::default()
         } else {
-            sum / count as f64
-        }
-    }));
+            sum.value() / count as f64
+        });
+    }
     Ok(centres)
 }
 
@@ -704,27 +797,115 @@ fn orient_face_area_vectors(
 }
 
 fn average_point(points: &[Point3]) -> Vec3 {
-    let sum = points
-        .iter()
-        .fold(Vec3::default(), |sum, point| sum + Vec3::from(*point));
-    sum / points.len() as f64
+    let reference = Vec3::from(points[0]);
+    let mut relative_sum = CompensatedVec3::default();
+    for point in points.iter().copied().skip(1) {
+        relative_sum.add(Vec3::from(point) - reference);
+    }
+    reference + relative_sum.value() / points.len() as f64
 }
 
-fn polygon_area_vector(points: &[Point3]) -> Vec3 {
-    let origin = Vec3::from(points[0]);
-    let mut area = Vec3::default();
-    for index in 1..points.len() - 1 {
-        let a = Vec3::from(points[index]) - origin;
-        let b = Vec3::from(points[index + 1]) - origin;
-        area += a.cross(b) * 0.5;
+fn polygon_face_geometry(points: &[Point3]) -> FaceGeometry {
+    let reference = average_point(points);
+    let mut area_vector = CompensatedVec3::default();
+    for edge in 0..points.len() {
+        let first = Vec3::from(points[edge]) - reference;
+        let second = Vec3::from(points[(edge + 1) % points.len()]) - reference;
+        let triangle_area_vector = first.cross(second) * 0.5;
+        area_vector.add(triangle_area_vector);
     }
-    area
+
+    let area_vector = area_vector.value();
+    let area = area_vector.stable_mag();
+    let centre = if area == 0.0 {
+        reference
+    } else {
+        let unit_normal = area_vector / area;
+        let mut projected_area = CompensatedScalar::default();
+        let mut relative_first_moment = CompensatedVec3::default();
+        for edge in 0..points.len() {
+            let first = Vec3::from(points[edge]) - reference;
+            let second = Vec3::from(points[(edge + 1) % points.len()]) - reference;
+            let triangle_area_vector = first.cross(second) * 0.5;
+            let weight = triangle_area_vector.dot(unit_normal);
+            projected_area.add(weight);
+            relative_first_moment.add_scaled((first + second) / 3.0, weight);
+        }
+        let projected_area = projected_area.value();
+        if projected_area == 0.0 {
+            reference
+        } else {
+            reference + relative_first_moment.value() / projected_area
+        }
+    };
+
+    FaceGeometry {
+        centre,
+        area_vector,
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
 struct FaceGeometry {
     centre: Vec3,
     area_vector: Vec3,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CellMomentAccumulator {
+    pyramid_volume: CompensatedScalar,
+    relative_moment: CompensatedVec3,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CompensatedScalar {
+    sum: f64,
+    correction: f64,
+}
+
+impl CompensatedScalar {
+    fn add(&mut self, value: f64) {
+        let next = self.sum + value;
+        let correction = if self.sum.abs() >= value.abs() {
+            (self.sum - next) + value
+        } else {
+            (value - next) + self.sum
+        };
+        self.sum = next;
+        self.correction += correction;
+    }
+
+    fn value(self) -> f64 {
+        let value = self.sum + self.correction;
+        if value == 0.0 { 0.0 } else { value }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CompensatedVec3 {
+    x: CompensatedScalar,
+    y: CompensatedScalar,
+    z: CompensatedScalar,
+}
+
+impl CompensatedVec3 {
+    fn add(&mut self, value: Vec3) {
+        self.x.add(value.x);
+        self.y.add(value.y);
+        self.z.add(value.z);
+    }
+
+    fn add_scaled(&mut self, value: Vec3, scale: f64) {
+        self.add(value * scale);
+    }
+
+    fn value(self) -> Vec3 {
+        Vec3 {
+            x: self.x.value(),
+            y: self.y.value(),
+            z: self.z.value(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -863,8 +1044,8 @@ mod tests {
     use crate::{MeshError, Point3};
 
     use super::{
-        FaceGeometry, PolyMeshGeometry, Vec3, average_point, compute_poly_mesh_geometry,
-        fallible_filled, polygon_area_vector, summarize_poly_mesh_geometry,
+        compute_solver_runtime_geometry, fallible_filled, polygon_face_geometry,
+        summarize_poly_mesh_geometry,
     };
 
     #[test]
@@ -945,150 +1126,224 @@ mod tests {
     }
 
     #[test]
-    fn fallible_refactor_is_bit_identical_to_original_geometry_order() {
+    fn polygon_face_centre_is_area_weighted_for_a_trapezoid() {
+        let points = [
+            point(0.0, 0.0, 0.0),
+            point(2.0, 0.0, 0.0),
+            point(1.0, 1.0, 0.0),
+            point(0.0, 1.0, 0.0),
+        ];
+        let face = polygon_face_geometry(&points);
+        let reversed = polygon_face_geometry(&points.into_iter().rev().collect::<Vec<_>>());
+
+        assert_close(face.centre.x, 7.0 / 9.0);
+        assert_close(face.centre.y, 4.0 / 9.0);
+        assert_close(face.centre.z, 0.0);
+        assert_close(face.area_vector.stable_mag(), 1.5);
+        assert_close(reversed.centre.x, face.centre.x);
+        assert_close(reversed.centre.y, face.centre.y);
+        assert_close(reversed.centre.z, face.centre.z);
+        assert_close(reversed.area_vector.x, -face.area_vector.x);
+        assert_close(reversed.area_vector.y, -face.area_vector.y);
+        assert_close(reversed.area_vector.z, -face.area_vector.z);
+    }
+
+    #[test]
+    fn concave_polygon_uses_projected_signed_area_weights() {
+        let points = [
+            point(0.0, 0.0, 0.0),
+            point(2.0, 0.0, 0.0),
+            point(2.0, 1.0, 0.0),
+            point(1.0, 1.0, 0.0),
+            point(1.0, 2.0, 0.0),
+            point(0.0, 2.0, 0.0),
+        ];
+        let face = polygon_face_geometry(&points);
+        let reversed = polygon_face_geometry(&points.into_iter().rev().collect::<Vec<_>>());
+
+        assert_close(face.centre.x, 5.0 / 6.0);
+        assert_close(face.centre.y, 5.0 / 6.0);
+        assert_close(face.centre.z, 0.0);
+        assert_close(face.area_vector.stable_mag(), 3.0);
+        assert_close(reversed.centre.x, face.centre.x);
+        assert_close(reversed.centre.y, face.centre.y);
+        assert_close(reversed.centre.z, face.centre.z);
+        assert_close(reversed.area_vector.z, -face.area_vector.z);
+    }
+
+    #[test]
+    fn extruded_trapezoid_matches_area_and_volume_centroid_oracles() {
+        let geometry =
+            compute_solver_runtime_geometry(&extruded_trapezoid()).expect("trapezoid prism");
+        let centre = geometry.cell_centres[0];
+
+        assert_close(centre.x, 7.0 / 9.0);
+        assert_close(centre.y, 4.0 / 9.0);
+        assert_close(centre.z, 1.5);
+        assert_close(geometry.cell_volumes[0], 4.5);
+    }
+
+    #[test]
+    fn affine_hexahedron_matches_determinant_and_centroid_oracles() {
         let mesh = PolyMesh {
-            path: PathBuf::from("polyMesh"),
+            path: PathBuf::from("affine-hexahedron/polyMesh"),
             points: vec![
-                point(0.0, 0.0, 0.0),
-                point(1.3, 0.0, 0.0),
-                point(1.3, 0.7, 0.0),
-                point(0.0, 0.7, 0.0),
-                point(0.2, 0.1, 2.1),
-                point(1.5, 0.1, 2.1),
-                point(1.5, 0.8, 2.1),
-                point(0.2, 0.8, 2.1),
+                point(0.2, -0.4, 0.7),
+                point(1.5, -0.3, 0.9),
+                point(1.3, 0.6, 1.05),
+                point(0.0, 0.5, 0.85),
+                point(0.45, -0.5, 2.4),
+                point(1.75, -0.4, 2.6),
+                point(1.55, 0.5, 2.75),
+                point(0.25, 0.4, 2.55),
             ],
-            faces: vec![
-                vec![0, 3, 2, 1],
-                vec![4, 5, 6, 7],
-                vec![0, 1, 5, 4],
-                vec![1, 2, 6, 5],
-                vec![2, 3, 7, 6],
-                vec![3, 0, 4, 7],
-            ],
+            faces: hexahedron_faces(),
             owner: vec![0; 6],
             neighbour: Vec::new(),
             patches: Vec::new(),
         };
+        let geometry = compute_solver_runtime_geometry(&mesh).expect("affine hexahedron");
+        let centre = geometry.cell_centres[0];
 
-        let actual = compute_poly_mesh_geometry(&mesh).expect("fallible geometry");
-        let original = original_geometry_order(&mesh);
+        assert_close(centre.x, 0.875);
+        assert_close(centre.y, 0.05);
+        assert_close(centre.z, 1.725);
+        assert_close(geometry.cell_volumes[0], 2.00525);
+    }
 
-        assert_points_bit_equal(&actual.face_centres, &original.face_centres);
-        assert_points_bit_equal(&actual.face_area_vectors, &original.face_area_vectors);
-        assert_points_bit_equal(&actual.cell_centres, &original.cell_centres);
-        assert_eq!(
-            actual
-                .cell_volumes
-                .iter()
-                .map(|value| value.to_bits())
-                .collect::<Vec<_>>(),
-            original
-                .cell_volumes
-                .iter()
-                .map(|value| value.to_bits())
-                .collect::<Vec<_>>()
+    #[test]
+    fn annular_wedge_prism_matches_closed_centroid_oracle() {
+        let mesh = annular_wedge_cell();
+        let geometry = compute_solver_runtime_geometry(&mesh).expect("wedge geometry");
+        let centre = geometry.cell_centres[0];
+
+        assert_close(centre.x, 0.0625);
+        assert_close(centre.y, 0.564_277_236_263_827);
+        assert_close(centre.z, 0.0);
+        let theta = 2.5_f64.to_radians();
+        let expected_volume =
+            0.125 * 0.5 * (0.625_f64.powi(2) - 0.5_f64.powi(2)) * (2.0 * theta).sin();
+        assert_close(geometry.cell_volumes[0], expected_volume);
+    }
+
+    #[test]
+    fn wedge_centroid_is_translation_scale_and_face_order_invariant() {
+        let baseline = compute_solver_runtime_geometry(&annular_wedge_cell())
+            .expect("baseline wedge geometry");
+
+        let mut transformed = annular_wedge_cell();
+        for point in &mut transformed.points {
+            point.x = 1_000_000.0 + 8.0 * point.x;
+            point.y = -2_000_000.0 + 8.0 * point.y;
+            point.z = 3_000_000.0 + 8.0 * point.z;
+        }
+        transformed.faces.reverse();
+        transformed.owner.reverse();
+        for face in &mut transformed.faces {
+            face.reverse();
+            face.rotate_left(1);
+        }
+        let actual =
+            compute_solver_runtime_geometry(&transformed).expect("transformed wedge geometry");
+
+        assert_translation_close(
+            actual.cell_centres[0].x,
+            1_000_000.0 + 8.0 * baseline.cell_centres[0].x,
         );
-        assert_eq!(
-            actual.non_positive_cell_volumes,
-            original.non_positive_cell_volumes
+        assert_translation_close(
+            actual.cell_centres[0].y,
+            -2_000_000.0 + 8.0 * baseline.cell_centres[0].y,
+        );
+        assert_translation_close(
+            actual.cell_centres[0].z,
+            3_000_000.0 + 8.0 * baseline.cell_centres[0].z,
+        );
+        // Adding million-scale offsets quantizes the stored input coordinates
+        // before geometry is reconstructed. Keep the volume check tighter than
+        // that input-conditioned round-off, rather than below one input ULP.
+        assert_relative_close(
+            actual.cell_volumes[0],
+            baseline.cell_volumes[0] * 8.0_f64.powi(3),
+            2e-9,
         );
     }
 
-    fn original_geometry_order(mesh: &PolyMesh) -> PolyMeshGeometry {
-        let face_geometry = mesh
-            .faces
-            .iter()
-            .map(|face| {
-                let points = face
-                    .iter()
-                    .map(|&index| mesh.points[index])
-                    .collect::<Vec<_>>();
-                FaceGeometry {
-                    centre: average_point(&points),
-                    area_vector: polygon_area_vector(&points),
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let mut sums = vec![Vec3::default(); mesh.cell_count()];
-        let mut counts = vec![0usize; mesh.cell_count()];
-        for (face_index, face) in face_geometry.iter().enumerate() {
-            let owner = mesh.owner[face_index];
-            sums[owner] += face.centre;
-            counts[owner] += 1;
-            if let Some(&neighbour) = mesh.neighbour.get(face_index) {
-                sums[neighbour] += face.centre;
-                counts[neighbour] += 1;
-            }
+    #[test]
+    fn solver_geometry_rejects_a_flat_zero_volume_cell() {
+        let mut mesh = annular_wedge_cell();
+        for point in &mut mesh.points {
+            point.x = 0.0;
         }
-        let cell_centres = sums
-            .into_iter()
-            .zip(counts)
-            .map(|(sum, count)| {
-                if count == 0 {
-                    Vec3::default()
-                } else {
-                    sum / count as f64
-                }
-            })
-            .collect::<Vec<_>>();
+        assert!(matches!(
+            compute_solver_runtime_geometry(&mesh),
+            Err(MeshError::InvalidInput(message))
+                if message.contains("invalid oriented volume")
+        ));
+    }
 
-        let oriented_area_vectors = face_geometry
-            .iter()
-            .enumerate()
-            .map(|(face_index, face)| {
-                let owner = mesh.owner[face_index];
-                let desired_direction = if let Some(&neighbour) = mesh.neighbour.get(face_index) {
-                    cell_centres[neighbour] - cell_centres[owner]
-                } else {
-                    face.centre - cell_centres[owner]
-                };
-                if face.area_vector.dot(desired_direction) < 0.0 {
-                    -face.area_vector
-                } else {
-                    face.area_vector
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let mut cell_volumes = vec![0.0; mesh.cell_count()];
-        for (face_index, face) in face_geometry.iter().enumerate() {
-            let owner = mesh.owner[face_index];
-            let owner_centre = cell_centres[owner];
-            cell_volumes[owner] +=
-                oriented_area_vectors[face_index].dot(face.centre - owner_centre) / 3.0;
-            if let Some(&neighbour) = mesh.neighbour.get(face_index) {
-                let neighbour_centre = cell_centres[neighbour];
-                cell_volumes[neighbour] +=
-                    (-oriented_area_vectors[face_index]).dot(face.centre - neighbour_centre) / 3.0;
-            }
-        }
-        let non_positive_cell_volumes =
-            cell_volumes.iter().filter(|volume| **volume <= 0.0).count();
-
-        PolyMeshGeometry {
-            face_centres: face_geometry
-                .iter()
-                .map(|face| Point3::from(face.centre))
-                .collect(),
-            face_area_vectors: oriented_area_vectors
-                .into_iter()
-                .map(Point3::from)
-                .collect(),
-            cell_centres: cell_centres.into_iter().map(Point3::from).collect(),
-            cell_volumes: cell_volumes.into_iter().map(f64::abs).collect(),
-            non_positive_cell_volumes,
+    fn annular_wedge_cell() -> PolyMesh {
+        let theta = 2.5_f64.to_radians();
+        let c = theta.cos();
+        let s = theta.sin();
+        let x0 = 0.0;
+        let x1 = 0.125;
+        let r0 = 0.5;
+        let r1 = 0.625;
+        PolyMesh {
+            path: PathBuf::from("annular-wedge/polyMesh"),
+            points: vec![
+                point(x0, r0 * c, -r0 * s),
+                point(x1, r0 * c, -r0 * s),
+                point(x1, r1 * c, -r1 * s),
+                point(x0, r1 * c, -r1 * s),
+                point(x0, r0 * c, r0 * s),
+                point(x1, r0 * c, r0 * s),
+                point(x1, r1 * c, r1 * s),
+                point(x0, r1 * c, r1 * s),
+            ],
+            faces: vec![
+                vec![0, 4, 7, 3],
+                vec![1, 2, 6, 5],
+                vec![0, 1, 5, 4],
+                vec![3, 7, 6, 2],
+                vec![0, 3, 2, 1],
+                vec![4, 5, 6, 7],
+            ],
+            owner: vec![0; 6],
+            neighbour: Vec::new(),
+            patches: Vec::new(),
         }
     }
 
-    fn assert_points_bit_equal(left: &[Point3], right: &[Point3]) {
-        assert_eq!(left.len(), right.len());
-        for (left, right) in left.iter().zip(right) {
-            assert_eq!(left.x.to_bits(), right.x.to_bits());
-            assert_eq!(left.y.to_bits(), right.y.to_bits());
-            assert_eq!(left.z.to_bits(), right.z.to_bits());
+    fn extruded_trapezoid() -> PolyMesh {
+        PolyMesh {
+            path: PathBuf::from("extruded-trapezoid/polyMesh"),
+            points: vec![
+                point(0.0, 0.0, 0.0),
+                point(2.0, 0.0, 0.0),
+                point(1.0, 1.0, 0.0),
+                point(0.0, 1.0, 0.0),
+                point(0.0, 0.0, 3.0),
+                point(2.0, 0.0, 3.0),
+                point(1.0, 1.0, 3.0),
+                point(0.0, 1.0, 3.0),
+            ],
+            faces: hexahedron_faces(),
+            owner: vec![0; 6],
+            neighbour: Vec::new(),
+            patches: Vec::new(),
         }
+    }
+
+    fn hexahedron_faces() -> Vec<Vec<usize>> {
+        vec![
+            vec![0, 3, 2, 1],
+            vec![4, 5, 6, 7],
+            vec![0, 1, 5, 4],
+            vec![1, 2, 6, 5],
+            vec![2, 3, 7, 6],
+            vec![3, 0, 4, 7],
+        ]
     }
 
     fn point(x: f64, y: f64, z: f64) -> Point3 {
@@ -1096,9 +1351,26 @@ mod tests {
     }
 
     fn assert_close(left: f64, right: f64) {
+        assert_close_scaled(left, right, 1e-12);
+    }
+
+    fn assert_close_scaled(left: f64, right: f64, tolerance: f64) {
         assert!(
-            (left - right).abs() < 1e-12,
-            "expected {left} to be close to {right}"
+            (left - right).abs() <= tolerance,
+            "expected {left:.17e} to be within {tolerance:.3e} of {right:.17e}"
+        );
+    }
+
+    fn assert_translation_close(left: f64, right: f64) {
+        let tolerance = 2.0 * f64::EPSILON * right.abs().max(1.0);
+        assert_close_scaled(left, right, tolerance);
+    }
+
+    fn assert_relative_close(left: f64, right: f64, relative_tolerance: f64) {
+        assert_close_scaled(
+            left,
+            right,
+            relative_tolerance * left.abs().max(right.abs()).max(f64::MIN_POSITIVE),
         );
     }
 }
