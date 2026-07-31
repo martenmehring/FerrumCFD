@@ -112,13 +112,61 @@ fn packaged_cylinder_preflight_and_two_iteration_smoke() {
     assert_eq!(parse_evidence_usize(forces, "selectedFaces"), 16);
     assert!(parse_evidence_f64(forces, "dragTotal").is_finite());
     assert!(parse_evidence_f64(forces, "liftTotal").is_finite());
+    let force_method = solve_stdout
+        .lines()
+        .find(|line| line.starts_with("incompressibleFluid wallForceMethod:"))
+        .expect("missing wall-force method evidence");
+    assert!(force_method.contains("tractionMethod=reconstructedGradientFullDeviatoric"));
+    assert!(force_method.contains("tractionMethodVersion=1"));
+    assert!(force_method.contains("forceConvention=fluidOnBody"));
+    assert!(force_method.contains("faceAreaVectorOrientation=outwardFromFluid"));
+    assert!(force_method.contains("pressureFaceTreatment=zeroGradientOwner"));
+    assert!(force_method.contains("gradU=\"cellLimited Gauss linear 1\""));
 
     let json = fs::read_to_string(temporary.join("report.json")).expect("read JSON report");
     let markdown = fs::read_to_string(temporary.join("report.md")).expect("read Markdown report");
     assert!(json.contains("\"continuityErrors\""));
     assert!(json.contains("\"wallForces\""));
+    assert!(json.contains("\"tractionMethod\": \"reconstructedGradientFullDeviatoric\""));
+    assert!(json.contains("\"tractionMethodVersion\": 1"));
+    assert!(json.contains("\"forceConvention\": \"fluidOnBody\""));
+    assert!(json.contains("\"faceAreaVectorOrientation\": \"outwardFromFluid\""));
+    assert!(json.contains("\"pressureFaceTreatment\": \"zeroGradientOwner\""));
+    assert!(json.contains("\"velocityGradientScheme\": \"cellLimited Gauss linear 1\""));
     assert!(markdown.contains("Continuity errors"));
     assert!(markdown.contains("Wall forces"));
+    assert!(markdown.contains("| Traction method | reconstructedGradientFullDeviatoric |"));
+    assert!(markdown.contains("| Force convention | fluidOnBody |"));
+    assert!(markdown.contains("| Pressure face treatment | zeroGradientOwner |"));
+    assert!(markdown.contains("| Velocity gradient scheme | cellLimited Gauss linear 1 |"));
+
+    let solve_without_wall_forces = run_case(
+        &temporary,
+        &temporary,
+        &[
+            "--maxSimpleIterations",
+            "2",
+            "--solveReportJson",
+            "report-no-wall.json",
+            "--solveReportMarkdown",
+            "report-no-wall.md",
+        ],
+    );
+    assert!(
+        solve_without_wall_forces.status.success(),
+        "no-wall smoke solve failed: {}",
+        String::from_utf8_lossy(&solve_without_wall_forces.stderr)
+    );
+    let no_wall_stdout = stdout(&solve_without_wall_forces);
+    assert!(!no_wall_stdout.contains("incompressibleFluid wallForces:"));
+    assert!(!no_wall_stdout.contains("incompressibleFluid wallForceMethod:"));
+    let no_wall_json = fs::read_to_string(temporary.join("report-no-wall.json"))
+        .expect("read no-wall JSON report");
+    let no_wall_markdown = fs::read_to_string(temporary.join("report-no-wall.md"))
+        .expect("read no-wall Markdown report");
+    assert!(no_wall_json.contains("\"schemaVersion\": 3"));
+    assert!(no_wall_json.contains("\"wallForces\": null"));
+    assert!(!no_wall_markdown.contains("## Wall forces"));
 
     let _ = fs::remove_dir_all(&temporary);
 }

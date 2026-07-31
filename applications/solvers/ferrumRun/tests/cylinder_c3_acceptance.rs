@@ -180,6 +180,7 @@ fn run_preset(root: &Path, preset: CylinderOGridPreset, label: &str) -> RunEvide
     let linear = evidence_line(&stdout, "incompressibleFluid linearSolves:");
     let continuity = evidence_line(&stdout, "incompressibleFluid continuityErrors:");
     let forces = evidence_line(&stdout, "incompressibleFluid wallForces:");
+    let force_method = evidence_line(&stdout, "incompressibleFluid wallForceMethod:");
 
     assert_eq!(token(solve, "converged"), "yes");
     assert_eq!(token(solve, "stopReason"), "Converged");
@@ -219,6 +220,20 @@ fn run_preset(root: &Path, preset: CylinderOGridPreset, label: &str) -> RunEvide
     assert_eq!(token(forces, "patches"), "cylinder");
     assert_eq!(parse_usize(forces, "selectedPatches"), 1);
     assert_eq!(parse_usize(forces, "selectedFaces"), expected.1);
+    assert_eq!(
+        token(force_method, "tractionMethod"),
+        "reconstructedGradientFullDeviatoric"
+    );
+    assert_eq!(parse_usize(force_method, "tractionMethodVersion"), 1);
+    assert_eq!(token(force_method, "forceConvention"), "fluidOnBody");
+    assert_eq!(
+        token(force_method, "faceAreaVectorOrientation"),
+        "outwardFromFluid"
+    );
+    assert_eq!(
+        token(force_method, "pressureFaceTreatment"),
+        "zeroGradientOwner"
+    );
     let cd = parse_f64(forces, "dragTotal");
     let cl = parse_f64(forces, "liftTotal");
     let reference_error = (cd - REFERENCE_CD).abs() / REFERENCE_CD;
@@ -232,8 +247,18 @@ fn run_preset(root: &Path, preset: CylinderOGridPreset, label: &str) -> RunEvide
     let markdown = fs::read_to_string(run_root.join("report.md")).expect("read C3 Markdown report");
     assert!(json.contains("\"continuityErrors\""));
     assert!(json.contains("\"wallForces\""));
+    assert!(json.contains("\"tractionMethod\": \"reconstructedGradientFullDeviatoric\""));
+    assert!(json.contains("\"tractionMethodVersion\": 1"));
+    assert!(json.contains("\"forceConvention\": \"fluidOnBody\""));
+    assert!(json.contains("\"faceAreaVectorOrientation\": \"outwardFromFluid\""));
+    assert!(json.contains("\"pressureFaceTreatment\": \"zeroGradientOwner\""));
+    assert!(json.contains("\"velocityGradientScheme\": \"cellLimited Gauss linear 1\""));
     assert!(markdown.contains("Continuity errors"));
     assert!(markdown.contains("Wall forces"));
+    assert!(markdown.contains("| Traction method | reconstructedGradientFullDeviatoric |"));
+    assert!(markdown.contains("| Force convention | fluidOnBody |"));
+    assert!(markdown.contains("| Pressure face treatment | zeroGradientOwner |"));
+    assert!(markdown.contains("| Velocity gradient scheme | cellLimited Gauss linear 1 |"));
 
     RunEvidence {
         cells: expected.0,
