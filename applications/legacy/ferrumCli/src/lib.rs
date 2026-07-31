@@ -2236,6 +2236,8 @@ fn parse_laminar_simple_gradient_scheme(
     let tokens = normalized_scheme_tokens(value);
     if scheme_tokens_are(&tokens, &["gauss", "linear"]) {
         Ok(LaminarSimpleGradientScheme::GaussLinear)
+    } else if scheme_tokens_are(&tokens, &["leastsquares"]) {
+        Ok(LaminarSimpleGradientScheme::LeastSquares)
     } else if tokens.len() == 4
         && scheme_token_is(&tokens, 0, "celllimited")
         && scheme_token_is(&tokens, 1, "gauss")
@@ -2259,7 +2261,7 @@ fn parse_laminar_simple_gradient_scheme(
         ))
     } else {
         Err(format!(
-            "unsupported laminar SIMPLE grad scheme '{value}'; currently supported: Gauss linear or cellLimited Gauss linear k"
+            "unsupported laminar SIMPLE grad scheme '{value}'; currently supported: Gauss linear, leastSquares, or cellLimited Gauss linear k"
         ))
     }
 }
@@ -12464,6 +12466,14 @@ mod tests {
             LaminarSimpleGradientScheme::GaussLinear
         );
         assert_eq!(
+            parse_laminar_simple_gradient_scheme("leastSquares").expect("least-squares scheme"),
+            LaminarSimpleGradientScheme::LeastSquares
+        );
+        assert_eq!(
+            LaminarSimpleGradientScheme::LeastSquares.to_string(),
+            "leastSquares"
+        );
+        assert_eq!(
             parse_laminar_simple_gradient_scheme("cellLimited Gauss linear 0.5")
                 .expect("limited grad scheme"),
             LaminarSimpleGradientScheme::CellLimitedGaussLinear(0.5)
@@ -12599,6 +12609,9 @@ mod tests {
     #[test]
     fn gradient_scheme_parser_rejects_invalid_coefficients_and_arity() {
         for value in [
+            "leastSquares trailing",
+            "weightedLeastSquares",
+            "cellLimited leastSquares 1",
             "cellLimited Gauss linear",
             "cellLimited Gauss linear 0.5 trailing",
             "cellLimited Gauss linear -0.1",
