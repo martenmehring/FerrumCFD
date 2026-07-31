@@ -603,7 +603,8 @@ It builds the first finite-volume flow operators on the runtime mesh:
 `phi = U_f . S_f`, `grad(p)`, `div(phi,U)`, and `laplacian(nu,U)`. The SIMPLE
 path now reads the supported `system/fvSchemes` subset directly:
 
-- `gradSchemes`: `Gauss linear` for `grad(p)` and `grad(U)`
+- `gradSchemes`: `Gauss linear`, `leastSquares`, or
+  `cellLimited Gauss linear k` for `grad(p)` and `grad(U)`
 - `divSchemes`: `div(phi,U) Gauss upwind` or
   `div(phi,U) Gauss linearUpwind grad(U)`
 - `laplacianSchemes`: `Gauss linear corrected`, `orthogonal`, or `uncorrected`
@@ -614,8 +615,21 @@ path now reads the supported `system/fvSchemes` subset directly:
 `Gauss linearUpwind grad(U)` keeps that upwind matrix and adds the gradient
 part as a deferred correction to the right-hand side. This is closer to the
 OpenFOAM workflow without hiding artificial field clipping in the solver. For
-pipe/axisymmetric benchmarks and general inlet/outlet workflows, the supported
-boundary-condition contract is:
+`leastSquares`, Ferrum builds a deterministic weighted stencil in the mesh's
+intrinsic active dimension and applies the same selected reconstruction to
+pressure and to every velocity component consumed by `linearUpwind`. Invalid
+or rank-deficient geometry is rejected before the one-shot initial field
+payloads are consumed. `empty`, paired `wedge`, and `symmetryPlane` constraints
+are handled explicitly; no artificial field-magnitude cap is introduced.
+
+For diagnostics, the library function
+`reconstruct_laminar_initial_gradients` exposes the cell-centred initial
+`grad(p)` and, when the selected convection path consumes it, the three
+component rows of `grad(U)`. The call is non-consuming and does not assemble or
+advance SIMPLE.
+
+For pipe/axisymmetric benchmarks and general inlet/outlet workflows, the
+supported boundary-condition contract is:
 
 - `U`: inlet `fixedValue` including nonuniform/parabolic values, wall `noSlip`,
   outlet `zeroGradient`, plus OpenFOAM-style `inletOutlet` and
