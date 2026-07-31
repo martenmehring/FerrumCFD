@@ -1,3 +1,6 @@
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use crate::fields::{FieldFile, FieldValueSummary, InitialFieldSet};
@@ -42,6 +45,13 @@ pub enum LaminarSimplePreconditioner {
     IncompleteCholesky,
     Dic,
     Fdic,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LaminarSimpleMomentumExecution {
+    #[default]
+    Serial,
+    ParallelComponents,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -109,6 +119,7 @@ pub struct LaminarSimpleOptions {
     pub dynamic_viscosity: f64,
     pub linear_solver: LaminarSimpleLinearSolver,
     pub momentum_linear_solver: LaminarSimpleLinearSolver,
+    pub momentum_execution: LaminarSimpleMomentumExecution,
     pub pressure_linear_solver: LaminarSimpleLinearSolver,
     pub momentum_preconditioner: LaminarSimplePreconditioner,
     pub pressure_preconditioner: LaminarSimplePreconditioner,
@@ -568,6 +579,15 @@ impl std::fmt::Display for LaminarSimplePreconditioner {
     }
 }
 
+impl std::fmt::Display for LaminarSimpleMomentumExecution {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Serial => formatter.write_str("serial"),
+            Self::ParallelComponents => formatter.write_str("parallel-components"),
+        }
+    }
+}
+
 impl Default for LaminarSimpleSchemes {
     fn default() -> Self {
         Self {
@@ -805,6 +825,12 @@ fn solve_laminar_simple_driven(
         };
     let mut pressure_gamg_workspace = None;
     let mut scalar_solve_workspace = ScalarSolveWorkspace::new(runtime.mesh.cells);
+    let mut momentum_component_executor = match options.momentum_execution {
+        LaminarSimpleMomentumExecution::Serial => None,
+        LaminarSimpleMomentumExecution::ParallelComponents => {
+            Some(MomentumComponentExecutor::new(runtime.mesh.cells)?)
+        }
+    };
 
     let (mut velocity, mut pressure) = take_runtime_initial_fields(runtime)?;
     let initial_phi = compute_face_flux_with_addressing(
@@ -904,6 +930,7 @@ fn solve_laminar_simple_driven(
             },
             options,
             &mut scalar_solve_workspace,
+            momentum_component_executor.as_mut(),
         )?;
         timing.momentum_assembly_seconds += momentum.assembly_seconds;
         timing.momentum_gradient_seconds += momentum.gradient_seconds;
@@ -1609,6 +1636,9 @@ fn solve_laminar_simple_driven(
         pressure: summarize_scalars(&pressure),
     };
     let linear_solve_summary = summarize_linear_solves(&history);
+    if let Some(executor) = momentum_component_executor.as_mut() {
+        executor.shutdown()?;
+    }
     timing.finalization_seconds = finalization_started.elapsed().as_secs_f64();
     let timing = timing.finish(solver_started.elapsed().as_secs_f64());
 
@@ -1787,6 +1817,38 @@ impl ScalarSolveWorkspace {
         }
     }
 
+    fn try_new(size: usize) -> Result<Self> {
+        fn try_zeroed(size: usize) -> Result<Vec<f64>> {
+            let mut values = Vec::new();
+            values
+                .try_reserve_exact(size)
+                .map_err(|_| MeshError::OutOfMemory)?;
+            values.resize(size, 0.0);
+            Ok(values)
+        }
+
+        Ok(Self {
+            zero_initial: try_zeroed(size)?,
+            matrix_product: try_zeroed(size)?,
+            residual: try_zeroed(size)?,
+        })
+    }
+
+    #[cfg(test)]
+    fn identity(&self) -> ScalarSolveWorkspaceIdentity {
+        ScalarSolveWorkspaceIdentity {
+            zero_initial: (
+                self.zero_initial.as_ptr() as usize,
+                self.zero_initial.capacity(),
+            ),
+            matrix_product: (
+                self.matrix_product.as_ptr() as usize,
+                self.matrix_product.capacity(),
+            ),
+            residual: (self.residual.as_ptr() as usize, self.residual.capacity()),
+        }
+    }
+
     fn validate(&self, matrix: &CsrMatrix, rhs: &[f64]) -> Result<()> {
         let size = self.zero_initial.len();
         if matrix.rows() != size
@@ -1805,6 +1867,374 @@ impl ScalarSolveWorkspace {
             )));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ScalarSolveWorkspaceIdentity {
+    zero_initial: (usize, usize),
+    matrix_product: (usize, usize),
+    residual: (usize, usize),
+}
+
+struct MomentumComponentSolveJob {
+    component: usize,
+    system: ScalarComponentSystem,
+    initial: Vec<f64>,
+    controls: ScalarSolveControls,
+    #[cfg(test)]
+    action: MomentumComponentTestAction,
+}
+
+enum MomentumComponentWorkerFailure {
+    Solve(MeshError),
+    Panicked,
+}
+
+type MomentumComponentCommand = Option<MomentumComponentSolveJob>;
+type MomentumComponentWorkerResult =
+    std::result::Result<ScalarSolveReport, MomentumComponentWorkerFailure>;
+
+struct MomentumComponentOutcome {
+    component: usize,
+    result: MomentumComponentWorkerResult,
+    #[cfg(test)]
+    workspace_identity: ScalarSolveWorkspaceIdentity,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MomentumComponentTestAction {
+    Solve,
+    Error(&'static str),
+    Panic,
+}
+
+struct MomentumComponentExecutor {
+    command_senders: Vec<SyncSender<MomentumComponentCommand>>,
+    result_receiver: Receiver<MomentumComponentOutcome>,
+    handles: Vec<Option<JoinHandle<()>>>,
+    finished: bool,
+    #[cfg(test)]
+    test_actions: [MomentumComponentTestAction; 3],
+    #[cfg(test)]
+    workspace_observations: [Vec<ScalarSolveWorkspaceIdentity>; 3],
+}
+
+impl MomentumComponentExecutor {
+    fn new(size: usize) -> Result<Self> {
+        let workspaces = [
+            ScalarSolveWorkspace::try_new(size)?,
+            ScalarSolveWorkspace::try_new(size)?,
+            ScalarSolveWorkspace::try_new(size)?,
+        ];
+        let (result_sender, result_receiver) = sync_channel(3);
+        let mut command_senders = Vec::with_capacity(3);
+        let mut handles = Vec::with_capacity(3);
+
+        for (component, workspace) in workspaces.into_iter().enumerate() {
+            let (command_sender, command_receiver) = sync_channel(1);
+            let worker_result_sender = result_sender.clone();
+            let worker_name = format!(
+                "ferrum-momentum-{}",
+                ["X", "Y", "Z"]
+                    .get(component)
+                    .expect("three fixed momentum components")
+            );
+            let spawn_result = thread::Builder::new().name(worker_name).spawn(move || {
+                run_momentum_component_worker(
+                    component,
+                    command_receiver,
+                    worker_result_sender,
+                    workspace,
+                );
+            });
+            match spawn_result {
+                Ok(handle) => {
+                    command_senders.push(command_sender);
+                    handles.push(Some(handle));
+                }
+                Err(error) => {
+                    for sender in &command_senders {
+                        let _ = sender.send(None);
+                    }
+                    for handle in handles.iter_mut().filter_map(Option::take) {
+                        let _ = handle.join();
+                    }
+                    return Err(MeshError::Io(error));
+                }
+            }
+        }
+        drop(result_sender);
+
+        Ok(Self {
+            command_senders,
+            result_receiver,
+            handles,
+            finished: false,
+            #[cfg(test)]
+            test_actions: [MomentumComponentTestAction::Solve; 3],
+            #[cfg(test)]
+            workspace_observations: std::array::from_fn(|_| Vec::new()),
+        })
+    }
+
+    fn solve(
+        &mut self,
+        components: Vec<ScalarComponentSystem>,
+        old_components: [Vec<f64>; 3],
+        controls: ScalarSolveControls,
+    ) -> Result<[ScalarSolveReport; 3]> {
+        if self.finished {
+            return Err(invalid_input(
+                "laminar SIMPLE momentum component executor is already shut down".to_string(),
+            ));
+        }
+        if components.len() != 3 {
+            return Err(invalid_input(format!(
+                "laminar SIMPLE momentum equation expected 3 components, got {}",
+                components.len()
+            )));
+        }
+        if self.command_senders.len() != 3 || self.handles.len() != 3 {
+            return Err(invalid_input(
+                "laminar SIMPLE momentum component executor has an invalid worker count"
+                    .to_string(),
+            ));
+        }
+
+        let systems: [ScalarComponentSystem; 3] =
+            components.try_into().map_err(|components: Vec<_>| {
+                invalid_input(format!(
+                    "laminar SIMPLE momentum equation expected 3 components, got {}",
+                    components.len()
+                ))
+            })?;
+        let mut outcomes: [Option<MomentumComponentWorkerResult>; 3] = [None, None, None];
+        let mut dispatched = 0;
+        for (component, (system, initial)) in systems.into_iter().zip(old_components).enumerate() {
+            let job = MomentumComponentSolveJob {
+                component,
+                system,
+                initial,
+                controls,
+                #[cfg(test)]
+                action: self.test_actions[component],
+            };
+            if self.command_senders[component].send(Some(job)).is_err() {
+                outcomes[component] = Some(Err(MomentumComponentWorkerFailure::Solve(
+                    invalid_input(format!(
+                        "laminar SIMPLE momentum component {} worker command channel disconnected",
+                        component_name(component)
+                    )),
+                )));
+            } else {
+                dispatched += 1;
+            }
+        }
+
+        for _ in 0..dispatched {
+            let outcome = self.result_receiver.recv().map_err(|_| {
+                let missing = outcomes
+                    .iter()
+                    .position(Option::is_none)
+                    .map(component_name)
+                    .unwrap_or("unknown");
+                invalid_input(format!(
+                    "laminar SIMPLE momentum component {missing} worker result channel disconnected"
+                ))
+            })?;
+            let component = outcome.component;
+            #[cfg(test)]
+            let workspace_identity = outcome.workspace_identity;
+            store_momentum_component_worker_result(&mut outcomes, component, outcome.result)?;
+            #[cfg(test)]
+            self.workspace_observations[component].push(workspace_identity);
+        }
+
+        let mut reports: [Option<ScalarSolveReport>; 3] = [None, None, None];
+        for component in 0..3 {
+            match outcomes[component].take().ok_or_else(|| {
+                invalid_input(format!(
+                    "laminar SIMPLE momentum component {} worker returned no result",
+                    component_name(component)
+                ))
+            })? {
+                Ok(report) => {
+                    reports[component] = Some(report);
+                }
+                Err(MomentumComponentWorkerFailure::Solve(error)) => {
+                    return Err(invalid_input(format!(
+                        "laminar SIMPLE momentum component {} solve failed: {error}",
+                        component_name(component)
+                    )));
+                }
+                Err(MomentumComponentWorkerFailure::Panicked) => {
+                    return Err(invalid_input(format!(
+                        "laminar SIMPLE momentum component {} worker panicked",
+                        component_name(component)
+                    )));
+                }
+            }
+        }
+
+        Ok([
+            reports[0]
+                .take()
+                .expect("validated momentum component X report"),
+            reports[1]
+                .take()
+                .expect("validated momentum component Y report"),
+            reports[2]
+                .take()
+                .expect("validated momentum component Z report"),
+        ])
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        self.finished = true;
+
+        let mut first_error = None;
+        for component in 0..self.command_senders.len() {
+            if self.command_senders[component].send(None).is_err() && first_error.is_none() {
+                first_error = Some(invalid_input(format!(
+                    "laminar SIMPLE momentum component {} worker shutdown channel disconnected",
+                    component_name(component)
+                )));
+            }
+        }
+        self.command_senders.clear();
+
+        for component in 0..self.handles.len() {
+            if let Some(handle) = self.handles[component].take()
+                && handle.join().is_err()
+                && first_error.is_none()
+            {
+                first_error = Some(invalid_input(format!(
+                    "laminar SIMPLE momentum component {} worker join failed",
+                    component_name(component)
+                )));
+            }
+        }
+
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(test)]
+    fn set_test_actions(&mut self, actions: [MomentumComponentTestAction; 3]) {
+        self.test_actions = actions;
+    }
+}
+
+fn store_momentum_component_worker_result(
+    outcomes: &mut [Option<MomentumComponentWorkerResult>; 3],
+    component: usize,
+    result: MomentumComponentWorkerResult,
+) -> Result<()> {
+    if component >= 3 {
+        return Err(invalid_input(format!(
+            "laminar SIMPLE momentum worker returned unexpected component index {component}"
+        )));
+    }
+    if outcomes[component].is_some() {
+        return Err(invalid_input(format!(
+            "laminar SIMPLE momentum component {} worker returned a duplicate result",
+            component_name(component)
+        )));
+    }
+    outcomes[component] = Some(result);
+    Ok(())
+}
+
+impl Drop for MomentumComponentExecutor {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+
+fn run_momentum_component_worker(
+    component: usize,
+    command_receiver: Receiver<MomentumComponentCommand>,
+    result_sender: SyncSender<MomentumComponentOutcome>,
+    mut workspace: ScalarSolveWorkspace,
+) {
+    let worker_result = catch_unwind(AssertUnwindSafe(|| {
+        while let Ok(command) = command_receiver.recv() {
+            let Some(job) = command else {
+                break;
+            };
+            let result = if job.component != component {
+                Err(MomentumComponentWorkerFailure::Solve(invalid_input(
+                    format!(
+                        "momentum worker {} received component {}",
+                        component_name(component),
+                        job.component
+                    ),
+                )))
+            } else {
+                #[cfg(test)]
+                {
+                    match job.action {
+                        MomentumComponentTestAction::Solve => solve_scalar_system_with_workspaces(
+                            &job.system.matrix,
+                            &job.system.rhs,
+                            Some(&job.initial),
+                            job.controls,
+                            &mut workspace,
+                            None,
+                            None,
+                        )
+                        .map_err(MomentumComponentWorkerFailure::Solve),
+                        MomentumComponentTestAction::Error(message) => {
+                            Err(MomentumComponentWorkerFailure::Solve(invalid_input(
+                                message.to_string(),
+                            )))
+                        }
+                        MomentumComponentTestAction::Panic => {
+                            panic!("injected momentum component worker panic")
+                        }
+                    }
+                }
+                #[cfg(not(test))]
+                {
+                    solve_scalar_system_with_workspaces(
+                        &job.system.matrix,
+                        &job.system.rhs,
+                        Some(&job.initial),
+                        job.controls,
+                        &mut workspace,
+                        None,
+                        None,
+                    )
+                    .map_err(MomentumComponentWorkerFailure::Solve)
+                }
+            };
+            let outcome = MomentumComponentOutcome {
+                component,
+                result,
+                #[cfg(test)]
+                workspace_identity: workspace.identity(),
+            };
+            if result_sender.send(outcome).is_err() {
+                break;
+            }
+        }
+    }));
+
+    if worker_result.is_err() {
+        let _ = result_sender.send(MomentumComponentOutcome {
+            component,
+            result: Err(MomentumComponentWorkerFailure::Panicked),
+            #[cfg(test)]
+            workspace_identity: workspace.identity(),
+        });
     }
 }
 
@@ -2078,6 +2508,7 @@ fn solve_momentum_predictor(
     fields: MomentumPredictorFields<'_>,
     options: &LaminarSimpleOptions,
     scalar_solve_workspace: &mut ScalarSolveWorkspace,
+    momentum_component_executor: Option<&mut MomentumComponentExecutor>,
 ) -> Result<MomentumPredictorReport> {
     let MomentumPredictorFields {
         velocity,
@@ -2106,37 +2537,28 @@ fn solve_momentum_predictor(
     let mut component_converged = [false; 3];
     let mut component_linear_solves = [LinearSolveConvergenceSummary::default(); 3];
     let linear_solve_started = Instant::now();
-
-    for (component, system) in equation.components.iter().enumerate() {
-        if component >= 3 {
-            return Err(invalid_input(format!(
-                "laminar SIMPLE momentum equation has unexpected component index {component}"
-            )));
-        }
-        let report = solve_scalar_system_with_workspaces(
-            &system.matrix,
-            &system.rhs,
-            Some(&old_components[component]),
-            ScalarSolveControls {
-                solver: options.momentum_linear_solver,
-                preconditioner: options.momentum_preconditioner,
-                tolerance: options.momentum_linear_tolerance,
-                relative_tolerance: options.momentum_linear_relative_tolerance,
-                max_iterations: options.momentum_max_linear_iterations,
-                gamg_options: None,
-                profile_gamg: false,
-                profile_pcg: false,
-            },
+    let controls = ScalarSolveControls {
+        solver: options.momentum_linear_solver,
+        preconditioner: options.momentum_preconditioner,
+        tolerance: options.momentum_linear_tolerance,
+        relative_tolerance: options.momentum_linear_relative_tolerance,
+        max_iterations: options.momentum_max_linear_iterations,
+        gamg_options: None,
+        profile_gamg: false,
+        profile_pcg: false,
+    };
+    let reports = if let Some(executor) = momentum_component_executor {
+        executor.solve(equation.components, old_components, controls)?
+    } else {
+        solve_momentum_components_serial(
+            &equation.components,
+            &old_components,
+            controls,
             scalar_solve_workspace,
-            None,
-            None,
-        )
-        .map_err(|error| {
-            invalid_input(format!(
-                "laminar SIMPLE momentum component {} solve failed: {error}",
-                component_name(component)
-            ))
-        })?;
+        )?
+    };
+
+    for (component, report) in reports.into_iter().enumerate() {
         total_iterations += report.iterations;
         residual_squared_sum += report.residual_norm * report.residual_norm;
         component_initial_normalized_residual_norms[component] =
@@ -2184,6 +2606,50 @@ fn solve_momentum_predictor(
         matrix_fill_seconds: equation.matrix_fill_seconds,
         linear_solve_seconds,
     })
+}
+
+fn solve_momentum_components_serial(
+    components: &[ScalarComponentSystem],
+    old_components: &[Vec<f64>; 3],
+    controls: ScalarSolveControls,
+    scalar_solve_workspace: &mut ScalarSolveWorkspace,
+) -> Result<[ScalarSolveReport; 3]> {
+    if components.len() != 3 {
+        return Err(invalid_input(format!(
+            "laminar SIMPLE momentum equation expected 3 components, got {}",
+            components.len()
+        )));
+    }
+    let mut reports: [Option<ScalarSolveReport>; 3] = [None, None, None];
+    for (component, system) in components.iter().enumerate() {
+        let report = solve_scalar_system_with_workspaces(
+            &system.matrix,
+            &system.rhs,
+            Some(&old_components[component]),
+            controls,
+            scalar_solve_workspace,
+            None,
+            None,
+        )
+        .map_err(|error| {
+            invalid_input(format!(
+                "laminar SIMPLE momentum component {} solve failed: {error}",
+                component_name(component)
+            ))
+        })?;
+        reports[component] = Some(report);
+    }
+    Ok([
+        reports[0]
+            .take()
+            .expect("validated serial momentum component X report"),
+        reports[1]
+            .take()
+            .expect("validated serial momentum component Y report"),
+        reports[2]
+            .take()
+            .expect("validated serial momentum component Z report"),
+    ])
 }
 
 fn assemble_momentum_equation(
@@ -6946,19 +7412,23 @@ mod tests {
 
     use super::{
         LaminarSimpleConvectionScheme, LaminarSimpleGradientScheme, LaminarSimpleLinearSolver,
-        LaminarSimpleMeshCache, LaminarSimpleOptions, LaminarSimplePreconditioner,
-        LaminarSimpleSchemes, LaminarSimpleStopReason, MAX_NON_ORTHOGONAL_CORRECTORS,
-        MomentumCsrPattern, ScalarFaceTreatment, ScalarGradientGeometry, VectorFaceTreatment,
-        adjust_phi_hby_a, apply_pressure_reference, assemble_momentum_component_system,
-        assemble_momentum_equation, assemble_variable_scalar_component_system,
-        assemble_variable_scalar_component_system_into, cell_face_adjacency, compute_face_flux,
-        compute_phi_hby_a, consistent_reciprocal_momentum_diagonal,
-        constrained_pressure_treatments, face_diffusion_coefficient, hby_a_from_predicted_velocity,
-        limit_scalar_gradient, net_cell_flux, non_orthogonal_pressure_flux_correction,
-        normalized_residual_norm, pressure_correction_flux, reciprocal_momentum_diagonal,
-        relax_scalar_component_equation, scalar_component_boundary, scalar_gradient,
-        solve_laminar_simple, split_components, subtract_face_fluxes, upwind_face_vector_value,
-        vector_convection_divergence, vector_face_treatments, velocity_from_hby_a, zero,
+        LaminarSimpleMeshCache, LaminarSimpleMomentumExecution, LaminarSimpleOptions,
+        LaminarSimplePreconditioner, LaminarSimpleSchemes, LaminarSimpleStopReason,
+        MAX_NON_ORTHOGONAL_CORRECTORS, MomentumComponentExecutor, MomentumComponentTestAction,
+        MomentumComponentWorkerFailure, MomentumCsrPattern, ScalarComponentSystem,
+        ScalarFaceTreatment, ScalarGradientGeometry, ScalarSolveControls, ScalarSolveReport,
+        ScalarSolveWorkspace, VectorFaceTreatment, adjust_phi_hby_a, apply_pressure_reference,
+        assemble_momentum_component_system, assemble_momentum_equation,
+        assemble_variable_scalar_component_system, assemble_variable_scalar_component_system_into,
+        cell_face_adjacency, compute_face_flux, compute_phi_hby_a,
+        consistent_reciprocal_momentum_diagonal, constrained_pressure_treatments,
+        face_diffusion_coefficient, hby_a_from_predicted_velocity, limit_scalar_gradient,
+        net_cell_flux, non_orthogonal_pressure_flux_correction, normalized_residual_norm,
+        pressure_correction_flux, reciprocal_momentum_diagonal, relax_scalar_component_equation,
+        scalar_component_boundary, scalar_gradient, solve_laminar_simple,
+        solve_momentum_components_serial, split_components, store_momentum_component_worker_result,
+        subtract_face_fluxes, upwind_face_vector_value, vector_convection_divergence,
+        vector_face_treatments, velocity_from_hby_a, zero,
     };
     use crate::{MeshError, Point3};
 
@@ -11888,12 +12358,386 @@ mod tests {
         assert!(error.to_string().contains("requires a matching hierarchy"));
     }
 
+    fn momentum_component_test_systems() -> Vec<ScalarComponentSystem> {
+        (0..3)
+            .map(|component| ScalarComponentSystem {
+                matrix: CsrMatrix::from_rows(
+                    vec![vec![(0, 4.0), (1, -1.0)], vec![(0, -1.0), (1, 3.0)]],
+                    2,
+                )
+                .expect("two-cell momentum component matrix"),
+                rhs: vec![1.0 + component as f64, 2.0 - 0.25 * component as f64],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn momentum_execution_defaults_to_serial_and_displays_exactly() {
+        assert_eq!(
+            LaminarSimpleMomentumExecution::default(),
+            LaminarSimpleMomentumExecution::Serial
+        );
+        assert_eq!(LaminarSimpleMomentumExecution::Serial.to_string(), "serial");
+        assert_eq!(
+            LaminarSimpleMomentumExecution::ParallelComponents.to_string(),
+            "parallel-components"
+        );
+    }
+
+    fn momentum_component_test_initials() -> [Vec<f64>; 3] {
+        [vec![0.125, -0.25], vec![-0.375, 0.5], vec![0.625, -0.75]]
+    }
+
+    fn momentum_component_test_controls(
+        solver: LaminarSimpleLinearSolver,
+        preconditioner: LaminarSimplePreconditioner,
+    ) -> ScalarSolveControls {
+        ScalarSolveControls {
+            solver,
+            preconditioner,
+            tolerance: 1.0e-10,
+            relative_tolerance: 0.0,
+            max_iterations: 100,
+            gamg_options: None,
+            profile_gamg: false,
+            profile_pcg: false,
+        }
+    }
+
+    fn assert_scalar_solve_reports_bit_equal(left: &ScalarSolveReport, right: &ScalarSolveReport) {
+        assert_eq!(
+            left.solution
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            right
+                .solution
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(left.iterations, right.iterations);
+        assert_eq!(left.converged, right.converged);
+        assert_eq!(left.termination, right.termination);
+        assert_eq!(
+            left.initial_normalized_residual_norm.to_bits(),
+            right.initial_normalized_residual_norm.to_bits()
+        );
+        assert_eq!(left.residual_norm.to_bits(), right.residual_norm.to_bits());
+        assert_eq!(
+            left.normalized_residual_norm.to_bits(),
+            right.normalized_residual_norm.to_bits()
+        );
+        assert_eq!(
+            left.effective_normalized_tolerance.to_bits(),
+            right.effective_normalized_tolerance.to_bits()
+        );
+        assert_eq!(left.stop_reason, right.stop_reason);
+        assert_eq!(left.pcg_timing.is_some(), right.pcg_timing.is_some());
+        assert_eq!(left.gamg_timing.is_some(), right.gamg_timing.is_some());
+    }
+
+    #[test]
+    fn parallel_momentum_components_reuse_three_named_worker_workspaces_for_ten_lifecycles() {
+        let mut executor =
+            MomentumComponentExecutor::new(2).expect("three component workers must start");
+        assert_eq!(executor.command_senders.len(), 3);
+        assert_eq!(
+            executor
+                .handles
+                .iter()
+                .map(|handle| {
+                    handle
+                        .as_ref()
+                        .and_then(|handle| handle.thread().name())
+                        .expect("named momentum worker")
+                        .to_string()
+                })
+                .collect::<Vec<_>>(),
+            [
+                "ferrum-momentum-X",
+                "ferrum-momentum-Y",
+                "ferrum-momentum-Z"
+            ]
+        );
+        let controls = momentum_component_test_controls(
+            LaminarSimpleLinearSolver::Cg,
+            LaminarSimplePreconditioner::None,
+        );
+        let mut serial_workspace = ScalarSolveWorkspace::new(2);
+
+        for _ in 0..10 {
+            let systems = momentum_component_test_systems();
+            let initials = momentum_component_test_initials();
+            let serial = solve_momentum_components_serial(
+                &systems,
+                &initials,
+                controls,
+                &mut serial_workspace,
+            )
+            .expect("serial component oracle");
+            let parallel = executor
+                .solve(systems, initials, controls)
+                .expect("parallel component solve");
+            for component in 0..3 {
+                assert_scalar_solve_reports_bit_equal(&serial[component], &parallel[component]);
+            }
+        }
+
+        for observations in &executor.workspace_observations {
+            assert_eq!(observations.len(), 10);
+            assert!(
+                observations
+                    .iter()
+                    .all(|identity| *identity == observations[0])
+            );
+        }
+        executor.shutdown().expect("deterministic worker shutdown");
+        assert!(executor.finished);
+        assert!(executor.handles.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn momentum_worker_results_store_out_of_order_but_select_errors_in_component_order() {
+        let mut outcomes = [None, None, None];
+        store_momentum_component_worker_result(
+            &mut outcomes,
+            2,
+            Err(MomentumComponentWorkerFailure::Solve(super::invalid_input(
+                "Z failure".to_string(),
+            ))),
+        )
+        .expect("Z arrival");
+        store_momentum_component_worker_result(
+            &mut outcomes,
+            0,
+            Err(MomentumComponentWorkerFailure::Solve(super::invalid_input(
+                "X failure".to_string(),
+            ))),
+        )
+        .expect("X arrival");
+        store_momentum_component_worker_result(
+            &mut outcomes,
+            1,
+            Err(MomentumComponentWorkerFailure::Panicked),
+        )
+        .expect("Y arrival");
+        assert!(outcomes.iter().all(Option::is_some));
+
+        let duplicate = store_momentum_component_worker_result(
+            &mut outcomes,
+            0,
+            Err(MomentumComponentWorkerFailure::Panicked),
+        )
+        .expect_err("duplicate X result must fail");
+        assert_eq!(
+            duplicate.to_string(),
+            "laminar SIMPLE momentum component Ux worker returned a duplicate result"
+        );
+        let unexpected = store_momentum_component_worker_result(
+            &mut outcomes,
+            3,
+            Err(MomentumComponentWorkerFailure::Panicked),
+        )
+        .expect_err("unexpected component must fail");
+        assert_eq!(
+            unexpected.to_string(),
+            "laminar SIMPLE momentum worker returned unexpected component index 3"
+        );
+    }
+
+    #[test]
+    fn parallel_momentum_components_prioritize_x_error_before_y_panic_and_z_error() {
+        let mut executor = MomentumComponentExecutor::new(2).expect("component executor");
+        executor.set_test_actions([
+            MomentumComponentTestAction::Error("injected X error"),
+            MomentumComponentTestAction::Panic,
+            MomentumComponentTestAction::Error("injected Z error"),
+        ]);
+        let error = executor
+            .solve(
+                momentum_component_test_systems(),
+                momentum_component_test_initials(),
+                momentum_component_test_controls(
+                    LaminarSimpleLinearSolver::Cg,
+                    LaminarSimplePreconditioner::None,
+                ),
+            )
+            .err()
+            .expect("injected component failures must fail");
+        assert_eq!(
+            error.to_string(),
+            "laminar SIMPLE momentum component Ux solve failed: injected X error"
+        );
+    }
+
+    #[test]
+    fn parallel_momentum_components_report_y_panic_before_z_error() {
+        let mut executor = MomentumComponentExecutor::new(2).expect("component executor");
+        executor.set_test_actions([
+            MomentumComponentTestAction::Solve,
+            MomentumComponentTestAction::Panic,
+            MomentumComponentTestAction::Error("injected Z error"),
+        ]);
+        let error = executor
+            .solve(
+                momentum_component_test_systems(),
+                momentum_component_test_initials(),
+                momentum_component_test_controls(
+                    LaminarSimpleLinearSolver::Cg,
+                    LaminarSimplePreconditioner::None,
+                ),
+            )
+            .err()
+            .expect("injected component panic must fail");
+        assert_eq!(
+            error.to_string(),
+            "laminar SIMPLE momentum component Uy worker panicked"
+        );
+    }
+
+    #[test]
+    fn parallel_momentum_components_match_serial_for_all_supported_solver_preconditioner_pairs() {
+        let combinations = [
+            (
+                LaminarSimpleLinearSolver::BiCgStab,
+                LaminarSimplePreconditioner::None,
+            ),
+            (
+                LaminarSimpleLinearSolver::Cg,
+                LaminarSimplePreconditioner::None,
+            ),
+            (
+                LaminarSimpleLinearSolver::GaussSeidel,
+                LaminarSimplePreconditioner::None,
+            ),
+            (
+                LaminarSimpleLinearSolver::SymGaussSeidel,
+                LaminarSimplePreconditioner::None,
+            ),
+            (
+                LaminarSimpleLinearSolver::Jacobi,
+                LaminarSimplePreconditioner::None,
+            ),
+            (
+                LaminarSimpleLinearSolver::Pcg,
+                LaminarSimplePreconditioner::None,
+            ),
+            (
+                LaminarSimpleLinearSolver::Pcg,
+                LaminarSimplePreconditioner::Diagonal,
+            ),
+            (
+                LaminarSimpleLinearSolver::Pcg,
+                LaminarSimplePreconditioner::IncompleteCholesky,
+            ),
+            (
+                LaminarSimpleLinearSolver::Pcg,
+                LaminarSimplePreconditioner::Dic,
+            ),
+            (
+                LaminarSimpleLinearSolver::Pcg,
+                LaminarSimplePreconditioner::Fdic,
+            ),
+        ];
+
+        for (solver, preconditioner) in combinations {
+            let systems = momentum_component_test_systems();
+            let initials = momentum_component_test_initials();
+            let controls = momentum_component_test_controls(solver, preconditioner);
+            let mut serial_workspace = ScalarSolveWorkspace::new(2);
+            let serial = solve_momentum_components_serial(
+                &systems,
+                &initials,
+                controls,
+                &mut serial_workspace,
+            )
+            .unwrap_or_else(|error| {
+                panic!("{solver}/{preconditioner} serial solve failed: {error}")
+            });
+            let mut executor = MomentumComponentExecutor::new(2).expect("component executor");
+            let parallel = executor
+                .solve(systems, initials, controls)
+                .unwrap_or_else(|error| {
+                    panic!("{solver}/{preconditioner} parallel solve failed: {error}")
+                });
+            for component in 0..3 {
+                assert_scalar_solve_reports_bit_equal(&serial[component], &parallel[component]);
+            }
+            executor.shutdown().expect("component executor shutdown");
+        }
+    }
+
+    fn assert_public_serial_parallel_bit_parity(mut options: LaminarSimpleOptions) {
+        let fields = two_cell_fields();
+        let mut serial_runtime = two_cell_runtime();
+        let mut parallel_runtime = serial_runtime.clone();
+
+        options.momentum_execution = LaminarSimpleMomentumExecution::Serial;
+        let mut serial = solve_laminar_simple(&mut serial_runtime, &fields, &options)
+            .expect("serial public SIMPLE solve");
+        options.momentum_execution = LaminarSimpleMomentumExecution::ParallelComponents;
+        let mut parallel = solve_laminar_simple(&mut parallel_runtime, &fields, &options)
+            .expect("parallel public SIMPLE solve");
+
+        serial.timing = super::LaminarSimpleTimingSummary::default();
+        parallel.timing = super::LaminarSimpleTimingSummary::default();
+        assert_eq!(format!("{serial:?}"), format!("{parallel:?}"));
+        assert_eq!(
+            format!("{serial_runtime:?}"),
+            format!("{parallel_runtime:?}")
+        );
+    }
+
+    #[test]
+    fn public_parallel_momentum_matches_serial_across_schemes_and_skewed_geometry() {
+        for scheme in [
+            LaminarSimpleConvectionScheme::GaussUpwind,
+            LaminarSimpleConvectionScheme::GaussLinearUpwind,
+            LaminarSimpleConvectionScheme::BoundedGaussLinearUpwind(
+                LaminarSimpleGradientScheme::GaussLinear,
+            ),
+        ] {
+            let mut options = minimal_laminar_options();
+            options.max_simple_iterations = 2;
+            options.schemes.div_phi_u = scheme;
+            assert_public_serial_parallel_bit_parity(options);
+        }
+
+        let mut options = minimal_laminar_options();
+        options.max_simple_iterations = 2;
+        options.non_orthogonal_correctors = 1;
+        let fields = two_cell_fields();
+        let mut serial_runtime = two_cell_runtime();
+        serial_runtime.mesh.face_centres[0].y = 0.05;
+        serial_runtime.mesh.cell_centres[1].y = 0.2;
+        let mut parallel_runtime = serial_runtime.clone();
+        options.momentum_execution = LaminarSimpleMomentumExecution::Serial;
+        let mut serial = solve_laminar_simple(&mut serial_runtime, &fields, &options)
+            .expect("serial skewed SIMPLE solve");
+        options.momentum_execution = LaminarSimpleMomentumExecution::ParallelComponents;
+        let mut parallel = solve_laminar_simple(&mut parallel_runtime, &fields, &options)
+            .expect("parallel skewed SIMPLE solve");
+        serial.timing = super::LaminarSimpleTimingSummary::default();
+        parallel.timing = super::LaminarSimpleTimingSummary::default();
+        assert_eq!(format!("{serial:?}"), format!("{parallel:?}"));
+    }
+
+    #[test]
+    fn parallel_workspace_capacity_failure_is_fallible() {
+        let error = ScalarSolveWorkspace::try_new(usize::MAX)
+            .err()
+            .expect("capacity overflow must fail without a process abort");
+        assert!(matches!(error, MeshError::OutOfMemory));
+    }
+
     fn minimal_laminar_options() -> LaminarSimpleOptions {
         LaminarSimpleOptions {
             density: 1.0,
             dynamic_viscosity: 1.0,
             linear_solver: LaminarSimpleLinearSolver::Cg,
             momentum_linear_solver: LaminarSimpleLinearSolver::Cg,
+            momentum_execution: LaminarSimpleMomentumExecution::Serial,
             pressure_linear_solver: LaminarSimpleLinearSolver::Cg,
             momentum_preconditioner: LaminarSimplePreconditioner::None,
             pressure_preconditioner: LaminarSimplePreconditioner::None,
@@ -11950,41 +12794,47 @@ mod tests {
 
     #[test]
     fn public_gamg_relative_tolerance_mismatch_rejects_before_runtime_mutation() {
-        let mut runtime = two_cell_runtime();
-        let before = runtime.clone();
-        let value_pointers = runtime
-            .fields
-            .iter()
-            .map(|field| field.values.as_ref().map(Vec::as_ptr))
-            .collect::<Vec<_>>();
-        let mut options = minimal_laminar_options();
-        options.pressure_linear_solver = LaminarSimpleLinearSolver::Gamg;
-        options.pressure_linear_relative_tolerance = 0.5;
-        options.pressure_gamg_options = Some(GamgOptions {
-            max_iterations: options.pressure_max_linear_iterations,
-            tolerance: options.pressure_linear_tolerance,
-            relative_tolerance: 0.25,
-            n_cells_in_coarsest_level: 1,
-            direct_solve_coarsest: true,
-            ..GamgOptions::default()
-        });
-
-        let error = solve_laminar_simple(&mut runtime, &two_cell_fields(), &options)
-            .expect_err("public GAMG relTol mismatch must fail closed");
-
-        assert_eq!(
-            error.to_string(),
-            "laminar SIMPLE pressure GAMG relTol sources must match exactly, got pressure=0.5 and GAMG=0.25"
-        );
-        assert_eq!(format!("{runtime:?}"), format!("{before:?}"));
-        assert_eq!(
-            runtime
+        for momentum_execution in [
+            LaminarSimpleMomentumExecution::Serial,
+            LaminarSimpleMomentumExecution::ParallelComponents,
+        ] {
+            let mut runtime = two_cell_runtime();
+            let before = runtime.clone();
+            let value_pointers = runtime
                 .fields
                 .iter()
                 .map(|field| field.values.as_ref().map(Vec::as_ptr))
-                .collect::<Vec<_>>(),
-            value_pointers
-        );
+                .collect::<Vec<_>>();
+            let mut options = minimal_laminar_options();
+            options.momentum_execution = momentum_execution;
+            options.pressure_linear_solver = LaminarSimpleLinearSolver::Gamg;
+            options.pressure_linear_relative_tolerance = 0.5;
+            options.pressure_gamg_options = Some(GamgOptions {
+                max_iterations: options.pressure_max_linear_iterations,
+                tolerance: options.pressure_linear_tolerance,
+                relative_tolerance: 0.25,
+                n_cells_in_coarsest_level: 1,
+                direct_solve_coarsest: true,
+                ..GamgOptions::default()
+            });
+
+            let error = solve_laminar_simple(&mut runtime, &two_cell_fields(), &options)
+                .expect_err("public GAMG relTol mismatch must fail closed");
+
+            assert_eq!(
+                error.to_string(),
+                "laminar SIMPLE pressure GAMG relTol sources must match exactly, got pressure=0.5 and GAMG=0.25"
+            );
+            assert_eq!(format!("{runtime:?}"), format!("{before:?}"));
+            assert_eq!(
+                runtime
+                    .fields
+                    .iter()
+                    .map(|field| field.values.as_ref().map(Vec::as_ptr))
+                    .collect::<Vec<_>>(),
+                value_pointers
+            );
+        }
     }
 
     #[test]
