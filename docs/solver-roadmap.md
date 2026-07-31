@@ -335,8 +335,10 @@ solver instability behind artificial clipping.
 
 Current executable subset:
 
-- `grad(p)`: `Gauss linear`, `cellLimited Gauss linear k`;
-- `grad(U)`: `Gauss linear`, `cellLimited Gauss linear k`;
+- `grad(p)`: `Gauss linear`, `leastSquares`,
+  `cellLimited Gauss linear k`;
+- `grad(U)`: `Gauss linear`, `leastSquares`,
+  `cellLimited Gauss linear k`;
 - `div(phi,U)`: `Gauss upwind`, `Gauss linearUpwind grad(U)`;
 - `laplacian`: `Gauss linear corrected`, `orthogonal`, `uncorrected`;
 - `snGrad`: `corrected`, `orthogonal`, `uncorrected`;
@@ -355,22 +357,26 @@ Next scheme targets:
 
 ### Spatial Accuracy Track
 
-Keep spatial accuracy independent from the pressure-kernel timing sequence:
+Keep spatial accuracy independent from the pressure-kernel timing sequence.
+The first two implementation leaves are complete: weighted least-squares
+scalar/vector reconstruction now has exact constant/affine, ordering,
+constraint, rank, and allocation gates in an intrinsic active-dimensional
+basis, and the selected scheme reaches momentum assembly and pressure
+non-orthogonal correction. Public `0/1/2`-corrector gates cover open/closed
+pressure systems on orthogonal/skewed meshes without fallback. The remaining
+evidence sequence is:
 
-1. add weighted least-squares scalar and vector gradients with exact constant
-   and linear reproduction in an intrinsic active-dimensional basis,
-   deterministic stencils, and fail-closed deficiency handling relative to
-   that active dimension so valid `empty` and `wedge` meshes remain supported;
-2. propagate the selected gradient through momentum assembly, pressure
-   non-orthogonal correction, and explicit `0/1/2` corrector gates on open,
-   closed, orthogonal, non-orthogonal, and deliberately skewed meshes;
-3. replace the current lowest-order wall-force baseline with reconstructed
+1. run the direct cellwise Ferrum/OpenFOAM Foundation 13 gradient matrix from
+   one hashed mesh and one manufactured field set. Keep all OpenFOAM cases,
+   launchers, binaries, and raw artifacts outside the repository; record only
+   exact provenance and accepted results;
+2. replace the current lowest-order wall-force baseline with reconstructed
    wall-face pressure and full deviatoric viscous traction from reconstructed
    `grad(U)`, while preserving pressure-gauge, orientation, and area contracts;
-4. run at least three geometrically similar meshes and report observed order,
+3. run at least three geometrically similar meshes and report observed order,
    Richardson extrapolation, and GCI for `Cd`, fields, wall pressure, and wall
    shear, with iterative error demonstrably below spatial error;
-5. only then repeat same-mesh OpenFOAM parity. Cross-engine parity and formal
+4. only then repeat same-mesh OpenFOAM parity. Cross-engine parity and formal
    grid convergence remain separate claims.
 
 ## Milestone 4: Benchmark Matrix
@@ -1782,11 +1788,15 @@ The immediate sequence is:
       for Channel (`9/9`), and `0.969953` for Cylinder (`8/9`). Therefore the
       parallel mode remains opt-in, no 30-pair escalation was warranted, and no
       default or general-speed claim is accepted;
-   6. **F-CYL-SPATIAL-ACCURACY (planned):** execute the separate Spatial
-      Accuracy Track above: weighted least-squares gradients, the
-      skewness/corrector matrix, reconstructed wall traction, and at least
-      three-mesh observed-order plus GCI evidence before making a
-      higher-accuracy claim.
+   6. **F-CYL-SPATIAL-ACCURACY (active; WLS implementation and production
+      propagation completed):** weighted least-squares scalar/vector kernels,
+      constraint semantics, production dispatch, and the public
+      open/closed-pressure-system and orthogonal/skewed `0/1/2`-corrector
+      matrix are complete. The next leaf is the external direct cellwise
+      Foundation 13 gradient proof;
+      reconstructed wall traction, three-mesh observed-order/Richardson/GCI,
+      and the final same-mesh parity/performance refresh still follow before
+      any general higher-accuracy or speed claim.
 
    The executed per-leaf protocols, fixed-work budgets, input hashes, and
    results are recorded above and in external hashed artifacts; they must not be

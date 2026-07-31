@@ -420,10 +420,21 @@ level. The preflight can report entries such as `ddtSchemes.default=Euler` or
 `SIMPLE.nNonOrthogonalCorrectors=0`, while executable solver code decides which
 schemes and linear/nonlinear solver settings are valid for each equation
 system. The current laminar SIMPLE bridge already consumes a focused
-`fvSchemes` subset: `grad(p)`, `grad(U)`, `div(phi,U)` with `Gauss upwind` or
-`Gauss linearUpwind grad(U)`, `Gauss linear` laplacians with
+`fvSchemes` subset: `grad(p)` and `grad(U)` with `Gauss linear`,
+`leastSquares`, or `cellLimited Gauss linear k`; `div(phi,U)` with
+`Gauss upwind` or `Gauss linearUpwind grad(U)`; `Gauss linear` laplacians with
 `corrected`/`orthogonal`/`uncorrected` snGrad behavior, `linear`
 interpolation, and matching `snGradSchemes`.
+
+The production `leastSquares` path caches deterministic weighted geometry once
+per solve, reconstructs scalar and vector-component gradients in an intrinsic
+active-dimensional basis, and fails closed for non-finite, deficient, or
+unsupported constraint geometry. `empty`, paired `wedge`, and
+`symmetryPlane` have explicit reconstruction semantics. A separate
+non-consuming initial-gradient probe reuses the same boundary resolution,
+initial face flux, cache, and production dispatchers so cellwise validation can
+be performed without exposing coefficient internals or changing the one-shot
+solver lifecycle.
 
 Basic structural validation belongs in the preflight. Examples include missing
 standard `fvSchemes` sections, missing `default` entries, missing

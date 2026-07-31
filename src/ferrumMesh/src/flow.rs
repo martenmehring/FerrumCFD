@@ -125,6 +125,18 @@ pub struct LaminarSimpleSchemes {
     pub sn_grad: LaminarSimpleSnGradScheme,
 }
 
+/// Cell-centred gradients reconstructed from the loaded laminar initial fields.
+///
+/// `velocity_component_gradients[0]`, `[1]`, and `[2]` are the gradients of
+/// `Ux`, `Uy`, and `Uz`, respectively. They are present only when the selected
+/// convection scheme consumes `grad(U)`.
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub struct LaminarInitialGradientProbe {
+    pub pressure_gradient: Vec<Point3>,
+    pub velocity_component_gradients: Option<[Vec<Point3>; 3]>,
+}
+
 pub const MAX_NON_ORTHOGONAL_CORRECTORS: usize = 20;
 pub const MAX_PRESSURE_CORRECTION_LINEAR_SOLVES: usize = MAX_NON_ORTHOGONAL_CORRECTORS + 1;
 
@@ -737,6 +749,76 @@ impl std::fmt::Display for LinearSolveStopReason {
             Self::Breakdown => formatter.write_str("Breakdown"),
         }
     }
+}
+
+/// Reconstructs `grad(p)` and `grad(U)` from the loaded initial fields without
+/// consuming or mutating their one-shot runtime payloads.
+///
+/// The probe uses the same field-boundary resolution, face-flux construction,
+/// geometry caches, and gradient dispatchers as [`solve_laminar_simple`]. It is
+/// intended for diagnostics and cross-engine validation; it does not assemble
+/// equations or advance SIMPLE.
+pub fn reconstruct_laminar_initial_gradients(
+    runtime: &SolverRuntimeData,
+    fields: &InitialFieldSet,
+    schemes: LaminarSimpleSchemes,
+) -> Result<LaminarInitialGradientProbe> {
+    validate_runtime_mesh(&runtime.mesh)?;
+
+    let velocity_field = find_field(fields, "U", "volVectorField")?;
+    let pressure_field = find_field(fields, "p", "volScalarField")?;
+    let velocity_boundary = vector_face_treatments(&runtime.mesh, velocity_field)?;
+    let pressure_boundary = scalar_face_treatments(&runtime.mesh, pressure_field)?;
+
+    let mesh_cache = LaminarSimpleMeshCache::from_mesh(&runtime.mesh, schemes)?;
+    let (velocity, pressure) = snapshot_runtime_initial_fields(runtime)?;
+    let flux = compute_face_flux_with_addressing(
+        &runtime.mesh,
+        &mesh_cache.face_addressing,
+        &velocity,
+        &velocity_boundary,
+    )?;
+    let continuity = summarize_continuity(&net_cell_flux_with_addressing(
+        &runtime.mesh,
+        &mesh_cache.face_addressing,
+        &flux,
+    )?);
+    checked_update_metrics(&velocity, pressure, &flux, continuity).ok_or_else(|| {
+        invalid_input(
+            "laminar initial-gradient probe field metrics exceed the finite numeric range"
+                .to_string(),
+        )
+    })?;
+    let resolved_pressure_boundary = resolve_pressure_inlet_outlet(&pressure_boundary, &flux)?;
+
+    let pressure_gradient = scalar_gradient_with_scheme_and_addressing(
+        &runtime.mesh,
+        &mesh_cache.scalar_gradient,
+        mesh_cache.weighted_least_squares.as_ref(),
+        &mesh_cache.face_addressing,
+        pressure,
+        &resolved_pressure_boundary,
+        schemes.grad_p,
+    )?;
+    let velocity_component_gradients = if schemes.div_phi_u.uses_linear_upwind() {
+        Some(vector_component_gradients_with_scheme_and_addressing(
+            &runtime.mesh,
+            &mesh_cache.scalar_gradient,
+            mesh_cache.weighted_least_squares.as_ref(),
+            &mesh_cache.face_addressing,
+            &velocity,
+            &velocity_boundary,
+            &flux,
+            schemes.div_phi_u.gradient_scheme(schemes.grad_u),
+        )?)
+    } else {
+        None
+    };
+
+    Ok(LaminarInitialGradientProbe {
+        pressure_gradient,
+        velocity_component_gradients,
+    })
 }
 
 /// Runs the laminar SIMPLE solver from the initial `U` and `p` payloads stored
@@ -5956,6 +6038,43 @@ fn field_patch<'a>(
         })
 }
 
+fn snapshot_runtime_initial_fields(runtime: &SolverRuntimeData) -> Result<(Vec<Point3>, &[f64])> {
+    let velocity_index = runtime_field_index(runtime, "U", SolverStateFieldKind::VolVector, 3)?;
+    let pressure_index = runtime_field_index(runtime, "p", SolverStateFieldKind::VolScalar, 1)?;
+    validate_runtime_field(runtime, velocity_index, "U", 3)?;
+    validate_runtime_field(runtime, pressure_index, "p", 1)?;
+
+    let velocity_scalars = runtime.fields[velocity_index]
+        .values
+        .as_deref()
+        .ok_or_else(|| {
+            invalid_input(
+                "runtime field 'U' initial payload was already consumed or not loaded".to_string(),
+            )
+        })?;
+    let mut velocity = Vec::new();
+    velocity
+        .try_reserve_exact(runtime.mesh.cells)
+        .map_err(|_| invalid_input("runtime vector field 'U' allocation failed".to_string()))?;
+    for chunk in velocity_scalars.chunks_exact(3) {
+        velocity.push(Point3 {
+            x: chunk[0],
+            y: chunk[1],
+            z: chunk[2],
+        });
+    }
+
+    let pressure = runtime.fields[pressure_index]
+        .values
+        .as_deref()
+        .ok_or_else(|| {
+            invalid_input(
+                "runtime field 'p' initial payload was already consumed or not loaded".to_string(),
+            )
+        })?;
+    Ok((velocity, pressure))
+}
+
 fn take_runtime_initial_fields(runtime: &mut SolverRuntimeData) -> Result<(Vec<Point3>, Vec<f64>)> {
     let velocity_index = runtime_field_index(runtime, "U", SolverStateFieldKind::VolVector, 3)?;
     let pressure_index = runtime_field_index(runtime, "p", SolverStateFieldKind::VolScalar, 1)?;
@@ -6901,11 +7020,11 @@ mod tests {
         LaminarSimpleConvectionScheme, LaminarSimpleGradientScheme, LaminarSimpleLinearSolver,
         LaminarSimpleMeshCache, LaminarSimpleMomentumExecution, LaminarSimpleOptions,
         LaminarSimplePreconditioner, LaminarSimpleSchemes, LaminarSimpleStopReason,
-        MAX_NON_ORTHOGONAL_CORRECTORS, MomentumComponentExecutor, MomentumComponentTestAction,
-        MomentumComponentWorkerFailure, MomentumCsrPattern, ScalarComponentSystem,
-        ScalarFaceTreatment, ScalarGradientGeometry, ScalarSolveControls, ScalarSolveReport,
-        ScalarSolveWorkspace, VectorFaceTreatment, adjust_phi_hby_a, apply_pressure_reference,
-        assemble_momentum_component_system, assemble_momentum_equation,
+        LinearSolveStopReason, MAX_NON_ORTHOGONAL_CORRECTORS, MomentumComponentExecutor,
+        MomentumComponentTestAction, MomentumComponentWorkerFailure, MomentumCsrPattern,
+        ScalarComponentSystem, ScalarFaceTreatment, ScalarGradientGeometry, ScalarSolveControls,
+        ScalarSolveReport, ScalarSolveWorkspace, VectorFaceTreatment, adjust_phi_hby_a,
+        apply_pressure_reference, assemble_momentum_component_system, assemble_momentum_equation,
         assemble_variable_scalar_component_system, assemble_variable_scalar_component_system_into,
         cell_face_adjacency, compute_face_flux, compute_phi_hby_a,
         consistent_reciprocal_momentum_diagonal, constrained_pressure_treatments,
@@ -8529,6 +8648,292 @@ mod tests {
     }
 
     #[test]
+    fn public_initial_gradient_probe_is_non_consuming_and_matches_production_dispatch() {
+        let mut runtime = two_cell_runtime_with_empty_sides();
+        let fields = two_cell_fields_with_empty_sides();
+        let schemes = LaminarSimpleSchemes {
+            grad_p: LaminarSimpleGradientScheme::LeastSquares,
+            grad_u: LaminarSimpleGradientScheme::LeastSquares,
+            div_phi_u: LaminarSimpleConvectionScheme::GaussLinearUpwind,
+            ..LaminarSimpleSchemes::default()
+        };
+        let before = format!("{runtime:?}");
+        let fields_before = format!("{fields:?}");
+        let value_pointers = runtime
+            .fields
+            .iter()
+            .map(|field| field.values.as_ref().map(Vec::as_ptr))
+            .collect::<Vec<_>>();
+        let value_capacities = runtime
+            .fields
+            .iter()
+            .map(|field| field.values.as_ref().map(Vec::capacity))
+            .collect::<Vec<_>>();
+
+        let probe = super::reconstruct_laminar_initial_gradients(&runtime, &fields, schemes)
+            .expect("public leastSquares initial-gradient probe");
+        let repeated = super::reconstruct_laminar_initial_gradients(&runtime, &fields, schemes)
+            .expect("repeated public leastSquares initial-gradient probe");
+
+        assert_eq!(format!("{runtime:?}"), before);
+        assert_eq!(format!("{fields:?}"), fields_before);
+        assert_eq!(
+            runtime
+                .fields
+                .iter()
+                .map(|field| field.values.as_ref().map(Vec::as_ptr))
+                .collect::<Vec<_>>(),
+            value_pointers
+        );
+        assert_eq!(
+            runtime
+                .fields
+                .iter()
+                .map(|field| field.values.as_ref().map(Vec::capacity))
+                .collect::<Vec<_>>(),
+            value_capacities
+        );
+
+        let velocity_field = super::find_field(&fields, "U", "volVectorField").expect("U field");
+        let pressure_field = super::find_field(&fields, "p", "volScalarField").expect("p field");
+        let velocity_boundary = super::vector_face_treatments(&runtime.mesh, velocity_field)
+            .expect("velocity boundary");
+        let pressure_boundary = super::scalar_face_treatments(&runtime.mesh, pressure_field)
+            .expect("pressure boundary");
+        let cache = LaminarSimpleMeshCache::from_mesh(&runtime.mesh, schemes)
+            .expect("production mesh cache");
+        let (velocity, pressure) =
+            super::snapshot_runtime_initial_fields(&runtime).expect("initial field snapshot");
+        let flux = super::compute_face_flux_with_addressing(
+            &runtime.mesh,
+            &cache.face_addressing,
+            &velocity,
+            &velocity_boundary,
+        )
+        .expect("initial face flux");
+        let resolved_pressure_boundary =
+            super::resolve_pressure_inlet_outlet(&pressure_boundary, &flux)
+                .expect("resolved pressure boundary");
+        let expected_pressure = super::scalar_gradient_with_scheme_and_addressing(
+            &runtime.mesh,
+            &cache.scalar_gradient,
+            cache.weighted_least_squares.as_ref(),
+            &cache.face_addressing,
+            pressure,
+            &resolved_pressure_boundary,
+            schemes.grad_p,
+        )
+        .expect("production pressure-gradient dispatch");
+        let expected_velocity = super::vector_component_gradients_with_scheme_and_addressing(
+            &runtime.mesh,
+            &cache.scalar_gradient,
+            cache.weighted_least_squares.as_ref(),
+            &cache.face_addressing,
+            &velocity,
+            &velocity_boundary,
+            &flux,
+            schemes.grad_u,
+        )
+        .expect("production velocity-gradient dispatch");
+
+        assert_point_fields_bit_equal(&probe.pressure_gradient, &expected_pressure);
+        assert_point_fields_bit_equal(&probe.pressure_gradient, &repeated.pressure_gradient);
+        let actual_velocity = probe
+            .velocity_component_gradients
+            .as_ref()
+            .expect("linearUpwind must request grad(U)");
+        let repeated_velocity = repeated
+            .velocity_component_gradients
+            .as_ref()
+            .expect("repeated linearUpwind must request grad(U)");
+        for component in 0..3 {
+            assert_point_fields_bit_equal(
+                &actual_velocity[component],
+                &expected_velocity[component],
+            );
+            assert_point_fields_bit_equal(
+                &actual_velocity[component],
+                &repeated_velocity[component],
+            );
+        }
+
+        let mut options = minimal_laminar_options();
+        options.max_simple_iterations = 1;
+        options.schemes = schemes;
+        let report = solve_laminar_simple(&mut runtime, &fields, &options)
+            .expect("probe must leave one-shot fields available to the solver");
+        assert_eq!(report.simple_iterations, 1);
+    }
+
+    #[test]
+    fn public_initial_gradient_probe_preserves_gauss_bits_and_upwind_dispatch() {
+        let runtime = two_cell_runtime();
+        let fields = two_cell_fields();
+        let gauss_upwind = LaminarSimpleSchemes::default();
+        let upwind_probe =
+            super::reconstruct_laminar_initial_gradients(&runtime, &fields, gauss_upwind)
+                .expect("Gauss/upwind initial-gradient probe");
+        assert!(
+            upwind_probe.velocity_component_gradients.is_none(),
+            "Gauss upwind must not evaluate grad(U)"
+        );
+
+        let schemes = LaminarSimpleSchemes {
+            div_phi_u: LaminarSimpleConvectionScheme::GaussLinearUpwind,
+            ..gauss_upwind
+        };
+        let probe = super::reconstruct_laminar_initial_gradients(&runtime, &fields, schemes)
+            .expect("Gauss/linearUpwind initial-gradient probe");
+        let cache = LaminarSimpleMeshCache::from_mesh(&runtime.mesh, schemes)
+            .expect("production Gauss mesh cache");
+        let velocity_field = super::find_field(&fields, "U", "volVectorField").expect("U field");
+        let pressure_field = super::find_field(&fields, "p", "volScalarField").expect("p field");
+        let velocity_boundary = super::vector_face_treatments(&runtime.mesh, velocity_field)
+            .expect("velocity boundary");
+        let pressure_boundary = super::scalar_face_treatments(&runtime.mesh, pressure_field)
+            .expect("pressure boundary");
+        let (velocity, pressure) =
+            super::snapshot_runtime_initial_fields(&runtime).expect("initial field snapshot");
+        let flux = super::compute_face_flux_with_addressing(
+            &runtime.mesh,
+            &cache.face_addressing,
+            &velocity,
+            &velocity_boundary,
+        )
+        .expect("initial face flux");
+        let resolved_pressure_boundary =
+            super::resolve_pressure_inlet_outlet(&pressure_boundary, &flux)
+                .expect("resolved pressure boundary");
+        let expected_pressure = super::scalar_gradient_with_scheme_and_addressing(
+            &runtime.mesh,
+            &cache.scalar_gradient,
+            None,
+            &cache.face_addressing,
+            pressure,
+            &resolved_pressure_boundary,
+            schemes.grad_p,
+        )
+        .expect("Gauss pressure-gradient dispatch");
+        let expected_velocity = super::vector_component_gradients_with_scheme_and_addressing(
+            &runtime.mesh,
+            &cache.scalar_gradient,
+            None,
+            &cache.face_addressing,
+            &velocity,
+            &velocity_boundary,
+            &flux,
+            schemes.grad_u,
+        )
+        .expect("Gauss velocity-gradient dispatch");
+
+        assert_point_fields_bit_equal(&probe.pressure_gradient, &expected_pressure);
+        let actual_velocity = probe
+            .velocity_component_gradients
+            .as_ref()
+            .expect("linearUpwind must request grad(U)");
+        for component in 0..3 {
+            assert_point_fields_bit_equal(
+                &actual_velocity[component],
+                &expected_velocity[component],
+            );
+        }
+    }
+
+    #[test]
+    fn public_initial_gradient_probe_uses_bounded_embedded_gradient_scheme() {
+        let runtime = two_cell_runtime_with_empty_sides();
+        let fields = two_cell_fields_with_empty_sides();
+        let schemes = LaminarSimpleSchemes {
+            grad_u: LaminarSimpleGradientScheme::GaussLinear,
+            div_phi_u: LaminarSimpleConvectionScheme::BoundedGaussLinearUpwind(
+                LaminarSimpleGradientScheme::LeastSquares,
+            ),
+            ..LaminarSimpleSchemes::default()
+        };
+
+        let probe = super::reconstruct_laminar_initial_gradients(&runtime, &fields, schemes)
+            .expect("bounded embedded leastSquares initial-gradient probe");
+        let cache = LaminarSimpleMeshCache::from_mesh(&runtime.mesh, schemes)
+            .expect("bounded embedded leastSquares production cache");
+        assert!(cache.weighted_least_squares.is_some());
+        let velocity_field = super::find_field(&fields, "U", "volVectorField").expect("U field");
+        let velocity_boundary = super::vector_face_treatments(&runtime.mesh, velocity_field)
+            .expect("velocity boundary");
+        let (velocity, _) =
+            super::snapshot_runtime_initial_fields(&runtime).expect("initial field snapshot");
+        let flux = super::compute_face_flux_with_addressing(
+            &runtime.mesh,
+            &cache.face_addressing,
+            &velocity,
+            &velocity_boundary,
+        )
+        .expect("initial face flux");
+        let expected = super::vector_component_gradients_with_scheme_and_addressing(
+            &runtime.mesh,
+            &cache.scalar_gradient,
+            cache.weighted_least_squares.as_ref(),
+            &cache.face_addressing,
+            &velocity,
+            &velocity_boundary,
+            &flux,
+            LaminarSimpleGradientScheme::LeastSquares,
+        )
+        .expect("embedded leastSquares production dispatch");
+        let actual = probe
+            .velocity_component_gradients
+            .as_ref()
+            .expect("bounded linearUpwind must request grad(U)");
+        for component in 0..3 {
+            assert_point_fields_bit_equal(&actual[component], &expected[component]);
+        }
+    }
+
+    #[test]
+    fn public_initial_gradient_probe_failure_preserves_runtime_and_fields() {
+        let runtime = two_cell_runtime();
+        let fields = two_cell_fields();
+        let schemes = LaminarSimpleSchemes {
+            grad_p: LaminarSimpleGradientScheme::LeastSquares,
+            ..LaminarSimpleSchemes::default()
+        };
+        let runtime_before = format!("{runtime:?}");
+        let fields_before = format!("{fields:?}");
+        let value_pointers = runtime
+            .fields
+            .iter()
+            .map(|field| field.values.as_ref().map(Vec::as_ptr))
+            .collect::<Vec<_>>();
+        let value_capacities = runtime
+            .fields
+            .iter()
+            .map(|field| field.values.as_ref().map(Vec::capacity))
+            .collect::<Vec<_>>();
+
+        let error = super::reconstruct_laminar_initial_gradients(&runtime, &fields, schemes)
+            .expect_err("rank-deficient 3D leastSquares probe must fail");
+
+        assert!(error.to_string().contains("weighted least-squares"));
+        assert_eq!(format!("{runtime:?}"), runtime_before);
+        assert_eq!(format!("{fields:?}"), fields_before);
+        assert_eq!(
+            runtime
+                .fields
+                .iter()
+                .map(|field| field.values.as_ref().map(Vec::as_ptr))
+                .collect::<Vec<_>>(),
+            value_pointers
+        );
+        assert_eq!(
+            runtime
+                .fields
+                .iter()
+                .map(|field| field.values.as_ref().map(Vec::capacity))
+                .collect::<Vec<_>>(),
+            value_capacities
+        );
+    }
+
+    #[test]
     fn public_least_squares_paths_run_zero_one_and_two_correctors_without_fallback() {
         let fields = two_cell_fields_with_empty_sides();
         for correctors in 0..=2 {
@@ -8581,6 +8986,141 @@ mod tests {
             assert_close(value.x, 2.0);
             assert_eq!(value.y.to_bits(), 0.0f64.to_bits());
             assert_eq!(value.z.to_bits(), 0.0f64.to_bits());
+        }
+    }
+
+    #[test]
+    fn public_least_squares_corrector_matrix_covers_open_closed_pressure_systems_and_geometry() {
+        for closed in [false, true] {
+            for skewed in [false, true] {
+                for correctors in 0..=2 {
+                    let mut runtime = four_cell_planar_runtime(skewed);
+                    let fields = four_cell_planar_fields(closed);
+                    let pressure_has_fixed_value = fields
+                        .fields
+                        .iter()
+                        .find(|field| field.name == "p")
+                        .expect("p field")
+                        .boundary_patches
+                        .iter()
+                        .any(|patch| patch.patch_type.as_deref() == Some("fixedValue"));
+                    assert_eq!(pressure_has_fixed_value, !closed);
+                    let has_non_orthogonal_internal_face =
+                        (0..runtime.mesh.internal_faces).any(|face| {
+                            let owner = runtime.mesh.owner[face];
+                            let neighbour =
+                                runtime.mesh.neighbour[face].expect("internal neighbour");
+                            let delta = point(
+                                runtime.mesh.cell_centres[neighbour].x
+                                    - runtime.mesh.cell_centres[owner].x,
+                                runtime.mesh.cell_centres[neighbour].y
+                                    - runtime.mesh.cell_centres[owner].y,
+                                runtime.mesh.cell_centres[neighbour].z
+                                    - runtime.mesh.cell_centres[owner].z,
+                            );
+                            let area = runtime.mesh.face_area_vectors[face];
+                            let cross = point(
+                                delta.y * area.z - delta.z * area.y,
+                                delta.z * area.x - delta.x * area.z,
+                                delta.x * area.y - delta.y * area.x,
+                            );
+                            cross.x != 0.0 || cross.y != 0.0 || cross.z != 0.0
+                        });
+                    assert_eq!(has_non_orthogonal_internal_face, skewed);
+                    let has_skewed_internal_face = (0..runtime.mesh.internal_faces).any(|face| {
+                        let owner = runtime.mesh.owner[face];
+                        let neighbour = runtime.mesh.neighbour[face].expect("internal neighbour");
+                        let owner_centre = runtime.mesh.cell_centres[owner];
+                        let neighbour_centre = runtime.mesh.cell_centres[neighbour];
+                        let face_centre = runtime.mesh.face_centres[face];
+                        let delta = point(
+                            neighbour_centre.x - owner_centre.x,
+                            neighbour_centre.y - owner_centre.y,
+                            neighbour_centre.z - owner_centre.z,
+                        );
+                        let owner_to_face = point(
+                            face_centre.x - owner_centre.x,
+                            face_centre.y - owner_centre.y,
+                            face_centre.z - owner_centre.z,
+                        );
+                        let delta_squared =
+                            delta.x * delta.x + delta.y * delta.y + delta.z * delta.z;
+                        let projection = (owner_to_face.x * delta.x
+                            + owner_to_face.y * delta.y
+                            + owner_to_face.z * delta.z)
+                            / delta_squared;
+                        let offset = point(
+                            owner_to_face.x - projection * delta.x,
+                            owner_to_face.y - projection * delta.y,
+                            owner_to_face.z - projection * delta.z,
+                        );
+                        offset.x != 0.0 || offset.y != 0.0 || offset.z != 0.0
+                    });
+                    assert_eq!(has_skewed_internal_face, skewed);
+                    let mut options = minimal_laminar_options();
+                    options.max_simple_iterations = 1;
+                    options.non_orthogonal_correctors = correctors;
+                    options.pressure_reference_cell = closed.then_some(0);
+                    assert_eq!(options.pressure_reference_cell.is_some(), closed);
+                    options.schemes.grad_p = LaminarSimpleGradientScheme::LeastSquares;
+                    options.schemes.grad_u = LaminarSimpleGradientScheme::LeastSquares;
+                    options.schemes.div_phi_u = LaminarSimpleConvectionScheme::GaussLinearUpwind;
+
+                    let report = solve_laminar_simple(&mut runtime, &fields, &options)
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "leastSquares matrix failed for closed={closed}, skewed={skewed}, correctors={correctors}: {error}"
+                            )
+                        });
+                    assert_eq!(report.simple_iterations, 1);
+                    assert_eq!(
+                        report.stop_reason,
+                        LaminarSimpleStopReason::ConvergenceCriteriaNotConfigured
+                    );
+                    let iteration = &report.history[0];
+                    assert!(iteration.pressure_correction_accepted);
+                    assert_eq!(iteration.pressure_linear_solves, correctors + 1);
+                    assert!(iteration.momentum_linear_converged);
+                    assert!(
+                        iteration
+                            .momentum_component_linear_converged
+                            .iter()
+                            .all(|converged| *converged)
+                    );
+                    assert!(iteration.pressure_linear_converged);
+                    assert_eq!(iteration.pressure_linear_non_converged_solves, 0);
+                    assert!(
+                        iteration
+                            .momentum_component_linear_solves
+                            .iter()
+                            .all(|solve| solve.converged
+                                && solve.stop_reason != LinearSolveStopReason::Breakdown)
+                    );
+                    assert!(
+                        iteration.pressure_correction_linear_solves
+                            [..iteration.pressure_linear_solves]
+                            .iter()
+                            .all(|solve| solve.converged
+                                && solve.stop_reason != LinearSolveStopReason::Breakdown)
+                    );
+                    assert_eq!(
+                        report
+                            .linear_solve_summary
+                            .momentum_component_non_converged_solves,
+                        0
+                    );
+                    assert_eq!(
+                        report
+                            .linear_solve_summary
+                            .pressure_correction_non_converged_solves,
+                        0
+                    );
+                    assert!(report.final_pressure.iter().all(|value| value.is_finite()));
+                    assert!(report.final_velocity.iter().all(|value| {
+                        value.x.is_finite() && value.y.is_finite() && value.z.is_finite()
+                    }));
+                }
+            }
         }
     }
 
@@ -12530,6 +13070,252 @@ mod tests {
         }
     }
 
+    fn four_cell_planar_runtime(skewed: bool) -> SolverRuntimeData {
+        let cell_centres = if skewed {
+            vec![
+                point(0.24, 0.22, 0.0),
+                point(0.76, 0.29, 0.0),
+                point(0.18, 0.77, 0.0),
+                point(0.82, 0.83, 0.0),
+            ]
+        } else {
+            vec![
+                point(0.25, 0.25, 0.0),
+                point(0.75, 0.25, 0.0),
+                point(0.25, 0.75, 0.0),
+                point(0.75, 0.75, 0.0),
+            ]
+        };
+        let mut face_centres = if skewed {
+            vec![
+                point(0.51, 0.28, 0.0),
+                point(0.48, 0.79, 0.0),
+                point(0.23, 0.49, 0.0),
+                point(0.78, 0.56, 0.0),
+                point(0.0, 0.22, 0.0),
+                point(0.0, 0.77, 0.0),
+                point(1.0, 0.29, 0.0),
+                point(1.0, 0.83, 0.0),
+                point(0.24, 0.0, 0.0),
+                point(0.76, 0.0, 0.0),
+                point(0.18, 1.0, 0.0),
+                point(0.82, 1.0, 0.0),
+            ]
+        } else {
+            vec![
+                point(0.5, 0.25, 0.0),
+                point(0.5, 0.75, 0.0),
+                point(0.25, 0.5, 0.0),
+                point(0.75, 0.5, 0.0),
+                point(0.0, 0.25, 0.0),
+                point(0.0, 0.75, 0.0),
+                point(1.0, 0.25, 0.0),
+                point(1.0, 0.75, 0.0),
+                point(0.25, 0.0, 0.0),
+                point(0.75, 0.0, 0.0),
+                point(0.25, 1.0, 0.0),
+                point(0.75, 1.0, 0.0),
+            ]
+        };
+        for centre in &cell_centres {
+            face_centres.push(point(centre.x, centre.y, 0.5));
+            face_centres.push(point(centre.x, centre.y, -0.5));
+        }
+
+        SolverRuntimeData {
+            mesh: SolverRuntimeMeshData {
+                points: 0,
+                cells: 4,
+                faces: 20,
+                internal_faces: 4,
+                boundary_faces: 16,
+                owner: vec![0, 2, 0, 1, 0, 2, 1, 3, 0, 1, 2, 3, 0, 0, 1, 1, 2, 2, 3, 3],
+                neighbour: vec![
+                    Some(1),
+                    Some(3),
+                    Some(2),
+                    Some(3),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ],
+                patches: vec![
+                    SolverRuntimePatchRange {
+                        name: "inlet".to_string(),
+                        patch_type: "patch".to_string(),
+                        start_face: 4,
+                        faces: 2,
+                    },
+                    SolverRuntimePatchRange {
+                        name: "outlet".to_string(),
+                        patch_type: "patch".to_string(),
+                        start_face: 6,
+                        faces: 2,
+                    },
+                    SolverRuntimePatchRange {
+                        name: "walls".to_string(),
+                        patch_type: "wall".to_string(),
+                        start_face: 8,
+                        faces: 4,
+                    },
+                    SolverRuntimePatchRange {
+                        name: "frontAndBack".to_string(),
+                        patch_type: "empty".to_string(),
+                        start_face: 12,
+                        faces: 8,
+                    },
+                ],
+                face_centres,
+                face_area_vectors: vec![
+                    point(1.0, 0.0, 0.0),
+                    point(1.0, 0.0, 0.0),
+                    point(0.0, 1.0, 0.0),
+                    point(0.0, 1.0, 0.0),
+                    point(-1.0, 0.0, 0.0),
+                    point(-1.0, 0.0, 0.0),
+                    point(1.0, 0.0, 0.0),
+                    point(1.0, 0.0, 0.0),
+                    point(0.0, -1.0, 0.0),
+                    point(0.0, -1.0, 0.0),
+                    point(0.0, 1.0, 0.0),
+                    point(0.0, 1.0, 0.0),
+                    point(0.0, 0.0, 1.0),
+                    point(0.0, 0.0, -1.0),
+                    point(0.0, 0.0, 1.0),
+                    point(0.0, 0.0, -1.0),
+                    point(0.0, 0.0, 1.0),
+                    point(0.0, 0.0, -1.0),
+                    point(0.0, 0.0, 1.0),
+                    point(0.0, 0.0, -1.0),
+                ],
+                cell_centres,
+                cell_volumes: vec![0.25; 4],
+                min_face_area: 1.0,
+                max_face_area: 1.0,
+                min_cell_volume: 0.25,
+                max_cell_volume: 0.25,
+                total_cell_volume: 1.0,
+                non_positive_cell_volumes: 0,
+            },
+            fields: vec![
+                SolverRuntimeFieldBuffer {
+                    region: None,
+                    name: "U".to_string(),
+                    kind: SolverStateFieldKind::VolVector,
+                    components: 3,
+                    scalar_slots: 12,
+                    bytes_f64: 96,
+                    values: Some(vec![
+                        1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+                    ]),
+                },
+                SolverRuntimeFieldBuffer {
+                    region: None,
+                    name: "p".to_string(),
+                    kind: SolverStateFieldKind::VolScalar,
+                    components: 1,
+                    scalar_slots: 4,
+                    bytes_f64: 32,
+                    values: Some(vec![1.0, 0.0, 1.0, 0.0]),
+                },
+            ],
+            warnings: Vec::new(),
+        }
+    }
+
+    fn four_cell_planar_fields(closed: bool) -> InitialFieldSet {
+        InitialFieldSet {
+            case_dir: PathBuf::from("case"),
+            fields: vec![
+                FieldFile {
+                    path: PathBuf::from("case/0/U"),
+                    region: None,
+                    name: "U".to_string(),
+                    class_name: Some("volVectorField".to_string()),
+                    dimensions: None,
+                    internal_field: None,
+                    boundary_patches: vec![
+                        FieldBoundaryPatch {
+                            name: "inlet".to_string(),
+                            patch_type: Some("fixedValue".to_string()),
+                            inlet_value: None,
+                            value: Some(FieldValueSummary::Uniform("(1 0 0)".to_string())),
+                        },
+                        FieldBoundaryPatch {
+                            name: "outlet".to_string(),
+                            patch_type: Some("zeroGradient".to_string()),
+                            inlet_value: None,
+                            value: None,
+                        },
+                        FieldBoundaryPatch {
+                            name: "walls".to_string(),
+                            patch_type: Some("noSlip".to_string()),
+                            inlet_value: None,
+                            value: None,
+                        },
+                        FieldBoundaryPatch {
+                            name: "frontAndBack".to_string(),
+                            patch_type: Some("empty".to_string()),
+                            inlet_value: None,
+                            value: None,
+                        },
+                    ],
+                },
+                FieldFile {
+                    path: PathBuf::from("case/0/p"),
+                    region: None,
+                    name: "p".to_string(),
+                    class_name: Some("volScalarField".to_string()),
+                    dimensions: None,
+                    internal_field: None,
+                    boundary_patches: vec![
+                        FieldBoundaryPatch {
+                            name: "inlet".to_string(),
+                            patch_type: Some("zeroGradient".to_string()),
+                            inlet_value: None,
+                            value: None,
+                        },
+                        FieldBoundaryPatch {
+                            name: "outlet".to_string(),
+                            patch_type: Some(if closed {
+                                "zeroGradient".to_string()
+                            } else {
+                                "fixedValue".to_string()
+                            }),
+                            inlet_value: None,
+                            value: (!closed).then(|| FieldValueSummary::Uniform("0".to_string())),
+                        },
+                        FieldBoundaryPatch {
+                            name: "walls".to_string(),
+                            patch_type: Some("zeroGradient".to_string()),
+                            inlet_value: None,
+                            value: None,
+                        },
+                        FieldBoundaryPatch {
+                            name: "frontAndBack".to_string(),
+                            patch_type: Some("empty".to_string()),
+                            inlet_value: None,
+                            value: None,
+                        },
+                    ],
+                },
+            ],
+        }
+    }
+
     fn two_cell_runtime() -> SolverRuntimeData {
         SolverRuntimeData {
             mesh: SolverRuntimeMeshData {
@@ -12752,6 +13538,15 @@ mod tests {
 
     fn point(x: f64, y: f64, z: f64) -> Point3 {
         Point3 { x, y, z }
+    }
+
+    fn assert_point_fields_bit_equal(actual: &[Point3], expected: &[Point3]) {
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_eq!(actual.x.to_bits(), expected.x.to_bits());
+            assert_eq!(actual.y.to_bits(), expected.y.to_bits());
+            assert_eq!(actual.z.to_bits(), expected.z.to_bits());
+        }
     }
 
     fn assert_close(left: f64, right: f64) {
