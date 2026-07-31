@@ -1713,7 +1713,7 @@ The immediate sequence is:
    OpenFOAM case, source, executable, or comparison launcher is tracked.
    Validation order remains Pipe, Channel, then Cylinder.
 
-   **Post-C4 Cylinder pressure and accuracy sequence (planned):**
+   **Post-C4 Cylinder pressure and accuracy sequence:**
 
    1. **F-CYL-PCG-PROFILE (completed diagnostic; no speed claim):** Exact
       post-merge commit `966e32ee9508` and tree `caff8b6a6b4f` were archived
@@ -1750,40 +1750,56 @@ The immediate sequence is:
       time by `14.85%`; host-load dispersion forbids extrapolating those
       percentages to other cases. This is not a reopening of the rejected
       LDU-addressed symmetric Gauss-Seidel experiment;
-   3. **F-CYL-PCG-NL1:** the semantic prerequisite now uses the exact OpenFOAM
-      Foundation 13 `relTol > 1e-20` boundary for every scalar solver and adds
-      `1e-20` to the LDU residual-normalisation factor. Next, make non-GAMG PCG
+   3. **F-CYL-PCG-NL1 (completed):** commit `19fe1909fc7f` makes non-GAMG PCG
       evaluate the public normalized-L1 residual directly on each convergence
-      check and reuse the already written residual. Preserve strict
-      absolute/relative boundaries,
-      zero-iteration initial convergence, exact iteration-count/max-iteration
-      lifecycle, L2 telemetry, breakdown behavior, final acceptance, and
-      existing outer SIMPLE bounds. This is not the rejected C8
-      reduction-only fusion;
-   4. **F-CYL-PRESSURE-GEOMETRY-CACHE:** build immutable mesh-bound pressure
+      check while reusing the already written residual. It retains the exact
+      OpenFOAM Foundation 13 `relTol > 1e-20` activation boundary and `1e-20`
+      LDU normalisation addition, strict absolute/relative comparisons,
+      zero-iteration initial convergence, iteration/max-iteration lifecycle,
+      L2 telemetry, breakdown behavior, final true-residual acceptance, and
+      existing outer SIMPLE bounds. The legacy public L2 paths remain protected
+      and this is not the rejected C8 reduction-only fusion;
+   4. **F-CYL-PRESSURE-GEOMETRY-CACHE (completed; no standalone speed claim):**
+      commit `5f0f121f0af7` builds immutable solve-local mesh-bound pressure
       geometry once, including face areas, projected owner/neighbour distances,
-      and non-orthogonal area-vector terms. Refresh only when the mesh changes,
-      keep coefficient fields solve-local, and prove exact assembly parity;
-   5. **F-CYL-COMPACT-FACES / F-PERF-THREAD-MOMENTUM:** introduce compact
-      owner/neighbour internal-face arrays as an isolated storage leaf, then
-      benchmark deterministic parallel momentum components as the existing
-      separate threading leaf. Keep a serial fallback and do not combine the
-      storage and threading acceptance decisions;
-   6. **F-CYL-SPATIAL-ACCURACY:** execute the separate Spatial Accuracy Track
-      above: weighted least-squares gradients, the skewness/corrector matrix,
-      reconstructed wall traction, and at least three-mesh observed-order plus
-      GCI evidence before making a higher-accuracy claim.
+      and non-orthogonal area-vector terms. Coefficient fields remain
+      solve-local and exact assembly, error-order, allocation-lifecycle, and
+      public-entrypoint parity gates passed;
+   5. **F-CYL-COMPACT-FACES / F-PERF-THREAD-MOMENTUM (completed as two separate
+      leaves):** commit `5e281fd4351b` adds compact immutable owner/neighbour
+      face addressing while preserving global mixed-face order and lazy
+      cell-limiter adjacency. On the official 5,388-cell Cylinder, Rust
+      `1.94.0`, `target-cpu=native`, CPU `2`, two warmup pairs and nine
+      counterbalanced measured pairs, canonical reports and final fields were
+      exact while the paired median internal-solver/process ratios were
+      `0.906212`/`0.908557` (`7/9` wins). This is a narrow positive Cylinder
+      signal, not a general speed claim. Commit `416db3d368db` separately adds
+      explicit deterministic `parallel-components` momentum execution while
+      retaining `serial` as the default. With one identical Linux binary,
+      affinity `2-4`, two warmup pairs and nine measured pairs per case,
+      serial/parallel fields, reports, and work counts were exact. Paired
+      internal-solver ratios were `1.056534` for Pipe (`4/9` wins), `0.903537`
+      for Channel (`9/9`), and `0.969953` for Cylinder (`8/9`). Therefore the
+      parallel mode remains opt-in, no 30-pair escalation was warranted, and no
+      default or general-speed claim is accepted;
+   6. **F-CYL-SPATIAL-ACCURACY (planned):** execute the separate Spatial
+      Accuracy Track above: weighted least-squares gradients, the
+      skewness/corrector matrix, reconstructed wall traction, and at least
+      three-mesh observed-order plus GCI evidence before making a
+      higher-accuracy claim.
 
-   Performance leaves 1-4 and the compact-face storage leaf use the same
-   generated official 5,388-cell Cylinder mesh and recorded input hashes,
-   serial Linux CPU lane, separate Fixed-1,000 and time-to-accuracy results,
-   and unchanged schemes, tolerances, iteration budgets, and physical gates.
-   Effects below 5% require at least two warmups and nine alternating measured
-   pairs. The threading leaf instead compares pinned single-thread and
-   multi-thread lanes while retaining an exact serial oracle and reporting
-   scaling efficiency. The accuracy leaf follows its separate multi-mesh
-   protocol above and may change only the explicitly selected discretization or
-   reconstruction scheme.
+   The executed per-leaf protocols, fixed-work budgets, input hashes, and
+   results are recorded above and in external hashed artifacts; they must not be
+   retroactively recast as one common Fixed-1,000 or time-to-accuracy run. A
+   future final-stack cross-engine refresh returns to the same generated
+   official 5,388-cell Cylinder mesh and recorded input hashes, a serial Linux
+   CPU lane, separate Fixed-1,000 and time-to-accuracy results, and unchanged
+   schemes, tolerances, iteration budgets, and physical gates. Effects below
+   5% require at least two warmups and nine alternating measured pairs. The
+   threading leaf compares pinned single-thread and multi-thread lanes while
+   retaining an exact serial oracle and reporting scaling efficiency. The
+   accuracy leaf follows its separate multi-mesh protocol above and may change
+   only the explicitly selected discretization or reconstruction scheme.
 
    Record `U`, `p`, `Cd`, `Cl`, continuity, iterations, preconditioner
    applications, and relevant work counters in every applicable lane. No
