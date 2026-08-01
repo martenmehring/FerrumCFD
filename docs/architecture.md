@@ -640,9 +640,13 @@ normalisation factor likewise adds `1e-20` to the accumulated factor instead of
 flooring it. This is a static user control whose effective target is recomputed
 per solve, not an autonomous adaptive controller. A non-zero `minIter` outside
 GAMG and `smoothSolver nSweeps` other than `1` remain explicitly unsupported.
-The pressure bridge now follows the OpenFOAM shape more closely: it applies
-equation relaxation through an internal momentum-equation object, builds
-cell-wise `rAU` from the original momentum diagonal, exposes per-component
+The pressure bridge now follows the OpenFOAM shape more closely: bounded
+momentum assembly keeps diffusion diagonals separate until the conservative
+net-flux correction is complete, preventing a large cancelling flux pair from
+rounding out finite diffusion. It then applies OpenFOAM-style equation
+relaxation through an internal momentum-equation object, builds cell-wise
+`rAU` from the stabilized pre-alpha momentum diagonal (equivalently the
+reciprocal of the final relaxed diagonal), exposes per-component
 momentum residuals plus `A/H1` ranges in reports, reconstructs `HbyA`, computes
 `phiHbyA` from that HbyA field with velocity boundary constraints applied,
 applies an OpenFOAM-like `adjustPhi` mass-balance correction only on

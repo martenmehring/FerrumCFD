@@ -1846,6 +1846,18 @@ The immediate sequence is:
       parity/performance refresh remain open before any general higher-accuracy
       or speed claim.
 
+      The first formal 6F run stopped fail-closed on 2026-08-01 when the G2
+      normal solve reached a zero Ux diagonal at row `85973`; G0 and G1 had
+      converged, but no mixed-run GCI result was accepted. A deterministic
+      powers-of-two oracle reproduced a mechanism consistent with the failure:
+      floating-point cancellation between a large bounded boundary-flux
+      contribution and its later net-flux correction. The active generic
+      correction defers bounded diffusion diagonals until that conservative
+      correction is complete and applies the Foundation-13 equation-relaxation
+      formula before deriving `rAU`. All seven
+      6F solves must be rerun from one exact merged tree before point 6 can
+      close; the retained pre-correction artifacts are diagnostic only.
+
    The executed per-leaf protocols, fixed-work budgets, input hashes, and
    results are recorded above and in external hashed artifacts; they must not be
    retroactively recast as one common Fixed-1,000 or time-to-accuracy run. A

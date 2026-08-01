@@ -3433,10 +3433,23 @@ fn relax_scalar_component_equation(
     old_solution: &[f64],
     relaxation: f64,
 ) -> Result<Vec<f64>> {
-    if old_solution.len() != system.rhs.len() {
+    let rows = system.matrix.rows();
+    if system.matrix.cols() != rows {
         return Err(invalid_input(format!(
-            "equation relaxation expected old solution with {} entries, got {}",
-            system.rhs.len(),
+            "equation relaxation requires a square matrix, got {}x{}",
+            rows,
+            system.matrix.cols()
+        )));
+    }
+    if system.rhs.len() != rows {
+        return Err(invalid_input(format!(
+            "equation relaxation expected RHS with {rows} entries, got {}",
+            system.rhs.len()
+        )));
+    }
+    if old_solution.len() != rows {
+        return Err(invalid_input(format!(
+            "equation relaxation expected old solution with {rows} entries, got {}",
             old_solution.len()
         )));
     }
@@ -3446,26 +3459,103 @@ fn relax_scalar_component_equation(
         )));
     }
 
-    let diagonal = system.matrix.diagonal()?;
-    if (relaxation - 1.0).abs() <= f64::EPSILON {
-        return Ok(diagonal);
+    // Match OpenFOAM's equation under-relaxation: first make every row at
+    // least diagonally dominant, then apply the configured relaxation factor.
+    // Validate every derived value before mutating either the matrix or RHS so
+    // failures cannot leave a partially relaxed equation behind.
+    let mut base_diagonal = flow_try_vec(rows)?;
+    for (row, (&rhs, &old_value)) in system.rhs.iter().zip(old_solution).enumerate() {
+        let start = system.matrix.row_offsets()[row];
+        let end = system.matrix.row_offsets()[row + 1];
+        let mut diagonal_entry = None;
+        let mut diagonal = 0.0;
+        let mut off_diagonal_abs_sum = 0.0;
+        for entry in start..end {
+            let column = system.matrix.col_indices()[entry];
+            let coefficient = system.matrix.values()[entry];
+            if !coefficient.is_finite() {
+                return Err(invalid_input(format!(
+                    "equation relaxation row {row} column {column} coefficient must be finite, got {coefficient}"
+                )));
+            }
+            if column == row {
+                if diagonal_entry.replace(entry).is_some() {
+                    return Err(invalid_input(format!(
+                        "equation relaxation row {row} has multiple diagonal entries"
+                    )));
+                }
+                diagonal = coefficient;
+            } else {
+                off_diagonal_abs_sum += coefficient.abs();
+                if !off_diagonal_abs_sum.is_finite() {
+                    return Err(invalid_input(format!(
+                        "equation relaxation row {row} off-diagonal absolute sum is not finite"
+                    )));
+                }
+            }
+        }
+        if diagonal_entry.is_none() {
+            return Err(invalid_input(format!(
+                "equation relaxation row {row} has no diagonal entry"
+            )));
+        }
+        if !rhs.is_finite() {
+            return Err(invalid_input(format!(
+                "equation relaxation RHS entry {row} must be finite, got {rhs}"
+            )));
+        }
+        if !old_value.is_finite() {
+            return Err(invalid_input(format!(
+                "equation relaxation old solution entry {row} must be finite, got {old_value}"
+            )));
+        }
+
+        let base = diagonal.abs().max(off_diagonal_abs_sum);
+        if !base.is_finite() || base <= 0.0 {
+            return Err(invalid_input(format!(
+                "equation relaxation row {row} cannot form a positive finite diagonal from diagonal {diagonal} and off-diagonal absolute sum {off_diagonal_abs_sum}"
+            )));
+        }
+        let relaxed = base / relaxation;
+        if !relaxed.is_finite() {
+            return Err(invalid_input(format!(
+                "equation relaxation row {row} relaxed diagonal is not finite"
+            )));
+        }
+        let diagonal_delta = relaxed - diagonal;
+        if !diagonal_delta.is_finite() {
+            return Err(invalid_input(format!(
+                "equation relaxation row {row} diagonal correction is not finite"
+            )));
+        }
+        let source_correction = diagonal_delta * old_value;
+        if !source_correction.is_finite() {
+            return Err(invalid_input(format!(
+                "equation relaxation row {row} source correction is not finite"
+            )));
+        }
+        let relaxed_rhs = rhs + source_correction;
+        if !relaxed_rhs.is_finite() {
+            return Err(invalid_input(format!(
+                "equation relaxation RHS entry {row} is not finite after correction"
+            )));
+        }
+        base_diagonal.push(base);
     }
 
-    let rhs_scale = (1.0 / relaxation) - 1.0;
-    for ((rhs, diagonal), old_value) in system.rhs.iter_mut().zip(&diagonal).zip(old_solution) {
-        *rhs += rhs_scale * diagonal * old_value;
-    }
-
-    for row in 0..system.matrix.rows() {
+    for row in 0..rows {
         let start = system.matrix.row_offsets()[row];
         let end = system.matrix.row_offsets()[row + 1];
         let diagonal_entry = (start..end)
             .find(|entry| system.matrix.col_indices()[*entry] == row)
-            .ok_or_else(|| invalid_input(format!("row {row} has no diagonal entry")))?;
-        system.matrix.values_mut()[diagonal_entry] /= relaxation;
+            .expect("validated unique equation-relaxation diagonal entry");
+        let diagonal = system.matrix.values()[diagonal_entry];
+        let relaxed = base_diagonal[row] / relaxation;
+        system.rhs[row] += (relaxed - diagonal) * old_solution[row];
+        system.matrix.values_mut()[diagonal_entry] = relaxed;
     }
 
-    Ok(diagonal)
+    Ok(base_diagonal)
 }
 
 fn apply_pressure_reference(
@@ -3916,6 +4006,14 @@ fn assemble_momentum_component_system_with_addressing(
     }
 
     let mut values = vec![0.0; momentum_csr_pattern.sparsity.nnz()];
+    // Defer only bounded-scheme diffusion diagonals until the conservative
+    // net-flux term has been removed. Otherwise a large extrapolated boundary
+    // flux can be added to a small diffusive diagonal and subtracted again
+    // later, irreversibly rounding the diffusion out of the shared CSR slot.
+    let mut bounded_diffusion_diagonal = convection_scheme
+        .is_bounded()
+        .then(|| flow_try_filled_vec(mesh.cells, 0.0))
+        .transpose()?;
     let mut rhs = volumetric_source
         .iter()
         .zip(&mesh.cell_volumes)
@@ -3941,17 +4039,22 @@ fn assemble_momentum_component_system_with_addressing(
             )?;
             let (owner_neighbour_slot, neighbour_owner_slot) =
                 momentum_csr_pattern.internal_slots(face_index);
-            add_csr_value(
-                &mut values,
-                momentum_csr_pattern.diagonal_slot(owner),
-                coefficient,
-            );
+            if let Some(diffusion_diagonal) = bounded_diffusion_diagonal.as_deref_mut() {
+                diffusion_diagonal[owner] += coefficient;
+                diffusion_diagonal[neighbour] += coefficient;
+            } else {
+                add_csr_value(
+                    &mut values,
+                    momentum_csr_pattern.diagonal_slot(owner),
+                    coefficient,
+                );
+                add_csr_value(
+                    &mut values,
+                    momentum_csr_pattern.diagonal_slot(neighbour),
+                    coefficient,
+                );
+            }
             add_csr_value(&mut values, owner_neighbour_slot, -coefficient);
-            add_csr_value(
-                &mut values,
-                momentum_csr_pattern.diagonal_slot(neighbour),
-                coefficient,
-            );
             add_csr_value(&mut values, neighbour_owner_slot, -coefficient);
             add_internal_convection(
                 &mut values,
@@ -3978,11 +4081,15 @@ fn assemble_momentum_component_system_with_addressing(
                     mesh.face_centres[face_index],
                     face_index,
                 )?;
-                add_csr_value(
-                    &mut values,
-                    momentum_csr_pattern.diagonal_slot(owner),
-                    coefficient,
-                );
+                if let Some(diffusion_diagonal) = bounded_diffusion_diagonal.as_deref_mut() {
+                    diffusion_diagonal[owner] += coefficient;
+                } else {
+                    add_csr_value(
+                        &mut values,
+                        momentum_csr_pattern.diagonal_slot(owner),
+                        coefficient,
+                    );
+                }
                 rhs[owner] += coefficient * value;
                 add_boundary_convection(
                     &mut values,
@@ -4006,11 +4113,15 @@ fn assemble_momentum_component_system_with_addressing(
                     mesh.face_centres[face_index],
                     face_index,
                 )?;
-                add_csr_value(
-                    &mut values,
-                    momentum_csr_pattern.diagonal_slot(owner),
-                    coefficient,
-                );
+                if let Some(diffusion_diagonal) = bounded_diffusion_diagonal.as_deref_mut() {
+                    diffusion_diagonal[owner] += coefficient;
+                } else {
+                    add_csr_value(
+                        &mut values,
+                        momentum_csr_pattern.diagonal_slot(owner),
+                        coefficient,
+                    );
+                }
                 rhs[owner] += coefficient * value;
                 add_boundary_convection(
                     &mut values,
@@ -4058,6 +4169,15 @@ fn assemble_momentum_component_system_with_addressing(
                 &mut values,
                 momentum_csr_pattern.diagonal_slot(cell),
                 -correction,
+            );
+        }
+    }
+    if let Some(diffusion_diagonal) = bounded_diffusion_diagonal {
+        for (cell, coefficient) in diffusion_diagonal.into_iter().enumerate() {
+            add_csr_value(
+                &mut values,
+                momentum_csr_pattern.diagonal_slot(cell),
+                coefficient,
             );
         }
     }
@@ -7995,45 +8115,407 @@ mod tests {
     }
 
     #[test]
-    fn equation_relaxation_preserves_original_diagonal_for_rau() {
+    fn equation_relaxation_returns_stabilized_base_diagonal_for_rau() {
+        let runtime = two_cell_runtime();
+        let old_values = vec![3.0, -2.0];
+        let mut system = ScalarComponentSystem {
+            matrix: CsrMatrix::from_rows(
+                vec![vec![(0, 1.0), (1, -4.0)], vec![(0, -1.0), (1, 2.0)]],
+                2,
+            )
+            .expect("underdominant momentum matrix"),
+            rhs: vec![5.0, 7.0],
+        };
+
+        let base_diagonal = relax_scalar_component_equation(&mut system, &old_values, 0.5)
+            .expect("relaxed momentum system");
+
+        assert_eq!(base_diagonal, vec![4.0, 2.0]);
+        let relaxed_diagonal = system.matrix.diagonal().expect("relaxed diagonal");
+        assert_eq!(relaxed_diagonal, vec![8.0, 4.0]);
+        assert_eq!(system.rhs, vec![26.0, 3.0]);
+        let r_au = reciprocal_momentum_diagonal(&runtime.mesh, &base_diagonal, 0.5)
+            .expect("relaxed reciprocal momentum diagonal");
+        assert_eq!(r_au, vec![1.0 / 16.0, 1.0 / 8.0]);
+        for cell in 0..runtime.mesh.cells {
+            assert_eq!(
+                r_au[cell].to_bits(),
+                (0.5 * runtime.mesh.cell_volumes[cell] / base_diagonal[cell]).to_bits()
+            );
+            assert_eq!(
+                r_au[cell].to_bits(),
+                (runtime.mesh.cell_volumes[cell] / relaxed_diagonal[cell]).to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn equation_relaxation_matches_openfoam_formula_for_diagonal_dominance_and_rhs() {
+        let matrix = CsrMatrix::from_rows(
+            vec![
+                vec![(2, 1.0), (0, 4.0), (1, -6.0)],
+                vec![(0, -1.0), (2, 1.0), (1, -3.0)],
+                vec![(1, -3.0), (2, 10.0), (0, -2.0)],
+            ],
+            3,
+        )
+        .expect("OpenFOAM relaxation oracle matrix");
+        let old_solution = vec![2.0, -1.0, 0.25];
+        let original_rhs = vec![1.0, 2.0, 3.0];
+        let original_product = matrix
+            .matvec(&old_solution)
+            .expect("original matrix product");
+        let original_residual = original_product
+            .iter()
+            .zip(&original_rhs)
+            .map(|(product, rhs)| product - rhs)
+            .collect::<Vec<_>>();
+        let row_offsets_ptr = matrix.row_offsets().as_ptr();
+        let col_indices_ptr = matrix.col_indices().as_ptr();
+        let original_values = matrix.values().to_vec();
+        let mut system = ScalarComponentSystem {
+            matrix,
+            rhs: original_rhs,
+        };
+
+        let base_diagonal = relax_scalar_component_equation(&mut system, &old_solution, 0.5)
+            .expect("OpenFOAM equation relaxation");
+
+        assert_eq!(base_diagonal, vec![7.0, 3.0, 10.0]);
+        assert_eq!(
+            system.matrix.diagonal().expect("relaxed diagonal"),
+            vec![14.0, 6.0, 20.0]
+        );
+        assert_eq!(system.rhs, vec![21.0, -7.0, 5.5]);
+        assert_eq!(system.matrix.row_offsets().as_ptr(), row_offsets_ptr);
+        assert_eq!(system.matrix.col_indices().as_ptr(), col_indices_ptr);
+        for entry in [0, 2, 3, 4, 6, 8] {
+            assert_eq!(system.matrix.values()[entry], original_values[entry]);
+        }
+        let relaxed_product = system
+            .matrix
+            .matvec(&old_solution)
+            .expect("relaxed matrix product");
+        let relaxed_residual = relaxed_product
+            .iter()
+            .zip(&system.rhs)
+            .map(|(product, rhs)| product - rhs)
+            .collect::<Vec<_>>();
+        assert_eq!(relaxed_residual, original_residual);
+    }
+
+    #[test]
+    fn bounded_assembly_preserves_outlet_diffusion_below_flux_ulp_before_relaxation() {
         let runtime = two_cell_runtime();
         let momentum_csr_pattern =
             MomentumCsrPattern::from_mesh(&runtime.mesh).expect("momentum CSR pattern");
-        let fields = two_cell_fields();
-        let u_field = fields
-            .fields
-            .iter()
-            .find(|field| field.name == "U")
-            .expect("U field");
-        let vector_boundary = vector_face_treatments(&runtime.mesh, u_field).expect("U boundary");
-        let boundary = scalar_component_boundary(&vector_boundary, 0);
-        let flux = vec![1.0, -2.0, 3.0];
-        let source = vec![0.0, 0.0];
-        let old_values = vec![5.0, 3.0];
+        let diffusivity = f64::from_bits(0x3e60_0000_0000_0000); // 2^-25
+        let expected_internal = f64::from_bits(0x3e70_0000_0000_0000); // 2^-24
+        let outlet_flux = f64::from_bits(0x41d0_0000_0000_0000); // 2^30
+        let boundary = vec![
+            ScalarFaceTreatment::ZeroGradient,
+            ScalarFaceTreatment::FixedValue(0.0),
+            ScalarFaceTreatment::ZeroGradient,
+        ];
+        let old_values = vec![3.0, -2.0];
+        let old_gradient = vec![zero(); 2];
         let mut system = assemble_momentum_component_system(
             &runtime.mesh,
             &momentum_csr_pattern,
+            diffusivity,
             1.0,
-            2.0,
-            &flux,
-            &source,
+            &[0.0, 0.0, outlet_flux],
+            &[0.0, 2.0 * expected_internal],
             &boundary,
             &old_values,
-            None,
-            LaminarSimpleConvectionScheme::GaussUpwind,
+            Some(&old_gradient),
+            LaminarSimpleConvectionScheme::BoundedGaussLinearUpwind(
+                LaminarSimpleGradientScheme::GaussLinear,
+            ),
         )
-        .expect("momentum system");
+        .expect("bounded cancellation oracle system");
 
-        let original_diagonal =
-            relax_scalar_component_equation(&mut system, &[5.0, 3.0], 0.5).expect("relaxed system");
+        let assembled_diagonal = system.matrix.diagonal().expect("assembled diagonal");
+        assert_eq!(assembled_diagonal[1].to_bits(), expected_internal.to_bits());
+        assert!(
+            system
+                .matrix
+                .shares_sparsity_with(&momentum_csr_pattern.sparsity)
+        );
+        let row_start = system.matrix.row_offsets()[1];
+        let row_end = system.matrix.row_offsets()[2];
+        let internal_entry = (row_start..row_end)
+            .find(|entry| system.matrix.col_indices()[*entry] == 0)
+            .expect("cell 1 internal off-diagonal");
+        assert_eq!(
+            system.matrix.values()[internal_entry].to_bits(),
+            (-expected_internal).to_bits()
+        );
+        assert_eq!(system.rhs[1].to_bits(), expected_internal.to_bits());
+        let assembled_values = system.matrix.values().to_vec();
+        let assembled_rhs = system.rhs.clone();
 
-        assert_close(original_diagonal[0], 8.0);
-        assert_close(original_diagonal[1], 8.0);
-        let relaxed_diagonal = system.matrix.diagonal().expect("relaxed diagonal");
-        assert_close(relaxed_diagonal[0], 16.0);
-        assert_close(relaxed_diagonal[1], 16.0);
-        assert_close(system.rhs[0], 48.0);
-        assert_close(system.rhs[1], 24.0);
+        let base_diagonal = relax_scalar_component_equation(&mut system, &old_values, 1.0)
+            .expect("equation relaxation preserves the dominant equation");
+        assert_eq!(base_diagonal[1].to_bits(), expected_internal.to_bits());
+        assert_eq!(
+            system.matrix.diagonal().expect("relaxed diagonal")[1].to_bits(),
+            expected_internal.to_bits()
+        );
+        assert_eq!(system.matrix.values(), assembled_values);
+        assert_eq!(system.rhs, assembled_rhs);
+        let r_au = reciprocal_momentum_diagonal(&runtime.mesh, &base_diagonal, 1.0)
+            .expect("bounded reciprocal momentum diagonal");
+        assert_eq!(
+            r_au[1].to_bits(),
+            (runtime.mesh.cell_volumes[1] / expected_internal).to_bits()
+        );
+    }
+
+    #[test]
+    fn equation_relaxation_at_alpha_one_still_enforces_diagonal_dominance() {
+        let mut system = ScalarComponentSystem {
+            matrix: CsrMatrix::from_rows(
+                vec![vec![(1, -4.0), (0, 1.0)], vec![(1, 2.0), (0, -1.0)]],
+                2,
+            )
+            .expect("weak-diagonal matrix"),
+            rhs: vec![3.0, 4.0],
+        };
+
+        let base_diagonal = relax_scalar_component_equation(&mut system, &[2.0, 0.0], 1.0)
+            .expect("alpha=1 still applies diagonal dominance");
+
+        assert_eq!(base_diagonal, vec![4.0, 2.0]);
+        assert_eq!(
+            system.matrix.diagonal().expect("dominant diagonal"),
+            vec![4.0, 2.0]
+        );
+        assert_eq!(system.rhs, vec![9.0, 4.0]);
+    }
+
+    #[test]
+    fn equation_relaxation_next_down_from_one_is_not_treated_as_unrelaxed() {
+        let alpha = f64::from_bits(1.0_f64.to_bits() - 1);
+        let mut system = ScalarComponentSystem {
+            matrix: CsrMatrix::from_rows(vec![vec![(0, 1.0), (1, -4.0)], vec![(1, 2.0)]], 2)
+                .expect("next-down relaxation matrix"),
+            rhs: vec![3.0, 4.0],
+        };
+
+        let base_diagonal = relax_scalar_component_equation(&mut system, &[2.0, 0.0], alpha)
+            .expect("next-down relaxation");
+
+        assert_eq!(base_diagonal, vec![4.0, 2.0]);
+        assert_eq!(
+            system.matrix.diagonal().expect("relaxed diagonal")[0].to_bits(),
+            (4.0 / alpha).to_bits()
+        );
+        assert_eq!(
+            system.rhs[0].to_bits(),
+            (3.0 + ((4.0 / alpha) - 1.0) * 2.0).to_bits()
+        );
+    }
+
+    #[test]
+    fn equation_relaxation_sums_absolute_duplicate_offdiagonals() {
+        let mut system = ScalarComponentSystem {
+            matrix: CsrMatrix::from_rows(
+                vec![vec![(1, 3.0), (0, 1.0), (1, -4.0)], vec![(1, 1.0)]],
+                2,
+            )
+            .expect("duplicate off-diagonal matrix"),
+            rhs: vec![0.0, 0.0],
+        };
+
+        let base_diagonal = relax_scalar_component_equation(&mut system, &[0.0, 0.0], 1.0)
+            .expect("absolute off-diagonal sum");
+
+        assert_eq!(base_diagonal, vec![7.0, 1.0]);
+        assert_eq!(system.matrix.diagonal().expect("dominant diagonal")[0], 7.0);
+    }
+
+    #[test]
+    fn equation_relaxation_failures_leave_matrix_and_rhs_unchanged() {
+        fn assert_atomic_failure(
+            mut system: ScalarComponentSystem,
+            old_solution: &[f64],
+            relaxation: f64,
+            expected_message: &str,
+        ) {
+            let original_values = system.matrix.values().to_vec();
+            let original_rhs = system.rhs.clone();
+            let error = relax_scalar_component_equation(&mut system, old_solution, relaxation)
+                .expect_err("invalid equation relaxation must fail");
+            assert!(
+                error.to_string().contains(expected_message),
+                "unexpected relaxation error: {error}"
+            );
+            assert_eq!(
+                system
+                    .matrix
+                    .values()
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                original_values
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                system
+                    .rhs
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                original_rhs
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        let valid = || ScalarComponentSystem {
+            matrix: CsrMatrix::from_rows(
+                vec![vec![(0, 2.0), (1, -1.0)], vec![(0, -1.0), (1, 2.0)]],
+                2,
+            )
+            .expect("valid atomicity matrix"),
+            rhs: vec![1.0, 2.0],
+        };
+        for relaxation in [
+            0.0,
+            -0.0,
+            -1.0,
+            f64::from_bits(1.0_f64.to_bits() + 1),
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            assert_atomic_failure(valid(), &[0.0, 0.0], relaxation, "factor must be in (0, 1]");
+        }
+
+        assert_atomic_failure(valid(), &[0.0], 0.5, "old solution with 2 entries");
+
+        let non_square = ScalarComponentSystem {
+            matrix: CsrMatrix::new(1, 2, vec![0, 1], vec![0], vec![2.0])
+                .expect("non-square atomicity matrix"),
+            rhs: vec![1.0],
+        };
+        assert_atomic_failure(non_square, &[0.0], 0.5, "requires a square matrix");
+
+        let mut wrong_rhs_length = valid();
+        wrong_rhs_length.rhs.pop();
+        assert_atomic_failure(wrong_rhs_length, &[0.0, 0.0], 0.5, "RHS with 2 entries");
+
+        let mut non_finite_coefficient = valid();
+        non_finite_coefficient.matrix.values_mut()[1] = f64::NAN;
+        assert_atomic_failure(
+            non_finite_coefficient,
+            &[0.0, 0.0],
+            0.5,
+            "coefficient must be finite",
+        );
+
+        let mut non_finite_rhs = valid();
+        non_finite_rhs.rhs[1] = f64::INFINITY;
+        assert_atomic_failure(
+            non_finite_rhs,
+            &[0.0, 0.0],
+            0.5,
+            "RHS entry 1 must be finite",
+        );
+
+        assert_atomic_failure(valid(), &[0.0, f64::NAN], 0.5, "old solution entry 1");
+
+        let missing_diagonal = ScalarComponentSystem {
+            matrix: CsrMatrix::from_rows(vec![vec![(1, -1.0)], vec![(0, -1.0), (1, 2.0)]], 2)
+                .expect("missing-diagonal matrix"),
+            rhs: vec![1.0, 2.0],
+        };
+        assert_atomic_failure(missing_diagonal, &[0.0, 0.0], 0.5, "no diagonal entry");
+
+        let duplicate_diagonal = ScalarComponentSystem {
+            matrix: CsrMatrix::from_rows(vec![vec![(0, 1.0), (0, 2.0)]], 1)
+                .expect("duplicate-diagonal matrix"),
+            rhs: vec![1.0],
+        };
+        assert_atomic_failure(duplicate_diagonal, &[0.0], 0.5, "multiple diagonal entries");
+
+        let zero_row = ScalarComponentSystem {
+            matrix: CsrMatrix::from_rows(vec![vec![(0, 0.0)]], 1).expect("zero-row matrix"),
+            rhs: vec![0.0],
+        };
+        assert_atomic_failure(
+            zero_row,
+            &[0.0],
+            1.0,
+            "cannot form a positive finite diagonal",
+        );
+
+        let overflow_sum = ScalarComponentSystem {
+            matrix: CsrMatrix::from_rows(
+                vec![vec![(0, 1.0), (1, f64::MAX), (1, f64::MAX)], vec![(1, 1.0)]],
+                2,
+            )
+            .expect("overflowing off-diagonal sum matrix"),
+            rhs: vec![0.0, 0.0],
+        };
+        assert_atomic_failure(
+            overflow_sum,
+            &[0.0, 0.0],
+            1.0,
+            "off-diagonal absolute sum is not finite",
+        );
+
+        let relaxed_diagonal_overflow = ScalarComponentSystem {
+            matrix: CsrMatrix::from_rows(vec![vec![(0, f64::MAX)]], 1)
+                .expect("relaxed-diagonal overflow matrix"),
+            rhs: vec![0.0],
+        };
+        assert_atomic_failure(
+            relaxed_diagonal_overflow,
+            &[0.0],
+            0.5,
+            "relaxed diagonal is not finite",
+        );
+
+        let diagonal_correction_overflow = ScalarComponentSystem {
+            matrix: CsrMatrix::from_rows(vec![vec![(0, -f64::MAX)]], 1)
+                .expect("diagonal-correction overflow matrix"),
+            rhs: vec![0.0],
+        };
+        assert_atomic_failure(
+            diagonal_correction_overflow,
+            &[0.0],
+            1.0,
+            "diagonal correction is not finite",
+        );
+
+        let source_correction_overflow = ScalarComponentSystem {
+            matrix: CsrMatrix::from_rows(vec![vec![(0, 1.0), (1, -3.0)], vec![(1, 1.0)]], 2)
+                .expect("source-correction overflow matrix"),
+            rhs: vec![0.0, 0.0],
+        };
+        assert_atomic_failure(
+            source_correction_overflow,
+            &[f64::MAX, 0.0],
+            1.0,
+            "source correction is not finite",
+        );
+
+        let rhs_correction_overflow = ScalarComponentSystem {
+            matrix: CsrMatrix::from_rows(vec![vec![(0, 1.0), (1, -2.0)], vec![(1, 1.0)]], 2)
+                .expect("RHS-correction overflow matrix"),
+            rhs: vec![f64::MAX, 0.0],
+        };
+        assert_atomic_failure(
+            rhs_correction_overflow,
+            &[f64::MAX, 0.0],
+            1.0,
+            "RHS entry 0 is not finite after correction",
+        );
     }
 
     #[test]
