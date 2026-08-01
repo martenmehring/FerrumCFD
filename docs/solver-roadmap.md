@@ -1854,9 +1854,18 @@ The immediate sequence is:
       contribution and its later net-flux correction. The active generic
       correction defers bounded diffusion diagonals until that conservative
       correction is complete and applies the Foundation-13 equation-relaxation
-      formula before deriving `rAU`. All seven
-      6F solves must be rerun from one exact merged tree before point 6 can
-      close; the retained pre-correction artifacts are diagnostic only.
+      formula before deriving `rAU`. The first retained G2 diagnostic on that
+      candidate then stopped fail-closed at boundary face `171582`: its
+      `rAU = 2.1752942825948595e-16` was finite and positive but fell just below
+      an absolute `f64::EPSILON` guard in `fixedFluxPressure`. Foundation 13 has
+      no corresponding absolute cutoff in its `rAU`, `constrainPressure`, or
+      pressure-Laplacian path. The active correction therefore accepts every
+      representable positive `rAU`/`rAtU`, restores the exact consistent
+      `rAtU >= rAU` invariant after reciprocal roundoff, and retains fail-closed
+      checks for zero, underflow, overflow, non-finite derived values, and
+      non-positive denominators. A fresh retained G2 diagnostic remains required,
+      followed by all seven 6F solves from one exact merged tree before point 6
+      can close; every pre-correction artifact remains diagnostic only.
 
    The executed per-leaf protocols, fixed-work budgets, input hashes, and
    results are recorded above and in external hashed artifacts; they must not be

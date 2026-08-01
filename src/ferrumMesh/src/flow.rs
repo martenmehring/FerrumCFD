@@ -4774,7 +4774,7 @@ fn consistent_phi_hby_a_pressure_correction_with_geometry(
     let mut delta = Vec::with_capacity(mesh.cells);
     for (cell, (r_au, r_at_u)) in r_au.iter().zip(r_at_u).enumerate() {
         let value = r_at_u - r_au;
-        if !value.is_finite() || value < -f64::EPSILON {
+        if !value.is_finite() || value < 0.0 {
             return Err(invalid_input(format!(
                 "consistent SIMPLE rAtU-rAU for cell {cell} must be non-negative and finite, got {value}"
             )));
@@ -4816,7 +4816,7 @@ fn consistent_phi_hby_a_pressure_correction_with_geometry_and_addressing(
     let mut delta = Vec::with_capacity(mesh.cells);
     for (cell, (r_au, r_at_u)) in r_au.iter().zip(r_at_u).enumerate() {
         let value = r_at_u - r_au;
-        if !value.is_finite() || value < -f64::EPSILON {
+        if !value.is_finite() || value < 0.0 {
             return Err(invalid_input(format!(
                 "consistent SIMPLE rAtU-rAU for cell {cell} must be non-negative and finite, got {value}"
             )));
@@ -5409,7 +5409,7 @@ fn reciprocal_momentum_diagonal(
         .zip(&mesh.cell_volumes)
         .enumerate()
         .map(|(cell, (diagonal, volume))| {
-            if !diagonal.is_finite() || *diagonal <= f64::EPSILON {
+            if !diagonal.is_finite() || *diagonal <= 0.0 {
                 return Err(invalid_input(format!(
                     "momentum diagonal for cell {cell} must be positive and finite, got {diagonal}"
                 )));
@@ -5419,7 +5419,13 @@ fn reciprocal_momentum_diagonal(
                     "cell volume for cell {cell} must be positive and finite, got {volume}"
                 )));
             }
-            Ok(velocity_relaxation * volume / diagonal)
+            let r_au = velocity_relaxation * volume / diagonal;
+            if !r_au.is_finite() || r_au <= 0.0 {
+                return Err(invalid_input(format!(
+                    "momentum cell {cell} produced invalid rAU {r_au}"
+                )));
+            }
+            Ok(r_au)
         })
         .collect()
 }
@@ -5448,7 +5454,7 @@ fn consistent_reciprocal_momentum_diagonal(
         .zip(h1)
         .enumerate()
         .map(|(cell, (r_au, h1))| {
-            if !r_au.is_finite() || *r_au <= f64::EPSILON {
+            if !r_au.is_finite() || *r_au <= 0.0 {
                 return Err(invalid_input(format!(
                     "consistent SIMPLE rAU for cell {cell} must be positive and finite, got {r_au}"
                 )));
@@ -5458,13 +5464,32 @@ fn consistent_reciprocal_momentum_diagonal(
                     "consistent SIMPLE H1 for cell {cell} must be non-negative and finite, got {h1}"
                 )));
             }
-            let denominator = (1.0 / r_au) - h1;
-            if !denominator.is_finite() || denominator <= f64::EPSILON {
+            let reciprocal_r_au = 1.0 / r_au;
+            if !reciprocal_r_au.is_finite() || reciprocal_r_au <= 0.0 {
+                return Err(invalid_input(format!(
+                    "consistent SIMPLE reciprocal rAU for cell {cell} must be positive and finite, got {reciprocal_r_au}"
+                )));
+            }
+            let denominator = reciprocal_r_au - h1;
+            if !denominator.is_finite() || denominator <= 0.0 {
                 return Err(invalid_input(format!(
                     "consistent SIMPLE rAtU denominator for cell {cell} must be positive and finite, got {denominator}"
                 )));
             }
-            Ok(1.0 / denominator)
+            let mut r_at_u = 1.0 / denominator;
+            if !r_at_u.is_finite() || r_at_u <= 0.0 {
+                return Err(invalid_input(format!(
+                    "consistent SIMPLE cell {cell} produced invalid rAtU {r_at_u}"
+                )));
+            }
+            // H1 is non-negative, so the exact formula guarantees rAtU >= rAU.
+            // Restore that analytic invariant when reciprocal roundoff lands one
+            // representable value below rAU; downstream delta paths can then use
+            // a strict sign check without a dimensionful absolute tolerance.
+            if r_at_u < *r_au {
+                r_at_u = *r_au;
+            }
+            Ok(r_at_u)
         })
         .collect()
 }
@@ -5921,9 +5946,15 @@ fn constrained_pressure_treatments_with_geometry_and_addressing(
                 "fixedFluxPressure face {face_index} has non-positive area magnitude {area}"
             )));
         }
-        if !face_r_au.is_finite() || face_r_au <= f64::EPSILON {
+        if !face_r_au.is_finite() || face_r_au <= 0.0 {
             return Err(invalid_input(format!(
                 "fixedFluxPressure face {face_index} has invalid rAU {face_r_au}"
+            )));
+        }
+        let pressure_flux_denominator = area * face_r_au;
+        if !pressure_flux_denominator.is_finite() || pressure_flux_denominator <= 0.0 {
+            return Err(invalid_input(format!(
+                "fixedFluxPressure face {face_index} has invalid area-rAU denominator {pressure_flux_denominator}"
             )));
         }
         let u_flux = prescribed_boundary_velocity_flux_with_addressing(
@@ -5946,7 +5977,23 @@ fn constrained_pressure_treatments_with_geometry_and_addressing(
                 mesh.face_area_vectors[face_index],
             )
         });
-        let gradient = (phi_hby_a[face_index] - u_flux) / (area * face_r_au);
+        let pressure_flux_difference = phi_hby_a[face_index] - u_flux;
+        if !pressure_flux_difference.is_finite() {
+            return Err(invalid_input(format!(
+                "fixedFluxPressure face {face_index} has non-finite flux difference {pressure_flux_difference}"
+            )));
+        }
+        let gradient = pressure_flux_difference / pressure_flux_denominator;
+        if !gradient.is_finite() {
+            return Err(invalid_input(format!(
+                "fixedFluxPressure face {face_index} produced non-finite gradient {gradient}"
+            )));
+        }
+        if pressure_flux_difference != 0.0 && gradient == 0.0 {
+            return Err(invalid_input(format!(
+                "fixedFluxPressure face {face_index} underflowed a non-zero flux difference to gradient {gradient}"
+            )));
+        }
         constrained[face_index] = ScalarFaceTreatment::FixedGradient(gradient);
     }
     Ok(constrained)
@@ -7109,7 +7156,27 @@ fn cached_fixed_gradient_pressure_flux(
             "fixed-gradient pressure face {face_index} has non-positive area magnitude {area}"
         )));
     }
-    Ok(-cell_diffusivity[owner] * area * gradient)
+    let diffusivity = cell_diffusivity[owner];
+    if !diffusivity.is_finite() || diffusivity < 0.0 {
+        return Err(invalid_input(format!(
+            "fixed-gradient pressure face {face_index} has invalid diffusivity {diffusivity}"
+        )));
+    }
+    if gradient == 0.0 {
+        return Ok(-0.0);
+    }
+    let flux = -diffusivity * area * gradient;
+    if !flux.is_finite() {
+        return Err(invalid_input(format!(
+            "fixed-gradient pressure face {face_index} produced non-finite flux {flux}"
+        )));
+    }
+    if diffusivity > 0.0 && flux == 0.0 {
+        return Err(invalid_input(format!(
+            "fixed-gradient pressure face {face_index} underflowed a non-zero flux to {flux}"
+        )));
+    }
+    Ok(flux)
 }
 
 fn boundary_normal_distance(mesh: &SolverRuntimeMeshData, owner: usize, face_index: usize) -> f64 {
@@ -7128,7 +7195,7 @@ fn boundary_normal_distance(mesh: &SolverRuntimeMeshData, owner: usize, face_ind
 
 fn validate_positive_cell_values(name: &str, values: &[f64]) -> Result<()> {
     for (index, value) in values.iter().copied().enumerate() {
-        if !value.is_finite() || value <= f64::EPSILON {
+        if !value.is_finite() || value <= 0.0 {
             return Err(invalid_input(format!(
                 "{name} value for cell {index} must be positive and finite, got {value}"
             )));
@@ -7809,6 +7876,32 @@ mod tests {
     }
 
     #[test]
+    fn reciprocal_momentum_diagonal_accepts_positive_sub_epsilon_scales() {
+        let runtime = two_cell_runtime();
+        let large_diagonal = 2.0_f64.powi(52);
+        let expected_r_au = 2.0_f64.powi(-53);
+
+        let r_au = reciprocal_momentum_diagonal(&runtime.mesh, &[large_diagonal, 1.0], 1.0)
+            .expect("finite positive sub-epsilon rAU");
+
+        assert_eq!(r_au[0].to_bits(), expected_r_au.to_bits());
+        assert!(r_au[0] > 0.0 && r_au[0] < f64::EPSILON);
+    }
+
+    #[test]
+    fn reciprocal_momentum_diagonal_rejects_unrepresentable_results() {
+        let runtime = two_cell_runtime();
+        let underflow =
+            reciprocal_momentum_diagonal(&runtime.mesh, &[f64::MAX, 1.0], f64::MIN_POSITIVE)
+                .expect_err("rAU underflow to zero must fail closed");
+        assert!(underflow.to_string().contains("invalid rAU 0"));
+
+        let overflow = reciprocal_momentum_diagonal(&runtime.mesh, &[f64::from_bits(1), 1.0], 1.0)
+            .expect_err("non-finite rAU must fail closed");
+        assert!(overflow.to_string().contains("invalid rAU inf"));
+    }
+
+    #[test]
     fn consistent_simple_r_at_u_uses_h1_term() {
         let runtime = two_cell_runtime();
         let r_at_u =
@@ -7820,6 +7913,58 @@ mod tests {
         assert_close(r_at_u[1], 1.0 / 6.0);
         assert!(delta[0] > 0.0);
         assert!(delta[1] > 0.0);
+    }
+
+    #[test]
+    fn consistent_simple_accepts_positive_sub_epsilon_r_au() {
+        let runtime = two_cell_runtime();
+        let tiny_r_au = f64::EPSILON.next_down();
+
+        let r_at_u = consistent_reciprocal_momentum_diagonal(
+            &runtime.mesh,
+            &[tiny_r_au, 0.125],
+            &[0.0, 2.0],
+        )
+        .expect("finite positive sub-epsilon rAU");
+
+        assert!(r_at_u[0].is_finite());
+        assert!(r_at_u[0] > 0.0 && r_at_u[0] < f64::EPSILON);
+    }
+
+    #[test]
+    fn consistent_simple_restores_the_exact_r_at_u_not_below_r_au_invariant() {
+        let runtime = two_cell_runtime();
+        let r_au = f64::from_bits(0x411a_b260_300f_079c);
+        let rounded_reciprocal = 1.0 / (1.0 / r_au);
+        assert!(rounded_reciprocal < r_au);
+
+        let r_at_u =
+            consistent_reciprocal_momentum_diagonal(&runtime.mesh, &[r_au, 0.125], &[0.0, 2.0])
+                .expect("roundoff-safe consistent rAtU");
+
+        assert_eq!(r_at_u[0].to_bits(), r_au.to_bits());
+    }
+
+    #[test]
+    fn consistent_simple_rejects_unrepresentable_reciprocal_or_r_at_u() {
+        let runtime = two_cell_runtime();
+        let reciprocal_overflow = consistent_reciprocal_momentum_diagonal(
+            &runtime.mesh,
+            &[f64::from_bits(1), 0.125],
+            &[0.0, 2.0],
+        )
+        .expect_err("non-finite reciprocal rAU must fail closed");
+        assert!(reciprocal_overflow.to_string().contains("reciprocal rAU"));
+
+        let reciprocal = f64::MIN_POSITIVE;
+        let r_au = 1.0 / reciprocal;
+        let output_overflow = consistent_reciprocal_momentum_diagonal(
+            &runtime.mesh,
+            &[r_au, 0.125],
+            &[reciprocal.next_down(), 2.0],
+        )
+        .expect_err("non-finite rAtU must fail closed");
+        assert!(output_overflow.to_string().contains("invalid rAtU inf"));
     }
 
     #[test]
@@ -10018,6 +10163,49 @@ mod tests {
     }
 
     #[test]
+    fn consistent_simple_pressure_correction_rejects_any_negative_r_at_u_delta() {
+        let runtime = two_cell_runtime();
+        let boundary = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
+        let pressure = vec![1.0, 0.0];
+        let r_au = vec![1.0, 1.0];
+        let r_at_u = vec![1.0_f64.next_down(), 1.0];
+        let pressure_geometry = super::PressureGeometryCache::from_mesh(&runtime.mesh);
+        let face_addressing =
+            super::CompactSimpleFaceAddressing::from_mesh(&runtime.mesh).expect("face addressing");
+
+        let legacy_geometry_path = super::consistent_phi_hby_a_pressure_correction_with_geometry(
+            &runtime.mesh,
+            &pressure_geometry,
+            &pressure,
+            &boundary,
+            &r_au,
+            &r_at_u,
+        )
+        .expect_err("negative rAtU-rAU must fail without an absolute tolerance");
+        assert!(
+            legacy_geometry_path
+                .to_string()
+                .contains("must be non-negative and finite")
+        );
+
+        let production_addressing_path =
+            super::consistent_phi_hby_a_pressure_correction_with_geometry_and_addressing(
+                &runtime.mesh,
+                &pressure_geometry,
+                &face_addressing,
+                &pressure,
+                &boundary,
+                &r_au,
+                &r_at_u,
+            )
+            .expect_err("production negative rAtU-rAU must fail without an absolute tolerance");
+        assert_eq!(
+            production_addressing_path.to_string(),
+            legacy_geometry_path.to_string()
+        );
+    }
+
+    #[test]
     fn consistent_simple_hby_a_matches_openfoam_update() {
         let hby_a = vec![point(4.0, 0.0, 0.0), point(2.0, 0.0, 0.0)];
         let grad_p = vec![point(3.0, 0.0, 0.0), point(5.0, 0.0, 0.0)];
@@ -10214,6 +10402,235 @@ mod tests {
                 .expect("pressure flux");
 
         assert_close(phi_hby_a[1] + pressure_flux[1], -1.0);
+    }
+
+    #[test]
+    fn pressure_path_accepts_the_finite_positive_g2_sub_epsilon_r_au() {
+        let runtime = two_cell_runtime();
+        let fields = two_cell_fields();
+        let u_field = fields
+            .fields
+            .iter()
+            .find(|field| field.name == "U")
+            .expect("U field");
+        let velocity_boundary = vector_face_treatments(&runtime.mesh, u_field).expect("U boundary");
+        let velocity = vec![point(0.0, 0.0, 0.0), point(0.0, 0.0, 0.0)];
+        let mut pressure_boundary = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
+        pressure_boundary[1] = ScalarFaceTreatment::FixedGradient(0.0);
+        let phi_hby_a = vec![0.0, -0.25, 0.0];
+        let g2_r_au: f64 = 2.175_294_282_594_859_5e-16;
+        assert_eq!(g2_r_au.to_bits(), 0x3caf_596b_5cb2_a31e);
+        assert!(g2_r_au > 0.0 && g2_r_au < f64::EPSILON);
+        let r_au = vec![g2_r_au; runtime.mesh.cells];
+
+        let constrained = constrained_pressure_treatments(
+            &runtime.mesh,
+            &pressure_boundary,
+            &velocity_boundary,
+            &velocity,
+            &phi_hby_a,
+            &r_au,
+        )
+        .expect("finite positive G2 rAU pressure constraint");
+        assert!(matches!(
+            constrained[1],
+            ScalarFaceTreatment::FixedGradient(gradient) if gradient.is_finite()
+        ));
+
+        let system = assemble_variable_scalar_component_system(
+            &runtime.mesh,
+            &r_au,
+            &[0.0, 0.0],
+            &constrained,
+        )
+        .expect("finite positive G2 rAU pressure matrix");
+        assert!(system.matrix.values().iter().all(|value| value.is_finite()));
+        for diagonal in system.matrix.diagonal().expect("pressure diagonal") {
+            assert!(diagonal.is_finite() && diagonal > 0.0);
+        }
+
+        let pressure_flux =
+            pressure_correction_flux(&runtime.mesh, &[0.0, 0.0], &r_au, &constrained)
+                .expect("finite positive G2 rAU pressure flux");
+        assert!(pressure_flux.iter().all(|value| value.is_finite()));
+        assert_close(phi_hby_a[1] + pressure_flux[1], -1.0);
+
+        let scalar_gradient_geometry =
+            ScalarGradientGeometry::from_mesh(&runtime.mesh).expect("scalar gradient geometry");
+        let non_orthogonal_flux = non_orthogonal_pressure_flux_correction(
+            &runtime.mesh,
+            &scalar_gradient_geometry,
+            &[0.0, 0.0],
+            &r_au,
+            &constrained,
+            LaminarSimpleGradientScheme::GaussLinear,
+        )
+        .expect("finite positive G2 rAtU non-orthogonal flux");
+        assert!(non_orthogonal_flux.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn fixed_flux_pressure_rejects_an_unrepresentable_subnormal_gradient() {
+        let runtime = two_cell_runtime();
+        let fields = two_cell_fields();
+        let u_field = fields
+            .fields
+            .iter()
+            .find(|field| field.name == "U")
+            .expect("U field");
+        let velocity_boundary = vector_face_treatments(&runtime.mesh, u_field).expect("U boundary");
+        let velocity = vec![point(0.0, 0.0, 0.0), point(0.0, 0.0, 0.0)];
+        let mut pressure_boundary = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
+        pressure_boundary[1] = ScalarFaceTreatment::FixedGradient(0.0);
+        let phi_hby_a = vec![0.0, -0.25, 0.0];
+        let mut r_au = vec![1.0; runtime.mesh.cells];
+        r_au[runtime.mesh.owner[1]] = f64::MIN_POSITIVE / 8.0;
+
+        let error = constrained_pressure_treatments(
+            &runtime.mesh,
+            &pressure_boundary,
+            &velocity_boundary,
+            &velocity,
+            &phi_hby_a,
+            &r_au,
+        )
+        .expect_err("non-finite fixedFluxPressure gradient must fail closed");
+        assert!(error.to_string().contains("non-finite gradient"));
+
+        let mut zero_velocity_boundary =
+            vec![VectorFaceTreatment::ZeroGradient; runtime.mesh.faces];
+        zero_velocity_boundary[1] = VectorFaceTreatment::FixedValue(zero());
+        let mut finite_r_au = vec![1.0; runtime.mesh.cells];
+        finite_r_au[runtime.mesh.owner[1]] = 2.0;
+        let gradient_underflow = constrained_pressure_treatments(
+            &runtime.mesh,
+            &pressure_boundary,
+            &zero_velocity_boundary,
+            &velocity,
+            &[0.0, f64::from_bits(1), 0.0],
+            &finite_r_au,
+        )
+        .expect_err("non-zero fixedFluxPressure gradient underflow must fail closed");
+        assert!(
+            gradient_underflow
+                .to_string()
+                .contains("underflowed a non-zero flux difference to gradient 0")
+        );
+    }
+
+    #[test]
+    fn fixed_flux_pressure_rejects_unrepresentable_denominators_and_flux_difference() {
+        let fields = two_cell_fields();
+        let u_field = fields
+            .fields
+            .iter()
+            .find(|field| field.name == "U")
+            .expect("U field");
+
+        let mut underflow_runtime = two_cell_runtime();
+        underflow_runtime.mesh.face_area_vectors[1] = point(f64::EPSILON.next_up(), 0.0, 0.0);
+        let velocity_boundary =
+            vector_face_treatments(&underflow_runtime.mesh, u_field).expect("U boundary");
+        let mut pressure_boundary =
+            vec![ScalarFaceTreatment::ZeroGradient; underflow_runtime.mesh.faces];
+        pressure_boundary[1] = ScalarFaceTreatment::FixedGradient(0.0);
+        let mut r_au = vec![1.0; underflow_runtime.mesh.cells];
+        r_au[underflow_runtime.mesh.owner[1]] = f64::from_bits(1);
+        let denominator_underflow = constrained_pressure_treatments(
+            &underflow_runtime.mesh,
+            &pressure_boundary,
+            &velocity_boundary,
+            &[point(0.0, 0.0, 0.0); 2],
+            &[0.0, -0.25, 0.0],
+            &r_au,
+        )
+        .expect_err("area-rAU underflow must fail closed");
+        assert!(
+            denominator_underflow
+                .to_string()
+                .contains("invalid area-rAU denominator 0")
+        );
+
+        let mut overflow_runtime = two_cell_runtime();
+        overflow_runtime.mesh.face_area_vectors[1] = point(1.0e150, 0.0, 0.0);
+        let velocity_boundary =
+            vector_face_treatments(&overflow_runtime.mesh, u_field).expect("U boundary");
+        let mut r_au = vec![1.0; overflow_runtime.mesh.cells];
+        r_au[overflow_runtime.mesh.owner[1]] = 1.0e200;
+        let denominator_overflow = constrained_pressure_treatments(
+            &overflow_runtime.mesh,
+            &pressure_boundary,
+            &velocity_boundary,
+            &[point(0.0, 0.0, 0.0); 2],
+            &[0.0, -0.25, 0.0],
+            &r_au,
+        )
+        .expect_err("area-rAU overflow must fail closed");
+        assert!(
+            denominator_overflow
+                .to_string()
+                .contains("invalid area-rAU denominator inf")
+        );
+
+        let runtime = two_cell_runtime();
+        let mut velocity_boundary = vec![VectorFaceTreatment::ZeroGradient; runtime.mesh.faces];
+        velocity_boundary[1] = VectorFaceTreatment::FixedValue(point(f64::MAX, 0.0, 0.0));
+        let flux_difference_overflow = constrained_pressure_treatments(
+            &runtime.mesh,
+            &pressure_boundary,
+            &velocity_boundary,
+            &[point(0.0, 0.0, 0.0); 2],
+            &[0.0, f64::MAX, 0.0],
+            &[1.0, 1.0],
+        )
+        .expect_err("fixedFluxPressure flux subtraction overflow must fail closed");
+        assert!(
+            flux_difference_overflow
+                .to_string()
+                .contains("non-finite flux difference inf")
+        );
+    }
+
+    #[test]
+    fn fixed_gradient_pressure_flux_rejects_unrepresentable_results() {
+        let runtime = two_cell_runtime();
+        let pressure_geometry = super::PressureGeometryCache::from_mesh(&runtime.mesh);
+        let face = 1;
+        let owner = runtime.mesh.owner[face];
+
+        let overflow = super::cached_fixed_gradient_pressure_flux(
+            &pressure_geometry,
+            &[f64::MAX, 1.0],
+            owner,
+            face,
+            f64::MAX,
+        )
+        .expect_err("fixed-gradient pressure flux overflow must fail closed");
+        assert!(overflow.to_string().contains("non-finite flux -inf"));
+
+        let underflow = super::cached_fixed_gradient_pressure_flux(
+            &pressure_geometry,
+            &[f64::from_bits(1), 1.0],
+            owner,
+            face,
+            0.5,
+        )
+        .expect_err("fixed-gradient pressure flux underflow must fail closed");
+        assert!(
+            underflow
+                .to_string()
+                .contains("underflowed a non-zero flux to -0")
+        );
+
+        let zero_delta = super::cached_fixed_gradient_pressure_flux(
+            &pressure_geometry,
+            &[0.0, 1.0],
+            owner,
+            face,
+            1.0,
+        )
+        .expect("zero consistent-delta diffusivity remains valid");
+        assert_eq!(zero_delta.to_bits(), (-0.0_f64).to_bits());
     }
 
     #[test]

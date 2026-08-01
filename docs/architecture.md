@@ -664,6 +664,14 @@ pressure solve. `SIMPLE.consistent true` switches the pressure and velocity
 correction to a Rust `rAtU` value derived from the current momentum matrix
 (`1/rAU - H1`), and the non-orthogonal corrector loop now rebuilds the pressure
 source with an explicit non-orthogonal pressure-flux correction between solves.
+Finite positive `rAU`/`rAtU` values remain valid independent of their absolute
+magnitude, matching the Foundation 13 pressure-coupling path instead of using a
+dimensionful machine-epsilon cutoff. Underflow to zero, overflow, non-finite
+`rAU` reciprocals, area-`rAU` denominators, and fixed-gradient values or fluxes
+still fail closed.
+The consistent path also restores its analytic `rAtU >= rAU` invariant after
+reciprocal roundoff, so downstream differences use a strict sign contract rather
+than an absolute tolerance.
 The momentum convection term is scheme-driven. `Gauss upwind` uses a fully
 implicit upwind contribution. `Gauss linearUpwind grad(U)` keeps the same
 non-symmetric upwind matrix and adds the gradient part as a deferred
