@@ -581,12 +581,17 @@ non-symmetric `bicgstab` momentum path with a PCG pressure solve without
 changing the case files. OpenFOAM-style `fvSolution`
 entries are the default source for pressure and velocity under-relaxation and
 for per-equation linear
-tolerances: `relaxationFactors.equations.U`,
+tolerances: `relaxationFactors.equations.U` with
+`relaxationFactors.equations.default` fallback,
 `relaxationFactors.fields.p`, `solvers.U.tolerance`, `solvers.p.tolerance`,
 `solvers.U.relTol`, `solvers.p.relTol`,
 `solvers.p.solver PCG`, `solvers.p.preconditioner DIC`,
 `SIMPLE.nNonOrthogonalCorrectors`, `SIMPLE.pRefCell`, `SIMPLE.pRefValue`, and
-`SIMPLE.consistent`, and optional `maxIter` values. OpenFOAM-style
+`SIMPLE.consistent`, and optional `maxIter` values. Momentum equation
+relaxation also preserves configuration presence: missing `U` and
+`equations.default` entries are a no-op, whereas an explicit effective value
+of `1` still applies the Foundation-style diagonal-dominance transformation.
+OpenFOAM-style
 `SIMPLE.residualControl` entries for `U` and `p` are read as the normal
 early-convergence criteria. As in OpenFOAM Foundation 13, each steady SIMPLE
 criterion is one absolute scalar. Ferrum evaluates the initial residual from

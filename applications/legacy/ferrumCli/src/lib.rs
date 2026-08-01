@@ -2665,6 +2665,13 @@ fn resolve_laminar_simple_options(
         .or(fv_solution_bool(plan, "SIMPLE", "consistent")?)
         .unwrap_or(false);
     let schemes = resolve_laminar_simple_schemes(plan)?;
+    let velocity_relaxation = if let Some(relaxation) = solve.velocity_relaxation {
+        Some(relaxation)
+    } else if let Some(relaxation) = fv_solution_number(plan, "relaxationFactors.equations", "U")? {
+        Some(relaxation)
+    } else {
+        fv_solution_number(plan, "relaxationFactors.equations", "default")?
+    };
 
     Ok(LaminarSimpleOptions {
         density,
@@ -2695,14 +2702,7 @@ fn resolve_laminar_simple_options(
         pressure_reference_value,
         non_orthogonal_correctors,
         simple_consistent,
-        velocity_relaxation: solve
-            .velocity_relaxation
-            .or(fv_solution_number(
-                plan,
-                "relaxationFactors.equations",
-                "U",
-            )?)
-            .unwrap_or(1.0),
+        velocity_relaxation,
         pressure_relaxation: solve
             .pressure_relaxation
             .or(fv_solution_number(plan, "relaxationFactors.fields", "p")?)
@@ -4949,7 +4949,7 @@ fn write_json_laminar_simple_options(
     write_json_optional_number(writer, Some(options.pressure_linear_relative_tolerance))?;
     writeln!(writer, ",")?;
     write_json_key(writer, 4, "velocityRelaxation")?;
-    write_json_optional_number(writer, Some(options.velocity_relaxation))?;
+    write_json_optional_number(writer, options.velocity_relaxation)?;
     writeln!(writer, ",")?;
     write_json_key(writer, 4, "pressureRelaxation")?;
     write_json_optional_number(writer, Some(options.pressure_relaxation))?;
@@ -5588,6 +5588,22 @@ fn write_json_incident_face_diagnostic_summary(
         ("maxAbsFaceOwner", summary.max_abs_face_owner),
         ("maxAbsFaceNeighbour", summary.max_abs_face_neighbour),
         ("maxAbsFacePatchIndex", summary.max_abs_face_patch_index),
+        (
+            "firstNonFiniteFaceIndex",
+            summary.first_non_finite_face_index,
+        ),
+        (
+            "firstNonFiniteFaceOwner",
+            summary.first_non_finite_face_owner,
+        ),
+        (
+            "firstNonFiniteFaceNeighbour",
+            summary.first_non_finite_face_neighbour,
+        ),
+        (
+            "firstNonFiniteFacePatchIndex",
+            summary.first_non_finite_face_patch_index,
+        ),
     ] {
         writeln!(writer, ",")?;
         write_json_key(writer, indent + 2, name)?;
@@ -10786,6 +10802,53 @@ mod tests {
     }
 
     #[test]
+    fn incident_face_json_keeps_finite_maximum_and_non_finite_origin_distinct() {
+        let summary = IncidentFaceDiagnosticSummary {
+            representable: false,
+            count: 2,
+            signed_sum: Some(5.0),
+            sum_abs: Some(5.0),
+            min: Some(5.0),
+            max: Some(5.0),
+            max_abs_face_index: Some(1),
+            max_abs_face_owner: Some(0),
+            max_abs_face_neighbour: None,
+            max_abs_face_patch_index: Some(0),
+            max_abs_face_flux: Some(5.0),
+            first_non_finite_face_index: Some(0),
+            first_non_finite_face_owner: Some(0),
+            first_non_finite_face_neighbour: Some(1),
+            first_non_finite_face_patch_index: None,
+        };
+        let mut json = Vec::new();
+        super::write_json_incident_face_diagnostic_summary(&mut json, 0, &summary)
+            .expect("incident-face JSON");
+
+        assert_eq!(
+            String::from_utf8(json).expect("UTF-8 incident-face diagnostic"),
+            concat!(
+                "{\n",
+                "  \"representable\": false,\n",
+                "  \"count\": 2,\n",
+                "  \"signedSum\": 5,\n",
+                "  \"sumAbs\": 5,\n",
+                "  \"min\": 5,\n",
+                "  \"max\": 5,\n",
+                "  \"maxAbsFaceFlux\": 5,\n",
+                "  \"maxAbsFaceIndex\": 1,\n",
+                "  \"maxAbsFaceOwner\": 0,\n",
+                "  \"maxAbsFaceNeighbour\": null,\n",
+                "  \"maxAbsFacePatchIndex\": 0,\n",
+                "  \"firstNonFiniteFaceIndex\": 0,\n",
+                "  \"firstNonFiniteFaceOwner\": 0,\n",
+                "  \"firstNonFiniteFaceNeighbour\": 1,\n",
+                "  \"firstNonFiniteFacePatchIndex\": null\n",
+                "}"
+            )
+        );
+    }
+
+    #[test]
     fn simple_json_report_exposes_fixed_size_first_nonconvergence_diagnostics() {
         let empty_report = output_test_report();
         let mut empty_diagnostics = Vec::new();
@@ -10834,7 +10897,11 @@ mod tests {
                 "    \"maxAbsFaceIndex\": null,\n",
                 "    \"maxAbsFaceOwner\": null,\n",
                 "    \"maxAbsFaceNeighbour\": null,\n",
-                "    \"maxAbsFacePatchIndex\": null\n",
+                "    \"maxAbsFacePatchIndex\": null,\n",
+                "    \"firstNonFiniteFaceIndex\": null,\n",
+                "    \"firstNonFiniteFaceOwner\": null,\n",
+                "    \"firstNonFiniteFaceNeighbour\": null,\n",
+                "    \"firstNonFiniteFacePatchIndex\": null\n",
                 "  }\n",
                 "}"
             )
@@ -10890,6 +10957,10 @@ mod tests {
                     max_abs_face_neighbour: Some(43),
                     max_abs_face_patch_index: None,
                     max_abs_face_flux: Some(0.75),
+                    first_non_finite_face_index: None,
+                    first_non_finite_face_owner: None,
+                    first_non_finite_face_neighbour: None,
+                    first_non_finite_face_patch_index: None,
                 },
             },
         };
@@ -10949,7 +11020,11 @@ mod tests {
                 "      \"maxAbsFaceIndex\": 9,\n",
                 "      \"maxAbsFaceOwner\": 42,\n",
                 "      \"maxAbsFaceNeighbour\": 43,\n",
-                "      \"maxAbsFacePatchIndex\": null\n",
+                "      \"maxAbsFacePatchIndex\": null,\n",
+                "      \"firstNonFiniteFaceIndex\": null,\n",
+                "      \"firstNonFiniteFaceOwner\": null,\n",
+                "      \"firstNonFiniteFaceNeighbour\": null,\n",
+                "      \"firstNonFiniteFacePatchIndex\": null\n",
                 "    }\n",
                 "  }\n",
                 "}"
@@ -10984,6 +11059,7 @@ mod tests {
         assert!(json.contains("\"worstAlgebraicResidualRow\""));
         assert!(json.contains("\"row\": 42"));
         assert!(json.contains("\"maxAbsFacePatchIndex\": null"));
+        assert!(json.contains("\"firstNonFiniteFaceIndex\": null"));
 
         let _ = std::fs::remove_dir_all(base);
     }
@@ -12516,6 +12592,76 @@ mod tests {
     }
 
     #[test]
+    fn laminar_simple_resolves_equation_relaxation_presence_and_precedence() {
+        let parsed = parse_incompressible_fluid_args(&[]).expect("solver args should parse");
+        let solve = parsed
+            .laminar_simple_solve
+            .expect("laminar SIMPLE solve args");
+
+        let absent_plan = laminar_simple_test_plan(1000.0, 0.001002);
+        let absent = resolve_laminar_simple_options(&absent_plan, &solve)
+            .expect("missing U relaxation should resolve");
+        assert_eq!(absent.velocity_relaxation, None);
+        let mut absent_json = Vec::new();
+        super::write_json_laminar_simple_options(&mut absent_json, &absent, false)
+            .expect("absent equation relaxation JSON");
+        assert!(
+            String::from_utf8(absent_json)
+                .expect("UTF-8 options JSON")
+                .contains("\"velocityRelaxation\": null")
+        );
+
+        let mut default_plan = laminar_simple_test_plan(1000.0, 0.001002);
+        default_plan
+            .numerics
+            .fv_solution
+            .entries
+            .push(SolverNumericsEntryPlan {
+                section: "relaxationFactors.equations".to_string(),
+                key: "default".to_string(),
+                value: "0.6".to_string(),
+            });
+        let default = resolve_laminar_simple_options(&default_plan, &solve)
+            .expect("default equation relaxation should resolve");
+        assert_eq!(default.velocity_relaxation, Some(0.6));
+
+        let mut explicit_plan = laminar_simple_test_plan(1000.0, 0.001002);
+        explicit_plan
+            .numerics
+            .fv_solution
+            .entries
+            .push(SolverNumericsEntryPlan {
+                section: "relaxationFactors.equations".to_string(),
+                key: "U".to_string(),
+                value: "1".to_string(),
+            });
+        explicit_plan
+            .numerics
+            .fv_solution
+            .entries
+            .push(SolverNumericsEntryPlan {
+                section: "relaxationFactors.equations".to_string(),
+                key: "default".to_string(),
+                value: "0.6".to_string(),
+            });
+        let explicit = resolve_laminar_simple_options(&explicit_plan, &solve)
+            .expect("explicit U relaxation should resolve");
+        assert_eq!(explicit.velocity_relaxation, Some(1.0));
+
+        let override_parsed = parse_incompressible_fluid_args(&[
+            "--velocityRelaxation".to_string(),
+            "0.9".to_string(),
+        ])
+        .expect("CLI equation relaxation should parse");
+        let override_solve = override_parsed
+            .laminar_simple_solve
+            .expect("laminar SIMPLE solve args");
+        let overridden = resolve_laminar_simple_options(&explicit_plan, &override_solve)
+            .expect("CLI equation relaxation should override the dictionary");
+        assert_eq!(overridden.velocity_relaxation, Some(0.9));
+    }
+
+    #[test]
     fn laminar_simple_resolves_explicit_parallel_momentum_execution() {
         let plan = laminar_simple_test_plan(1000.0, 0.001002);
         let parsed = parse_incompressible_fluid_args(&[
@@ -12796,7 +12942,7 @@ mod tests {
             pressure_reference_value: 0.0,
             non_orthogonal_correctors: 0,
             simple_consistent: false,
-            velocity_relaxation: 0.7,
+            velocity_relaxation: Some(0.7),
             pressure_relaxation: 0.3,
             schemes: LaminarSimpleSchemes::default(),
         }

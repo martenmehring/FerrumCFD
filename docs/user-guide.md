@@ -719,9 +719,13 @@ ferrumRun -solver incompressibleFluid -case tutorials/incompressibleFluid/lamina
 ```
 
 By default, the current SIMPLE implementation reads OpenFOAM-style relaxation factors from
-`system/fvSolution`: `relaxationFactors.equations.U` for velocity and
+`system/fvSolution`: `relaxationFactors.equations.U`, falling back to
+`relaxationFactors.equations.default`, for velocity and
 `relaxationFactors.fields.p` for pressure. The CLI flags above are explicit
-overrides for experiments. It also reads `solvers.U.tolerance`,
+overrides for experiments. Matching OpenFOAM Foundation 13, momentum-equation
+relaxation is disabled only when both `U` and `equations.default` are absent,
+while an explicit effective value of `1` still performs the diagonal-dominance
+step of equation relaxation. It also reads `solvers.U.tolerance`,
 `solvers.p.tolerance`, `solvers.U.relTol`, `solvers.p.relTol`,
 `solvers.p.solver PCG`, `solvers.p.preconditioner DIC`,
 `SIMPLE.nNonOrthogonalCorrectors`, `SIMPLE.pRefCell`, `SIMPLE.pRefValue`, and
@@ -869,7 +873,12 @@ convergence flag, initial normalized residual, raw L2 residual, final normalized
 residual, effective normalized tolerance, and stop reason (`NotRun`,
 `ExactZero`, `AbsoluteTolerance`, `RelativeTolerance`, `MaxIterations`, or
 `Breakdown`). These fields are additive: the existing aggregate fields remain
-available. The iteration history, CSV, console, JSON, and Markdown outputs
+available. JSON additionally records the first non-converged momentum and
+pressure solves under `linearNonConvergenceDiagnostics`. Their worst algebraic
+row contains `incidentFaces`: `maxAbsFace*` identifies the largest finite
+incident flux, while `firstNonFiniteFace*` identifies the lowest global
+incident mesh-face index with a NaN or infinite flux; unavailable values are
+`null`. The iteration history, CSV, console, JSON, and Markdown outputs
 distinguish each field's OpenFOAM-normalized initial residual from its final
 linear residual and show the outer `residualControl` state independently.
 The top-level JSON `outerConvergence` object records `status`, `configured`,

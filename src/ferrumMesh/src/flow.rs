@@ -182,7 +182,7 @@ pub struct LaminarSimpleOptions {
     pub pressure_reference_value: f64,
     pub non_orthogonal_correctors: usize,
     pub simple_consistent: bool,
-    pub velocity_relaxation: f64,
+    pub velocity_relaxation: Option<f64>,
     pub pressure_relaxation: f64,
     pub schemes: LaminarSimpleSchemes,
 }
@@ -434,6 +434,11 @@ pub struct IncidentFaceDiagnosticSummary {
     pub max_abs_face_patch_index: Option<usize>,
     /// Stored mesh face flux before cell-orientation; sign follows owner addressing.
     pub max_abs_face_flux: Option<f64>,
+    /// Lowest global mesh-face index among incident faces whose stored flux is NaN or infinite.
+    pub first_non_finite_face_index: Option<usize>,
+    pub first_non_finite_face_owner: Option<usize>,
+    pub first_non_finite_face_neighbour: Option<usize>,
+    pub first_non_finite_face_patch_index: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1382,7 +1387,7 @@ fn solve_laminar_simple_driven(
         let r_au = reciprocal_momentum_diagonal(
             &runtime.mesh,
             &momentum.diagonal,
-            options.velocity_relaxation,
+            options.velocity_relaxation.unwrap_or(1.0),
         )?;
         let r_at_u = if options.simple_consistent {
             consistent_reciprocal_momentum_diagonal(&runtime.mesh, &r_au, &momentum.h1)?
@@ -3748,6 +3753,7 @@ fn attach_incident_face_diagnostics(
     let mut max_abs = f64::NEG_INFINITY;
     let mut max_abs_face_index = None;
     let mut max_abs_face_flux = None;
+    let mut first_non_finite_face_index = None;
     let mut values_representable = lengths_match;
 
     for (face_index, &face_flux) in flux.iter().enumerate().take(face_count) {
@@ -3763,10 +3769,7 @@ fn attach_incident_face_diagnostics(
         count += 1;
         if !face_flux.is_finite() {
             values_representable = false;
-            if max_abs_face_index.is_none() {
-                max_abs_face_index = Some(face_index);
-                max_abs_face_flux = None;
-            }
+            first_non_finite_face_index.get_or_insert(face_index);
             continue;
         }
         let signed_flux = orientation * face_flux;
@@ -3788,7 +3791,7 @@ fn attach_incident_face_diagnostics(
     let max_abs_face_owner = max_abs_face_index.map(|face| face_addressing.owner(face));
     let max_abs_face_neighbour =
         max_abs_face_index.and_then(|face| face_addressing.neighbour(face));
-    let max_abs_face_patch_index = max_abs_face_index.and_then(|face| {
+    let patch_index_for_face = |face| {
         mesh.patches
             .iter()
             .enumerate()
@@ -3799,7 +3802,14 @@ fn attach_incident_face_diagnostics(
                     .filter(|end| face >= patch.start_face && face < *end)
                     .map(|_| patch_index)
             })
-    });
+    };
+    let max_abs_face_patch_index = max_abs_face_index.and_then(&patch_index_for_face);
+    let first_non_finite_face_owner =
+        first_non_finite_face_index.map(|face| face_addressing.owner(face));
+    let first_non_finite_face_neighbour =
+        first_non_finite_face_index.and_then(|face| face_addressing.neighbour(face));
+    let first_non_finite_face_patch_index =
+        first_non_finite_face_index.and_then(patch_index_for_face);
     diagnostic.incident_faces = IncidentFaceDiagnosticSummary {
         representable: values_representable,
         count,
@@ -3812,6 +3822,10 @@ fn attach_incident_face_diagnostics(
         max_abs_face_neighbour,
         max_abs_face_patch_index,
         max_abs_face_flux,
+        first_non_finite_face_index,
+        first_non_finite_face_owner,
+        first_non_finite_face_neighbour,
+        first_non_finite_face_patch_index,
     };
     diagnostic.representable &= diagnostic.cell_volume.is_some() && values_representable;
     diagnostic
@@ -3906,8 +3920,11 @@ fn normalized_residual_norm(residual_norm: f64, reference_norm: f64) -> f64 {
 fn relax_scalar_component_equation(
     system: &mut ScalarComponentSystem,
     old_solution: &[f64],
-    relaxation: f64,
+    relaxation: Option<f64>,
 ) -> Result<Vec<f64>> {
+    let Some(relaxation) = relaxation else {
+        return system.matrix.diagonal();
+    };
     let rows = system.matrix.rows();
     if system.matrix.cols() != rows {
         return Err(invalid_input(format!(
@@ -7589,7 +7606,9 @@ fn validate_laminar_simple_options(options: &LaminarSimpleOptions) -> Result<()>
         "laminar SIMPLE p residualControl",
         options.pressure_residual_control,
     )?;
-    validate_relaxation("velocity", options.velocity_relaxation)?;
+    if let Some(relaxation) = options.velocity_relaxation {
+        validate_relaxation("velocity", relaxation)?;
+    }
     validate_relaxation("pressure", options.pressure_relaxation)?;
     Ok(())
 }
@@ -8954,7 +8973,7 @@ mod tests {
             rhs: vec![5.0, 7.0],
         };
 
-        let base_diagonal = relax_scalar_component_equation(&mut system, &old_values, 0.5)
+        let base_diagonal = relax_scalar_component_equation(&mut system, &old_values, Some(0.5))
             .expect("relaxed momentum system");
 
         assert_eq!(base_diagonal, vec![4.0, 2.0]);
@@ -9005,7 +9024,7 @@ mod tests {
             rhs: original_rhs,
         };
 
-        let base_diagonal = relax_scalar_component_equation(&mut system, &old_solution, 0.5)
+        let base_diagonal = relax_scalar_component_equation(&mut system, &old_solution, Some(0.5))
             .expect("OpenFOAM equation relaxation");
 
         assert_eq!(base_diagonal, vec![7.0, 3.0, 10.0]);
@@ -9082,7 +9101,7 @@ mod tests {
         let assembled_values = system.matrix.values().to_vec();
         let assembled_rhs = system.rhs.clone();
 
-        let base_diagonal = relax_scalar_component_equation(&mut system, &old_values, 1.0)
+        let base_diagonal = relax_scalar_component_equation(&mut system, &old_values, Some(1.0))
             .expect("equation relaxation preserves the dominant equation");
         assert_eq!(base_diagonal[1].to_bits(), expected_internal.to_bits());
         assert_eq!(
@@ -9100,6 +9119,31 @@ mod tests {
     }
 
     #[test]
+    fn absent_equation_relaxation_leaves_matrix_and_rhs_bit_exact() {
+        let mut system = ScalarComponentSystem {
+            matrix: CsrMatrix::from_rows(
+                vec![vec![(1, -4.0), (0, 1.0)], vec![(1, 2.0), (0, -1.0)]],
+                2,
+            )
+            .expect("weak-diagonal matrix"),
+            rhs: vec![3.0, 4.0],
+        };
+        let original_values = system.matrix.values().to_vec();
+        let original_rhs = system.rhs.clone();
+        let values_ptr = system.matrix.values().as_ptr();
+        let rhs_ptr = system.rhs.as_ptr();
+
+        let diagonal = relax_scalar_component_equation(&mut system, &[2.0, 0.0], None)
+            .expect("absent equation relaxation is a no-op");
+
+        assert_eq!(diagonal, vec![1.0, 2.0]);
+        assert_eq!(system.matrix.values(), original_values);
+        assert_eq!(system.rhs, original_rhs);
+        assert_eq!(system.matrix.values().as_ptr(), values_ptr);
+        assert_eq!(system.rhs.as_ptr(), rhs_ptr);
+    }
+
+    #[test]
     fn equation_relaxation_at_alpha_one_still_enforces_diagonal_dominance() {
         let mut system = ScalarComponentSystem {
             matrix: CsrMatrix::from_rows(
@@ -9110,7 +9154,7 @@ mod tests {
             rhs: vec![3.0, 4.0],
         };
 
-        let base_diagonal = relax_scalar_component_equation(&mut system, &[2.0, 0.0], 1.0)
+        let base_diagonal = relax_scalar_component_equation(&mut system, &[2.0, 0.0], Some(1.0))
             .expect("alpha=1 still applies diagonal dominance");
 
         assert_eq!(base_diagonal, vec![4.0, 2.0]);
@@ -9130,7 +9174,7 @@ mod tests {
             rhs: vec![3.0, 4.0],
         };
 
-        let base_diagonal = relax_scalar_component_equation(&mut system, &[2.0, 0.0], alpha)
+        let base_diagonal = relax_scalar_component_equation(&mut system, &[2.0, 0.0], Some(alpha))
             .expect("next-down relaxation");
 
         assert_eq!(base_diagonal, vec![4.0, 2.0]);
@@ -9155,7 +9199,7 @@ mod tests {
             rhs: vec![0.0, 0.0],
         };
 
-        let base_diagonal = relax_scalar_component_equation(&mut system, &[0.0, 0.0], 1.0)
+        let base_diagonal = relax_scalar_component_equation(&mut system, &[0.0, 0.0], Some(1.0))
             .expect("absolute off-diagonal sum");
 
         assert_eq!(base_diagonal, vec![7.0, 1.0]);
@@ -9172,8 +9216,9 @@ mod tests {
         ) {
             let original_values = system.matrix.values().to_vec();
             let original_rhs = system.rhs.clone();
-            let error = relax_scalar_component_equation(&mut system, old_solution, relaxation)
-                .expect_err("invalid equation relaxation must fail");
+            let error =
+                relax_scalar_component_equation(&mut system, old_solution, Some(relaxation))
+                    .expect_err("invalid equation relaxation must fail");
             assert!(
                 error.to_string().contains(expected_message),
                 "unexpected relaxation error: {error}"
@@ -14943,6 +14988,10 @@ mod tests {
         assert_eq!(owner_faces.max_abs_face_neighbour, None);
         assert_eq!(owner_faces.max_abs_face_patch_index, Some(0));
         assert_eq!(owner_faces.max_abs_face_flux, Some(-3.0));
+        assert_eq!(owner_faces.first_non_finite_face_index, None);
+        assert_eq!(owner_faces.first_non_finite_face_owner, None);
+        assert_eq!(owner_faces.first_non_finite_face_neighbour, None);
+        assert_eq!(owner_faces.first_non_finite_face_patch_index, None);
 
         let neighbour = super::attach_incident_face_diagnostics(
             super::AlgebraicResidualRowDiagnostic {
@@ -14965,6 +15014,10 @@ mod tests {
         assert_eq!(neighbour_faces.max_abs_face_neighbour, Some(1));
         assert_eq!(neighbour_faces.max_abs_face_patch_index, None);
         assert_eq!(neighbour_faces.max_abs_face_flux, Some(2.0));
+        assert_eq!(neighbour_faces.first_non_finite_face_index, None);
+        assert_eq!(neighbour_faces.first_non_finite_face_owner, None);
+        assert_eq!(neighbour_faces.first_non_finite_face_neighbour, None);
+        assert_eq!(neighbour_faces.first_non_finite_face_patch_index, None);
     }
 
     #[test]
@@ -15081,6 +15134,74 @@ mod tests {
         assert!(!attached.incident_faces.representable);
         assert_eq!(attached.incident_faces.signed_sum, None);
         assert_eq!(attached.incident_faces.sum_abs, None);
+    }
+
+    #[test]
+    fn incident_face_diagnostics_record_non_finite_face_without_overwriting_finite_maximum() {
+        let runtime = two_cell_runtime();
+        let face_addressing =
+            super::CompactSimpleFaceAddressing::from_mesh(&runtime.mesh).expect("face addressing");
+
+        let attached = super::attach_incident_face_diagnostics(
+            super::AlgebraicResidualRowDiagnostic {
+                representable: true,
+                row: Some(0),
+                ..super::AlgebraicResidualRowDiagnostic::default()
+            },
+            &runtime.mesh,
+            &face_addressing,
+            &[f64::NAN, 5.0, 0.0],
+        );
+
+        assert!(!attached.representable);
+        assert!(!attached.incident_faces.representable);
+        assert_eq!(attached.incident_faces.max_abs_face_index, Some(1));
+        assert_eq!(attached.incident_faces.max_abs_face_owner, Some(0));
+        assert_eq!(attached.incident_faces.max_abs_face_neighbour, None);
+        assert_eq!(attached.incident_faces.max_abs_face_patch_index, Some(0));
+        assert_eq!(attached.incident_faces.max_abs_face_flux, Some(5.0));
+        assert_eq!(attached.incident_faces.first_non_finite_face_index, Some(0));
+        assert_eq!(attached.incident_faces.first_non_finite_face_owner, Some(0));
+        assert_eq!(
+            attached.incident_faces.first_non_finite_face_neighbour,
+            Some(1)
+        );
+        assert_eq!(
+            attached.incident_faces.first_non_finite_face_patch_index,
+            None
+        );
+    }
+
+    #[test]
+    fn incident_face_diagnostics_choose_lowest_non_finite_global_face_index() {
+        let runtime = two_cell_runtime();
+        let face_addressing =
+            super::CompactSimpleFaceAddressing::from_mesh(&runtime.mesh).expect("face addressing");
+
+        let attached = super::attach_incident_face_diagnostics(
+            super::AlgebraicResidualRowDiagnostic {
+                representable: true,
+                row: Some(0),
+                ..super::AlgebraicResidualRowDiagnostic::default()
+            },
+            &runtime.mesh,
+            &face_addressing,
+            &[f64::NAN, f64::INFINITY, 0.0],
+        );
+
+        assert!(!attached.incident_faces.representable);
+        assert_eq!(attached.incident_faces.max_abs_face_index, None);
+        assert_eq!(attached.incident_faces.max_abs_face_flux, None);
+        assert_eq!(attached.incident_faces.first_non_finite_face_index, Some(0));
+        assert_eq!(attached.incident_faces.first_non_finite_face_owner, Some(0));
+        assert_eq!(
+            attached.incident_faces.first_non_finite_face_neighbour,
+            Some(1)
+        );
+        assert_eq!(
+            attached.incident_faces.first_non_finite_face_patch_index,
+            None
+        );
     }
 
     #[test]
@@ -15591,7 +15712,7 @@ mod tests {
             pressure_reference_value: 0.0,
             non_orthogonal_correctors: 0,
             simple_consistent: false,
-            velocity_relaxation: 0.7,
+            velocity_relaxation: Some(0.7),
             pressure_relaxation: 0.3,
             schemes: LaminarSimpleSchemes::default(),
         }
