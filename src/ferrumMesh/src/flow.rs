@@ -5847,11 +5847,12 @@ fn adjust_phi_hby_a_with_pressure_geometry_and_addressing(
         )));
     }
 
-    // OpenFOAM Foundation applies adjustPhi only when the original pressure
-    // field needs an explicit reference. A pressure patch that fixes the value,
-    // including a mixed inletOutlet patch, already anchors the system, so its
-    // outlet flux must be left to the pressure equation rather than
-    // redistributed here.
+    // Match OpenFOAM Foundation 13 exactly: GeometricField::needReference()
+    // consults the original patch class, mixedFvPatchField::fixesValue() always
+    // returns true independent of the current value fraction, and
+    // incompressibleFluid::correctPressure() calls adjustPhi only when that
+    // original field reports that a reference is needed. Therefore a pressure
+    // inletOutlet patch skips this redistribution in both resolved directions.
     if !pressure_needs_reference {
         return Ok(AdjustPhiSummary {
             global_flux_before,
@@ -5938,12 +5939,14 @@ fn adjust_phi_hby_a_with_pressure_geometry_and_addressing(
         {
             phi_hby_a[face_index]
         } else {
-            adjusted_faces += 1;
             let adjusted = phi_hby_a[face_index] * mass_correction;
             if !adjusted.is_finite() {
                 return Err(invalid_input(format!(
                     "adjustPhi boundary face {face_index} corrected flux must be finite, got {adjusted}"
                 )));
+            }
+            if adjusted.to_bits() != phi_hby_a[face_index].to_bits() {
+                adjusted_faces += 1;
             }
             adjusted
         };
@@ -11142,7 +11145,7 @@ mod tests {
         let pressure_boundary = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
 
         let mut at_vsmall = vec![0.0, 0.0, f64::MIN_POSITIVE];
-        adjust_phi_hby_a(
+        let at_vsmall_summary = adjust_phi_hby_a(
             &runtime.mesh,
             &velocity_boundary,
             &pressure_boundary,
@@ -11150,9 +11153,10 @@ mod tests {
         )
         .expect("vSmall equality");
         assert_eq!(at_vsmall[2].to_bits(), f64::MIN_POSITIVE.to_bits());
+        assert_eq!(at_vsmall_summary.adjusted_faces, 0);
 
         let mut above_vsmall = vec![0.0, 0.0, f64::MIN_POSITIVE.next_up()];
-        adjust_phi_hby_a(
+        let above_vsmall_summary = adjust_phi_hby_a(
             &runtime.mesh,
             &velocity_boundary,
             &pressure_boundary,
@@ -11160,10 +11164,11 @@ mod tests {
         )
         .expect("vSmall next_up");
         assert_eq!(above_vsmall[2].to_bits(), 0.0f64.to_bits());
+        assert_eq!(above_vsmall_summary.adjusted_faces, 1);
 
         let fixed_total = 1.0;
         let mut at_small = vec![fixed_total, 0.0, f64::EPSILON];
-        adjust_phi_hby_a(
+        let at_small_summary = adjust_phi_hby_a(
             &runtime.mesh,
             &velocity_boundary,
             &pressure_boundary,
@@ -11171,9 +11176,10 @@ mod tests {
         )
         .expect("small equality");
         assert_eq!(at_small[2].to_bits(), f64::EPSILON.to_bits());
+        assert_eq!(at_small_summary.adjusted_faces, 0);
 
         let mut above_small = vec![fixed_total, 0.0, f64::EPSILON.next_up()];
-        adjust_phi_hby_a(
+        let above_small_summary = adjust_phi_hby_a(
             &runtime.mesh,
             &velocity_boundary,
             &pressure_boundary,
@@ -11181,6 +11187,7 @@ mod tests {
         )
         .expect("small next_up");
         assert_eq!(above_small[2].to_bits(), 0.0f64.to_bits());
+        assert_eq!(above_small_summary.adjusted_faces, 1);
 
         velocity_boundary[2] = VectorFaceTreatment::FixedValue(point(1.0, 0.0, 0.0));
         let imbalance_limit = 1.0e-8;
