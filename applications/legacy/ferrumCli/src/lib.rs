@@ -31,15 +31,16 @@ use ferrum_mesh::fields::{
     read_initial_fields_with_policy, validate_initial_field_boundaries,
 };
 use ferrum_mesh::flow::{
-    ContinuitySummary, FaceFluxDiagnosticSummary, FlowBoundarySummary, FlowOperatorSummary,
+    AlgebraicResidualRowDiagnostic, ContinuitySummary, FaceFluxDiagnosticSummary,
+    FlowBoundarySummary, FlowOperatorSummary, IncidentFaceDiagnosticSummary,
     LaminarSimpleConvectionScheme, LaminarSimpleFieldSummary, LaminarSimpleGradientScheme,
     LaminarSimpleInterpolationScheme, LaminarSimpleIterationSummary, LaminarSimpleLaplacianScheme,
     LaminarSimpleLinearSolver, LaminarSimpleMomentumExecution, LaminarSimpleOptions,
     LaminarSimplePreconditioner, LaminarSimpleReport, LaminarSimpleResidualControlSummary,
     LaminarSimpleSchemes, LaminarSimpleSnGradScheme, LaminarSimpleStopReason,
-    LinearSolveConvergenceSummary, LinearSolveSummary, MatrixDiagnosticSummary,
-    PressureAssemblyDiagnostics, ScalarDiagnosticSummary, VectorDiagnosticSummary,
-    reconstruct_laminar_gradients_from_fields, solve_laminar_simple,
+    LinearNonConvergenceSnapshot, LinearSolveConvergenceSummary, LinearSolveSummary,
+    MatrixDiagnosticSummary, PressureAssemblyDiagnostics, ScalarDiagnosticSummary,
+    VectorDiagnosticSummary, reconstruct_laminar_gradients_from_fields, solve_laminar_simple,
     solve_laminar_simple_profiled_pcg, solve_laminar_simple_profiled_pcg_with_observer,
     solve_laminar_simple_with_observer,
 };
@@ -4355,6 +4356,8 @@ fn write_laminar_simple_report_json(
     writeln!(writer, ",")?;
     write_json_linear_solve_summary(&mut writer, &report.linear_solve_summary)?;
     writeln!(writer, ",")?;
+    write_json_linear_nonconvergence_diagnostics(&mut writer, report)?;
+    writeln!(writer, ",")?;
     write_json_laminar_simple_timing_summary(&mut writer, report, run.wall_clock_seconds)?;
     writeln!(writer, ",")?;
     write_json_key(&mut writer, 2, "continuity")?;
@@ -5431,6 +5434,167 @@ fn write_json_linear_solve_summary(
     )?;
     writeln!(writer)?;
     write_indent(writer, 2)?;
+    write!(writer, "}}")
+}
+
+fn write_json_linear_nonconvergence_diagnostics(
+    writer: &mut impl Write,
+    report: &LaminarSimpleReport,
+) -> std::io::Result<()> {
+    write_json_key(writer, 2, "linearNonConvergenceDiagnostics")?;
+    writeln!(writer, "{{")?;
+    write_json_key(writer, 4, "firstMomentum")?;
+    write_json_linear_nonconvergence_snapshot(
+        writer,
+        4,
+        report.first_momentum_linear_nonconvergence.as_ref(),
+    )?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "firstPressure")?;
+    write_json_linear_nonconvergence_snapshot(
+        writer,
+        4,
+        report.first_pressure_linear_nonconvergence.as_ref(),
+    )?;
+    writeln!(writer)?;
+    write_indent(writer, 2)?;
+    write!(writer, "}}")
+}
+
+fn write_json_linear_nonconvergence_snapshot(
+    writer: &mut impl Write,
+    indent: usize,
+    snapshot: Option<&LinearNonConvergenceSnapshot>,
+) -> std::io::Result<()> {
+    let Some(snapshot) = snapshot else {
+        return write!(writer, "null");
+    };
+    writeln!(writer, "{{")?;
+    write_json_number_field(
+        writer,
+        indent + 2,
+        "simpleIteration",
+        snapshot.simple_iteration,
+    )?;
+    writeln!(writer, ",")?;
+    write_json_number_field(writer, indent + 2, "solveOrdinal", snapshot.solve_ordinal)?;
+    writeln!(writer, ",")?;
+    write_json_string_field(writer, indent + 2, "solver", &snapshot.solver.to_string())?;
+    writeln!(writer, ",")?;
+    write_json_string_field(
+        writer,
+        indent + 2,
+        "preconditioner",
+        &snapshot.preconditioner.to_string(),
+    )?;
+    writeln!(writer, ",")?;
+    write_json_bool_field(
+        writer,
+        indent + 2,
+        "linearIterateAccepted",
+        snapshot.linear_iterate_accepted,
+    )?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "solve")?;
+    write_json_linear_solve_diagnostic(writer, indent + 2, &snapshot.solve)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "continuityBefore")?;
+    write_json_continuity_summary(writer, indent + 2, &snapshot.continuity_before)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "continuityStar")?;
+    write_json_optional_continuity_summary(writer, indent + 2, snapshot.continuity_star.as_ref())?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "continuityAfter")?;
+    write_json_optional_continuity_summary(writer, indent + 2, snapshot.continuity_after.as_ref())?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "worstAlgebraicResidualRow")?;
+    write_json_algebraic_residual_row(writer, indent + 2, &snapshot.worst_algebraic_residual_row)?;
+    writeln!(writer)?;
+    write_indent(writer, indent)?;
+    write!(writer, "}}")
+}
+
+fn write_json_optional_continuity_summary(
+    writer: &mut impl Write,
+    indent: usize,
+    summary: Option<&ContinuitySummary>,
+) -> std::io::Result<()> {
+    match summary {
+        Some(summary) => write_json_continuity_summary(writer, indent, summary),
+        None => write!(writer, "null"),
+    }
+}
+
+fn write_json_algebraic_residual_row(
+    writer: &mut impl Write,
+    indent: usize,
+    diagnostic: &AlgebraicResidualRowDiagnostic,
+) -> std::io::Result<()> {
+    writeln!(writer, "{{")?;
+    write_json_bool_field(
+        writer,
+        indent + 2,
+        "representable",
+        diagnostic.representable,
+    )?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "row")?;
+    write_json_optional_usize(writer, diagnostic.row)?;
+    for (name, value) in [
+        ("cellVolume", diagnostic.cell_volume),
+        ("diagonal", diagnostic.diagonal),
+        ("rowSumAbs", diagnostic.row_sum_abs),
+        ("offDiagonalSumAbs", diagnostic.off_diagonal_sum_abs),
+        ("rhs", diagnostic.rhs),
+        ("matrixProduct", diagnostic.matrix_product),
+        ("residual", diagnostic.residual),
+        ("initialValue", diagnostic.initial_value),
+        ("candidateValue", diagnostic.candidate_value),
+    ] {
+        writeln!(writer, ",")?;
+        write_json_key(writer, indent + 2, name)?;
+        write_json_optional_number(writer, value)?;
+    }
+    writeln!(writer, ",")?;
+    write_json_key(writer, indent + 2, "incidentFaces")?;
+    write_json_incident_face_diagnostic_summary(writer, indent + 2, &diagnostic.incident_faces)?;
+    writeln!(writer)?;
+    write_indent(writer, indent)?;
+    write!(writer, "}}")
+}
+
+fn write_json_incident_face_diagnostic_summary(
+    writer: &mut impl Write,
+    indent: usize,
+    summary: &IncidentFaceDiagnosticSummary,
+) -> std::io::Result<()> {
+    writeln!(writer, "{{")?;
+    write_json_bool_field(writer, indent + 2, "representable", summary.representable)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(writer, indent + 2, "count", summary.count)?;
+    for (name, value) in [
+        ("signedSum", summary.signed_sum),
+        ("sumAbs", summary.sum_abs),
+        ("min", summary.min),
+        ("max", summary.max),
+        ("maxAbsFaceFlux", summary.max_abs_face_flux),
+    ] {
+        writeln!(writer, ",")?;
+        write_json_key(writer, indent + 2, name)?;
+        write_json_optional_number(writer, value)?;
+    }
+    for (name, value) in [
+        ("maxAbsFaceIndex", summary.max_abs_face_index),
+        ("maxAbsFaceOwner", summary.max_abs_face_owner),
+        ("maxAbsFaceNeighbour", summary.max_abs_face_neighbour),
+        ("maxAbsFacePatchIndex", summary.max_abs_face_patch_index),
+    ] {
+        writeln!(writer, ",")?;
+        write_json_key(writer, indent + 2, name)?;
+        write_json_optional_usize(writer, value)?;
+    }
+    writeln!(writer)?;
+    write_indent(writer, indent)?;
     write!(writer, "}}")
 }
 
@@ -9721,10 +9885,11 @@ mod tests {
     use ferrum_mesh::backends::BackendChoice;
     use ferrum_mesh::control::ControlDict;
     use ferrum_mesh::flow::{
+        AlgebraicResidualRowDiagnostic, IncidentFaceDiagnosticSummary,
         LaminarSimpleConvectionScheme, LaminarSimpleGradientScheme, LaminarSimpleLaplacianScheme,
         LaminarSimpleLinearSolver, LaminarSimpleMomentumExecution, LaminarSimplePreconditioner,
-        LaminarSimpleSnGradScheme, LaminarSimpleStopReason, LinearSolveConvergenceSummary,
-        LinearSolveStopReason,
+        LaminarSimpleSnGradScheme, LaminarSimpleStopReason, LinearNonConvergenceSnapshot,
+        LinearSolveConvergenceSummary, LinearSolveStopReason,
     };
     use ferrum_mesh::linear::{
         GamgAgglomerator, GamgAggregateSizeBin, GamgHierarchyDiagnostics,
@@ -10621,6 +10786,209 @@ mod tests {
     }
 
     #[test]
+    fn simple_json_report_exposes_fixed_size_first_nonconvergence_diagnostics() {
+        let empty_report = output_test_report();
+        let mut empty_diagnostics = Vec::new();
+        super::write_json_linear_nonconvergence_diagnostics(&mut empty_diagnostics, &empty_report)
+            .expect("empty diagnostics JSON");
+        assert_eq!(
+            String::from_utf8(empty_diagnostics).expect("UTF-8 diagnostics"),
+            concat!(
+                "  \"linearNonConvergenceDiagnostics\": {\n",
+                "    \"firstMomentum\": null,\n",
+                "    \"firstPressure\": null\n",
+                "  }"
+            )
+        );
+
+        let mut nonrepresentable_row = Vec::new();
+        super::write_json_algebraic_residual_row(
+            &mut nonrepresentable_row,
+            0,
+            &AlgebraicResidualRowDiagnostic::default(),
+        )
+        .expect("nonrepresentable row JSON");
+        assert_eq!(
+            String::from_utf8(nonrepresentable_row).expect("UTF-8 row diagnostic"),
+            concat!(
+                "{\n",
+                "  \"representable\": false,\n",
+                "  \"row\": null,\n",
+                "  \"cellVolume\": null,\n",
+                "  \"diagonal\": null,\n",
+                "  \"rowSumAbs\": null,\n",
+                "  \"offDiagonalSumAbs\": null,\n",
+                "  \"rhs\": null,\n",
+                "  \"matrixProduct\": null,\n",
+                "  \"residual\": null,\n",
+                "  \"initialValue\": null,\n",
+                "  \"candidateValue\": null,\n",
+                "  \"incidentFaces\": {\n",
+                "    \"representable\": false,\n",
+                "    \"count\": 0,\n",
+                "    \"signedSum\": null,\n",
+                "    \"sumAbs\": null,\n",
+                "    \"min\": null,\n",
+                "    \"max\": null,\n",
+                "    \"maxAbsFaceFlux\": null,\n",
+                "    \"maxAbsFaceIndex\": null,\n",
+                "    \"maxAbsFaceOwner\": null,\n",
+                "    \"maxAbsFaceNeighbour\": null,\n",
+                "    \"maxAbsFacePatchIndex\": null\n",
+                "  }\n",
+                "}"
+            )
+        );
+
+        let base = output_test_dir("first-linear-nonconvergence");
+        std::fs::create_dir_all(&base).expect("output root should be created");
+        let output_root = SafeOutputRoot::open_existing(&base).expect("output root should open");
+        let plan = laminar_simple_test_plan(1000.0, 0.001);
+        let options = minimal_laminar_simple_options_for_estimate();
+        let populated_snapshot = LinearNonConvergenceSnapshot {
+            simple_iteration: 7,
+            solve_ordinal: 2,
+            solver: LaminarSimpleLinearSolver::Pcg,
+            preconditioner: LaminarSimplePreconditioner::Dic,
+            solve: LinearSolveConvergenceSummary {
+                iterations: 1000,
+                converged: false,
+                initial_normalized_residual_norm: 1.0,
+                residual_norm: 0.25,
+                normalized_residual_norm: 0.125,
+                effective_normalized_tolerance: 1.0e-9,
+                stop_reason: LinearSolveStopReason::MaxIterations,
+            },
+            linear_iterate_accepted: true,
+            continuity_before: ContinuitySummary {
+                l2_norm: 1.0,
+                ..ContinuitySummary::default()
+            },
+            continuity_star: None,
+            continuity_after: None,
+            worst_algebraic_residual_row: AlgebraicResidualRowDiagnostic {
+                representable: true,
+                row: Some(42),
+                cell_volume: Some(0.5),
+                diagonal: Some(4.0),
+                row_sum_abs: Some(6.0),
+                off_diagonal_sum_abs: Some(2.0),
+                rhs: Some(3.0),
+                matrix_product: Some(2.5),
+                residual: Some(0.5),
+                initial_value: Some(0.0),
+                candidate_value: Some(1.0),
+                incident_faces: IncidentFaceDiagnosticSummary {
+                    representable: true,
+                    count: 3,
+                    signed_sum: Some(0.25),
+                    sum_abs: Some(1.25),
+                    min: Some(-0.5),
+                    max: Some(0.75),
+                    max_abs_face_index: Some(9),
+                    max_abs_face_owner: Some(42),
+                    max_abs_face_neighbour: Some(43),
+                    max_abs_face_patch_index: None,
+                    max_abs_face_flux: Some(0.75),
+                },
+            },
+        };
+        let mut populated_snapshot_json = Vec::new();
+        super::write_json_linear_nonconvergence_snapshot(
+            &mut populated_snapshot_json,
+            0,
+            Some(&populated_snapshot),
+        )
+        .expect("populated snapshot JSON");
+        assert_eq!(
+            String::from_utf8(populated_snapshot_json).expect("UTF-8 populated snapshot"),
+            concat!(
+                "{\n",
+                "  \"simpleIteration\": 7,\n",
+                "  \"solveOrdinal\": 2,\n",
+                "  \"solver\": \"pcg\",\n",
+                "  \"preconditioner\": \"DIC\",\n",
+                "  \"linearIterateAccepted\": true,\n",
+                "  \"solve\": {\n",
+                "    \"iterations\": 1000,\n",
+                "    \"converged\": false,\n",
+                "    \"initialNormalizedResidual\": 1,\n",
+                "    \"residualNorm\": 0.25,\n",
+                "    \"normalizedResidual\": 0.125,\n",
+                "    \"effectiveNormalizedTolerance\": 0.000000001,\n",
+                "    \"stopReason\": \"MaxIterations\"\n",
+                "  },\n",
+                "  \"continuityBefore\": {\n",
+                "    \"l2Norm\": 1,\n",
+                "    \"maxAbs\": 0,\n",
+                "    \"sumAbs\": 0,\n",
+                "    \"globalSum\": 0\n",
+                "  },\n",
+                "  \"continuityStar\": null,\n",
+                "  \"continuityAfter\": null,\n",
+                "  \"worstAlgebraicResidualRow\": {\n",
+                "    \"representable\": true,\n",
+                "    \"row\": 42,\n",
+                "    \"cellVolume\": 0.5,\n",
+                "    \"diagonal\": 4,\n",
+                "    \"rowSumAbs\": 6,\n",
+                "    \"offDiagonalSumAbs\": 2,\n",
+                "    \"rhs\": 3,\n",
+                "    \"matrixProduct\": 2.5,\n",
+                "    \"residual\": 0.5,\n",
+                "    \"initialValue\": 0,\n",
+                "    \"candidateValue\": 1,\n",
+                "    \"incidentFaces\": {\n",
+                "      \"representable\": true,\n",
+                "      \"count\": 3,\n",
+                "      \"signedSum\": 0.25,\n",
+                "      \"sumAbs\": 1.25,\n",
+                "      \"min\": -0.5,\n",
+                "      \"max\": 0.75,\n",
+                "      \"maxAbsFaceFlux\": 0.75,\n",
+                "      \"maxAbsFaceIndex\": 9,\n",
+                "      \"maxAbsFaceOwner\": 42,\n",
+                "      \"maxAbsFaceNeighbour\": 43,\n",
+                "      \"maxAbsFacePatchIndex\": null\n",
+                "    }\n",
+                "  }\n",
+                "}"
+            )
+        );
+
+        let mut report = output_test_report();
+        report.first_pressure_linear_nonconvergence = Some(populated_snapshot);
+
+        write_laminar_simple_report_json(
+            &plan,
+            &options,
+            &report,
+            &output_test_post_processing(),
+            LaminarSimpleReportRunMetadata {
+                profile_pcg: false,
+                wall_clock_seconds: 0.0,
+            },
+            &output_root,
+            Path::new("report.json"),
+        )
+        .expect("JSON report should be written");
+
+        let json = std::fs::read_to_string(base.join("report.json"))
+            .expect("JSON report should be readable");
+        assert!(json.contains("\"linearNonConvergenceDiagnostics\""));
+        assert!(json.contains("\"firstMomentum\": null"));
+        assert!(json.contains("\"firstPressure\": {"));
+        assert!(json.contains("\"simpleIteration\": 7"));
+        assert!(json.contains("\"solveOrdinal\": 2"));
+        assert!(json.contains("\"linearIterateAccepted\": true"));
+        assert!(json.contains("\"worstAlgebraicResidualRow\""));
+        assert!(json.contains("\"row\": 42"));
+        assert!(json.contains("\"maxAbsFacePatchIndex\": null"));
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn gamg_hierarchy_json_contract_is_exact_ordered_and_decimal_encoded() {
         let profile = hierarchy_profile_fixture();
         let mut bytes = Vec::new();
@@ -11261,6 +11629,8 @@ mod tests {
             operator_summary: Default::default(),
             boundary_summary: Default::default(),
             pressure_assembly: None,
+            first_momentum_linear_nonconvergence: None,
+            first_pressure_linear_nonconvergence: None,
             timing: Default::default(),
             fields: Default::default(),
             final_velocity: vec![ferrum_mesh::Point3 {

@@ -211,6 +211,8 @@ pub struct LaminarSimpleReport {
     pub operator_summary: FlowOperatorSummary,
     pub boundary_summary: FlowBoundarySummary,
     pub pressure_assembly: Option<PressureAssemblyDiagnostics>,
+    pub first_momentum_linear_nonconvergence: Option<LinearNonConvergenceSnapshot>,
+    pub first_pressure_linear_nonconvergence: Option<LinearNonConvergenceSnapshot>,
     pub timing: LaminarSimpleTimingSummary,
     pub fields: LaminarSimpleFieldSummary,
     pub final_velocity: Vec<Point3>,
@@ -371,6 +373,67 @@ pub struct LinearSolveConvergenceSummary {
     pub normalized_residual_norm: f64,
     pub effective_normalized_tolerance: f64,
     pub stop_reason: LinearSolveStopReason,
+}
+
+/// Fixed-size, observational context for the first non-converged linear solve.
+///
+/// `solve_ordinal` is one-based and denotes the momentum component (x/y/z) for
+/// momentum snapshots or the pressure-correction solve for pressure snapshots.
+/// `linear_iterate_accepted` records only whether the finite linear result was
+/// admitted to the subsequent SIMPLE coupling stage; a later coupled-field
+/// validity check may still reject the complete SIMPLE update.
+/// This telemetry never participates in solver acceptance decisions.
+#[derive(Clone, Copy, Debug)]
+pub struct LinearNonConvergenceSnapshot {
+    pub simple_iteration: usize,
+    pub solve_ordinal: usize,
+    pub solver: LaminarSimpleLinearSolver,
+    pub preconditioner: LaminarSimplePreconditioner,
+    pub solve: LinearSolveConvergenceSummary,
+    pub linear_iterate_accepted: bool,
+    pub continuity_before: ContinuitySummary,
+    pub continuity_star: Option<ContinuitySummary>,
+    pub continuity_after: Option<ContinuitySummary>,
+    pub worst_algebraic_residual_row: AlgebraicResidualRowDiagnostic,
+}
+
+/// Allocation-free description of the matrix row with the largest algebraic
+/// residual magnitude. Non-representable values are recorded as `None` and
+/// reflected by `representable=false`; diagnostics must not introduce errors.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AlgebraicResidualRowDiagnostic {
+    pub representable: bool,
+    pub row: Option<usize>,
+    pub cell_volume: Option<f64>,
+    pub diagonal: Option<f64>,
+    pub row_sum_abs: Option<f64>,
+    pub off_diagonal_sum_abs: Option<f64>,
+    pub rhs: Option<f64>,
+    pub matrix_product: Option<f64>,
+    pub residual: Option<f64>,
+    pub initial_value: Option<f64>,
+    pub candidate_value: Option<f64>,
+    pub incident_faces: IncidentFaceDiagnosticSummary,
+}
+
+/// Fixed-size incident-face context for an algebraic residual row.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IncidentFaceDiagnosticSummary {
+    pub representable: bool,
+    pub count: usize,
+    /// Sum after orienting every incident face outward from the diagnosed cell.
+    pub signed_sum: Option<f64>,
+    pub sum_abs: Option<f64>,
+    /// Minimum outward-from-cell oriented incident flux.
+    pub min: Option<f64>,
+    /// Maximum outward-from-cell oriented incident flux.
+    pub max: Option<f64>,
+    pub max_abs_face_index: Option<usize>,
+    pub max_abs_face_owner: Option<usize>,
+    pub max_abs_face_neighbour: Option<usize>,
+    pub max_abs_face_patch_index: Option<usize>,
+    /// Stored mesh face flux before cell-orientation; sign follows owner addressing.
+    pub max_abs_face_flux: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1116,6 +1179,8 @@ fn solve_laminar_simple_driven(
     )?;
     let mut final_hby_a = vec![zero(); runtime.mesh.cells];
     let mut final_pressure_assembly = None;
+    let mut first_momentum_linear_nonconvergence = None;
+    let mut first_pressure_linear_nonconvergence = None;
     let mut stop_reason = None;
     let mut emit_iteration = |summary: LaminarSimpleIterationSummary| {
         history.push(summary);
@@ -1165,6 +1230,7 @@ fn solve_laminar_simple_driven(
                 grad_p: &grad_p,
             },
             options,
+            first_momentum_linear_nonconvergence.is_none(),
             &mut scalar_solve_workspace,
             momentum_component_executor.as_mut(),
         )?;
@@ -1172,7 +1238,39 @@ fn solve_laminar_simple_driven(
         timing.momentum_gradient_seconds += momentum.gradient_seconds;
         timing.momentum_matrix_fill_seconds += momentum.matrix_fill_seconds;
         timing.momentum_linear_solve_seconds += momentum.linear_solve_seconds;
-        if !momentum.residual_norm.is_finite() || !points_are_finite(&momentum.velocity) {
+        let momentum_linear_result_is_accepted =
+            momentum.residual_norm.is_finite() && points_are_finite(&momentum.velocity);
+        let first_nonconverged_momentum_component =
+            (first_momentum_linear_nonconvergence.is_none() && !momentum.converged)
+                .then(|| {
+                    momentum
+                        .component_linear_solves
+                        .iter()
+                        .position(|summary| !summary.converged)
+                })
+                .flatten();
+        if let Some(component) = first_nonconverged_momentum_component {
+            let row = momentum.component_algebraic_residual_rows[component].unwrap_or_default();
+            first_momentum_linear_nonconvergence = Some(LinearNonConvergenceSnapshot {
+                simple_iteration: iteration,
+                solve_ordinal: component + 1,
+                solver: options.momentum_linear_solver,
+                preconditioner: options.momentum_preconditioner,
+                solve: momentum.component_linear_solves[component],
+                linear_iterate_accepted: momentum_linear_result_is_accepted,
+                continuity_before,
+                continuity_star: None,
+                continuity_after: (!momentum_linear_result_is_accepted)
+                    .then_some(continuity_before),
+                worst_algebraic_residual_row: attach_incident_face_diagnostics(
+                    row,
+                    &runtime.mesh,
+                    &mesh_cache.face_addressing,
+                    &phi,
+                ),
+            });
+        }
+        if !momentum_linear_result_is_accepted {
             final_phi = phi;
             final_continuity = continuity_before;
             emit_iteration(LaminarSimpleIterationSummary {
@@ -1335,7 +1433,19 @@ fn solve_laminar_simple_driven(
         let net_flux_star =
             net_cell_flux_with_addressing(&runtime.mesh, &mesh_cache.face_addressing, &phi_hby_a)?;
         let continuity_star = summarize_continuity(&net_flux_star);
+        update_linear_nonconvergence_continuity(
+            &mut first_momentum_linear_nonconvergence,
+            iteration,
+            is_finite_continuity(continuity_star).then_some(continuity_star),
+            None,
+        );
         if !is_finite_continuity(continuity_star) {
+            update_linear_nonconvergence_continuity(
+                &mut first_momentum_linear_nonconvergence,
+                iteration,
+                None,
+                Some(continuity_before),
+            );
             final_phi = phi;
             final_continuity = continuity_before;
             emit_iteration(LaminarSimpleIterationSummary {
@@ -1503,7 +1613,7 @@ fn solve_laminar_simple_driven(
                     timing.add_pressure_gamg_hierarchy_build(started.elapsed().as_secs_f64());
                 }
             }
-            let pressure_solve_result = solve_scalar_system_with_workspaces(
+            let pressure_solve_result = solve_scalar_system_with_workspaces_and_diagnostic(
                 &pressure_system.matrix,
                 &pressure_system.rhs,
                 Some(initial_pressure),
@@ -1520,6 +1630,7 @@ fn solve_laminar_simple_driven(
                 &mut scalar_solve_workspace,
                 pressure_pcg_workspace.as_mut(),
                 pressure_gamg_workspace.as_mut(),
+                first_pressure_linear_nonconvergence.is_none(),
             );
             timing.pressure_linear_solve_seconds += pressure_solve_started.elapsed().as_secs_f64();
             let mut report = match pressure_solve_result {
@@ -1548,7 +1659,39 @@ fn solve_laminar_simple_driven(
             }
             pressure_correction_linear_solves[pressure_solve_index] =
                 LinearSolveConvergenceSummary::from(&report);
-            if let Some(pressure_stop_reason) = pressure_solver_stop_reason(report.termination) {
+            let pressure_stop_reason = pressure_solver_stop_reason(report.termination);
+            let capture_pressure_nonconvergence =
+                !report.converged && first_pressure_linear_nonconvergence.is_none();
+            let another_pressure_solve_would_follow =
+                pressure_solve_index + 1 < pressure_solve_count;
+            let pressure_linear_iterate_is_representable =
+                if capture_pressure_nonconvergence || another_pressure_solve_would_follow {
+                    checked_l2_norm(report.solution.iter().copied()).is_some()
+                } else {
+                    true
+                };
+            if capture_pressure_nonconvergence {
+                let row = report.algebraic_residual_row.unwrap_or_default();
+                first_pressure_linear_nonconvergence = Some(LinearNonConvergenceSnapshot {
+                    simple_iteration: iteration,
+                    solve_ordinal: pressure_solve_index + 1,
+                    solver: options.pressure_linear_solver,
+                    preconditioner: options.pressure_preconditioner,
+                    solve: pressure_correction_linear_solves[pressure_solve_index],
+                    linear_iterate_accepted: pressure_stop_reason.is_none()
+                        && pressure_linear_iterate_is_representable,
+                    continuity_before,
+                    continuity_star: Some(continuity_star),
+                    continuity_after: pressure_stop_reason.map(|_| continuity_before),
+                    worst_algebraic_residual_row: attach_incident_face_diagnostics(
+                        row,
+                        &runtime.mesh,
+                        &mesh_cache.face_addressing,
+                        &pressure_equation_flux,
+                    ),
+                });
+            }
+            if let Some(pressure_stop_reason) = pressure_stop_reason {
                 pressure_linear_converged_this_simple = false;
                 pressure_linear_non_converged_solves_this_simple += 1;
                 total_pressure_linear_iterations += report.iterations;
@@ -1560,6 +1703,18 @@ fn solve_laminar_simple_driven(
                     report.normalized_residual_norm;
                 final_phi = phi.clone();
                 final_continuity = continuity_before;
+                update_linear_nonconvergence_continuity(
+                    &mut first_momentum_linear_nonconvergence,
+                    iteration,
+                    Some(continuity_star),
+                    Some(final_continuity),
+                );
+                update_linear_nonconvergence_continuity(
+                    &mut first_pressure_linear_nonconvergence,
+                    iteration,
+                    Some(continuity_star),
+                    Some(final_continuity),
+                );
                 emit_iteration(LaminarSimpleIterationSummary {
                     iteration,
                     continuity_before,
@@ -1621,6 +1776,9 @@ fn solve_laminar_simple_driven(
             final_pressure_correction_normalized_residual_norm = report.normalized_residual_norm;
             last_pressure_equation_flux = Some(pressure_equation_flux);
             pressure_report = Some(report);
+            if another_pressure_solve_would_follow && !pressure_linear_iterate_is_representable {
+                break;
+            }
         }
         let Some(pressure_report) = pressure_report else {
             break;
@@ -1724,6 +1882,18 @@ fn solve_laminar_simple_driven(
             ) = accepted_final_residuals;
             final_phi = phi;
             final_continuity = continuity_before;
+            update_linear_nonconvergence_continuity(
+                &mut first_momentum_linear_nonconvergence,
+                iteration,
+                Some(continuity_star),
+                Some(final_continuity),
+            );
+            update_linear_nonconvergence_continuity(
+                &mut first_pressure_linear_nonconvergence,
+                iteration,
+                Some(continuity_star),
+                Some(final_continuity),
+            );
             emit_iteration(LaminarSimpleIterationSummary {
                 iteration,
                 continuity_before,
@@ -1797,6 +1967,18 @@ fn solve_laminar_simple_driven(
             options,
         );
         timing.field_correction_seconds += field_correction_started.elapsed().as_secs_f64();
+        update_linear_nonconvergence_continuity(
+            &mut first_momentum_linear_nonconvergence,
+            iteration,
+            Some(continuity_star),
+            Some(final_continuity),
+        );
+        update_linear_nonconvergence_continuity(
+            &mut first_pressure_linear_nonconvergence,
+            iteration,
+            Some(continuity_star),
+            Some(final_continuity),
+        );
 
         emit_iteration(LaminarSimpleIterationSummary {
             iteration,
@@ -1907,6 +2089,8 @@ fn solve_laminar_simple_driven(
         operator_summary,
         boundary_summary,
         pressure_assembly: final_pressure_assembly,
+        first_momentum_linear_nonconvergence,
+        first_pressure_linear_nonconvergence,
         timing,
         fields,
         final_velocity: velocity,
@@ -1938,6 +2122,7 @@ struct MomentumPredictorReport {
     component_normalized_residual_norms: [f64; 3],
     component_converged: [bool; 3],
     component_linear_solves: [LinearSolveConvergenceSummary; 3],
+    component_algebraic_residual_rows: [Option<AlgebraicResidualRowDiagnostic>; 3],
     diagonal_min: f64,
     diagonal_max: f64,
     h1_min: f64,
@@ -1965,6 +2150,7 @@ struct ScalarSolveReport {
     normalized_residual_norm: f64,
     effective_normalized_tolerance: f64,
     stop_reason: LinearSolveStopReason,
+    algebraic_residual_row: Option<AlgebraicResidualRowDiagnostic>,
     pcg_timing: Option<PcgKernelTiming>,
     gamg_timing: Option<GamgKernelTiming>,
 }
@@ -2122,6 +2308,7 @@ struct MomentumComponentSolveJob {
     system: ScalarComponentSystem,
     initial: Vec<f64>,
     controls: ScalarSolveControls,
+    capture_nonconvergence_diagnostic: bool,
     #[cfg(test)]
     action: MomentumComponentTestAction,
 }
@@ -2224,6 +2411,7 @@ impl MomentumComponentExecutor {
         components: Vec<ScalarComponentSystem>,
         old_components: [Vec<f64>; 3],
         controls: ScalarSolveControls,
+        capture_nonconvergence_diagnostic: bool,
     ) -> Result<[ScalarSolveReport; 3]> {
         if self.finished {
             return Err(invalid_input(
@@ -2252,12 +2440,18 @@ impl MomentumComponentExecutor {
             })?;
         let mut outcomes: [Option<MomentumComponentWorkerResult>; 3] = [None, None, None];
         let mut dispatched = 0;
+        // A parallel predictor has three simultaneous component solves, so the
+        // first failing predictor may produce at most three row diagnostics.
+        // The caller retains the lowest component and disables the permit for
+        // every later predictor; coordinating a single winning worker here
+        // would serialize the solve or add hot-path synchronization.
         for (component, (system, initial)) in systems.into_iter().zip(old_components).enumerate() {
             let job = MomentumComponentSolveJob {
                 component,
                 system,
                 initial,
                 controls,
+                capture_nonconvergence_diagnostic,
                 #[cfg(test)]
                 action: self.test_actions[component],
             };
@@ -2421,16 +2615,19 @@ fn run_momentum_component_worker(
                 #[cfg(test)]
                 {
                     match job.action {
-                        MomentumComponentTestAction::Solve => solve_scalar_system_with_workspaces(
-                            &job.system.matrix,
-                            &job.system.rhs,
-                            Some(&job.initial),
-                            job.controls,
-                            &mut workspace,
-                            None,
-                            None,
-                        )
-                        .map_err(MomentumComponentWorkerFailure::Solve),
+                        MomentumComponentTestAction::Solve => {
+                            solve_scalar_system_with_workspaces_and_diagnostic(
+                                &job.system.matrix,
+                                &job.system.rhs,
+                                Some(&job.initial),
+                                job.controls,
+                                &mut workspace,
+                                None,
+                                None,
+                                job.capture_nonconvergence_diagnostic,
+                            )
+                            .map_err(MomentumComponentWorkerFailure::Solve)
+                        }
                         MomentumComponentTestAction::Error(message) => {
                             Err(MomentumComponentWorkerFailure::Solve(invalid_input(
                                 message.to_string(),
@@ -2443,7 +2640,7 @@ fn run_momentum_component_worker(
                 }
                 #[cfg(not(test))]
                 {
-                    solve_scalar_system_with_workspaces(
+                    solve_scalar_system_with_workspaces_and_diagnostic(
                         &job.system.matrix,
                         &job.system.rhs,
                         Some(&job.initial),
@@ -2451,6 +2648,7 @@ fn run_momentum_component_worker(
                         &mut workspace,
                         None,
                         None,
+                        job.capture_nonconvergence_diagnostic,
                     )
                     .map_err(MomentumComponentWorkerFailure::Solve)
                 }
@@ -2702,6 +2900,7 @@ fn solve_momentum_predictor(
     mesh_cache: &LaminarSimpleMeshCache,
     fields: MomentumPredictorFields<'_>,
     options: &LaminarSimpleOptions,
+    capture_nonconvergence_diagnostic: bool,
     scalar_solve_workspace: &mut ScalarSolveWorkspace,
     momentum_component_executor: Option<&mut MomentumComponentExecutor>,
 ) -> Result<MomentumPredictorReport> {
@@ -2732,6 +2931,7 @@ fn solve_momentum_predictor(
     let mut component_normalized_residual_norms = [0.0; 3];
     let mut component_converged = [false; 3];
     let mut component_linear_solves = [LinearSolveConvergenceSummary::default(); 3];
+    let mut component_algebraic_residual_rows = [None; 3];
     let linear_solve_started = Instant::now();
     let controls = ScalarSolveControls {
         solver: options.momentum_linear_solver,
@@ -2744,12 +2944,18 @@ fn solve_momentum_predictor(
         profile_pcg: false,
     };
     let reports = if let Some(executor) = momentum_component_executor {
-        executor.solve(equation.components, old_components, controls)?
+        executor.solve(
+            equation.components,
+            old_components,
+            controls,
+            capture_nonconvergence_diagnostic,
+        )?
     } else {
         solve_momentum_components_serial(
             &equation.components,
             &old_components,
             controls,
+            capture_nonconvergence_diagnostic,
             scalar_solve_workspace,
         )?
     };
@@ -2763,6 +2969,7 @@ fn solve_momentum_predictor(
         component_normalized_residual_norms[component] = report.normalized_residual_norm;
         component_converged[component] = report.converged;
         component_linear_solves[component] = LinearSolveConvergenceSummary::from(&report);
+        component_algebraic_residual_rows[component] = report.algebraic_residual_row;
         solved_components[component] = report.solution;
     }
     let linear_solve_seconds = linear_solve_started.elapsed().as_secs_f64();
@@ -2793,6 +3000,7 @@ fn solve_momentum_predictor(
         component_normalized_residual_norms,
         component_converged,
         component_linear_solves,
+        component_algebraic_residual_rows,
         diagonal_min: equation.diagonal_min,
         diagonal_max: equation.diagonal_max,
         h1_min: equation.h1_min,
@@ -2808,6 +3016,7 @@ fn solve_momentum_components_serial(
     components: &[ScalarComponentSystem],
     old_components: &[Vec<f64>; 3],
     controls: ScalarSolveControls,
+    mut capture_nonconvergence_diagnostic: bool,
     scalar_solve_workspace: &mut ScalarSolveWorkspace,
 ) -> Result<[ScalarSolveReport; 3]> {
     if components.len() != 3 {
@@ -2818,7 +3027,7 @@ fn solve_momentum_components_serial(
     }
     let mut reports: [Option<ScalarSolveReport>; 3] = [None, None, None];
     for (component, system) in components.iter().enumerate() {
-        let report = solve_scalar_system_with_workspaces(
+        let report = solve_scalar_system_with_workspaces_and_diagnostic(
             &system.matrix,
             &system.rhs,
             Some(&old_components[component]),
@@ -2826,6 +3035,7 @@ fn solve_momentum_components_serial(
             scalar_solve_workspace,
             None,
             None,
+            capture_nonconvergence_diagnostic,
         )
         .map_err(|error| {
             invalid_input(format!(
@@ -2833,6 +3043,9 @@ fn solve_momentum_components_serial(
                 component_name(component)
             ))
         })?;
+        if !report.converged {
+            capture_nonconvergence_diagnostic = false;
+        }
         reports[component] = Some(report);
     }
     Ok([
@@ -2979,6 +3192,7 @@ fn coefficient_range(values: &[f64]) -> (f64, f64) {
     }
 }
 
+#[cfg(test)]
 fn solve_scalar_system_with_workspaces(
     matrix: &CsrMatrix,
     rhs: &[f64],
@@ -2987,6 +3201,29 @@ fn solve_scalar_system_with_workspaces(
     scalar_workspace: &mut ScalarSolveWorkspace,
     pcg_workspace: Option<&mut PreconditionedConjugateGradientWorkspace>,
     gamg_workspace: Option<&mut GamgWorkspace>,
+) -> Result<ScalarSolveReport> {
+    solve_scalar_system_with_workspaces_and_diagnostic(
+        matrix,
+        rhs,
+        initial,
+        controls,
+        scalar_workspace,
+        pcg_workspace,
+        gamg_workspace,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solve_scalar_system_with_workspaces_and_diagnostic(
+    matrix: &CsrMatrix,
+    rhs: &[f64],
+    initial: Option<&[f64]>,
+    controls: ScalarSolveControls,
+    scalar_workspace: &mut ScalarSolveWorkspace,
+    pcg_workspace: Option<&mut PreconditionedConjugateGradientWorkspace>,
+    gamg_workspace: Option<&mut GamgWorkspace>,
+    capture_nonconvergence_diagnostic: bool,
 ) -> Result<ScalarSolveReport> {
     if !controls.relative_tolerance.is_finite() || controls.relative_tolerance < 0.0 {
         return Err(invalid_input(format!(
@@ -3105,6 +3342,7 @@ fn solve_scalar_system_with_workspaces(
             } else {
                 dominant_tolerance_reason
             },
+            algebraic_residual_row: None,
             pcg_timing: None,
             gamg_timing: None,
         });
@@ -3349,6 +3587,16 @@ fn solve_scalar_system_with_workspaces(
     } else {
         LinearSolveStopReason::MaxIterations
     };
+    let algebraic_residual_row = (capture_nonconvergence_diagnostic && !converged).then(|| {
+        diagnose_worst_algebraic_residual_row(
+            matrix,
+            rhs,
+            initial_values,
+            &report.solution,
+            matrix_product,
+            residual,
+        )
+    });
     Ok(ScalarSolveReport {
         solution: report.solution,
         iterations: report.iterations,
@@ -3359,9 +3607,234 @@ fn solve_scalar_system_with_workspaces(
         normalized_residual_norm: final_normalized_residual_norm,
         effective_normalized_tolerance,
         stop_reason,
+        algebraic_residual_row,
         pcg_timing,
         gamg_timing,
     })
+}
+
+fn diagnose_worst_algebraic_residual_row(
+    matrix: &CsrMatrix,
+    rhs: &[f64],
+    initial: &[f64],
+    candidate: &[f64],
+    matrix_product: &[f64],
+    residual: &[f64],
+) -> AlgebraicResidualRowDiagnostic {
+    let rows = matrix.rows();
+    if rows == 0
+        || rhs.len() != rows
+        || candidate.len() != matrix.cols()
+        || initial.len() != matrix.cols()
+        || matrix_product.len() != rows
+        || residual.len() != rows
+    {
+        return AlgebraicResidualRowDiagnostic::default();
+    }
+    let mut selected_row = None;
+    let mut selected_ax = None;
+    let mut selected_residual = None;
+    let mut selected_abs = f64::NEG_INFINITY;
+
+    for row in 0..rows {
+        let ax = matrix_product[row];
+        let row_residual = residual[row];
+        if !row_residual.is_finite() {
+            selected_row = Some(row);
+            selected_ax = Some(ax);
+            selected_residual = Some(row_residual);
+            break;
+        }
+        let absolute = row_residual.abs();
+        if selected_row.is_none() || absolute > selected_abs {
+            selected_row = Some(row);
+            selected_ax = Some(ax);
+            selected_residual = Some(row_residual);
+            selected_abs = absolute;
+        }
+    }
+
+    let Some(row) = selected_row else {
+        return AlgebraicResidualRowDiagnostic::default();
+    };
+    let Some(start) = matrix.row_offsets().get(row).copied() else {
+        return AlgebraicResidualRowDiagnostic {
+            row: Some(row),
+            ..AlgebraicResidualRowDiagnostic::default()
+        };
+    };
+    let Some(end) = matrix.row_offsets().get(row + 1).copied() else {
+        return AlgebraicResidualRowDiagnostic {
+            row: Some(row),
+            ..AlgebraicResidualRowDiagnostic::default()
+        };
+    };
+    let mut diagonal = None;
+    let mut row_sum_abs = 0.0;
+    let mut off_diagonal_sum_abs = 0.0;
+    let mut coefficients_representable = true;
+    for entry in start..end {
+        let Some(&column) = matrix.col_indices().get(entry) else {
+            coefficients_representable = false;
+            break;
+        };
+        let Some(&coefficient) = matrix.values().get(entry) else {
+            coefficients_representable = false;
+            break;
+        };
+        if !coefficient.is_finite() {
+            coefficients_representable = false;
+        }
+        row_sum_abs += coefficient.abs();
+        if column == row {
+            diagonal = Some(coefficient);
+        } else {
+            off_diagonal_sum_abs += coefficient.abs();
+        }
+    }
+    let rhs_value = rhs.get(row).copied();
+    let initial_value = initial.get(row).copied();
+    let candidate_value = candidate.get(row).copied();
+    let representable = coefficients_representable
+        && diagonal.is_some_and(f64::is_finite)
+        && row_sum_abs.is_finite()
+        && off_diagonal_sum_abs.is_finite()
+        && rhs_value.is_some_and(f64::is_finite)
+        && selected_ax.is_some_and(f64::is_finite)
+        && selected_residual.is_some_and(f64::is_finite)
+        && initial_value.is_some_and(f64::is_finite)
+        && candidate_value.is_some_and(f64::is_finite);
+
+    AlgebraicResidualRowDiagnostic {
+        representable,
+        row: Some(row),
+        cell_volume: None,
+        diagonal: diagonal.filter(|value| value.is_finite()),
+        row_sum_abs: row_sum_abs.is_finite().then_some(row_sum_abs),
+        off_diagonal_sum_abs: off_diagonal_sum_abs
+            .is_finite()
+            .then_some(off_diagonal_sum_abs),
+        rhs: rhs_value.filter(|value| value.is_finite()),
+        matrix_product: selected_ax.filter(|value| value.is_finite()),
+        residual: selected_residual.filter(|value| value.is_finite()),
+        initial_value: initial_value.filter(|value| value.is_finite()),
+        candidate_value: candidate_value.filter(|value| value.is_finite()),
+        incident_faces: IncidentFaceDiagnosticSummary::default(),
+    }
+}
+
+fn attach_incident_face_diagnostics(
+    mut diagnostic: AlgebraicResidualRowDiagnostic,
+    mesh: &SolverRuntimeMeshData,
+    face_addressing: &CompactSimpleFaceAddressing,
+    flux: &[f64],
+) -> AlgebraicResidualRowDiagnostic {
+    let Some(row) = diagnostic.row else {
+        return diagnostic;
+    };
+    diagnostic.cell_volume = mesh
+        .cell_volumes
+        .get(row)
+        .copied()
+        .filter(|value| value.is_finite() && *value > 0.0);
+
+    let lengths_match = mesh.faces == face_addressing.faces() && flux.len() == mesh.faces;
+    let face_count = mesh.faces.min(face_addressing.faces()).min(flux.len());
+    let mut count = 0usize;
+    let mut signed_sum = 0.0;
+    let mut sum_abs = 0.0;
+    let mut minimum = f64::INFINITY;
+    let mut maximum = f64::NEG_INFINITY;
+    let mut max_abs = f64::NEG_INFINITY;
+    let mut max_abs_face_index = None;
+    let mut max_abs_face_flux = None;
+    let mut values_representable = lengths_match;
+
+    for (face_index, &face_flux) in flux.iter().enumerate().take(face_count) {
+        let owner = face_addressing.owner(face_index);
+        let neighbour = face_addressing.neighbour(face_index);
+        let orientation = if owner == row {
+            1.0
+        } else if neighbour == Some(row) {
+            -1.0
+        } else {
+            continue;
+        };
+        count += 1;
+        if !face_flux.is_finite() {
+            values_representable = false;
+            if max_abs_face_index.is_none() {
+                max_abs_face_index = Some(face_index);
+                max_abs_face_flux = None;
+            }
+            continue;
+        }
+        let signed_flux = orientation * face_flux;
+        signed_sum += signed_flux;
+        sum_abs += signed_flux.abs();
+        minimum = minimum.min(signed_flux);
+        maximum = maximum.max(signed_flux);
+        if signed_flux.abs() > max_abs {
+            max_abs = signed_flux.abs();
+            max_abs_face_index = Some(face_index);
+            max_abs_face_flux = Some(face_flux);
+        }
+    }
+    values_representable &= count > 0
+        && signed_sum.is_finite()
+        && sum_abs.is_finite()
+        && minimum.is_finite()
+        && maximum.is_finite();
+    let max_abs_face_owner = max_abs_face_index.map(|face| face_addressing.owner(face));
+    let max_abs_face_neighbour =
+        max_abs_face_index.and_then(|face| face_addressing.neighbour(face));
+    let max_abs_face_patch_index = max_abs_face_index.and_then(|face| {
+        mesh.patches
+            .iter()
+            .enumerate()
+            .find_map(|(patch_index, patch)| {
+                patch
+                    .start_face
+                    .checked_add(patch.faces)
+                    .filter(|end| face >= patch.start_face && face < *end)
+                    .map(|_| patch_index)
+            })
+    });
+    diagnostic.incident_faces = IncidentFaceDiagnosticSummary {
+        representable: values_representable,
+        count,
+        signed_sum: signed_sum.is_finite().then_some(signed_sum),
+        sum_abs: sum_abs.is_finite().then_some(sum_abs),
+        min: minimum.is_finite().then_some(minimum),
+        max: maximum.is_finite().then_some(maximum),
+        max_abs_face_index,
+        max_abs_face_owner,
+        max_abs_face_neighbour,
+        max_abs_face_patch_index,
+        max_abs_face_flux,
+    };
+    diagnostic.representable &= diagnostic.cell_volume.is_some() && values_representable;
+    diagnostic
+}
+
+fn update_linear_nonconvergence_continuity(
+    snapshot: &mut Option<LinearNonConvergenceSnapshot>,
+    iteration: usize,
+    continuity_star: Option<ContinuitySummary>,
+    continuity_after: Option<ContinuitySummary>,
+) {
+    let Some(snapshot) = snapshot.as_mut() else {
+        return;
+    };
+    if snapshot.simple_iteration != iteration {
+        return;
+    }
+    if snapshot.continuity_star.is_none() {
+        snapshot.continuity_star = continuity_star;
+    }
+    if snapshot.continuity_after.is_none() {
+        snapshot.continuity_after = continuity_after;
+    }
 }
 
 fn strict_l2_tolerance_for_l1_limit(l1_limit: f64, component_count: f64) -> f64 {
@@ -4572,6 +5045,15 @@ fn compute_face_flux_with_addressing(
     }
     let mut flux = flow_try_filled_vec(mesh.faces, 0.0)?;
     for (face_index, face_flux) in flux.iter_mut().enumerate() {
+        if face_addressing.neighbour(face_index).is_none()
+            && matches!(boundary[face_index], VectorFaceTreatment::Constraint)
+        {
+            // empty, wedge and symmetryPlane patches have no normal flux.
+            // Keep this local to flux construction: the owner value is still
+            // required by tangential interpolation and convection paths.
+            *face_flux = 0.0;
+            continue;
+        }
         let face_velocity = face_vector_value_with_addressing(
             mesh,
             face_addressing,
@@ -5318,6 +5800,29 @@ fn adjust_phi_hby_a_with_pressure_geometry_and_addressing(
         )));
     }
 
+    // Constraint patches represent empty, wedge and symmetryPlane faces. Their
+    // normal flux is identically zero and must never be used as an adjustable
+    // inlet or outlet. Validate before any correction can mutate phiHbyA.
+    for &face_index in face_addressing.boundary_faces() {
+        if !matches!(
+            velocity_boundary[face_index],
+            VectorFaceTreatment::Constraint
+        ) {
+            continue;
+        }
+        let flux = phi_hby_a[face_index];
+        if !flux.is_finite() {
+            return Err(invalid_input(format!(
+                "adjustPhi boundary face {face_index} flux must be finite, got {flux}"
+            )));
+        }
+        if flux != 0.0 {
+            return Err(invalid_input(format!(
+                "adjustPhi constraint boundary face {face_index} must have exactly zero normal flux, got {flux}"
+            )));
+        }
+    }
+
     let global_flux_before = boundary_global_flux_with_addressing(face_addressing, phi_hby_a);
     if !global_flux_before.is_finite() {
         return Err(invalid_input(format!(
@@ -5349,6 +5854,9 @@ fn adjust_phi_hby_a_with_pressure_geometry_and_addressing(
             )));
         }
         let velocity = velocity_boundary[face_index];
+        if matches!(velocity, VectorFaceTreatment::Constraint) {
+            continue;
+        }
         if flux < 0.0 {
             mass_in -= flux;
         } else if velocity_fixes_value_for_adjust_phi(velocity) {
@@ -5402,6 +5910,12 @@ fn adjust_phi_hby_a_with_pressure_geometry_and_addressing(
     let mut global_flux_after = 0.0;
     let mut adjusted_faces = 0;
     for &face_index in face_addressing.boundary_faces() {
+        if matches!(
+            velocity_boundary[face_index],
+            VectorFaceTreatment::Constraint
+        ) {
+            continue;
+        }
         let flux = if phi_hby_a[face_index] <= 0.0
             || velocity_fixes_value_for_adjust_phi(velocity_boundary[face_index])
         {
@@ -5425,6 +5939,12 @@ fn adjust_phi_hby_a_with_pressure_geometry_and_addressing(
     }
 
     for &face_index in face_addressing.boundary_faces() {
+        if matches!(
+            velocity_boundary[face_index],
+            VectorFaceTreatment::Constraint
+        ) {
+            continue;
+        }
         if phi_hby_a[face_index] > 0.0
             && !velocity_fixes_value_for_adjust_phi(velocity_boundary[face_index])
         {
@@ -7533,6 +8053,40 @@ mod tests {
         assert_close(flux[0], 2.0);
         assert_close(flux[1], -1.0);
         assert_close(flux[2], 3.0);
+    }
+
+    #[test]
+    fn constraint_boundary_flux_is_bit_exact_positive_zero_without_changing_internal_flux() {
+        let runtime = two_cell_runtime();
+        let boundary = vec![VectorFaceTreatment::Constraint; runtime.mesh.faces];
+        let velocity = vec![point(3.0, 4.0, 5.0), point(-7.0, 8.0, 9.0)];
+
+        let flux =
+            compute_face_flux(&runtime.mesh, &velocity, &boundary).expect("constraint face flux");
+
+        assert_eq!(flux[0].to_bits(), (-2.0f64).to_bits());
+        assert_eq!(flux[1].to_bits(), 0.0f64.to_bits());
+        assert_eq!(flux[2].to_bits(), 0.0f64.to_bits());
+    }
+
+    #[test]
+    fn empty_wedge_and_symmetry_plane_velocity_patches_map_to_constraints() {
+        for patch_type in ["empty", "wedge", "symmetryPlane"] {
+            let mut runtime = two_cell_runtime();
+            runtime.mesh.patches[1].patch_type = patch_type.to_string();
+            let mut fields = two_cell_fields();
+            let velocity_field = fields
+                .fields
+                .iter_mut()
+                .find(|field| field.name == "U")
+                .expect("U field");
+            velocity_field.boundary_patches[1].patch_type = Some(patch_type.to_string());
+
+            let boundary = vector_face_treatments(&runtime.mesh, velocity_field)
+                .expect("constraint boundary mapping");
+
+            assert!(matches!(boundary[2], VectorFaceTreatment::Constraint));
+        }
     }
 
     #[test]
@@ -10506,25 +11060,33 @@ mod tests {
     }
 
     #[test]
-    fn adjust_phi_treats_supported_uncoupled_constraint_flux_as_adjustable() {
+    fn adjust_phi_rejects_nonzero_constraint_flux_without_mutation() {
         let runtime = two_cell_runtime();
         let mut velocity_boundary = vec![VectorFaceTreatment::Constraint; runtime.mesh.faces];
         velocity_boundary[1] = VectorFaceTreatment::FixedValue(point(1.0, 0.0, 0.0));
         let pressure_boundary = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
-        let mut phi_hby_a = vec![1.0, -1.0, 0.5];
+        let mut phi_hby_a: Vec<f64> = vec![1.0, -1.0, 0.5];
+        let expected_bits = phi_hby_a
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>();
 
-        let summary = adjust_phi_hby_a(
+        let error = adjust_phi_hby_a(
             &runtime.mesh,
             &velocity_boundary,
             &pressure_boundary,
             &mut phi_hby_a,
         )
-        .expect("adjust uncoupled constraint outflow");
+        .expect_err("nonzero constraint normal flux must fail closed");
 
-        assert_eq!(summary.adjusted_faces, 1);
-        assert_eq!(phi_hby_a[1].to_bits(), (-1.0f64).to_bits());
-        assert_eq!(phi_hby_a[2].to_bits(), 1.0f64.to_bits());
-        assert_eq!(summary.global_flux_after.to_bits(), 0.0f64.to_bits());
+        assert!(error.to_string().contains("exactly zero normal flux"));
+        assert_eq!(
+            phi_hby_a
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected_bits
+        );
     }
 
     #[test]
@@ -14029,6 +14591,24 @@ mod tests {
             initial_continuity.l2_norm
         );
         assert!(breakdown.timing.pressure_matrix_vector_products > 0);
+        let breakdown_snapshot = breakdown
+            .first_pressure_linear_nonconvergence
+            .expect("breakdown must retain its first pressure failure");
+        assert_eq!(breakdown_snapshot.simple_iteration, 1);
+        assert_eq!(breakdown_snapshot.solve_ordinal, 2);
+        assert_eq!(
+            breakdown_snapshot.solve.stop_reason,
+            LinearSolveStopReason::Breakdown
+        );
+        assert!(!breakdown_snapshot.linear_iterate_accepted);
+        assert_eq!(
+            breakdown_snapshot
+                .continuity_after
+                .expect("rejected breakdown continuity")
+                .l2_norm
+                .to_bits(),
+            initial_continuity.l2_norm.to_bits()
+        );
 
         let mut drive_exhaustion =
             |solve: usize,
@@ -14063,6 +14643,510 @@ mod tests {
                 .pressure_correction_non_converged_solves
                 > 0
         );
+    }
+
+    #[test]
+    fn pressure_max_iterations_with_nonfinite_solution_stops_before_next_nonorthogonal_solve() {
+        let mut runtime = two_cell_runtime();
+        let fields = two_cell_fields();
+        let mut options = minimal_laminar_options();
+        options.max_simple_iterations = 1;
+        options.non_orthogonal_correctors = 1;
+        options.momentum_linear_tolerance = 2.0;
+        options.pressure_linear_tolerance = 2.0;
+
+        let initial_pressure = runtime.fields[1]
+            .values
+            .clone()
+            .expect("initial pressure payload");
+        let initial_velocity = [point(1.0, 0.0, 0.0), point(1.0, 0.0, 0.0)];
+        let velocity_boundary = super::vector_face_treatments(&runtime.mesh, &fields.fields[0])
+            .expect("velocity boundary");
+        let initial_phi = compute_face_flux(&runtime.mesh, &initial_velocity, &velocity_boundary)
+            .expect("initial phi");
+        let initial_continuity =
+            super::summarize_continuity(&net_cell_flux(&runtime.mesh, &initial_phi).unwrap());
+        let mut pressure_solves = 0usize;
+        let mut drive_nonfinite_max_iterations =
+            |solve: usize,
+             report: &mut super::ScalarSolveReport,
+             _predicted_velocity: &[Point3],
+             _phi_hby_a: &[f64],
+             _continuity_star: super::ContinuitySummary| {
+                pressure_solves += 1;
+                assert_eq!(solve, 1);
+                report.converged = false;
+                report.termination = IterativeSolveTermination::MaxIterations;
+                report.stop_reason = LinearSolveStopReason::MaxIterations;
+                report.solution.fill(f64::NAN);
+            };
+
+        let report = super::solve_laminar_simple_driven(
+            &mut runtime,
+            &fields,
+            &options,
+            None,
+            false,
+            Some(&mut drive_nonfinite_max_iterations),
+            None,
+        )
+        .expect("non-finite max-iteration pressure report");
+
+        assert_eq!(pressure_solves, 1);
+        assert_eq!(
+            report.stop_reason,
+            LaminarSimpleStopReason::SolverInvalidState
+        );
+        assert_eq!(report.simple_iterations, 1);
+        assert!(!report.history[0].pressure_correction_accepted);
+        assert_eq!(report.final_pressure, initial_pressure);
+        for (actual, expected) in report.final_velocity.iter().zip(initial_velocity) {
+            assert_eq!(actual.x.to_bits(), expected.x.to_bits());
+            assert_eq!(actual.y.to_bits(), expected.y.to_bits());
+            assert_eq!(actual.z.to_bits(), expected.z.to_bits());
+        }
+        assert_eq!(report.final_phi, initial_phi);
+        assert_eq!(
+            report.final_continuity.l2_norm.to_bits(),
+            initial_continuity.l2_norm.to_bits()
+        );
+        assert_eq!(
+            report.final_continuity.max_abs.to_bits(),
+            initial_continuity.max_abs.to_bits()
+        );
+        assert_eq!(
+            report.final_continuity.sum_abs.to_bits(),
+            initial_continuity.sum_abs.to_bits()
+        );
+        assert_eq!(
+            report.final_continuity.global_sum.to_bits(),
+            initial_continuity.global_sum.to_bits()
+        );
+
+        let snapshot = report
+            .first_pressure_linear_nonconvergence
+            .expect("injected pressure nonconvergence snapshot");
+        assert_eq!(snapshot.simple_iteration, 1);
+        assert_eq!(snapshot.solve_ordinal, 1);
+        assert_eq!(
+            snapshot.solve.stop_reason,
+            LinearSolveStopReason::MaxIterations
+        );
+        assert!(!snapshot.linear_iterate_accepted);
+        let continuity_after = snapshot
+            .continuity_after
+            .expect("rejected pressure continuity");
+        assert_eq!(
+            continuity_after.l2_norm.to_bits(),
+            initial_continuity.l2_norm.to_bits()
+        );
+        assert_eq!(
+            continuity_after.max_abs.to_bits(),
+            initial_continuity.max_abs.to_bits()
+        );
+        assert_eq!(
+            continuity_after.sum_abs.to_bits(),
+            initial_continuity.sum_abs.to_bits()
+        );
+        assert_eq!(
+            continuity_after.global_sum.to_bits(),
+            initial_continuity.global_sum.to_bits()
+        );
+    }
+
+    #[test]
+    fn pressure_minimum_iteration_budget_is_accepted_and_captures_a_csr_oracle() {
+        let mut runtime = two_cell_runtime();
+        let fields = two_cell_fields();
+        let mut options = minimal_laminar_options();
+        options.max_simple_iterations = 1;
+        options.momentum_linear_tolerance = 2.0;
+        options.pressure_max_linear_iterations = 1;
+        options.pressure_linear_tolerance = 0.0;
+
+        let report = solve_laminar_simple(&mut runtime, &fields, &options)
+            .expect("minimum-budget pressure semantics report");
+
+        let snapshot = report
+            .first_pressure_linear_nonconvergence
+            .expect("pressure nonconvergence snapshot");
+        assert_eq!(snapshot.simple_iteration, 1);
+        assert_eq!(snapshot.solve_ordinal, 1);
+        assert_eq!(snapshot.solve.iterations, 1);
+        assert_eq!(
+            snapshot.solve.stop_reason,
+            LinearSolveStopReason::MaxIterations
+        );
+        assert!(snapshot.linear_iterate_accepted);
+        assert!(snapshot.continuity_star.is_some());
+        assert!(snapshot.continuity_after.is_some());
+        let row = snapshot.worst_algebraic_residual_row;
+        assert!(row.representable);
+        assert_eq!(
+            row.residual.expect("row residual").to_bits(),
+            (row.rhs.expect("row rhs") - row.matrix_product.expect("row Ax")).to_bits()
+        );
+        assert_eq!(
+            row.row_sum_abs.expect("row sum").to_bits(),
+            (row.diagonal.expect("row diagonal").abs()
+                + row.off_diagonal_sum_abs.expect("off-diagonal sum"))
+            .to_bits()
+        );
+        assert!(row.incident_faces.representable);
+        assert!(row.incident_faces.count > 0);
+        assert_eq!(
+            report
+                .linear_solve_summary
+                .pressure_correction_non_converged_solves,
+            1
+        );
+        assert!(report.history[0].pressure_correction_accepted);
+    }
+
+    #[test]
+    fn converged_linear_solves_leave_fail_only_snapshots_empty() {
+        let mut runtime = two_cell_runtime();
+        let fields = two_cell_fields();
+        let mut options = minimal_laminar_options();
+        options.max_simple_iterations = 1;
+        options.momentum_linear_tolerance = 2.0;
+        options.pressure_linear_tolerance = 2.0;
+
+        let report = super::solve_laminar_simple(&mut runtime, &fields, &options)
+            .expect("converged linear solves report");
+
+        assert!(report.first_momentum_linear_nonconvergence.is_none());
+        assert!(report.first_pressure_linear_nonconvergence.is_none());
+        assert_eq!(
+            report
+                .linear_solve_summary
+                .momentum_component_non_converged_solves,
+            0
+        );
+        assert_eq!(
+            report
+                .linear_solve_summary
+                .pressure_correction_non_converged_solves,
+            0
+        );
+    }
+
+    #[test]
+    fn momentum_iteration_exhaustion_is_accepted_and_captured() {
+        let mut runtime = two_cell_runtime();
+        let fields = two_cell_fields();
+        let mut options = minimal_laminar_options();
+        options.max_simple_iterations = 1;
+        options.momentum_max_linear_iterations = 1;
+        options.momentum_linear_tolerance = 0.0;
+        options.pressure_linear_tolerance = 2.0;
+
+        let report = super::solve_laminar_simple(&mut runtime, &fields, &options)
+            .expect("momentum iteration-exhaustion report");
+        let snapshot = report
+            .first_momentum_linear_nonconvergence
+            .expect("momentum nonconvergence snapshot");
+
+        assert_eq!(snapshot.simple_iteration, 1);
+        assert_eq!(
+            snapshot.solve.stop_reason,
+            LinearSolveStopReason::MaxIterations
+        );
+        assert!(snapshot.linear_iterate_accepted);
+        assert!(snapshot.solve_ordinal <= 3);
+        assert!(snapshot.worst_algebraic_residual_row.row.is_some());
+        assert!(snapshot.continuity_star.is_some());
+        assert!(snapshot.continuity_after.is_some());
+        assert!(
+            report
+                .linear_solve_summary
+                .momentum_component_non_converged_solves
+                > 0
+        );
+    }
+
+    #[test]
+    fn first_pressure_nonconvergence_is_retained_across_corrections() {
+        let mut runtime = two_cell_runtime();
+        let fields = two_cell_fields();
+        let mut options = minimal_laminar_options();
+        options.max_simple_iterations = 1;
+        options.non_orthogonal_correctors = 1;
+        let mut forced_nonconvergences = 0usize;
+        let mut force_every_pressure_solve =
+            |_solve: usize,
+             report: &mut super::ScalarSolveReport,
+             _predicted_velocity: &[Point3],
+             _phi_hby_a: &[f64],
+             _continuity_star: super::ContinuitySummary| {
+                forced_nonconvergences += 1;
+                report.converged = false;
+                report.termination = IterativeSolveTermination::MaxIterations;
+                report.stop_reason = LinearSolveStopReason::MaxIterations;
+            };
+
+        let report = super::solve_laminar_simple_driven(
+            &mut runtime,
+            &fields,
+            &options,
+            None,
+            false,
+            Some(&mut force_every_pressure_solve),
+            None,
+        )
+        .expect("multi-correction nonconvergence report");
+        let snapshot = report
+            .first_pressure_linear_nonconvergence
+            .expect("first pressure snapshot");
+
+        assert_eq!(forced_nonconvergences, 2);
+        assert_eq!(snapshot.solve_ordinal, 1);
+        assert_eq!(
+            snapshot.solve.stop_reason,
+            LinearSolveStopReason::MaxIterations
+        );
+        assert_eq!(report.history[0].pressure_linear_non_converged_solves, 2);
+        assert_eq!(
+            report
+                .linear_solve_summary
+                .pressure_correction_non_converged_solves,
+            2
+        );
+    }
+
+    #[test]
+    fn incident_face_diagnostics_preserve_cell_orientation_and_patch_identity() {
+        let runtime = two_cell_runtime();
+        let face_addressing =
+            super::CompactSimpleFaceAddressing::from_mesh(&runtime.mesh).expect("face addressing");
+        let flux = [2.0, -3.0, 1.0];
+
+        let owner = super::attach_incident_face_diagnostics(
+            super::AlgebraicResidualRowDiagnostic {
+                representable: true,
+                row: Some(0),
+                ..super::AlgebraicResidualRowDiagnostic::default()
+            },
+            &runtime.mesh,
+            &face_addressing,
+            &flux,
+        );
+        let owner_faces = owner.incident_faces;
+        assert!(owner_faces.representable);
+        assert_eq!(owner_faces.count, 2);
+        assert_eq!(owner_faces.signed_sum, Some(-1.0));
+        assert_eq!(owner_faces.sum_abs, Some(5.0));
+        assert_eq!(owner_faces.min, Some(-3.0));
+        assert_eq!(owner_faces.max, Some(2.0));
+        assert_eq!(owner_faces.max_abs_face_index, Some(1));
+        assert_eq!(owner_faces.max_abs_face_owner, Some(0));
+        assert_eq!(owner_faces.max_abs_face_neighbour, None);
+        assert_eq!(owner_faces.max_abs_face_patch_index, Some(0));
+        assert_eq!(owner_faces.max_abs_face_flux, Some(-3.0));
+
+        let neighbour = super::attach_incident_face_diagnostics(
+            super::AlgebraicResidualRowDiagnostic {
+                representable: true,
+                row: Some(1),
+                ..super::AlgebraicResidualRowDiagnostic::default()
+            },
+            &runtime.mesh,
+            &face_addressing,
+            &flux,
+        );
+        let neighbour_faces = neighbour.incident_faces;
+        assert!(neighbour_faces.representable);
+        assert_eq!(neighbour_faces.count, 2);
+        assert_eq!(neighbour_faces.signed_sum, Some(-1.0));
+        assert_eq!(neighbour_faces.min, Some(-2.0));
+        assert_eq!(neighbour_faces.max, Some(1.0));
+        assert_eq!(neighbour_faces.max_abs_face_index, Some(0));
+        assert_eq!(neighbour_faces.max_abs_face_owner, Some(0));
+        assert_eq!(neighbour_faces.max_abs_face_neighbour, Some(1));
+        assert_eq!(neighbour_faces.max_abs_face_patch_index, None);
+        assert_eq!(neighbour_faces.max_abs_face_flux, Some(2.0));
+    }
+
+    #[test]
+    fn algebraic_residual_row_diagnostic_matches_multi_row_oracle_and_keeps_first_tie() {
+        let matrix = CsrMatrix::from_rows(
+            vec![
+                vec![(0usize, 4.0f64), (1usize, -1.0f64)],
+                vec![(0usize, -2.0f64), (1usize, 5.0f64), (2usize, -1.0f64)],
+                vec![(1usize, -3.0f64), (2usize, 6.0f64)],
+            ],
+            3usize,
+        )
+        .expect("three-row diagnostic oracle matrix");
+        let initial = [-1.0f64, 0.5, 4.0];
+        let candidate = [1.0f64, 2.0, 3.0];
+        let matrix_product = [2.0f64, 5.0, 12.0];
+        let rhs = [3.0f64, 8.0, 9.0];
+        let residual = [1.0f64, 3.0, -3.0];
+
+        let mut recomputed = [0.0f64; 3];
+        matrix
+            .matvec_into(&candidate, &mut recomputed)
+            .expect("three-row diagnostic oracle matvec");
+        assert_eq!(
+            recomputed.map(f64::to_bits),
+            matrix_product.map(f64::to_bits)
+        );
+        for row in 0..3 {
+            assert_eq!(
+                (rhs[row] - matrix_product[row]).to_bits(),
+                residual[row].to_bits()
+            );
+        }
+        assert!(residual[0].abs() < residual[1].abs());
+        assert_eq!(residual[1].abs().to_bits(), residual[2].abs().to_bits());
+
+        let diagnostic = super::diagnose_worst_algebraic_residual_row(
+            &matrix,
+            &rhs,
+            &initial,
+            &candidate,
+            &matrix_product,
+            &residual,
+        );
+
+        assert!(diagnostic.representable);
+        assert_eq!(diagnostic.row, Some(1));
+        assert_eq!(
+            diagnostic.diagonal.expect("diagonal").to_bits(),
+            5.0f64.to_bits()
+        );
+        assert_eq!(
+            diagnostic.row_sum_abs.expect("row sum").to_bits(),
+            8.0f64.to_bits()
+        );
+        assert_eq!(
+            diagnostic
+                .off_diagonal_sum_abs
+                .expect("off-diagonal sum")
+                .to_bits(),
+            3.0f64.to_bits()
+        );
+        assert_eq!(diagnostic.rhs.expect("rhs").to_bits(), 8.0f64.to_bits());
+        assert_eq!(
+            diagnostic.matrix_product.expect("Ax").to_bits(),
+            5.0f64.to_bits()
+        );
+        assert_eq!(
+            diagnostic.residual.expect("residual").to_bits(),
+            3.0f64.to_bits()
+        );
+        assert_eq!(
+            diagnostic.initial_value.expect("initial").to_bits(),
+            0.5f64.to_bits()
+        );
+        assert_eq!(
+            diagnostic.candidate_value.expect("candidate").to_bits(),
+            2.0f64.to_bits()
+        );
+    }
+
+    #[test]
+    fn algebraic_and_incident_diagnostic_overflow_is_fail_open() {
+        let matrix =
+            CsrMatrix::from_rows(vec![vec![(0, 1.0)]], 1).expect("single-row diagnostic matrix");
+        let row = super::diagnose_worst_algebraic_residual_row(
+            &matrix,
+            &[f64::MAX],
+            &[0.0],
+            &[-f64::MAX],
+            &[-f64::MAX],
+            &[f64::INFINITY],
+        );
+        assert_eq!(row.row, Some(0));
+        assert!(!row.representable);
+        assert_eq!(row.rhs, Some(f64::MAX));
+        assert_eq!(row.matrix_product, Some(-f64::MAX));
+        assert_eq!(row.residual, None);
+
+        let runtime = two_cell_runtime();
+        let face_addressing =
+            super::CompactSimpleFaceAddressing::from_mesh(&runtime.mesh).expect("face addressing");
+        let attached = super::attach_incident_face_diagnostics(
+            super::AlgebraicResidualRowDiagnostic {
+                representable: true,
+                row: Some(0),
+                ..super::AlgebraicResidualRowDiagnostic::default()
+            },
+            &runtime.mesh,
+            &face_addressing,
+            &[f64::MAX, f64::MAX, 0.0],
+        );
+        assert!(!attached.representable);
+        assert!(!attached.incident_faces.representable);
+        assert_eq!(attached.incident_faces.signed_sum, None);
+        assert_eq!(attached.incident_faces.sum_abs, None);
+    }
+
+    #[test]
+    fn serial_momentum_diagnostic_permit_is_consumed_by_first_nonconverged_component() {
+        let systems = momentum_component_test_systems();
+        let initials = momentum_component_test_initials();
+        let mut controls = momentum_component_test_controls(
+            LaminarSimpleLinearSolver::Cg,
+            LaminarSimplePreconditioner::None,
+        );
+        controls.tolerance = 0.0;
+        controls.max_iterations = 1;
+        let mut workspace = ScalarSolveWorkspace::new(2);
+
+        let reports =
+            solve_momentum_components_serial(&systems, &initials, controls, true, &mut workspace)
+                .expect("serial first-only diagnostic solves");
+
+        assert!(reports.iter().all(|report| !report.converged));
+        assert!(reports[0].algebraic_residual_row.is_some());
+        assert!(reports[1].algebraic_residual_row.is_none());
+        assert!(reports[2].algebraic_residual_row.is_none());
+    }
+
+    #[test]
+    fn parallel_momentum_diagnostic_is_bounded_to_first_failing_predictor() {
+        let mut controls = momentum_component_test_controls(
+            LaminarSimpleLinearSolver::Cg,
+            LaminarSimplePreconditioner::None,
+        );
+        controls.tolerance = 0.0;
+        controls.max_iterations = 1;
+        let mut executor = MomentumComponentExecutor::new(2).expect("component executor");
+
+        let first = executor
+            .solve(
+                momentum_component_test_systems(),
+                momentum_component_test_initials(),
+                controls,
+                true,
+            )
+            .expect("first failing parallel predictor");
+        assert!(first.iter().all(|report| !report.converged));
+        assert_eq!(
+            first
+                .iter()
+                .filter(|report| report.algebraic_residual_row.is_some())
+                .count(),
+            3
+        );
+
+        let later = executor
+            .solve(
+                momentum_component_test_systems(),
+                momentum_component_test_initials(),
+                controls,
+                false,
+            )
+            .expect("later failing parallel predictor");
+        assert!(later.iter().all(|report| !report.converged));
+        assert!(
+            later
+                .iter()
+                .all(|report| report.algebraic_residual_row.is_none())
+        );
+        executor.shutdown().expect("component executor shutdown");
     }
 
     #[test]
@@ -14217,11 +15301,12 @@ mod tests {
                 &systems,
                 &initials,
                 controls,
+                false,
                 &mut serial_workspace,
             )
             .expect("serial component oracle");
             let parallel = executor
-                .solve(systems, initials, controls)
+                .solve(systems, initials, controls, false)
                 .expect("parallel component solve");
             for component in 0..3 {
                 assert_scalar_solve_reports_bit_equal(&serial[component], &parallel[component]);
@@ -14306,6 +15391,7 @@ mod tests {
                     LaminarSimpleLinearSolver::Cg,
                     LaminarSimplePreconditioner::None,
                 ),
+                false,
             )
             .err()
             .expect("injected component failures must fail");
@@ -14331,6 +15417,7 @@ mod tests {
                     LaminarSimpleLinearSolver::Cg,
                     LaminarSimplePreconditioner::None,
                 ),
+                false,
             )
             .err()
             .expect("injected component panic must fail");
@@ -14394,6 +15481,7 @@ mod tests {
                 &systems,
                 &initials,
                 controls,
+                false,
                 &mut serial_workspace,
             )
             .unwrap_or_else(|error| {
@@ -14401,7 +15489,7 @@ mod tests {
             });
             let mut executor = MomentumComponentExecutor::new(2).expect("component executor");
             let parallel = executor
-                .solve(systems, initials, controls)
+                .solve(systems, initials, controls, false)
                 .unwrap_or_else(|error| {
                     panic!("{solver}/{preconditioner} parallel solve failed: {error}")
                 });
@@ -14534,6 +15622,49 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn public_pressure_zero_iteration_budget_rejects_before_runtime_mutation() {
+        let mut runtime = two_cell_runtime();
+        let before = runtime.clone();
+        let value_pointers = runtime
+            .fields
+            .iter()
+            .map(|field| field.values.as_ref().map(Vec::as_ptr))
+            .collect::<Vec<_>>();
+        let value_capacities = runtime
+            .fields
+            .iter()
+            .map(|field| field.values.as_ref().map(Vec::capacity))
+            .collect::<Vec<_>>();
+        let mut options = minimal_laminar_options();
+        options.pressure_max_linear_iterations = 0;
+
+        let error = solve_laminar_simple(&mut runtime, &two_cell_fields(), &options)
+            .expect_err("public zero pressure budget must fail before runtime mutation");
+
+        assert_eq!(
+            error.to_string(),
+            "laminar SIMPLE iteration limits must be greater than zero"
+        );
+        assert_eq!(format!("{runtime:?}"), format!("{before:?}"));
+        assert_eq!(
+            runtime
+                .fields
+                .iter()
+                .map(|field| field.values.as_ref().map(Vec::as_ptr))
+                .collect::<Vec<_>>(),
+            value_pointers
+        );
+        assert_eq!(
+            runtime
+                .fields
+                .iter()
+                .map(|field| field.values.as_ref().map(Vec::capacity))
+                .collect::<Vec<_>>(),
+            value_capacities
+        );
     }
 
     #[test]

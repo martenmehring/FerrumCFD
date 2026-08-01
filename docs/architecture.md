@@ -658,7 +658,10 @@ literal velocity `inletOutlet` face is adjustable only while it carries
 outflow and becomes prescribed inflow on backflow.
 `pressureInletOutletVelocity` remains backflow-sensitive in the momentum path,
 but its fixed-value classification makes positive outflow fixed for
-`adjustPhi`. The bridge then solves an absolute variable-coefficient pressure
+`adjustPhi`. Velocity constraints from `empty`, `wedge`, and `symmetryPlane`
+produce an exact zero normal face flux and are excluded from `adjustPhi` mass
+accounting and correction; a nonzero injected constraint flux fails before any
+flux mutation. The bridge then solves an absolute variable-coefficient pressure
 equation,
 corrects `phi` with the pressure-equation flux, corrects velocity as
 `U = HbyA - rAtU grad(p)`, and carries that corrected surface flux into the next

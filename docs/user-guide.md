@@ -887,7 +887,9 @@ system, positive adjustable outflow is scaled by the OpenFOAM mass-correction
 ratio derived from prescribed inflow and fixed outflow. A literal velocity
 `inletOutlet` face is adjustable only while it is outflowing;
 `pressureInletOutletVelocity` remains backflow-sensitive for momentum but is
-fixed positive outflow for `adjustPhi`.
+fixed positive outflow for `adjustPhi`. The `empty`, `wedge`, and
+`symmetryPlane` velocity constraints always contribute exact zero normal flux
+and are never adjusted; a nonzero constraint flux is rejected before mutation.
 The bridge then solves an absolute pressure equation, corrects `phi` from the
 pressure-equation flux, corrects velocity as `U = HbyA - rAtU grad(p)`, and
 carries that corrected surface flux into the next SIMPLE iteration. The
