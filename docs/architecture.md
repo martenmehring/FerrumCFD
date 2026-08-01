@@ -649,10 +649,17 @@ relaxation through an internal momentum-equation object, builds cell-wise
 reciprocal of the final relaxed diagonal), exposes per-component
 momentum residuals plus `A/H1` ranges in reports, reconstructs `HbyA`, computes
 `phiHbyA` from that HbyA field with velocity boundary constraints applied,
-applies an OpenFOAM-like `adjustPhi` mass-balance correction only on
-pressure-controlled open boundaries, treats velocity
-`inletOutlet`/`pressureInletOutletVelocity` as flux-dependent open boundaries
-for backflow, solves an absolute variable-coefficient pressure equation,
+applies `adjustPhi` only when the original pressure field needs an explicit
+reference, and leaves systems with pressure `fixedValue` or pressure
+`inletOutlet` unchanged in every flow direction. In a reference-needing system
+it follows the OpenFOAM mass balance: specified inflow and fixed outflow
+determine one multiplicative correction for positive adjustable outflow. A
+literal velocity `inletOutlet` face is adjustable only while it carries
+outflow and becomes prescribed inflow on backflow.
+`pressureInletOutletVelocity` remains backflow-sensitive in the momentum path,
+but its fixed-value classification makes positive outflow fixed for
+`adjustPhi`. The bridge then solves an absolute variable-coefficient pressure
+equation,
 corrects `phi` with the pressure-equation flux, corrects velocity as
 `U = HbyA - rAtU grad(p)`, and carries that corrected surface flux into the next
 SIMPLE iteration. The normal solver path no longer

@@ -550,6 +550,7 @@ struct AdjustPhiSummary {
 enum VectorFaceTreatment {
     FixedValue(Point3),
     InletOutlet(Point3),
+    PressureInletOutletVelocity(Point3),
     ZeroGradient,
     Constraint,
 }
@@ -1036,6 +1037,7 @@ fn solve_laminar_simple_driven(
     let pressure_field = find_field(fields, "p", "volScalarField")?;
     let velocity_boundary = vector_face_treatments(&runtime.mesh, velocity_field)?;
     let pressure_boundary = scalar_face_treatments(&runtime.mesh, pressure_field)?;
+    let pressure_needs_reference = pressure_field_needs_reference(&pressure_boundary);
     let boundary_summary =
         summarize_boundaries(&runtime.mesh, &velocity_boundary, &pressure_boundary);
     let mesh_cache = LaminarSimpleMeshCache::from_mesh(&runtime.mesh, options.schemes)?;
@@ -1312,7 +1314,7 @@ fn solve_laminar_simple_driven(
             &mesh_cache.pressure_geometry,
             &mesh_cache.face_addressing,
             &velocity_boundary,
-            &coupling_pressure_boundary,
+            pressure_needs_reference,
             &mut phi_hby_a,
         )?;
         let phi_hby_a_after_adjust_summary = summarize_face_fluxes(&runtime.mesh, &phi_hby_a);
@@ -1471,7 +1473,7 @@ fn solve_laminar_simple_driven(
             apply_pressure_reference(
                 &mut pressure_system,
                 &runtime.mesh,
-                &constrained_pressure_boundary,
+                pressure_needs_reference,
                 options,
             )?;
             pressure_matrix_summary = summarize_csr_matrix(&pressure_system.matrix)?;
@@ -3561,13 +3563,10 @@ fn relax_scalar_component_equation(
 fn apply_pressure_reference(
     system: &mut ScalarComponentSystem,
     mesh: &SolverRuntimeMeshData,
-    pressure_boundary: &[ScalarFaceTreatment],
+    pressure_needs_reference: bool,
     options: &LaminarSimpleOptions,
 ) -> Result<()> {
-    let pressure_needs_reference = !pressure_boundary
-        .iter()
-        .any(|treatment| matches!(treatment, ScalarFaceTreatment::FixedValue(_)));
-    if !pressure_needs_reference && options.pressure_reference_cell.is_none() {
+    if !pressure_needs_reference {
         return Ok(());
     }
 
@@ -3605,6 +3604,22 @@ fn apply_pressure_reference(
     }
     system.matrix.validate_values()?;
     Ok(())
+}
+
+fn pressure_field_needs_reference(pressure_boundary: &[ScalarFaceTreatment]) -> bool {
+    !pressure_boundary.iter().any(|treatment| {
+        matches!(
+            treatment,
+            ScalarFaceTreatment::FixedValue(_) | ScalarFaceTreatment::InletOutlet(_)
+        )
+    })
+}
+
+fn velocity_fixes_value_for_adjust_phi(treatment: VectorFaceTreatment) -> bool {
+    matches!(
+        treatment,
+        VectorFaceTreatment::FixedValue(_) | VectorFaceTreatment::PressureInletOutletVelocity(_)
+    )
 }
 
 fn map_cg_preconditioner(preconditioner: LaminarSimplePreconditioner) -> CgPreconditioner {
@@ -5271,29 +5286,32 @@ fn adjust_phi_hby_a_with_pressure_geometry(
     pressure_boundary: &[ScalarFaceTreatment],
     phi_hby_a: &mut [f64],
 ) -> Result<AdjustPhiSummary> {
+    if pressure_boundary.len() != mesh.faces {
+        return Err(invalid_input(format!(
+            "adjustPhi pressure boundary must match mesh face count {}",
+            mesh.faces
+        )));
+    }
     let face_addressing = CompactSimpleFaceAddressing::from_mesh(mesh)?;
     adjust_phi_hby_a_with_pressure_geometry_and_addressing(
         mesh,
         pressure_geometry,
         &face_addressing,
         velocity_boundary,
-        pressure_boundary,
+        pressure_field_needs_reference(pressure_boundary),
         phi_hby_a,
     )
 }
 
 fn adjust_phi_hby_a_with_pressure_geometry_and_addressing(
     mesh: &SolverRuntimeMeshData,
-    pressure_geometry: &PressureGeometryCache,
+    _pressure_geometry: &PressureGeometryCache,
     face_addressing: &CompactSimpleFaceAddressing,
     velocity_boundary: &[VectorFaceTreatment],
-    pressure_boundary: &[ScalarFaceTreatment],
+    pressure_needs_reference: bool,
     phi_hby_a: &mut [f64],
 ) -> Result<AdjustPhiSummary> {
-    if velocity_boundary.len() != mesh.faces
-        || pressure_boundary.len() != mesh.faces
-        || phi_hby_a.len() != mesh.faces
-    {
+    if velocity_boundary.len() != mesh.faces || phi_hby_a.len() != mesh.faces {
         return Err(invalid_input(format!(
             "adjustPhi inputs must match mesh face count {}",
             mesh.faces
@@ -5307,24 +5325,12 @@ fn adjust_phi_hby_a_with_pressure_geometry_and_addressing(
         )));
     }
 
-    let mut adjustable_area = 0.0;
-    let mut adjusted_faces = 0;
-    for &face_index in face_addressing.boundary_faces() {
-        if !is_adjustable_pressure_open_face(
-            velocity_boundary[face_index],
-            pressure_boundary[face_index],
-            phi_hby_a[face_index],
-        ) {
-            continue;
-        }
-        let area = pressure_geometry.face(face_index).area_magnitude;
-        if area.is_finite() && area > f64::EPSILON {
-            adjustable_area += area;
-            adjusted_faces += 1;
-        }
-    }
-
-    if adjusted_faces == 0 || adjustable_area <= f64::EPSILON {
+    // OpenFOAM Foundation applies adjustPhi only when the original pressure
+    // field needs an explicit reference. A pressure patch that fixes the value,
+    // including a mixed inletOutlet patch, already anchors the system, so its
+    // outlet flux must be left to the pressure equation rather than
+    // redistributed here.
+    if !pressure_needs_reference {
         return Ok(AdjustPhiSummary {
             global_flux_before,
             global_flux_after: global_flux_before,
@@ -5332,23 +5338,103 @@ fn adjust_phi_hby_a_with_pressure_geometry_and_addressing(
         });
     }
 
+    let mut mass_in = 0.0;
+    let mut fixed_mass_out = 0.0;
+    let mut adjustable_mass_out = 0.0;
     for &face_index in face_addressing.boundary_faces() {
-        if !is_adjustable_pressure_open_face(
-            velocity_boundary[face_index],
-            pressure_boundary[face_index],
-            phi_hby_a[face_index],
-        ) {
-            continue;
+        let flux = phi_hby_a[face_index];
+        if !flux.is_finite() {
+            return Err(invalid_input(format!(
+                "adjustPhi boundary face {face_index} flux must be finite, got {flux}"
+            )));
         }
-        let area = pressure_geometry.face(face_index).area_magnitude;
-        if area.is_finite() && area > f64::EPSILON {
-            phi_hby_a[face_index] += -global_flux_before * area / adjustable_area;
+        let velocity = velocity_boundary[face_index];
+        if flux < 0.0 {
+            mass_in -= flux;
+        } else if velocity_fixes_value_for_adjust_phi(velocity) {
+            fixed_mass_out += flux;
+        } else {
+            adjustable_mass_out += flux;
+        }
+    }
+
+    let summed_flux = face_addressing
+        .internal_faces()
+        .iter()
+        .try_fold(0.0, |total, &face_index| {
+            let flux = phi_hby_a[face_index];
+            let next = total + flux.abs();
+            next.is_finite().then_some(next)
+        })
+        .ok_or_else(|| invalid_input("adjustPhi total flux exceeds finite range".to_string()))?;
+    let total_flux = summed_flux + f64::MIN_POSITIVE;
+    if !total_flux.is_finite() {
+        return Err(invalid_input(
+            "adjustPhi total flux plus vSmall exceeds finite range".to_string(),
+        ));
+    }
+    let adjustable_fraction = adjustable_mass_out.abs() / total_flux;
+    let imbalance_fraction = (fixed_mass_out - mass_in).abs() / total_flux;
+    if !adjustable_fraction.is_finite() || !imbalance_fraction.is_finite() {
+        return Err(invalid_input(
+            "adjustPhi normalized flux diagnostics must remain finite".to_string(),
+        ));
+    }
+
+    let mass_correction = if adjustable_mass_out.abs() > f64::MIN_POSITIVE
+        && adjustable_fraction > f64::EPSILON
+    {
+        let correction = (mass_in - fixed_mass_out) / adjustable_mass_out;
+        if !correction.is_finite() {
+            return Err(invalid_input(format!(
+                "adjustPhi mass correction must be finite, got {correction}"
+            )));
+        }
+        correction
+    } else if imbalance_fraction > 1.0e-8 {
+        return Err(invalid_input(format!(
+            "adjustPhi cannot remove continuity error: total flux={total_flux}, specified inflow={mass_in}, fixed outflow={fixed_mass_out}, adjustable outflow={adjustable_mass_out}"
+        )));
+    } else {
+        1.0
+    };
+
+    let mut global_flux_after = 0.0;
+    let mut adjusted_faces = 0;
+    for &face_index in face_addressing.boundary_faces() {
+        let flux = if phi_hby_a[face_index] <= 0.0
+            || velocity_fixes_value_for_adjust_phi(velocity_boundary[face_index])
+        {
+            phi_hby_a[face_index]
+        } else {
+            adjusted_faces += 1;
+            let adjusted = phi_hby_a[face_index] * mass_correction;
+            if !adjusted.is_finite() {
+                return Err(invalid_input(format!(
+                    "adjustPhi boundary face {face_index} corrected flux must be finite, got {adjusted}"
+                )));
+            }
+            adjusted
+        };
+        global_flux_after += flux;
+        if !global_flux_after.is_finite() {
+            return Err(invalid_input(format!(
+                "adjustPhi corrected global flux exceeds finite range at boundary face {face_index}"
+            )));
+        }
+    }
+
+    for &face_index in face_addressing.boundary_faces() {
+        if phi_hby_a[face_index] > 0.0
+            && !velocity_fixes_value_for_adjust_phi(velocity_boundary[face_index])
+        {
+            phi_hby_a[face_index] *= mass_correction;
         }
     }
 
     Ok(AdjustPhiSummary {
         global_flux_before,
-        global_flux_after: boundary_global_flux_with_addressing(face_addressing, phi_hby_a),
+        global_flux_after,
         adjusted_faces,
     })
 }
@@ -5368,17 +5454,6 @@ fn adjust_phi_hby_a(
         pressure_boundary,
         phi_hby_a,
     )
-}
-
-fn is_adjustable_pressure_open_face(
-    velocity: VectorFaceTreatment,
-    pressure: ScalarFaceTreatment,
-    flux: f64,
-) -> bool {
-    matches!(
-        velocity,
-        VectorFaceTreatment::ZeroGradient | VectorFaceTreatment::InletOutlet(_) if flux >= 0.0
-    ) && matches!(pressure, ScalarFaceTreatment::FixedValue(_))
 }
 
 fn boundary_global_flux_with_addressing(
@@ -5771,7 +5846,10 @@ fn summarize_boundaries(
         }
         match treatment {
             VectorFaceTreatment::FixedValue(_) => summary.velocity_fixed_value_faces += 1,
-            VectorFaceTreatment::InletOutlet(_) => summary.velocity_inlet_outlet_faces += 1,
+            VectorFaceTreatment::InletOutlet(_)
+            | VectorFaceTreatment::PressureInletOutletVelocity(_) => {
+                summary.velocity_inlet_outlet_faces += 1;
+            }
             VectorFaceTreatment::ZeroGradient => summary.velocity_zero_gradient_faces += 1,
             VectorFaceTreatment::Constraint => summary.velocity_constraint_faces += 1,
         }
@@ -5808,9 +5886,18 @@ fn vector_face_treatments(
                 Some("noSlip") => {
                     flow_try_filled_vec(patch.faces, VectorFaceTreatment::FixedValue(zero()))?
                 }
-                Some("inletOutlet" | "pressureInletOutletVelocity") => {
-                    inlet_outlet_vector_patch_values(field, field_patch, patch.faces)?
-                }
+                Some("inletOutlet") => inlet_outlet_vector_patch_values(
+                    field,
+                    field_patch,
+                    patch.faces,
+                    VectorFaceTreatment::InletOutlet,
+                )?,
+                Some("pressureInletOutletVelocity") => inlet_outlet_vector_patch_values(
+                    field,
+                    field_patch,
+                    patch.faces,
+                    VectorFaceTreatment::PressureInletOutletVelocity,
+                )?,
                 Some("zeroGradient") => {
                     flow_try_filled_vec(patch.faces, VectorFaceTreatment::ZeroGradient)?
                 }
@@ -6036,7 +6123,8 @@ fn is_pressure_gradient_constrained_boundary(
 fn prescribed_velocity_boundary_is_active(velocity: VectorFaceTreatment, flux: f64) -> bool {
     match velocity {
         VectorFaceTreatment::FixedValue(_) => true,
-        VectorFaceTreatment::InletOutlet(_) => flux < 0.0,
+        VectorFaceTreatment::InletOutlet(_)
+        | VectorFaceTreatment::PressureInletOutletVelocity(_) => flux < 0.0,
         VectorFaceTreatment::ZeroGradient | VectorFaceTreatment::Constraint => false,
     }
 }
@@ -6051,8 +6139,14 @@ fn prescribed_boundary_velocity_flux_with_addressing(
 ) -> Option<f64> {
     let value = match boundary[face_index] {
         VectorFaceTreatment::FixedValue(value) => value,
-        VectorFaceTreatment::InletOutlet(value) if flux < 0.0 => value,
+        VectorFaceTreatment::InletOutlet(value)
+        | VectorFaceTreatment::PressureInletOutletVelocity(value)
+            if flux < 0.0 =>
+        {
+            value
+        }
         VectorFaceTreatment::InletOutlet(_)
+        | VectorFaceTreatment::PressureInletOutletVelocity(_)
         | VectorFaceTreatment::ZeroGradient
         | VectorFaceTreatment::Constraint => return None,
     };
@@ -6093,6 +6187,7 @@ fn inlet_outlet_vector_patch_values(
     field: &FieldFile,
     patch: &crate::fields::FieldBoundaryPatch,
     faces: usize,
+    treatment: fn(Point3) -> VectorFaceTreatment,
 ) -> Result<Vec<VectorFaceTreatment>> {
     let value = patch
         .inlet_value
@@ -6108,7 +6203,7 @@ fn inlet_outlet_vector_patch_values(
     let values = parse_patch_numeric_values(value, 3, faces, field, &patch.name)?;
     let mut treatments = flow_try_vec(faces)?;
     for chunk in values.as_slice().chunks_exact(3) {
-        treatments.push(VectorFaceTreatment::InletOutlet(Point3 {
+        treatments.push(treatment(Point3 {
             x: chunk[0],
             y: chunk[1],
             z: chunk[2],
@@ -6477,7 +6572,8 @@ fn face_vector_value_with_addressing(
     }
     match boundary[face_index] {
         VectorFaceTreatment::FixedValue(value) => value,
-        VectorFaceTreatment::InletOutlet(value) => {
+        VectorFaceTreatment::InletOutlet(value)
+        | VectorFaceTreatment::PressureInletOutletVelocity(value) => {
             let owner_flux = dot(velocity[owner], mesh.face_area_vectors[face_index]);
             if owner_flux < 0.0 {
                 value
@@ -6508,8 +6604,14 @@ fn upwind_face_vector_value(
     match boundary[face_index] {
         VectorFaceTreatment::FixedValue(value) if flux < 0.0 => value,
         VectorFaceTreatment::FixedValue(_) => velocity[owner],
-        VectorFaceTreatment::InletOutlet(value) if flux < 0.0 => value,
-        VectorFaceTreatment::InletOutlet(_) => velocity[owner],
+        VectorFaceTreatment::InletOutlet(value)
+        | VectorFaceTreatment::PressureInletOutletVelocity(value)
+            if flux < 0.0 =>
+        {
+            value
+        }
+        VectorFaceTreatment::InletOutlet(_)
+        | VectorFaceTreatment::PressureInletOutletVelocity(_) => velocity[owner],
         VectorFaceTreatment::ZeroGradient | VectorFaceTreatment::Constraint => velocity[owner],
     }
 }
@@ -6532,8 +6634,14 @@ fn upwind_face_vector_value_with_addressing(
     match boundary[face_index] {
         VectorFaceTreatment::FixedValue(value) if flux < 0.0 => value,
         VectorFaceTreatment::FixedValue(_) => velocity[owner],
-        VectorFaceTreatment::InletOutlet(value) if flux < 0.0 => value,
-        VectorFaceTreatment::InletOutlet(_) => velocity[owner],
+        VectorFaceTreatment::InletOutlet(value)
+        | VectorFaceTreatment::PressureInletOutletVelocity(value)
+            if flux < 0.0 =>
+        {
+            value
+        }
+        VectorFaceTreatment::InletOutlet(_)
+        | VectorFaceTreatment::PressureInletOutletVelocity(_) => velocity[owner],
         VectorFaceTreatment::ZeroGradient | VectorFaceTreatment::Constraint => velocity[owner],
     }
 }
@@ -6812,6 +6920,9 @@ fn scalar_component_boundary(
                 ScalarFaceTreatment::FixedValue(component_value(*value, component))
             }
             VectorFaceTreatment::InletOutlet(value) => {
+                ScalarFaceTreatment::InletOutlet(component_value(*value, component))
+            }
+            VectorFaceTreatment::PressureInletOutletVelocity(value) => {
                 ScalarFaceTreatment::InletOutlet(component_value(*value, component))
             }
             VectorFaceTreatment::ZeroGradient => ScalarFaceTreatment::ZeroGradient,
@@ -7848,6 +7959,23 @@ mod tests {
             VectorFaceTreatment::ZeroGradient,
             VectorFaceTreatment::ZeroGradient,
             VectorFaceTreatment::InletOutlet(point(-2.0, 0.0, 0.0)),
+        ];
+        let velocity = vec![point(5.0, 0.0, 0.0), point(3.0, 0.0, 0.0)];
+
+        let outflow = upwind_face_vector_value(&runtime.mesh, &velocity, &boundary, 2, 1.0);
+        let backflow = upwind_face_vector_value(&runtime.mesh, &velocity, &boundary, 2, -1.0);
+
+        assert_close(outflow.x, 3.0);
+        assert_close(backflow.x, -2.0);
+    }
+
+    #[test]
+    fn pressure_inlet_outlet_velocity_uses_inlet_value_only_for_backflow() {
+        let runtime = two_cell_runtime();
+        let boundary = vec![
+            VectorFaceTreatment::ZeroGradient,
+            VectorFaceTreatment::ZeroGradient,
+            VectorFaceTreatment::PressureInletOutletVelocity(point(-2.0, 0.0, 0.0)),
         ];
         let velocity = vec![point(5.0, 0.0, 0.0), point(3.0, 0.0, 0.0)];
 
@@ -8961,7 +9089,7 @@ mod tests {
             &pressure_boundary,
             &mut phi,
         )
-        .expect("adjustPhi silently excludes invalid adjustable area");
+        .expect("adjustPhi skips a fixed-value pressure system before geometry use");
         assert_eq!(adjust.adjusted_faces, 0);
         assert_eq!(phi[boundary_face].to_bits(), 1.0f64.to_bits());
 
@@ -10220,7 +10348,7 @@ mod tests {
     }
 
     #[test]
-    fn adjust_phi_balances_pressure_open_boundary_only() {
+    fn adjust_phi_skips_fixed_value_pressure_system() {
         let runtime = two_cell_runtime();
         let fields = two_cell_fields();
         let u_field = fields
@@ -10231,32 +10359,8 @@ mod tests {
         let velocity_boundary = vector_face_treatments(&runtime.mesh, u_field).expect("U boundary");
         let mut pressure_boundary = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
         pressure_boundary[2] = ScalarFaceTreatment::FixedValue(0.0);
-        let mut phi_hby_a = vec![0.5, -1.0, 0.0];
-
-        let summary = adjust_phi_hby_a(
-            &runtime.mesh,
-            &velocity_boundary,
-            &pressure_boundary,
-            &mut phi_hby_a,
-        )
-        .expect("adjust phi");
-
-        assert_eq!(summary.adjusted_faces, 1);
-        assert_close(summary.global_flux_before, -1.0);
-        assert_close(summary.global_flux_after, 0.0);
-        assert_close(phi_hby_a[0], 0.5);
-        assert_close(phi_hby_a[1], -1.0);
-        assert_close(phi_hby_a[2], 1.0);
-    }
-
-    #[test]
-    fn adjust_phi_does_not_change_fixed_velocity_open_boundary() {
-        let runtime = two_cell_runtime();
-        let mut velocity_boundary = vec![VectorFaceTreatment::ZeroGradient; runtime.mesh.faces];
-        velocity_boundary[2] = VectorFaceTreatment::FixedValue(point(1.0, 0.0, 0.0));
-        let mut pressure_boundary = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
-        pressure_boundary[2] = ScalarFaceTreatment::FixedValue(0.0);
-        let mut phi_hby_a = vec![0.0, 0.0, 1.0];
+        let mut phi_hby_a = vec![0.5, -1.0, 0.25];
+        let expected = phi_hby_a.clone();
 
         let summary = adjust_phi_hby_a(
             &runtime.mesh,
@@ -10267,19 +10371,257 @@ mod tests {
         .expect("adjust phi");
 
         assert_eq!(summary.adjusted_faces, 0);
-        assert_close(summary.global_flux_before, 1.0);
-        assert_close(summary.global_flux_after, 1.0);
+        assert_close(summary.global_flux_before, -0.75);
+        assert_close(summary.global_flux_after, -0.75);
+        assert_eq!(
+            phi_hby_a
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn adjust_phi_balances_closed_pressure_system_multiplicatively() {
+        let runtime = two_cell_runtime();
+        let mut velocity_boundary = vec![VectorFaceTreatment::Constraint; runtime.mesh.faces];
+        velocity_boundary[1] = VectorFaceTreatment::FixedValue(point(1.0, 0.0, 0.0));
+        velocity_boundary[2] = VectorFaceTreatment::ZeroGradient;
+        let pressure_boundary = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
+        let mut phi_hby_a = vec![0.5, -1.0, 0.25];
+
+        let summary = adjust_phi_hby_a(
+            &runtime.mesh,
+            &velocity_boundary,
+            &pressure_boundary,
+            &mut phi_hby_a,
+        )
+        .expect("adjust phi");
+
+        assert_eq!(summary.adjusted_faces, 1);
+        assert_close(summary.global_flux_before, -0.75);
+        assert_close(summary.global_flux_after, 0.0);
+        assert_close(phi_hby_a[0], 0.5);
+        assert_close(phi_hby_a[1], -1.0);
         assert_close(phi_hby_a[2], 1.0);
     }
 
     #[test]
-    fn adjust_phi_uses_inlet_outlet_only_for_outflow() {
+    fn adjust_phi_preserves_unequal_outflow_ratio_and_fixed_outflows() {
+        let runtime = four_cell_planar_runtime(false);
+        let mut velocity_boundary = vec![VectorFaceTreatment::Constraint; runtime.mesh.faces];
+        velocity_boundary[4] = VectorFaceTreatment::FixedValue(point(1.0, 0.0, 0.0));
+        velocity_boundary[5] = VectorFaceTreatment::FixedValue(point(1.0, 0.0, 0.0));
+        velocity_boundary[6] =
+            VectorFaceTreatment::PressureInletOutletVelocity(point(-1.0, 0.0, 0.0));
+        velocity_boundary[7] = VectorFaceTreatment::ZeroGradient;
+        velocity_boundary[8] = VectorFaceTreatment::InletOutlet(point(-1.0, 0.0, 0.0));
+        let pressure_boundary = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
+        let mut phi_hby_a = vec![0.0; runtime.mesh.faces];
+        phi_hby_a[4] = -3.0;
+        phi_hby_a[5] = 0.5;
+        phi_hby_a[6] = 0.5;
+        phi_hby_a[7] = 0.25;
+        phi_hby_a[8] = 0.75;
+        let original_ratio = phi_hby_a[7] / phi_hby_a[8];
+
+        let summary = adjust_phi_hby_a(
+            &runtime.mesh,
+            &velocity_boundary,
+            &pressure_boundary,
+            &mut phi_hby_a,
+        )
+        .expect("adjust unequal outflows");
+
+        assert_eq!(summary.adjusted_faces, 2);
+        assert_close(summary.global_flux_before, -1.0);
+        assert_close(summary.global_flux_after, 0.0);
+        assert_eq!(phi_hby_a[4].to_bits(), (-3.0f64).to_bits());
+        assert_eq!(phi_hby_a[5].to_bits(), 0.5f64.to_bits());
+        assert_eq!(phi_hby_a[6].to_bits(), 0.5f64.to_bits());
+        assert_eq!(phi_hby_a[7].to_bits(), 0.5f64.to_bits());
+        assert_eq!(phi_hby_a[8].to_bits(), 1.5f64.to_bits());
+        assert_eq!(
+            (phi_hby_a[7] / phi_hby_a[8]).to_bits(),
+            original_ratio.to_bits()
+        );
+    }
+
+    #[test]
+    fn adjust_phi_rejects_unremovable_closed_system_imbalance() {
         let runtime = two_cell_runtime();
-        let mut velocity_boundary = vec![VectorFaceTreatment::ZeroGradient; runtime.mesh.faces];
+        let mut velocity_boundary = vec![VectorFaceTreatment::Constraint; runtime.mesh.faces];
+        velocity_boundary[1] = VectorFaceTreatment::FixedValue(point(1.0, 0.0, 0.0));
+        velocity_boundary[2] = VectorFaceTreatment::FixedValue(point(1.0, 0.0, 0.0));
+        let pressure_boundary = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
+        let mut phi_hby_a: Vec<f64> = vec![0.0, -1.0, 0.5];
+
+        let error = adjust_phi_hby_a(
+            &runtime.mesh,
+            &velocity_boundary,
+            &pressure_boundary,
+            &mut phi_hby_a,
+        )
+        .expect_err("closed pressure system without adjustable outflow must fail");
+
+        assert!(error.to_string().contains("cannot remove continuity error"));
+        assert_close(phi_hby_a[1], -1.0);
+        assert_close(phi_hby_a[2], 0.5);
+    }
+
+    #[test]
+    fn adjust_phi_treats_pressure_inlet_outlet_velocity_as_fixed_outflow() {
+        let runtime = two_cell_runtime();
+        let mut velocity_boundary = vec![VectorFaceTreatment::Constraint; runtime.mesh.faces];
+        velocity_boundary[1] = VectorFaceTreatment::FixedValue(point(1.0, 0.0, 0.0));
+        velocity_boundary[2] =
+            VectorFaceTreatment::PressureInletOutletVelocity(point(-2.0, 0.0, 0.0));
+        let pressure_boundary = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
+        let mut phi_hby_a: Vec<f64> = vec![0.0, -1.0, 0.5];
+        let expected_bits = phi_hby_a
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>();
+
+        let error = adjust_phi_hby_a(
+            &runtime.mesh,
+            &velocity_boundary,
+            &pressure_boundary,
+            &mut phi_hby_a,
+        )
+        .expect_err("fixed pressureInletOutletVelocity outflow cannot absorb imbalance");
+
+        assert!(error.to_string().contains("cannot remove continuity error"));
+        assert_eq!(
+            phi_hby_a
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected_bits
+        );
+    }
+
+    #[test]
+    fn adjust_phi_treats_supported_uncoupled_constraint_flux_as_adjustable() {
+        let runtime = two_cell_runtime();
+        let mut velocity_boundary = vec![VectorFaceTreatment::Constraint; runtime.mesh.faces];
+        velocity_boundary[1] = VectorFaceTreatment::FixedValue(point(1.0, 0.0, 0.0));
+        let pressure_boundary = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
+        let mut phi_hby_a = vec![1.0, -1.0, 0.5];
+
+        let summary = adjust_phi_hby_a(
+            &runtime.mesh,
+            &velocity_boundary,
+            &pressure_boundary,
+            &mut phi_hby_a,
+        )
+        .expect("adjust uncoupled constraint outflow");
+
+        assert_eq!(summary.adjusted_faces, 1);
+        assert_eq!(phi_hby_a[1].to_bits(), (-1.0f64).to_bits());
+        assert_eq!(phi_hby_a[2].to_bits(), 1.0f64.to_bits());
+        assert_eq!(summary.global_flux_after.to_bits(), 0.0f64.to_bits());
+    }
+
+    #[test]
+    fn adjust_phi_uses_strict_openfoam_flux_thresholds() {
+        let runtime = two_cell_runtime();
+        let mut velocity_boundary = vec![VectorFaceTreatment::Constraint; runtime.mesh.faces];
+        velocity_boundary[2] = VectorFaceTreatment::ZeroGradient;
+        let pressure_boundary = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
+
+        let mut at_vsmall = vec![0.0, 0.0, f64::MIN_POSITIVE];
+        adjust_phi_hby_a(
+            &runtime.mesh,
+            &velocity_boundary,
+            &pressure_boundary,
+            &mut at_vsmall,
+        )
+        .expect("vSmall equality");
+        assert_eq!(at_vsmall[2].to_bits(), f64::MIN_POSITIVE.to_bits());
+
+        let mut above_vsmall = vec![0.0, 0.0, f64::MIN_POSITIVE.next_up()];
+        adjust_phi_hby_a(
+            &runtime.mesh,
+            &velocity_boundary,
+            &pressure_boundary,
+            &mut above_vsmall,
+        )
+        .expect("vSmall next_up");
+        assert_eq!(above_vsmall[2].to_bits(), 0.0f64.to_bits());
+
+        let fixed_total = 1.0;
+        let mut at_small = vec![fixed_total, 0.0, f64::EPSILON];
+        adjust_phi_hby_a(
+            &runtime.mesh,
+            &velocity_boundary,
+            &pressure_boundary,
+            &mut at_small,
+        )
+        .expect("small equality");
+        assert_eq!(at_small[2].to_bits(), f64::EPSILON.to_bits());
+
+        let mut above_small = vec![fixed_total, 0.0, f64::EPSILON.next_up()];
+        adjust_phi_hby_a(
+            &runtime.mesh,
+            &velocity_boundary,
+            &pressure_boundary,
+            &mut above_small,
+        )
+        .expect("small next_up");
+        assert_eq!(above_small[2].to_bits(), 0.0f64.to_bits());
+
+        velocity_boundary[2] = VectorFaceTreatment::FixedValue(point(1.0, 0.0, 0.0));
+        let imbalance_limit = 1.0e-8;
+        let background_flux = 1.0;
+        let mut at_imbalance_limit = vec![background_flux, 0.0, imbalance_limit];
+        adjust_phi_hby_a(
+            &runtime.mesh,
+            &velocity_boundary,
+            &pressure_boundary,
+            &mut at_imbalance_limit,
+        )
+        .expect("imbalance equality");
+        assert_eq!(at_imbalance_limit[2].to_bits(), imbalance_limit.to_bits());
+
+        let mut above_imbalance_limit = vec![background_flux, 0.0, imbalance_limit.next_up()];
+        let error = adjust_phi_hby_a(
+            &runtime.mesh,
+            &velocity_boundary,
+            &pressure_boundary,
+            &mut above_imbalance_limit,
+        )
+        .expect_err("imbalance next_up must fail");
+        assert!(error.to_string().contains("cannot remove continuity error"));
+        assert_eq!(
+            above_imbalance_limit[2].to_bits(),
+            imbalance_limit.next_up().to_bits()
+        );
+
+        velocity_boundary[2] = VectorFaceTreatment::ZeroGradient;
+        let mut signed_zero = vec![0.0, 0.0, -0.0];
+        adjust_phi_hby_a(
+            &runtime.mesh,
+            &velocity_boundary,
+            &pressure_boundary,
+            &mut signed_zero,
+        )
+        .expect("signed zero");
+        assert_eq!(signed_zero[2].to_bits(), (-0.0f64).to_bits());
+    }
+
+    #[test]
+    fn adjust_phi_scales_inlet_outlet_only_while_it_is_outflow() {
+        let runtime = two_cell_runtime();
+        let mut velocity_boundary = vec![VectorFaceTreatment::Constraint; runtime.mesh.faces];
+        velocity_boundary[1] = VectorFaceTreatment::FixedValue(point(1.0, 0.0, 0.0));
         velocity_boundary[2] = VectorFaceTreatment::InletOutlet(point(-2.0, 0.0, 0.0));
-        let mut pressure_boundary = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
-        pressure_boundary[2] = ScalarFaceTreatment::FixedValue(0.0);
-        let mut outflow_phi = vec![0.0, 0.0, 1.0];
+        let pressure_boundary = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
+        let mut outflow_phi = vec![0.0, -1.0, 0.5];
 
         let outflow_summary = adjust_phi_hby_a(
             &runtime.mesh,
@@ -10290,8 +10632,11 @@ mod tests {
         .expect("adjust outflow");
         assert_eq!(outflow_summary.adjusted_faces, 1);
         assert_close(outflow_summary.global_flux_after, 0.0);
+        assert_close(outflow_phi[1], -1.0);
+        assert_close(outflow_phi[2], 1.0);
 
-        let mut backflow_phi = vec![0.0, 0.0, -1.0];
+        velocity_boundary[1] = VectorFaceTreatment::ZeroGradient;
+        let mut backflow_phi = vec![0.0, 0.5, -1.0];
         let backflow_summary = adjust_phi_hby_a(
             &runtime.mesh,
             &velocity_boundary,
@@ -10299,8 +10644,60 @@ mod tests {
             &mut backflow_phi,
         )
         .expect("adjust backflow");
-        assert_eq!(backflow_summary.adjusted_faces, 0);
-        assert_close(backflow_summary.global_flux_after, -1.0);
+        assert_eq!(backflow_summary.adjusted_faces, 1);
+        assert_close(backflow_summary.global_flux_after, 0.0);
+        assert_close(backflow_phi[1], 1.0);
+        assert_close(backflow_phi[2], -1.0);
+    }
+
+    #[test]
+    fn simple_entrypoint_skips_adjust_phi_for_fixed_value_pressure_boundary() {
+        let mut runtime = two_cell_runtime();
+        let fields = two_cell_fields();
+        assert!(
+            fields
+                .fields
+                .iter()
+                .find(|field| field.name == "p")
+                .expect("p field")
+                .boundary_patches
+                .iter()
+                .any(|patch| patch.patch_type.as_deref() == Some("fixedValue"))
+        );
+        let mut options = minimal_laminar_options();
+        options.max_simple_iterations = 1;
+
+        let report = solve_laminar_simple(&mut runtime, &fields, &options)
+            .expect("fixed-value pressure SIMPLE step");
+        let iteration = &report.history[0];
+        let pressure_assembly = report.pressure_assembly.expect("pressure assembly");
+
+        assert!(iteration.pressure_correction_accepted);
+        assert_eq!(iteration.adjust_phi_adjusted_faces, 0);
+        assert_eq!(
+            iteration.adjust_phi_global_flux_before.to_bits(),
+            iteration.adjust_phi_global_flux_after.to_bits()
+        );
+        assert_eq!(
+            pressure_assembly.phi_hby_a_before_adjust.min.to_bits(),
+            pressure_assembly.phi_hby_a_after_adjust.min.to_bits()
+        );
+        assert_eq!(
+            pressure_assembly.phi_hby_a_before_adjust.max.to_bits(),
+            pressure_assembly.phi_hby_a_after_adjust.max.to_bits()
+        );
+        assert_eq!(
+            pressure_assembly.phi_hby_a_before_adjust.l2_norm.to_bits(),
+            pressure_assembly.phi_hby_a_after_adjust.l2_norm.to_bits()
+        );
+        assert_eq!(
+            pressure_assembly.phi_hby_a_before_adjust.sum.to_bits(),
+            pressure_assembly.phi_hby_a_after_adjust.sum.to_bits()
+        );
+        assert_eq!(
+            pressure_assembly.phi_hby_a_before_adjust.sum_abs.to_bits(),
+            pressure_assembly.phi_hby_a_after_adjust.sum_abs.to_bits()
+        );
     }
 
     #[test]
@@ -10346,8 +10743,13 @@ mod tests {
         )
         .expect("closed pressure PCG workspace");
 
-        apply_pressure_reference(&mut system, &runtime.mesh, &boundary, &options)
-            .expect("pressure reference");
+        apply_pressure_reference(
+            &mut system,
+            &runtime.mesh,
+            super::pressure_field_needs_reference(&boundary),
+            &options,
+        )
+        .expect("pressure reference");
         let solution = system.matrix.matvec(&[7.0, 7.0]).expect("matvec");
         let report = pcg_workspace
             .solve(
@@ -10700,12 +11102,12 @@ mod tests {
 
         assert!(matches!(
             velocity_boundary[2],
-            VectorFaceTreatment::InletOutlet(_)
+            VectorFaceTreatment::PressureInletOutletVelocity(_)
         ));
     }
 
     #[test]
-    fn pressure_inlet_outlet_velocity_alias_is_backflow_sensitive_for_pressure_constraint() {
+    fn pressure_inlet_outlet_velocity_is_backflow_sensitive_for_pressure_constraint() {
         let runtime = two_cell_runtime();
         let fields = two_cell_fields_with_pressure_inlet_outlet_velocity();
         let u_field = fields
@@ -10919,11 +11321,14 @@ mod tests {
     }
 
     #[test]
-    fn pressure_reference_tracks_resolved_inlet_outlet_state() {
+    fn pressure_reference_uses_original_inlet_outlet_patch_class() {
         let runtime = two_cell_runtime();
         let mut mixed = vec![ScalarFaceTreatment::ZeroGradient; runtime.mesh.faces];
         mixed[2] = ScalarFaceTreatment::InletOutlet(4.0);
-        let options = minimal_laminar_options();
+        assert!(!super::pressure_field_needs_reference(&mixed));
+        let mut options = minimal_laminar_options();
+        options.pressure_reference_cell = Some(1);
+        options.pressure_reference_value = 9.0;
         let make_system = || {
             assemble_variable_scalar_component_system(
                 &runtime.mesh,
@@ -10934,23 +11339,42 @@ mod tests {
             .expect("pressure system")
         };
 
-        let open = super::resolve_pressure_inlet_outlet(&mixed, &[0.0, 0.0, -1.0])
-            .expect("backflow resolution");
-        let mut open_system = make_system();
-        let open_values = open_system.matrix.values().to_vec();
-        let open_rhs = open_system.rhs.clone();
-        apply_pressure_reference(&mut open_system, &runtime.mesh, &open, &options)
-            .expect("open pressure system");
-        assert_eq!(open_system.matrix.values(), open_values);
-        assert_eq!(open_system.rhs, open_rhs);
+        for (label, decision_flux) in [("backflow", -1.0), ("outflow", 1.0)] {
+            let resolved = super::resolve_pressure_inlet_outlet(&mixed, &[0.0, 0.0, decision_flux])
+                .expect("pressure inletOutlet resolution");
+            assert!(matches!(
+                resolved[2],
+                ScalarFaceTreatment::FixedValue(_) | ScalarFaceTreatment::ZeroGradient
+            ));
 
-        let closed = super::resolve_pressure_inlet_outlet(&mixed, &[0.0, 0.0, 1.0])
-            .expect("outflow resolution");
-        let mut closed_system = make_system();
-        let closed_values = closed_system.matrix.values().to_vec();
-        apply_pressure_reference(&mut closed_system, &runtime.mesh, &closed, &options)
-            .expect("closed pressure system");
-        assert_ne!(closed_system.matrix.values(), closed_values);
+            let mut system = make_system();
+            let values = system.matrix.values().to_vec();
+            let rhs = system.rhs.clone();
+            apply_pressure_reference(
+                &mut system,
+                &runtime.mesh,
+                super::pressure_field_needs_reference(&mixed),
+                &options,
+            )
+            .unwrap_or_else(|error| panic!("{label} pressure system failed: {error}"));
+            assert_eq!(system.matrix.values(), values, "{label} matrix changed");
+            assert_eq!(system.rhs, rhs, "{label} right-hand side changed");
+        }
+    }
+
+    #[test]
+    fn pressure_field_reference_need_matches_original_patch_classes() {
+        let fixed_value = [ScalarFaceTreatment::FixedValue(0.0)];
+        let inlet_outlet = [ScalarFaceTreatment::InletOutlet(0.0)];
+        let reference_needing = [
+            ScalarFaceTreatment::ZeroGradient,
+            ScalarFaceTreatment::FixedGradient(0.0),
+            ScalarFaceTreatment::Constraint,
+        ];
+
+        assert!(!super::pressure_field_needs_reference(&fixed_value));
+        assert!(!super::pressure_field_needs_reference(&inlet_outlet));
+        assert!(super::pressure_field_needs_reference(&reference_needing));
     }
 
     #[test]
@@ -11006,6 +11430,11 @@ mod tests {
                 .iter()
                 .all(|step| step.pressure_correction_accepted)
         );
+        assert!(report.history.iter().all(|step| {
+            step.adjust_phi_adjusted_faces == 0
+                && step.adjust_phi_global_flux_before.to_bits()
+                    == step.adjust_phi_global_flux_after.to_bits()
+        }));
         assert_eq!(resolved_steps, 3);
     }
 

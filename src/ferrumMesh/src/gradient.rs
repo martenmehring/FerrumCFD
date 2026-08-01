@@ -617,7 +617,8 @@ fn gradient_try_scalar_component_boundary(
             VectorFaceTreatment::FixedValue(value) => {
                 ScalarFaceTreatment::FixedValue(component_value(*value, component))
             }
-            VectorFaceTreatment::InletOutlet(value) => {
+            VectorFaceTreatment::InletOutlet(value)
+            | VectorFaceTreatment::PressureInletOutletVelocity(value) => {
                 ScalarFaceTreatment::InletOutlet(component_value(*value, component))
             }
             VectorFaceTreatment::ZeroGradient => ScalarFaceTreatment::ZeroGradient,
@@ -2348,7 +2349,8 @@ fn wls_vector_boundary_deltas(
                         format!("leastSquares vector fixed-value face {face} delta")
                     })?
                 }
-                VectorFaceTreatment::InletOutlet(value) => {
+                VectorFaceTreatment::InletOutlet(value)
+                | VectorFaceTreatment::PressureInletOutletVelocity(value) => {
                     let decision_flux = flux[face];
                     if !decision_flux.is_finite() {
                         return Err(invalid_input(format!(

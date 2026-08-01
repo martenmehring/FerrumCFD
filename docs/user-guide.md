@@ -880,11 +880,18 @@ reported through the corresponding `SolverPerformance`-style fields. The pressur
 bridge uses an internal momentum-equation object to apply equation relaxation,
 retain cell-wise `A` and `H1` diagnostics for `rAU/rAtU`, reconstruct
 `HbyA`, compute `phiHbyA` from HbyA with velocity boundary constraints applied,
-run OpenFOAM-like `adjustPhi` on pressure-controlled open boundaries, including
-`inletOutlet` faces only while they are outflowing, solve an absolute pressure
-equation, correct `phi` from the pressure-equation flux, correct velocity as
-`U = HbyA - rAtU grad(p)`, and carry that corrected surface flux into the next
-SIMPLE iteration. The pressure equation now supports
+run `adjustPhi` only when the original pressure field needs an explicit
+reference, and leave systems with pressure `fixedValue` or pressure
+`inletOutlet` unchanged in every flow direction. In a reference-needing
+system, positive adjustable outflow is scaled by the OpenFOAM mass-correction
+ratio derived from prescribed inflow and fixed outflow. A literal velocity
+`inletOutlet` face is adjustable only while it is outflowing;
+`pressureInletOutletVelocity` remains backflow-sensitive for momentum but is
+fixed positive outflow for `adjustPhi`.
+The bridge then solves an absolute pressure equation, corrects `phi` from the
+pressure-equation flux, corrects velocity as `U = HbyA - rAtU grad(p)`, and
+carries that corrected surface flux into the next SIMPLE iteration. The
+pressure equation now supports
 OpenFOAM-like pressure reference anchoring for closed-pressure cases and executes
 `nNonOrthogonalCorrectors + 1` pressure solves, with `phi` updated from the
 final pressure solve. With `SIMPLE.consistent true`, Ferrum builds a

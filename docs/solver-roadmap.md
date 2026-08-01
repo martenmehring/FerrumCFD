@@ -839,7 +839,7 @@ another unbounded sequence of GAMG micro-optimizations:
 1. retain the new Lid Cavity closed-pressure E2E smoke for
    `pRefCell`/`pRefValue` and `constrainPressure`, then complete the remaining
    deliberately skewed corrected non-orthogonal E2E mesh and physical cavity
-   acceptance; open-pressure `adjustPhi` and pressure-flux coverage remains
+   acceptance; reference-needing `adjustPhi` and pressure-flux coverage remains
    part of the combined gate;
 2. retain the accepted Cylinder force/continuity gate, refine the
    `lidDrivenCavity` physical acceptance, then add `backwardFacingStep` and
