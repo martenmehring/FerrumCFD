@@ -331,12 +331,14 @@ impl CsrMatrix {
             )));
         }
 
-        for (row, output) in y.iter_mut().enumerate() {
-            let start = self.row_offsets[row];
-            let end = self.row_offsets[row + 1];
+        for (offsets, output) in self.row_offsets.windows(2).zip(y.iter_mut()) {
+            let start = offsets[0];
+            let end = offsets[1];
+            let row_values = &self.values[start..end];
+            let row_columns = &self.col_indices[start..end];
             let mut sum = 0.0;
-            for entry in start..end {
-                sum += self.values[entry] * x[self.col_indices[entry]];
+            for (&value, &column) in row_values.iter().zip(row_columns) {
+                sum += value * x[column];
             }
             *output = sum;
         }
@@ -2545,6 +2547,147 @@ mod tests {
         assert_eq!(matrix.rows(), 3);
         assert_eq!(matrix.cols(), 3);
         assert_eq!(matrix.nnz(), 7);
+    }
+
+    #[test]
+    fn matvec_row_slices_match_indexed_reference_bit_for_bit() {
+        let matrix = CsrMatrix::new(
+            6,
+            5,
+            vec![0, 0, 3, 4, 7, 9, 11],
+            vec![4, 0, 4, 2, 1, 3, 0, 4, 2, 3, 1],
+            vec![
+                -0.0,
+                3.0,
+                f64::from_bits(1),
+                -2.0,
+                f64::MIN_POSITIVE,
+                -f64::MIN_POSITIVE,
+                4.0,
+                f64::MAX / 8.0,
+                -(f64::MAX / 8.0),
+                0.5,
+                -0.5,
+            ],
+        )
+        .expect("irregular CSR matrix");
+        let input = [-2.0, f64::from_bits(2), 3.0, -4.0, f64::MIN_POSITIVE];
+
+        let mut expected = vec![0.0; matrix.rows()];
+        for (row, output) in expected.iter_mut().enumerate() {
+            let mut sum = 0.0;
+            for entry in matrix.row_offsets[row]..matrix.row_offsets[row + 1] {
+                sum += matrix.values[entry] * input[matrix.col_indices[entry]];
+            }
+            *output = sum;
+        }
+
+        let mut actual = vec![f64::NAN; matrix.rows()];
+        matrix
+            .matvec_into(&input, &mut actual)
+            .expect("row-slice matvec");
+        assert_eq!(
+            actual
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn matvec_row_slice_edge_shapes_and_length_failures_are_exact() {
+        let zero_rows = CsrMatrix::new(0, 3, vec![0], vec![], vec![]).expect("zero-row matrix");
+        assert_eq!(
+            zero_rows.matvec(&[1.0, 2.0, 3.0]).expect("zero-row matvec"),
+            Vec::<f64>::new()
+        );
+
+        let empty_rows =
+            CsrMatrix::new(3, 0, vec![0, 0, 0, 0], vec![], vec![]).expect("all-empty matrix");
+        let mut empty_outputs = vec![f64::NAN, -0.0, f64::from_bits(1)];
+        let output_ptr = empty_outputs.as_ptr();
+        let output_capacity = empty_outputs.capacity();
+        empty_rows
+            .matvec_into(&[], &mut empty_outputs)
+            .expect("all-empty matvec");
+        assert_eq!(empty_outputs.as_ptr(), output_ptr);
+        assert_eq!(empty_outputs.capacity(), output_capacity);
+        assert_eq!(
+            empty_outputs
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            vec![0.0_f64.to_bits(); 3]
+        );
+
+        let matrix = CsrMatrix::new(2, 3, vec![0, 2, 3], vec![0, 2, 1], vec![1.0, -2.0, 3.0])
+            .expect("length-check matrix");
+        let row_offsets = std::sync::Arc::as_ptr(&matrix.row_offsets);
+        let col_indices = std::sync::Arc::as_ptr(&matrix.col_indices);
+        let values = matrix
+            .values
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>();
+
+        let check_failure = |input: &[f64], output: &mut [f64], expected: &str| {
+            let original = output
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>();
+            let error = matrix
+                .matvec_into(input, output)
+                .expect_err("length mismatch must fail");
+            assert_eq!(error.to_string(), expected);
+            assert_eq!(
+                output
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                original
+            );
+        };
+
+        check_failure(
+            &[1.0, 2.0],
+            &mut [f64::NAN, -0.0],
+            "CSR matvec expected x with 3 entries, got 2",
+        );
+        check_failure(
+            &[1.0, 2.0, 3.0, 4.0],
+            &mut [f64::NAN, -0.0],
+            "CSR matvec expected x with 3 entries, got 4",
+        );
+        check_failure(
+            &[1.0, 2.0],
+            &mut [f64::NAN],
+            "CSR matvec expected x with 3 entries, got 2",
+        );
+        check_failure(
+            &[1.0, 2.0, 3.0],
+            &mut [f64::NAN],
+            "CSR matvec expected y with 2 entries, got 1",
+        );
+        check_failure(
+            &[1.0, 2.0, 3.0],
+            &mut [f64::NAN, -0.0, f64::from_bits(1)],
+            "CSR matvec expected y with 2 entries, got 3",
+        );
+
+        assert_eq!(std::sync::Arc::as_ptr(&matrix.row_offsets), row_offsets);
+        assert_eq!(std::sync::Arc::as_ptr(&matrix.col_indices), col_indices);
+        assert_eq!(
+            matrix
+                .values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            values
+        );
     }
 
     #[test]
