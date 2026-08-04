@@ -886,8 +886,9 @@ pub fn reconstruct_laminar_gradients_from_fields(
 
     let scalar_gradient = ScalarGradientGeometry::from_mesh(&runtime.mesh)?;
     let face_addressing = CompactSimpleFaceAddressing::from_mesh(&runtime.mesh)?;
+    let velocity_gradient_scheme = schemes.div_phi_u.gradient_scheme(schemes.grad_u);
     let weighted_least_squares = (schemes.grad_p.uses_weighted_least_squares()
-        || schemes.grad_u.uses_weighted_least_squares())
+        || velocity_gradient_scheme.uses_weighted_least_squares())
     .then(|| {
         WeightedLeastSquaresGeometry::from_mesh(&runtime.mesh, &scalar_gradient, &face_addressing)
     })
@@ -929,7 +930,7 @@ pub fn reconstruct_laminar_gradients_from_fields(
         velocity,
         &velocity_boundary,
         &flux,
-        schemes.grad_u,
+        velocity_gradient_scheme,
     )?;
 
     Ok(LaminarFieldGradients {
@@ -9029,8 +9030,10 @@ mod tests {
         let fields = two_cell_fields_with_empty_sides();
         let schemes = LaminarSimpleSchemes {
             grad_p: LaminarSimpleGradientScheme::LeastSquares,
-            grad_u: LaminarSimpleGradientScheme::LeastSquares,
-            div_phi_u: LaminarSimpleConvectionScheme::GaussLinearUpwind,
+            grad_u: LaminarSimpleGradientScheme::GaussLinear,
+            div_phi_u: LaminarSimpleConvectionScheme::BoundedGaussLinearUpwind(
+                LaminarSimpleGradientScheme::LeastSquares,
+            ),
             ..LaminarSimpleSchemes::default()
         };
         let (velocity, pressure) =
