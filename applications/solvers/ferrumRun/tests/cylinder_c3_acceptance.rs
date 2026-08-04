@@ -54,6 +54,7 @@ struct RunEvidence {
     cl: f64,
     final_u: Vec<u8>,
     final_p: Vec<u8>,
+    wall_face_loads_csv: Vec<u8>,
 }
 
 #[test]
@@ -164,6 +165,8 @@ fn run_preset(root: &Path, preset: CylinderOGridPreset, label: &str) -> RunEvide
         .arg("0.015")
         .arg("--forceReferenceArea")
         .arg("1e-6")
+        .arg("--wallFaceLoadsCsv")
+        .arg("wall-face-loads.csv")
         .arg("--solveReportJson")
         .arg("report.json")
         .arg("--solveReportMarkdown")
@@ -180,6 +183,7 @@ fn run_preset(root: &Path, preset: CylinderOGridPreset, label: &str) -> RunEvide
     let linear = evidence_line(&stdout, "incompressibleFluid linearSolves:");
     let continuity = evidence_line(&stdout, "incompressibleFluid continuityErrors:");
     let forces = evidence_line(&stdout, "incompressibleFluid wallForces:");
+    let force_method = evidence_line(&stdout, "incompressibleFluid wallForceMethod:");
 
     assert_eq!(token(solve, "converged"), "yes");
     assert_eq!(token(solve, "stopReason"), "Converged");
@@ -219,6 +223,20 @@ fn run_preset(root: &Path, preset: CylinderOGridPreset, label: &str) -> RunEvide
     assert_eq!(token(forces, "patches"), "cylinder");
     assert_eq!(parse_usize(forces, "selectedPatches"), 1);
     assert_eq!(parse_usize(forces, "selectedFaces"), expected.1);
+    assert_eq!(
+        token(force_method, "tractionMethod"),
+        "reconstructedGradientFullDeviatoric"
+    );
+    assert_eq!(parse_usize(force_method, "tractionMethodVersion"), 1);
+    assert_eq!(token(force_method, "forceConvention"), "fluidOnBody");
+    assert_eq!(
+        token(force_method, "faceAreaVectorOrientation"),
+        "outwardFromFluid"
+    );
+    assert_eq!(
+        token(force_method, "pressureFaceTreatment"),
+        "zeroGradientOwner"
+    );
     let cd = parse_f64(forces, "dragTotal");
     let cl = parse_f64(forces, "liftTotal");
     let reference_error = (cd - REFERENCE_CD).abs() / REFERENCE_CD;
@@ -232,8 +250,27 @@ fn run_preset(root: &Path, preset: CylinderOGridPreset, label: &str) -> RunEvide
     let markdown = fs::read_to_string(run_root.join("report.md")).expect("read C3 Markdown report");
     assert!(json.contains("\"continuityErrors\""));
     assert!(json.contains("\"wallForces\""));
+    assert!(json.contains("\"tractionMethod\": \"reconstructedGradientFullDeviatoric\""));
+    assert!(json.contains("\"tractionMethodVersion\": 1"));
+    assert!(json.contains("\"forceConvention\": \"fluidOnBody\""));
+    assert!(json.contains("\"faceAreaVectorOrientation\": \"outwardFromFluid\""));
+    assert!(json.contains("\"pressureFaceTreatment\": \"zeroGradientOwner\""));
+    assert!(json.contains("\"velocityGradientScheme\": \"cellLimited Gauss linear 1\""));
     assert!(markdown.contains("Continuity errors"));
     assert!(markdown.contains("Wall forces"));
+    assert!(markdown.contains("| Traction method | reconstructedGradientFullDeviatoric |"));
+    assert!(markdown.contains("| Force convention | fluidOnBody |"));
+    assert!(markdown.contains("| Pressure face treatment | zeroGradientOwner |"));
+    assert!(markdown.contains("| Velocity gradient scheme | cellLimited Gauss linear 1 |"));
+    let wall_face_loads_csv =
+        fs::read(run_root.join("wall-face-loads.csv")).expect("read C3 wall-face loads CSV");
+    assert_wall_face_loads_csv(
+        &wall_face_loads_csv,
+        expected.1,
+        parse_f64(forces, "pressureFx"),
+        parse_f64(forces, "viscousFx"),
+        parse_f64(forces, "totalFx"),
+    );
 
     RunEvidence {
         cells: expected.0,
@@ -247,6 +284,7 @@ fn run_preset(root: &Path, preset: CylinderOGridPreset, label: &str) -> RunEvide
         cl,
         final_u: fs::read(run_root.join("final/U")).expect("read final U"),
         final_p: fs::read(run_root.join("final/p")).expect("read final p"),
+        wall_face_loads_csv,
     }
 }
 
@@ -303,6 +341,54 @@ fn assert_repeated_run_equal(first: &RunEvidence, second: &RunEvidence) {
     }
     assert_eq!(first.final_u, second.final_u);
     assert_eq!(first.final_p, second.final_p);
+    assert_eq!(first.wall_face_loads_csv, second.wall_face_loads_csv);
+}
+
+fn assert_wall_face_loads_csv(
+    bytes: &[u8],
+    expected_faces: usize,
+    pressure_fx: f64,
+    viscous_fx: f64,
+    total_fx: f64,
+) {
+    let csv = std::str::from_utf8(bytes).expect("C3 wall-face CSV is UTF-8");
+    let mut lines = csv.lines();
+    let header = lines.next().expect("C3 wall-face CSV header");
+    assert!(header.starts_with("wallFaceLoadsSchemaVersion,tractionMethod,"));
+    assert!(header.ends_with("totalForceOnBodyZN"));
+
+    let mut previous_face = None;
+    let mut pressure_sum = 0.0;
+    let mut viscous_sum = 0.0;
+    let mut total_sum = 0.0;
+    let mut rows = 0usize;
+    for line in lines {
+        let columns = line.split(',').collect::<Vec<_>>();
+        assert_eq!(columns.len(), 45);
+        assert_eq!(columns[1], "\"reconstructedGradientFullDeviatoric\"");
+        assert_eq!(columns[16], "\"cylinder\"");
+        let face = columns[17].parse::<usize>().expect("C3 global face index");
+        if let Some(previous) = previous_face {
+            assert_eq!(face, previous + 1);
+        }
+        previous_face = Some(face);
+        pressure_sum += columns[36].parse::<f64>().expect("C3 pressure force x");
+        viscous_sum += columns[39].parse::<f64>().expect("C3 viscous force x");
+        total_sum += columns[42].parse::<f64>().expect("C3 total force x");
+        rows += 1;
+    }
+    assert_eq!(rows, expected_faces);
+    assert_close_to_console(pressure_sum, pressure_fx);
+    assert_close_to_console(viscous_sum, viscous_fx);
+    assert_close_to_console(total_sum, total_fx);
+}
+
+fn assert_close_to_console(actual: f64, rounded_console: f64) {
+    let tolerance = 1.0e-6 * actual.abs().max(rounded_console.abs()).max(1.0);
+    assert!(
+        (actual - rounded_console).abs() <= tolerance,
+        "{actual} differs from rounded console value {rounded_console} by more than {tolerance}"
+    );
 }
 
 fn assert_reference_manifest() {

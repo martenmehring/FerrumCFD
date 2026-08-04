@@ -10,9 +10,10 @@ use std::time::Instant;
 
 use case::{InitCaseOptions, init_case};
 use ferrum_finite_volume::boundary_forces::{
-    MAX_RELATIVE_AREA_VECTOR_IMBALANCE_TOLERANCE, NoSlipWallForceOptions, PressureFieldKind,
-    PressureReference, ReferenceArea, WallForceCoefficients,
-    integrate_stationary_no_slip_zero_gradient_pressure_wall_forces,
+    CellVelocityGradientComponents, MAX_RELATIVE_AREA_VECTOR_IMBALANCE_TOLERANCE,
+    NoSlipWallForceOptions, PressureFieldKind, PressureReference, ReferenceArea,
+    WallFaceForceContribution, WallForceCoefficients,
+    integrate_stationary_no_slip_zero_gradient_pressure_wall_forces_with_reconstructed_gradient,
 };
 use ferrum_finite_volume::continuity::{NormalizedContinuity, normalize_steady_continuity};
 use ferrum_mesh::Point3;
@@ -38,8 +39,9 @@ use ferrum_mesh::flow::{
     LaminarSimpleSchemes, LaminarSimpleSnGradScheme, LaminarSimpleStopReason,
     LinearSolveConvergenceSummary, LinearSolveSummary, MatrixDiagnosticSummary,
     PressureAssemblyDiagnostics, ScalarDiagnosticSummary, VectorDiagnosticSummary,
-    solve_laminar_simple, solve_laminar_simple_profiled_pcg,
-    solve_laminar_simple_profiled_pcg_with_observer, solve_laminar_simple_with_observer,
+    reconstruct_laminar_gradients_from_fields, solve_laminar_simple,
+    solve_laminar_simple_profiled_pcg, solve_laminar_simple_profiled_pcg_with_observer,
+    solve_laminar_simple_with_observer,
 };
 use ferrum_mesh::foam::{FoamWriteOptions, write_openfoam_case_with_options};
 use ferrum_mesh::geometry::{GeometrySummary, summarize_case_geometry};
@@ -59,7 +61,7 @@ use ferrum_mesh::runner::{
     MAX_RUNNER_DRY_RUN_STEPS, SolverRunnerDryRun, SolverRunnerDryRunEvent,
     SolverRunnerDryRunOptions, build_solver_runner_dry_run,
 };
-use ferrum_mesh::runtime::SolverRuntimeData;
+use ferrum_mesh::runtime::{SolverRuntimeData, SolverRuntimeMeshData};
 use ferrum_mesh::safe_output::{SafeOutputEntry, SafeOutputRoot};
 use ferrum_mesh::solver_plan::{
     SolverBackendPlan, SolverCasePlan, SolverFieldPlan, SolverInterfacePlan, SolverMeshPlan,
@@ -72,6 +74,14 @@ const FERRUM_DEFAULT_LDU_TOLERANCE: f64 = 1.0e-6;
 const FERRUM_DEFAULT_LDU_MAX_ITERATIONS: usize = 1_000;
 const FERRUM_MAX_CASE_LDU_MAX_ITERATIONS: usize = FERRUM_DEFAULT_LDU_MAX_ITERATIONS;
 const FERRUM_MAX_CASE_SIMPLE_ITERATIONS: usize = 10_000;
+const WALL_FORCE_TRACTION_METHOD: &str = "reconstructedGradientFullDeviatoric";
+const WALL_FORCE_TRACTION_METHOD_VERSION: usize = 1;
+const WALL_FORCE_FORCE_CONVENTION: &str = "fluidOnBody";
+const WALL_FORCE_AREA_VECTOR_ORIENTATION: &str = "outwardFromFluid";
+const WALL_FORCE_PRESSURE_FACE_TREATMENT: &str = "zeroGradientOwner";
+const WALL_FACE_LOADS_CSV_SCHEMA_VERSION: usize = 1;
+const WALL_FORCE_PRESSURE_FIELD_KIND: &str = "kinematic";
+const WALL_FORCE_PRESSURE_REFERENCE_MODE: &str = "areaVectorBalancedMean";
 
 pub fn run_ferrum() -> i32 {
     let args = env::args().skip(1).collect::<Vec<_>>();
@@ -721,6 +731,7 @@ fn run_laminar_simple_solve(
     solve: &LaminarSimpleSolveArgs,
 ) -> Result<(), String> {
     let options = resolve_laminar_simple_options(plan, solve)?;
+    validate_wall_face_loads_output_destination(solve)?;
     if let Some(wall_forces) = &solve.wall_forces {
         validate_wall_force_boundary_conditions(&plan.initial_fields, &wall_forces.patch_names)?;
     }
@@ -783,6 +794,7 @@ fn run_laminar_simple_solve(
     }
     if let Some(wall_forces) = &post_processing.wall_forces {
         print_wall_force_coefficients(wall_forces);
+        print_wall_force_method(wall_forces);
     }
 
     println!(
@@ -1024,7 +1036,12 @@ fn run_laminar_simple_solve(
         || solve.solve_residual_plot.is_some()
         || solve.report_json.is_some()
         || solve.report_markdown.is_some()
-        || solve.write_final_fields.is_some();
+        || solve.write_final_fields.is_some()
+        || solve
+            .wall_forces
+            .as_ref()
+            .and_then(|request| request.face_loads_csv.as_ref())
+            .is_some();
     let output_root = if needs_output_root {
         let path = env::current_dir()
             .map_err(|error| format!("could not resolve the solver output root ({error})"))?;
@@ -1038,6 +1055,31 @@ fn run_laminar_simple_solve(
         None
     };
     let output_root = output_root.as_ref();
+
+    if let Some(path) = solve
+        .wall_forces
+        .as_ref()
+        .and_then(|request| request.face_loads_csv.as_ref())
+    {
+        let wall_forces = post_processing.wall_forces.as_ref().ok_or_else(|| {
+            "internal error: wall-face CSV was requested without reconstructed wall forces"
+                .to_string()
+        })?;
+        write_laminar_simple_wall_face_loads_csv(
+            &plan.runtime_data.mesh,
+            &options,
+            wall_forces,
+            output_root.expect("output requested"),
+            path,
+        )
+        .map_err(|error| {
+            format!(
+                "could not write per-face wall loads CSV to {} ({error})",
+                path.display()
+            )
+        })?;
+        println!("wrote per-face wall loads CSV: {}", path.display());
+    }
 
     let mut residual_csv_path = solve.solve_residual_csv.clone();
     if let Some(path) = &solve.solve_residual_csv {
@@ -1175,6 +1217,129 @@ fn run_laminar_simple_solve(
     Ok(())
 }
 
+fn validate_wall_face_loads_output_destination(
+    solve: &LaminarSimpleSolveArgs,
+) -> Result<(), String> {
+    let Some(path) = solve
+        .wall_forces
+        .as_ref()
+        .and_then(|request| request.face_loads_csv.as_ref())
+    else {
+        return Ok(());
+    };
+    let root = env::current_dir()
+        .map_err(|error| format!("could not resolve the solver output root ({error})"))?;
+    let output_root = SafeOutputRoot::open_existing(&root).map_err(|error| {
+        format!(
+            "could not safely open solver output root {} ({error})",
+            root.display()
+        )
+    })?;
+    validate_wall_face_loads_output_destination_in_root(solve, path, &output_root)
+}
+
+fn validate_wall_face_loads_output_destination_in_root(
+    solve: &LaminarSimpleSolveArgs,
+    wall_face_loads_path: &Path,
+    output_root: &SafeOutputRoot,
+) -> Result<(), String> {
+    let wall_face_loads =
+        validated_output_collision_key(output_root, wall_face_loads_path, "--wallFaceLoadsCsv")?;
+    let mut other_files = Vec::new();
+    other_files
+        .try_reserve_exact(7)
+        .map_err(|_| "could not allocate solver output collision checks".to_string())?;
+    if let Some(path) = solve.solve_residual_csv.as_deref() {
+        other_files.push(("--solveResidualCsv", path.to_path_buf()));
+    } else if let Some(plot) = solve.solve_residual_plot.as_deref() {
+        other_files.push(("automatic residual CSV", plot.with_extension("csv")));
+    }
+    if let Some(path) = solve.solve_residual_plot.as_deref() {
+        other_files.push(("--solveResidualPlot", path.to_path_buf()));
+    }
+    if let Some(path) = solve.report_json.as_deref() {
+        other_files.push(("--solveReportJson", path.to_path_buf()));
+    }
+    if let Some(path) = solve.report_markdown.as_deref() {
+        other_files.push(("--solveReportMarkdown", path.to_path_buf()));
+    }
+    if let Some(directory) = solve.write_final_fields.as_deref() {
+        other_files.push((
+            "--writeFinalFields U",
+            fallible_join_output_path(directory, "U")
+                .map_err(|error| format!("could not validate final U output path ({error})"))?,
+        ));
+        other_files.push((
+            "--writeFinalFields p",
+            fallible_join_output_path(directory, "p")
+                .map_err(|error| format!("could not validate final p output path ({error})"))?,
+        ));
+        let directory_key =
+            validated_output_collision_key(output_root, directory, "--writeFinalFields")?;
+        if wall_face_loads == directory_key
+            || output_key_is_prefix(&wall_face_loads, &directory_key)
+        {
+            return Err(format!(
+                "--wallFaceLoadsCsv path '{}' collides with --writeFinalFields directory '{}'",
+                wall_face_loads_path.display(),
+                directory.display()
+            ));
+        }
+    }
+
+    for (label, path) in other_files {
+        let other = validated_output_collision_key(output_root, &path, label)?;
+        if wall_face_loads == other
+            || output_key_is_prefix(&wall_face_loads, &other)
+            || output_key_is_prefix(&other, &wall_face_loads)
+        {
+            return Err(format!(
+                "--wallFaceLoadsCsv path '{}' collides with {label} path '{}'",
+                wall_face_loads_path.display(),
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validated_output_collision_key(
+    output_root: &SafeOutputRoot,
+    path: &Path,
+    label: &str,
+) -> Result<Vec<String>, String> {
+    let relative = relative_output_path(output_root, path)
+        .and_then(|relative| {
+            output_root.validate_file_path(&relative)?;
+            Ok(relative)
+        })
+        .map_err(|error| format!("invalid {label} output path '{}' ({error})", path.display()))?;
+    let components = relative.components().count();
+    let mut key = Vec::new();
+    key.try_reserve_exact(components)
+        .map_err(|_| format!("could not allocate {label} output path validation"))?;
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(format!("invalid {label} output path '{}'", path.display()));
+        };
+        let component = component.to_str().ok_or_else(|| {
+            format!(
+                "invalid non-Unicode {label} output path '{}'",
+                path.display()
+            )
+        })?;
+        #[cfg(windows)]
+        key.push(component.to_lowercase());
+        #[cfg(not(windows))]
+        key.push(component.to_string());
+    }
+    Ok(key)
+}
+
+fn output_key_is_prefix(prefix: &[String], value: &[String]) -> bool {
+    prefix.len() < value.len() && prefix.iter().zip(value).all(|(left, right)| left == right)
+}
+
 fn build_laminar_simple_post_processing(
     plan: &SolverCasePlan,
     solve: &LaminarSimpleSolveArgs,
@@ -1228,16 +1393,32 @@ fn build_laminar_simple_post_processing(
     let wall_forces = solve
         .wall_forces
         .as_ref()
-        .map(|request| {
+        .map(|request| -> Result<WallForceReport, String> {
             let patch_names = request
                 .patch_names
                 .iter()
                 .map(String::as_str)
                 .collect::<Vec<_>>();
-            integrate_stationary_no_slip_zero_gradient_pressure_wall_forces(
+            let gradients = reconstruct_laminar_gradients_from_fields(
+                &plan.runtime_data,
+                &plan.initial_fields,
+                &report.final_velocity,
+                &report.final_pressure,
+                options.schemes,
+            )
+            .map_err(|error| {
+                format!("could not reconstruct final fields for selected wall forces ({error})")
+            })?;
+            let resolved =
+                integrate_stationary_no_slip_zero_gradient_pressure_wall_forces_with_reconstructed_gradient(
                 &plan.runtime_data.mesh,
                 &report.final_velocity,
                 &report.final_pressure,
+                CellVelocityGradientComponents {
+                    grad_ux: &gradients.velocity_component_gradients[0],
+                    grad_uy: &gradients.velocity_component_gradients[1],
+                    grad_uz: &gradients.velocity_component_gradients[2],
+                },
                 &patch_names,
                 NoSlipWallForceOptions {
                     pressure_kind: PressureFieldKind::Kinematic,
@@ -1261,12 +1442,14 @@ fn build_laminar_simple_post_processing(
                     },
                 },
             )
-            .map(|coefficients| WallForceReport {
+            .map_err(|error| format!("could not integrate selected wall forces ({error})"))?;
+            Ok(WallForceReport {
                 patch_names: request.patch_names.clone(),
                 reference_speed: request.reference_speed,
-                coefficients,
+                velocity_gradient_scheme: options.schemes.grad_u,
+                coefficients: resolved.coefficients,
+                faces: resolved.faces,
             })
-            .map_err(|error| format!("could not integrate selected wall forces ({error})"))
         })
         .transpose()?;
 
@@ -1375,6 +1558,362 @@ fn print_wall_force_coefficients(report: &WallForceReport) {
         format_scientific(value.resolved_reference_area),
         format_scientific(report.reference_speed),
     );
+}
+
+fn print_wall_force_method(report: &WallForceReport) {
+    println!(
+        "incompressibleFluid wallForceMethod: tractionMethod={} tractionMethodVersion={} forceConvention={} faceAreaVectorOrientation={} pressureFaceTreatment={} gradU=\"{}\"",
+        WALL_FORCE_TRACTION_METHOD,
+        WALL_FORCE_TRACTION_METHOD_VERSION,
+        WALL_FORCE_FORCE_CONVENTION,
+        WALL_FORCE_AREA_VECTOR_ORIENTATION,
+        WALL_FORCE_PRESSURE_FACE_TREATMENT,
+        report.velocity_gradient_scheme,
+    );
+}
+
+fn write_laminar_simple_wall_face_loads_csv(
+    mesh: &SolverRuntimeMeshData,
+    options: &LaminarSimpleOptions,
+    report: &WallForceReport,
+    output_root: &SafeOutputRoot,
+    path: &Path,
+) -> std::io::Result<()> {
+    validate_wall_face_loads_metadata(options, report)?;
+    visit_wall_face_load_rows(mesh, report, |_patch, _centre, _face| Ok(()))?;
+
+    let relative = relative_output_path(output_root, path)?;
+    output_root.validate_file_path(&relative)?;
+    validate_replace_output_entry(output_root, &relative)?;
+
+    let file = open_replace_output_file(output_root, path)?;
+    let mut writer = BufWriter::new(file);
+    writeln!(
+        writer,
+        "wallFaceLoadsSchemaVersion,tractionMethod,tractionMethodVersion,forceConvention,faceAreaVectorOrientation,pressureFieldKind,pressureReferenceMode,pressureReferenceRelativeAreaVectorImbalanceTolerance,pressureFaceTreatment,velocityGradientScheme,densityKgPerM3,dynamicViscosityPaS,referenceSpeedMPerS,referenceAreaM2,referenceDynamicPressurePa,resolvedPressureReferenceM2PerS2,patch,faceIndex,ownerCell,faceCenterXM,faceCenterYM,faceCenterZM,areaVectorXM2,areaVectorYM2,areaVectorZM2,boundaryPressureM2PerS2,resolvedDynamicPressurePa,pressureTractionOnBodyXPa,pressureTractionOnBodyYPa,pressureTractionOnBodyZPa,viscousTractionOnBodyXPa,viscousTractionOnBodyYPa,viscousTractionOnBodyZPa,wallShearTractionOnBodyXPa,wallShearTractionOnBodyYPa,wallShearTractionOnBodyZPa,pressureForceOnBodyXN,pressureForceOnBodyYN,pressureForceOnBodyZN,viscousForceOnBodyXN,viscousForceOnBodyYN,viscousForceOnBodyZN,totalForceOnBodyXN,totalForceOnBodyYN,totalForceOnBodyZN"
+    )?;
+    visit_wall_face_load_rows(mesh, report, |patch, centre, face| {
+        write!(writer, "{WALL_FACE_LOADS_CSV_SCHEMA_VERSION},")?;
+        write_csv_text_field(&mut writer, WALL_FORCE_TRACTION_METHOD)?;
+        write!(writer, ",{WALL_FORCE_TRACTION_METHOD_VERSION},")?;
+        write_csv_text_field(&mut writer, WALL_FORCE_FORCE_CONVENTION)?;
+        writer.write_all(b",")?;
+        write_csv_text_field(&mut writer, WALL_FORCE_AREA_VECTOR_ORIENTATION)?;
+        writer.write_all(b",")?;
+        write_csv_text_field(&mut writer, WALL_FORCE_PRESSURE_FIELD_KIND)?;
+        writer.write_all(b",")?;
+        write_csv_text_field(&mut writer, WALL_FORCE_PRESSURE_REFERENCE_MODE)?;
+        write!(writer, ",{},", MAX_RELATIVE_AREA_VECTOR_IMBALANCE_TOLERANCE)?;
+        write_csv_text_field(&mut writer, WALL_FORCE_PRESSURE_FACE_TREATMENT)?;
+        writer.write_all(b",")?;
+        write_csv_text_field(&mut writer, &report.velocity_gradient_scheme.to_string())?;
+        write!(
+            writer,
+            ",{},{},{},{},{},{},",
+            options.density,
+            options.dynamic_viscosity,
+            report.reference_speed,
+            report.coefficients.resolved_reference_area,
+            report.coefficients.reference_dynamic_pressure,
+            report.coefficients.resolved_pressure_reference,
+        )?;
+        write_csv_text_field(&mut writer, patch)?;
+        writeln!(
+            writer,
+            ",{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            face.face_index,
+            face.owner_cell,
+            centre.x,
+            centre.y,
+            centre.z,
+            face.area_vector.x,
+            face.area_vector.y,
+            face.area_vector.z,
+            face.boundary_pressure,
+            face.resolved_dynamic_pressure,
+            face.pressure_traction_on_body.x,
+            face.pressure_traction_on_body.y,
+            face.pressure_traction_on_body.z,
+            face.viscous_traction_on_body.x,
+            face.viscous_traction_on_body.y,
+            face.viscous_traction_on_body.z,
+            face.wall_shear_traction_on_body.x,
+            face.wall_shear_traction_on_body.y,
+            face.wall_shear_traction_on_body.z,
+            face.pressure_force_on_body.x,
+            face.pressure_force_on_body.y,
+            face.pressure_force_on_body.z,
+            face.viscous_force_on_body.x,
+            face.viscous_force_on_body.y,
+            face.viscous_force_on_body.z,
+            face.total_force_on_body.x,
+            face.total_force_on_body.y,
+            face.total_force_on_body.z,
+        )
+    })?;
+    writer.flush()
+}
+
+fn validate_wall_face_loads_metadata(
+    options: &LaminarSimpleOptions,
+    report: &WallForceReport,
+) -> std::io::Result<()> {
+    if !options.density.is_finite()
+        || options.density <= 0.0
+        || !options.dynamic_viscosity.is_finite()
+        || options.dynamic_viscosity <= 0.0
+        || !report.reference_speed.is_finite()
+        || report.reference_speed <= 0.0
+        || report.patch_names.is_empty()
+        || report.coefficients.selected_patches != report.patch_names.len()
+        || report.coefficients.selected_faces != report.faces.len()
+    {
+        return Err(invalid_field_data(
+            "per-face wall loads metadata is inconsistent".to_string(),
+        ));
+    }
+    for value in [
+        report.coefficients.selected_area,
+        report.coefficients.resolved_pressure_reference,
+        report.coefficients.resolved_reference_area,
+        report.coefficients.reference_dynamic_pressure,
+    ] {
+        if !value.is_finite() {
+            return Err(invalid_field_data(
+                "per-face wall loads metadata contains a non-finite value".to_string(),
+            ));
+        }
+    }
+    if report.coefficients.selected_area <= 0.0
+        || report.coefficients.resolved_reference_area <= 0.0
+        || report.coefficients.reference_dynamic_pressure <= 0.0
+    {
+        return Err(invalid_field_data(
+            "per-face wall loads metadata contains a non-positive scale".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn visit_wall_face_load_rows(
+    mesh: &SolverRuntimeMeshData,
+    report: &WallForceReport,
+    mut visitor: impl FnMut(&str, Point3, &WallFaceForceContribution) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    if mesh.owner.len() != mesh.faces
+        || mesh.neighbour.len() != mesh.faces
+        || mesh.face_centres.len() != mesh.faces
+        || mesh.face_area_vectors.len() != mesh.faces
+    {
+        return Err(invalid_field_data(
+            "runtime mesh arrays do not match the face count".to_string(),
+        ));
+    }
+
+    let mut row = 0usize;
+    let mut pressure_force = CsvCompensatedPoint::default();
+    let mut viscous_force = CsvCompensatedPoint::default();
+    for (patch_position, patch_name) in report.patch_names.iter().enumerate() {
+        if report.patch_names[..patch_position]
+            .iter()
+            .any(|previous| previous == patch_name)
+        {
+            return Err(invalid_field_data(format!(
+                "per-face wall loads patch '{patch_name}' is selected more than once"
+            )));
+        }
+        let mut matches = mesh
+            .patches
+            .iter()
+            .filter(|patch| patch.name == *patch_name);
+        let patch = matches.next().ok_or_else(|| {
+            invalid_field_data(format!(
+                "per-face wall loads patch '{patch_name}' is missing from the runtime mesh"
+            ))
+        })?;
+        if matches.next().is_some() {
+            return Err(invalid_field_data(format!(
+                "per-face wall loads patch '{patch_name}' occurs more than once in the runtime mesh"
+            )));
+        }
+        if patch.patch_type != "wall" {
+            return Err(invalid_field_data(format!(
+                "per-face wall loads patch '{patch_name}' has mesh type '{}', expected wall",
+                patch.patch_type
+            )));
+        }
+        let end = patch.start_face.checked_add(patch.faces).ok_or_else(|| {
+            invalid_field_data(format!(
+                "per-face wall loads patch '{patch_name}' face range overflows"
+            ))
+        })?;
+        if patch.start_face < mesh.internal_faces || end > mesh.faces {
+            return Err(invalid_field_data(format!(
+                "per-face wall loads patch '{patch_name}' has an invalid boundary-face range"
+            )));
+        }
+
+        for expected_face in patch.start_face..end {
+            let face = report.faces.get(row).ok_or_else(|| {
+                invalid_field_data(format!(
+                    "per-face wall loads ended before patch '{patch_name}' face {expected_face}"
+                ))
+            })?;
+            if face.face_index != expected_face {
+                return Err(invalid_field_data(format!(
+                    "per-face wall loads row {row} has face {}, expected {expected_face}",
+                    face.face_index
+                )));
+            }
+            let expected_owner = mesh.owner[expected_face];
+            if face.owner_cell != expected_owner || expected_owner >= mesh.cells {
+                return Err(invalid_field_data(format!(
+                    "per-face wall loads face {expected_face} has an inconsistent owner cell"
+                )));
+            }
+            if mesh.neighbour[expected_face].is_some() {
+                return Err(invalid_field_data(format!(
+                    "per-face wall loads face {expected_face} is not a boundary face"
+                )));
+            }
+            let centre = mesh.face_centres[expected_face];
+            let area_vector = mesh.face_area_vectors[expected_face];
+            if !point_is_finite(centre)
+                || !point_bits_equal(face.area_vector, area_vector)
+                || !wall_face_contribution_is_finite(face)
+            {
+                return Err(invalid_field_data(format!(
+                    "per-face wall loads face {expected_face} contains invalid geometry or values"
+                )));
+            }
+            let total = Point3 {
+                x: face.pressure_force_on_body.x + face.viscous_force_on_body.x,
+                y: face.pressure_force_on_body.y + face.viscous_force_on_body.y,
+                z: face.pressure_force_on_body.z + face.viscous_force_on_body.z,
+            };
+            if !point_bits_equal(total, face.total_force_on_body) {
+                return Err(invalid_field_data(format!(
+                    "per-face wall loads face {expected_face} has an inconsistent total force"
+                )));
+            }
+            pressure_force.add(face.pressure_force_on_body);
+            viscous_force.add(face.viscous_force_on_body);
+            visitor(patch_name, centre, face)?;
+            row = row.checked_add(1).ok_or_else(|| {
+                invalid_field_data("per-face wall loads row count overflows".to_string())
+            })?;
+        }
+    }
+
+    if row != report.faces.len() {
+        return Err(invalid_field_data(format!(
+            "per-face wall loads contains {} rows after the selected patch ranges",
+            report.faces.len() - row
+        )));
+    }
+    let pressure_force = pressure_force.total();
+    let viscous_force = viscous_force.total();
+    let total_force = Point3 {
+        x: pressure_force.x + viscous_force.x,
+        y: pressure_force.y + viscous_force.y,
+        z: pressure_force.z + viscous_force.z,
+    };
+    if !point_bits_equal(pressure_force, report.coefficients.pressure_force)
+        || !point_bits_equal(viscous_force, report.coefficients.viscous_force)
+        || !point_bits_equal(total_force, report.coefficients.total_force)
+    {
+        return Err(invalid_field_data(
+            "per-face wall loads do not reproduce the aggregate wall forces".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CsvCompensatedSum {
+    sum: f64,
+    correction: f64,
+}
+
+impl CsvCompensatedSum {
+    fn add(&mut self, value: f64) {
+        let next = self.sum + value;
+        if self.sum.abs() >= value.abs() {
+            self.correction += (self.sum - next) + value;
+        } else {
+            self.correction += (value - next) + self.sum;
+        }
+        self.sum = next;
+    }
+
+    fn total(self) -> f64 {
+        self.sum + self.correction
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CsvCompensatedPoint {
+    x: CsvCompensatedSum,
+    y: CsvCompensatedSum,
+    z: CsvCompensatedSum,
+}
+
+impl CsvCompensatedPoint {
+    fn add(&mut self, value: Point3) {
+        self.x.add(value.x);
+        self.y.add(value.y);
+        self.z.add(value.z);
+    }
+
+    fn total(self) -> Point3 {
+        Point3 {
+            x: self.x.total(),
+            y: self.y.total(),
+            z: self.z.total(),
+        }
+    }
+}
+
+fn point_is_finite(value: Point3) -> bool {
+    value.x.is_finite() && value.y.is_finite() && value.z.is_finite()
+}
+
+fn point_bits_equal(left: Point3, right: Point3) -> bool {
+    left.x.to_bits() == right.x.to_bits()
+        && left.y.to_bits() == right.y.to_bits()
+        && left.z.to_bits() == right.z.to_bits()
+}
+
+fn wall_face_contribution_is_finite(face: &WallFaceForceContribution) -> bool {
+    face.boundary_pressure.is_finite()
+        && face.resolved_dynamic_pressure.is_finite()
+        && point_is_finite(face.area_vector)
+        && point_is_finite(face.pressure_traction_on_body)
+        && point_is_finite(face.viscous_traction_on_body)
+        && point_is_finite(face.wall_shear_traction_on_body)
+        && point_is_finite(face.pressure_force_on_body)
+        && point_is_finite(face.viscous_force_on_body)
+        && point_is_finite(face.total_force_on_body)
+}
+
+fn write_csv_text_field(writer: &mut impl Write, value: &str) -> std::io::Result<()> {
+    writer.write_all(b"\"")?;
+    if value
+        .chars()
+        .next()
+        .is_some_and(|first| matches!(first, '=' | '+' | '-' | '@' | '\t' | '\r'))
+    {
+        writer.write_all(b"'")?;
+    }
+    for character in value.chars() {
+        if character == '"' {
+            writer.write_all(b"\"\"")?;
+        } else {
+            let mut encoded = [0u8; 4];
+            writer.write_all(character.encode_utf8(&mut encoded).as_bytes())?;
+        }
+    }
+    writer.write_all(b"\"")
 }
 
 fn write_laminar_simple_residual_csv(
@@ -4626,6 +5165,28 @@ fn write_json_wall_forces(
     write_json_key(writer, 4, "pressureReference")?;
     write_json_string(writer, "areaVectorBalancedMean")?;
     writeln!(writer, ",")?;
+    write_json_key(writer, 4, "tractionMethod")?;
+    write_json_string(writer, WALL_FORCE_TRACTION_METHOD)?;
+    writeln!(writer, ",")?;
+    write_json_number_field(
+        writer,
+        4,
+        "tractionMethodVersion",
+        WALL_FORCE_TRACTION_METHOD_VERSION,
+    )?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "forceConvention")?;
+    write_json_string(writer, WALL_FORCE_FORCE_CONVENTION)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "faceAreaVectorOrientation")?;
+    write_json_string(writer, WALL_FORCE_AREA_VECTOR_ORIENTATION)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "pressureFaceTreatment")?;
+    write_json_string(writer, WALL_FORCE_PRESSURE_FACE_TREATMENT)?;
+    writeln!(writer, ",")?;
+    write_json_key(writer, 4, "velocityGradientScheme")?;
+    write_json_string(writer, &report.velocity_gradient_scheme.to_string())?;
+    writeln!(writer, ",")?;
     write_json_key(writer, 4, "resolvedPressureReference")?;
     write_json_optional_number(writer, Some(value.resolved_pressure_reference))?;
     writeln!(writer, ",")?;
@@ -5890,6 +6451,28 @@ fn write_laminar_simple_report_markdown(
         writeln!(writer, "| Selected faces | {} |", value.selected_faces)?;
         writeln!(writer, "| Pressure field kind | kinematic |")?;
         writeln!(writer, "| Pressure reference | area-vector balanced mean |")?;
+        writeln!(writer, "| Traction method | {WALL_FORCE_TRACTION_METHOD} |")?;
+        writeln!(
+            writer,
+            "| Traction method version | {WALL_FORCE_TRACTION_METHOD_VERSION} |"
+        )?;
+        writeln!(
+            writer,
+            "| Force convention | {WALL_FORCE_FORCE_CONVENTION} |"
+        )?;
+        writeln!(
+            writer,
+            "| Face area-vector orientation | {WALL_FORCE_AREA_VECTOR_ORIENTATION} |"
+        )?;
+        writeln!(
+            writer,
+            "| Pressure face treatment | {WALL_FORCE_PRESSURE_FACE_TREATMENT} |"
+        )?;
+        writeln!(
+            writer,
+            "| Velocity gradient scheme | {} |",
+            wall_forces.velocity_gradient_scheme
+        )?;
         writeln!(
             writer,
             "| Selected area | {} |",
@@ -7996,6 +8579,7 @@ struct WallForceSolveArgs {
     patch_names: Vec<String>,
     reference_speed: f64,
     reference_area: f64,
+    face_loads_csv: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -8010,7 +8594,9 @@ struct ContinuityErrorsReport {
 struct WallForceReport {
     patch_names: Vec<String>,
     reference_speed: f64,
+    velocity_gradient_scheme: LaminarSimpleGradientScheme,
     coefficients: WallForceCoefficients,
+    faces: Vec<WallFaceForceContribution>,
 }
 
 #[derive(Clone, Debug)]
@@ -8105,6 +8691,7 @@ fn parse_solver_args_for_invocation(
     let mut wall_force_patches = None;
     let mut force_reference_speed = None;
     let mut force_reference_area = None;
+    let mut wall_face_loads_csv = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -8550,6 +9137,23 @@ fn parse_solver_args_for_invocation(
                 laminar_simple_option_seen = true;
                 index += 2;
             }
+            "-wallFaceLoadsCsv"
+            | "--wallFaceLoadsCsv"
+            | "-wall-face-loads-csv"
+            | "--wall-face-loads-csv" => {
+                if wall_face_loads_csv.is_some() {
+                    return Err("--wallFaceLoadsCsv may be specified only once".to_string());
+                }
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--wallFaceLoadsCsv requires a file path".to_string())?;
+                if value.trim().is_empty() {
+                    return Err("--wallFaceLoadsCsv requires a non-empty file path".to_string());
+                }
+                wall_face_loads_csv = Some(PathBuf::from(value));
+                laminar_simple_option_seen = true;
+                index += 2;
+            }
             other => return Err(format!("unknown ferrum solve option '{other}'")),
         }
     }
@@ -8571,12 +9175,19 @@ fn parse_solver_args_for_invocation(
         force_reference_speed,
         force_reference_area,
     ) {
-        (None, None, None) => None,
+        (None, None, None) if wall_face_loads_csv.is_none() => None,
+        (None, None, None) => {
+            return Err(
+                "--wallFaceLoadsCsv requires --wallForcePatches, --forceReferenceSpeed, and --forceReferenceArea"
+                    .to_string(),
+            );
+        }
         (Some(patch_names), Some(reference_speed), Some(reference_area)) => {
             Some(WallForceSolveArgs {
                 patch_names,
                 reference_speed,
                 reference_area,
+                face_loads_csv: wall_face_loads_csv,
             })
         }
         _ => {
@@ -9020,6 +9631,7 @@ fn print_ferrum_run_usage() {
     println!("  --wallForcePatches <a,b>         integrate selected noSlip wall patches");
     println!("  --forceReferenceSpeed <m/s>      positive force-coefficient speed");
     println!("  --forceReferenceArea <m2>        positive force-coefficient area");
+    println!("  --wallFaceLoadsCsv <file>        write optional per-face wall loads CSV");
     println!("  wall-force options are opt-in and must be supplied together");
 }
 
@@ -9098,11 +9710,13 @@ mod tests {
         resolve_laminar_simple_convection_scheme, resolve_laminar_simple_options,
         resolve_laminar_simple_schemes, resolve_solver_dispatch, resolved_gradient_scheme_value,
         run_ferrum_subcommand, validate_laminar_residual_control_dictionary,
-        validate_module_execution_contract, validate_wall_force_boundary_conditions,
-        write_json_gamg_hierarchy, write_json_optional_u128_decimal, write_json_solver_state,
-        write_json_string, write_laminar_simple_fields, write_laminar_simple_report_json,
+        validate_module_execution_contract, validate_wall_face_loads_output_destination_in_root,
+        validate_wall_force_boundary_conditions, write_json_gamg_hierarchy,
+        write_json_optional_u128_decimal, write_json_solver_state, write_json_string,
+        write_laminar_simple_fields, write_laminar_simple_report_json,
         write_laminar_simple_report_markdown, write_laminar_simple_residual_csv,
-        write_laminar_simple_residual_plot, write_solver_plan_json_in_root,
+        write_laminar_simple_residual_plot, write_laminar_simple_wall_face_loads_csv,
+        write_solver_plan_json_in_root,
     };
     use ferrum_mesh::backends::BackendChoice;
     use ferrum_mesh::control::ControlDict;
@@ -9117,7 +9731,7 @@ mod tests {
         GamgHierarchyLevelDiagnostics, GamgKernelTiming, GamgLevelTiming, GamgOptions,
         GamgOuterSolver, GamgSmoother, GamgTransferDiagnostics,
     };
-    use ferrum_mesh::runtime::{SolverRuntimeData, SolverRuntimeMeshData};
+    use ferrum_mesh::runtime::{SolverRuntimeData, SolverRuntimeMeshData, SolverRuntimePatchRange};
     use ferrum_mesh::solver_plan::{
         SolverBackendPlan, SolverCasePlan, SolverCpuResourcePlan, SolverDimensionality,
         SolverFieldPlan, SolverGpuResourcePlan, SolverInterfacePlan, SolverMeshPlan,
@@ -9132,7 +9746,9 @@ mod tests {
     use std::io::ErrorKind;
     use std::path::{Path, PathBuf};
 
-    use ferrum_finite_volume::boundary_forces::{DirectionalCoefficient, WallForceCoefficients};
+    use ferrum_finite_volume::boundary_forces::{
+        DirectionalCoefficient, WallFaceForceContribution, WallForceCoefficients,
+    };
 
     #[test]
     fn outer_convergence_status_distinguishes_missing_and_unmet_criteria() {
@@ -9484,6 +10100,142 @@ mod tests {
         assert_eq!(wall_forces.patch_names, ["cylinder", "innerWall"]);
         assert_eq!(wall_forces.reference_speed, 0.015);
         assert_eq!(wall_forces.reference_area, 1.0e-6);
+        assert_eq!(wall_forces.face_loads_csv, None);
+    }
+
+    #[test]
+    fn wall_face_loads_csv_is_atomic_optional_and_execution_only() {
+        for flag in ["--wallFaceLoadsCsv", "--wall-face-loads-csv"] {
+            let parsed = parse_incompressible_fluid_args(&[
+                "--wallForcePatches".to_string(),
+                "cylinder".to_string(),
+                "--forceReferenceSpeed".to_string(),
+                "0.015".to_string(),
+                "--forceReferenceArea".to_string(),
+                "1e-6".to_string(),
+                flag.to_string(),
+                "nested/loads.csv".to_string(),
+            ])
+            .expect("complete per-face wall-load request should parse");
+            assert_eq!(
+                parsed
+                    .laminar_simple_solve
+                    .expect("incompressible solve")
+                    .wall_forces
+                    .expect("wall-force request")
+                    .face_loads_csv,
+                Some(PathBuf::from("nested/loads.csv"))
+            );
+        }
+
+        let without_wall_forces = ["--wallFaceLoadsCsv", "loads.csv"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let error = parse_incompressible_fluid_args(&without_wall_forces)
+            .expect_err("CSV output without wall forces must fail");
+        assert!(error.contains("requires --wallForcePatches"));
+        assert!(parse_solver_args(&without_wall_forces).is_err());
+        assert!(parse_incompressible_fluid_plan_args(&without_wall_forces).is_err());
+
+        for args in [
+            vec!["--wallFaceLoadsCsv"],
+            vec!["--wallFaceLoadsCsv", ""],
+            vec![
+                "--wallForcePatches",
+                "cylinder",
+                "--forceReferenceSpeed",
+                "1",
+                "--forceReferenceArea",
+                "1",
+                "--wallFaceLoadsCsv",
+                "first.csv",
+                "--wallFaceLoadsCsv",
+                "second.csv",
+            ],
+        ] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            parse_incompressible_fluid_args(&args)
+                .expect_err("missing, empty, or duplicate CSV path must fail");
+        }
+    }
+
+    #[test]
+    fn wall_face_loads_csv_rejects_output_namespace_collisions_before_solve() {
+        let base = output_test_dir("wall-face-loads-collisions");
+        std::fs::create_dir_all(&base).expect("output root should be created");
+        let output_root = SafeOutputRoot::open_existing(&base).expect("output root should open");
+
+        for extra in [
+            vec!["--solveResidualCsv", "same.csv"],
+            vec!["--solveResidualPlot", "plots/history.svg"],
+            vec!["--writeFinalFields", "final"],
+            vec!["--solveReportJson", "reports/report.json"],
+        ] {
+            let wall_path = match extra[0] {
+                "--solveResidualCsv" => "same.csv",
+                "--solveResidualPlot" => "plots/history.csv",
+                "--writeFinalFields" => "final/U",
+                "--solveReportJson" => "reports",
+                _ => unreachable!(),
+            };
+            let mut args = vec![
+                "--wallForcePatches",
+                "cylinder",
+                "--forceReferenceSpeed",
+                "1",
+                "--forceReferenceArea",
+                "1",
+                "--wallFaceLoadsCsv",
+                wall_path,
+            ];
+            args.extend(extra);
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            let solve = parse_incompressible_fluid_args(&args)
+                .expect("colliding outputs should pass syntax parsing")
+                .laminar_simple_solve
+                .expect("incompressible solve");
+            let path = solve
+                .wall_forces
+                .as_ref()
+                .and_then(|request| request.face_loads_csv.as_deref())
+                .expect("wall-face CSV path");
+            let error =
+                validate_wall_face_loads_output_destination_in_root(&solve, path, &output_root)
+                    .expect_err("colliding output paths must fail before the solve");
+            assert!(error.contains("collides"), "unexpected error: {error}");
+        }
+
+        let args = [
+            "--wallForcePatches",
+            "cylinder",
+            "--forceReferenceSpeed",
+            "1",
+            "--forceReferenceArea",
+            "1",
+            "--wallFaceLoadsCsv",
+            "final/audit.csv",
+            "--writeFinalFields",
+            "final",
+            "--solveReportJson",
+            "reports/report.json",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let solve = parse_incompressible_fluid_args(&args)
+            .expect("non-colliding outputs should parse")
+            .laminar_simple_solve
+            .expect("incompressible solve");
+        let path = solve
+            .wall_forces
+            .as_ref()
+            .and_then(|request| request.face_loads_csv.as_deref())
+            .expect("wall-face CSV path");
+        validate_wall_face_loads_output_destination_in_root(&solve, path, &output_root)
+            .expect("separate output paths must remain valid");
+
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
@@ -10547,6 +11299,7 @@ mod tests {
             wall_forces: Some(WallForceReport {
                 patch_names: vec!["cylinder".to_string()],
                 reference_speed: 0.015,
+                velocity_gradient_scheme: LaminarSimpleGradientScheme::CellLimitedGaussLinear(1.0),
                 coefficients: WallForceCoefficients {
                     pressure_force: ferrum_mesh::Point3 {
                         x: 1.0,
@@ -10585,8 +11338,253 @@ mod tests {
                     resolved_reference_area: 1.0e-6,
                     reference_dynamic_pressure: 0.1125,
                 },
+                faces: Vec::new(),
             }),
         }
+    }
+
+    fn wall_face_csv_contribution(
+        face_index: usize,
+        owner_cell: usize,
+        area_vector: ferrum_mesh::Point3,
+        pressure_force_x: f64,
+        viscous_force_x: f64,
+    ) -> WallFaceForceContribution {
+        WallFaceForceContribution {
+            face_index,
+            owner_cell,
+            area_vector,
+            boundary_pressure: 0.123_456_789_012_345_66 + face_index as f64,
+            resolved_dynamic_pressure: pressure_force_x,
+            pressure_traction_on_body: ferrum_mesh::Point3 {
+                x: pressure_force_x,
+                y: 0.0,
+                z: 0.0,
+            },
+            viscous_traction_on_body: ferrum_mesh::Point3 {
+                x: viscous_force_x,
+                y: 0.25 * face_index as f64,
+                z: 0.0,
+            },
+            wall_shear_traction_on_body: ferrum_mesh::Point3 {
+                x: 0.0,
+                y: 0.25 * face_index as f64,
+                z: 0.0,
+            },
+            pressure_force_on_body: ferrum_mesh::Point3 {
+                x: pressure_force_x,
+                y: 0.0,
+                z: 0.0,
+            },
+            viscous_force_on_body: ferrum_mesh::Point3 {
+                x: viscous_force_x,
+                y: 0.0,
+                z: 0.0,
+            },
+            total_force_on_body: ferrum_mesh::Point3 {
+                x: pressure_force_x + viscous_force_x,
+                y: 0.0,
+                z: 0.0,
+            },
+        }
+    }
+
+    fn wall_face_csv_fixture() -> (SolverRuntimeMeshData, WallForceReport) {
+        let area_vectors = vec![
+            ferrum_mesh::Point3 {
+                x: 1.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            ferrum_mesh::Point3 {
+                x: 0.0,
+                y: 1.0,
+                z: 0.0,
+            },
+            ferrum_mesh::Point3 {
+                x: -1.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            ferrum_mesh::Point3 {
+                x: 0.0,
+                y: -1.0,
+                z: 0.0,
+            },
+        ];
+        let mesh = SolverRuntimeMeshData {
+            points: 8,
+            cells: 4,
+            faces: 4,
+            internal_faces: 0,
+            boundary_faces: 4,
+            owner: vec![0, 1, 2, 3],
+            neighbour: vec![None; 4],
+            patches: vec![
+                SolverRuntimePatchRange {
+                    name: "first".to_string(),
+                    patch_type: "wall".to_string(),
+                    start_face: 0,
+                    faces: 2,
+                },
+                SolverRuntimePatchRange {
+                    name: "=SUM(1,2)\"wall".to_string(),
+                    patch_type: "wall".to_string(),
+                    start_face: 2,
+                    faces: 2,
+                },
+            ],
+            face_centres: (0..4)
+                .map(|index| ferrum_mesh::Point3 {
+                    x: index as f64,
+                    y: index as f64 + 0.5,
+                    z: 0.0,
+                })
+                .collect(),
+            face_area_vectors: area_vectors.clone(),
+            cell_centres: vec![
+                ferrum_mesh::Point3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                };
+                4
+            ],
+            cell_volumes: vec![1.0; 4],
+            min_face_area: 1.0,
+            max_face_area: 1.0,
+            min_cell_volume: 1.0,
+            max_cell_volume: 1.0,
+            total_cell_volume: 4.0,
+            non_positive_cell_volumes: 0,
+        };
+        let faces = vec![
+            wall_face_csv_contribution(2, 2, area_vectors[2], 3.0, 0.5),
+            wall_face_csv_contribution(3, 3, area_vectors[3], 4.0, 0.25),
+            wall_face_csv_contribution(0, 0, area_vectors[0], 1.0, -0.5),
+            wall_face_csv_contribution(1, 1, area_vectors[1], 2.0, -0.25),
+        ];
+        let report = WallForceReport {
+            patch_names: vec!["=SUM(1,2)\"wall".to_string(), "first".to_string()],
+            reference_speed: 0.015,
+            velocity_gradient_scheme: LaminarSimpleGradientScheme::CellLimitedGaussLinear(1.0),
+            coefficients: WallForceCoefficients {
+                pressure_force: ferrum_mesh::Point3 {
+                    x: 10.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                viscous_force: ferrum_mesh::Point3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                total_force: ferrum_mesh::Point3 {
+                    x: 10.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                drag: DirectionalCoefficient {
+                    pressure: 1.0,
+                    viscous: 0.0,
+                    total: 1.0,
+                },
+                lift: DirectionalCoefficient {
+                    pressure: 0.0,
+                    viscous: 0.0,
+                    total: 0.0,
+                },
+                selected_patches: 2,
+                selected_faces: 4,
+                selected_area: 4.0,
+                area_vector_sum: ferrum_mesh::Point3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                resolved_pressure_reference: 1.25,
+                resolved_reference_area: 1.0e-6,
+                reference_dynamic_pressure: 0.1125,
+            },
+            faces,
+        };
+        (mesh, report)
+    }
+
+    #[test]
+    fn wall_face_loads_csv_is_round_trip_deterministic_and_confined() {
+        let base = output_test_dir("wall-face-loads-csv");
+        std::fs::create_dir_all(&base).expect("output root should be created");
+        let output_root = SafeOutputRoot::open_existing(&base).expect("output root should open");
+        let options = minimal_laminar_simple_options_for_estimate();
+        let (mesh, report) = wall_face_csv_fixture();
+
+        write_laminar_simple_wall_face_loads_csv(
+            &mesh,
+            &options,
+            &report,
+            &output_root,
+            Path::new("nested/loads.csv"),
+        )
+        .expect("wall-face CSV should be written");
+        write_laminar_simple_wall_face_loads_csv(
+            &mesh,
+            &options,
+            &report,
+            &output_root,
+            Path::new("repeat.csv"),
+        )
+        .expect("repeated wall-face CSV should be written");
+
+        let bytes = std::fs::read(base.join("nested/loads.csv")).expect("read wall-face CSV");
+        assert_eq!(
+            bytes,
+            std::fs::read(base.join("repeat.csv")).expect("read repeated wall-face CSV")
+        );
+        let csv = String::from_utf8(bytes.clone()).expect("wall-face CSV is UTF-8");
+        let lines = csv.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 5);
+        assert!(lines[0].starts_with("wallFaceLoadsSchemaVersion,tractionMethod,"));
+        assert!(lines[0].ends_with("totalForceOnBodyZN"));
+        assert!(lines[1].contains("\"'=SUM(1,2)\"\"wall\",2,2,"));
+        assert!(lines[2].contains("\"'=SUM(1,2)\"\"wall\",3,3,"));
+        assert!(lines[3].contains("\"first\",0,0,"));
+        assert!(lines[4].contains("\"first\",1,1,"));
+        assert!(csv.contains("0.12345678901234566"));
+
+        let outside = base
+            .parent()
+            .expect("test root parent")
+            .join("escaped-wall-face-loads.csv");
+        let _ = std::fs::remove_file(&outside);
+        let error = write_laminar_simple_wall_face_loads_csv(
+            &mesh,
+            &options,
+            &report,
+            &output_root,
+            &outside,
+        )
+        .expect_err("wall-face CSV must remain below its safe output root");
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+        assert!(!outside.exists());
+
+        let mut invalid = report;
+        invalid.faces[0].face_index = 3;
+        let error = write_laminar_simple_wall_face_loads_csv(
+            &mesh,
+            &options,
+            &invalid,
+            &output_root,
+            Path::new("nested/loads.csv"),
+        )
+        .expect_err("invalid row order must fail before replacing the output");
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        assert_eq!(
+            std::fs::read(base.join("nested/loads.csv")).expect("read preserved wall-face CSV"),
+            bytes
+        );
+
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
@@ -10744,6 +11742,27 @@ mod tests {
             .expect("missing deltaT must preserve the existing solve contract");
 
         assert!(post.continuity_errors.is_none());
+        assert!(post.wall_forces.is_none());
+    }
+
+    #[test]
+    fn no_wall_force_request_does_not_reconstruct_invalid_final_fields() {
+        let mut plan = laminar_simple_test_plan(1000.0, 0.001);
+        plan.run.delta_t = None;
+        let solve = parse_incompressible_fluid_args(&[])
+            .expect("default incompressible args")
+            .laminar_simple_solve
+            .expect("incompressible solve");
+        assert!(solve.wall_forces.is_none());
+        let options = minimal_laminar_simple_options_for_estimate();
+        let mut report = output_test_report();
+        report.final_velocity.clear();
+        report.final_pressure.clear();
+
+        let post = build_laminar_simple_post_processing(&plan, &solve, &options, &report)
+            .expect("no wall-force request must not reconstruct invalid final fields");
+
+        assert!(post.wall_forces.is_none());
     }
 
     #[test]
@@ -10792,11 +11811,23 @@ mod tests {
         assert!(json.contains("\"cumulativeGlobal\": -0.00000000375"));
         assert!(json.contains("\"wallForces\""));
         assert!(json.contains("\"pressureFieldKind\": \"kinematic\""));
+        assert!(json.contains("\"tractionMethod\": \"reconstructedGradientFullDeviatoric\""));
+        assert!(json.contains("\"tractionMethodVersion\": 1"));
+        assert!(json.contains("\"forceConvention\": \"fluidOnBody\""));
+        assert!(json.contains("\"faceAreaVectorOrientation\": \"outwardFromFluid\""));
+        assert!(json.contains("\"pressureFaceTreatment\": \"zeroGradientOwner\""));
+        assert!(json.contains("\"velocityGradientScheme\": \"cellLimited Gauss linear 1\""));
         assert!(json.contains("\"selectedFaces\": 16"));
         assert!(json.contains("\"total\": 6"));
         assert!(markdown.contains("- Schema version: `3`"));
         assert!(markdown.contains("## Continuity errors"));
         assert!(markdown.contains("## Wall forces"));
+        assert!(markdown.contains("| Traction method | reconstructedGradientFullDeviatoric |"));
+        assert!(markdown.contains("| Traction method version | 1 |"));
+        assert!(markdown.contains("| Force convention | fluidOnBody |"));
+        assert!(markdown.contains("| Face area-vector orientation | outwardFromFluid |"));
+        assert!(markdown.contains("| Pressure face treatment | zeroGradientOwner |"));
+        assert!(markdown.contains("| Velocity gradient scheme | cellLimited Gauss linear 1 |"));
         assert!(
             markdown
                 .contains("| Drag pressure/viscous/total | 4.000000e0 / 2.000000e0 / 6.000000e0 |")

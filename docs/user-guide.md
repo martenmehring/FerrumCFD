@@ -656,6 +656,43 @@ solve, pressure-coupling setup, pressure assembly/solve, field correction,
 finalization, and remaining solver work. These timings measure the executable
 solver only; they never include Cargo compilation.
 
+Wall-force reporting is opt-in and does not add gradient-reconstruction work to
+the normal solve path. Supply `--wallForcePatches`,
+`--forceReferenceSpeed`, and `--forceReferenceArea` together:
+
+```console
+ferrumRun -solver incompressibleFluid -case tutorials/incompressibleFluid/cylinder/ferrum/case --wallForcePatches cylinder --forceReferenceSpeed 0.015 --forceReferenceArea 1e-6 --solveReportJson target/cylinder.json --solveReportMarkdown target/cylinder.md
+```
+
+Every selected patch must use `U` type `noSlip` and `p` type
+`zeroGradient`. After the solve, Ferrum reconstructs the final velocity
+gradient with the active `grad(U)` scheme and integrates wall-face owner
+pressure plus the full deviatoric Newtonian viscous traction. Reported forces
+use the force exerted by the fluid on the body; face area vectors point outward
+from the fluid. The existing `wallForces` summary remains stable, and a
+separate `wallForceMethod` line plus additive JSON/Markdown fields record the
+traction method, method version, sign convention, face orientation,
+zero-gradient owner-pressure treatment, and velocity-gradient scheme.
+
+For spatial-convergence studies and force audits, add
+`--wallFaceLoadsCsv <file>`. This fourth option is valid only together with the
+complete wall-force triple and remains absent by default:
+
+```console
+ferrumRun -solver incompressibleFluid -case tutorials/incompressibleFluid/cylinder/ferrum/case --wallForcePatches cylinder --forceReferenceSpeed 0.015 --forceReferenceArea 1e-6 --wallFaceLoadsCsv target/cylinder-wall-face-loads.csv
+```
+
+The versioned CSV writes one deterministic row per selected face in requested
+patch order and then increasing global face index. It records the face centre,
+outward fluid-area vector, raw kinematic owner pressure, resolved dynamic
+pressure, full pressure and viscous tractions, tangential wall shear, and
+pressure/viscous/total force-on-body components. Floating-point values use
+round-trip text. Method, pressure-reference, sign, units, density, viscosity,
+and coefficient-reference provenance are repeated in every row so that the
+CSV remains independently auditable. Text fields are RFC-4180 quoted with
+spreadsheet-formula protection, and output paths use the same capability-scoped
+no-follow replacement contract as the other solver reports.
+
 Pressure-PCG kernel timing is disabled by default. With pressure `PCG`,
 `--profilePcg` enables diagnostic timing for total PCG work, selected
 preconditioner update/application, matrix-vector products, and vector

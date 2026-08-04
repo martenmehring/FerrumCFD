@@ -112,13 +112,129 @@ fn packaged_cylinder_preflight_and_two_iteration_smoke() {
     assert_eq!(parse_evidence_usize(forces, "selectedFaces"), 16);
     assert!(parse_evidence_f64(forces, "dragTotal").is_finite());
     assert!(parse_evidence_f64(forces, "liftTotal").is_finite());
+    let force_method = solve_stdout
+        .lines()
+        .find(|line| line.starts_with("incompressibleFluid wallForceMethod:"))
+        .expect("missing wall-force method evidence");
+    assert!(force_method.contains("tractionMethod=reconstructedGradientFullDeviatoric"));
+    assert!(force_method.contains("tractionMethodVersion=1"));
+    assert!(force_method.contains("forceConvention=fluidOnBody"));
+    assert!(force_method.contains("faceAreaVectorOrientation=outwardFromFluid"));
+    assert!(force_method.contains("pressureFaceTreatment=zeroGradientOwner"));
+    assert!(force_method.contains("gradU=\"cellLimited Gauss linear 1\""));
 
     let json = fs::read_to_string(temporary.join("report.json")).expect("read JSON report");
     let markdown = fs::read_to_string(temporary.join("report.md")).expect("read Markdown report");
     assert!(json.contains("\"continuityErrors\""));
     assert!(json.contains("\"wallForces\""));
+    assert!(json.contains("\"tractionMethod\": \"reconstructedGradientFullDeviatoric\""));
+    assert!(json.contains("\"tractionMethodVersion\": 1"));
+    assert!(json.contains("\"forceConvention\": \"fluidOnBody\""));
+    assert!(json.contains("\"faceAreaVectorOrientation\": \"outwardFromFluid\""));
+    assert!(json.contains("\"pressureFaceTreatment\": \"zeroGradientOwner\""));
+    assert!(json.contains("\"velocityGradientScheme\": \"cellLimited Gauss linear 1\""));
     assert!(markdown.contains("Continuity errors"));
     assert!(markdown.contains("Wall forces"));
+    assert!(markdown.contains("| Traction method | reconstructedGradientFullDeviatoric |"));
+    assert!(markdown.contains("| Force convention | fluidOnBody |"));
+    assert!(markdown.contains("| Pressure face treatment | zeroGradientOwner |"));
+    assert!(markdown.contains("| Velocity gradient scheme | cellLimited Gauss linear 1 |"));
+
+    let csv_only = run_case(
+        &temporary,
+        &temporary,
+        &[
+            "--maxSimpleIterations",
+            "2",
+            "--wallForcePatches",
+            "cylinder",
+            "--forceReferenceSpeed",
+            "0.015",
+            "--forceReferenceArea",
+            "1e-6",
+            "--wallFaceLoadsCsv",
+            "wall-face-loads.csv",
+        ],
+    );
+    assert!(
+        csv_only.status.success(),
+        "wall-face CSV smoke solve failed: {}",
+        String::from_utf8_lossy(&csv_only.stderr)
+    );
+    let csv_stdout = stdout(&csv_only);
+    assert_eq!(
+        csv_stdout
+            .lines()
+            .filter(|line| *line == "wrote per-face wall loads CSV: wall-face-loads.csv")
+            .count(),
+        1
+    );
+    let csv_forces = csv_stdout
+        .lines()
+        .find(|line| line.starts_with("incompressibleFluid wallForces:"))
+        .expect("missing CSV solve wall-force evidence");
+    let csv = fs::read_to_string(temporary.join("wall-face-loads.csv"))
+        .expect("read per-face wall loads CSV");
+    let mut lines = csv.lines();
+    let header = lines.next().expect("wall-face CSV header");
+    assert!(header.starts_with("wallFaceLoadsSchemaVersion,tractionMethod,"));
+    assert!(header.ends_with("totalForceOnBodyZN"));
+    let rows = lines
+        .map(|line| line.split(',').collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 16);
+    let mut pressure_x = 0.0;
+    let mut viscous_x = 0.0;
+    let mut total_x = 0.0;
+    for (offset, row) in rows.iter().enumerate() {
+        assert_eq!(row.len(), 45);
+        assert_eq!(row[1], "\"reconstructedGradientFullDeviatoric\"");
+        assert_eq!(row[16], "\"cylinder\"");
+        assert_eq!(
+            row[17].parse::<usize>().expect("global face index"),
+            96 + offset
+        );
+        pressure_x += row[36].parse::<f64>().expect("pressure force x");
+        viscous_x += row[39].parse::<f64>().expect("viscous force x");
+        total_x += row[42].parse::<f64>().expect("total force x");
+        for value in &row[19..45] {
+            assert!(
+                value.parse::<f64>().is_ok_and(f64::is_finite),
+                "non-finite numeric CSV cell {value:?}"
+            );
+        }
+    }
+    assert_close_to_console(pressure_x, parse_evidence_f64(csv_forces, "pressureFx"));
+    assert_close_to_console(viscous_x, parse_evidence_f64(csv_forces, "viscousFx"));
+    assert_close_to_console(total_x, parse_evidence_f64(csv_forces, "totalFx"));
+
+    let solve_without_wall_forces = run_case(
+        &temporary,
+        &temporary,
+        &[
+            "--maxSimpleIterations",
+            "2",
+            "--solveReportJson",
+            "report-no-wall.json",
+            "--solveReportMarkdown",
+            "report-no-wall.md",
+        ],
+    );
+    assert!(
+        solve_without_wall_forces.status.success(),
+        "no-wall smoke solve failed: {}",
+        String::from_utf8_lossy(&solve_without_wall_forces.stderr)
+    );
+    let no_wall_stdout = stdout(&solve_without_wall_forces);
+    assert!(!no_wall_stdout.contains("incompressibleFluid wallForces:"));
+    assert!(!no_wall_stdout.contains("incompressibleFluid wallForceMethod:"));
+    let no_wall_json = fs::read_to_string(temporary.join("report-no-wall.json"))
+        .expect("read no-wall JSON report");
+    let no_wall_markdown = fs::read_to_string(temporary.join("report-no-wall.md"))
+        .expect("read no-wall Markdown report");
+    assert!(no_wall_json.contains("\"schemaVersion\": 3"));
+    assert!(no_wall_json.contains("\"wallForces\": null"));
+    assert!(!no_wall_markdown.contains("## Wall forces"));
 
     let _ = fs::remove_dir_all(&temporary);
 }
@@ -140,4 +256,12 @@ fn parse_evidence_usize(line: &str, key: &str) -> usize {
     evidence_token(line, key)
         .parse()
         .unwrap_or_else(|_| panic!("token {key:?} is not usize in {line:?}"))
+}
+
+fn assert_close_to_console(actual: f64, rounded_console: f64) {
+    let tolerance = 1.0e-6 * actual.abs().max(rounded_console.abs()).max(1.0);
+    assert!(
+        (actual - rounded_console).abs() <= tolerance,
+        "{actual} differs from rounded console value {rounded_console} by more than {tolerance}"
+    );
 }

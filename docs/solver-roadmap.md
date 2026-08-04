@@ -375,12 +375,17 @@ the frozen thresholds. Rejected v3 through v6 runs remain rejected evidence.
 Exact metrics and sealed provenance are recorded in
 [WLS direct-gradient parity](benchmarks/wls-gradient-foundation13.md).
 
-The remaining evidence sequence is:
+The evidence sequence is:
 
-1. replace the current lowest-order wall-force baseline with
+1. completed: replace the lowest-order wall-force baseline with
    boundary-condition-resolved wall-face pressure and full deviatoric viscous
    traction from reconstructed `grad(U)`, while preserving pressure-gauge,
-   orientation, and area contracts;
+   orientation, and area contracts. The production CLI reconstructs only when
+   wall forces are requested and records the method, sign, pressure-face
+   treatment, area-vector orientation, and active `grad(U)` scheme. The
+   optional versioned per-face CSV bridge retains the exact core visit order
+   and round-trip pressure, traction, wall-shear, and force values without
+   changing the normal solve or aggregate report paths;
 2. run at least three geometrically similar meshes and report observed order,
    Richardson extrapolation, and GCI for `Cd`, fields, wall pressure, and wall
    shear, with iterative error demonstrably below spatial error;
@@ -1689,11 +1694,15 @@ The immediate sequence is:
    `<= 1e-6`, `Cd` within 15% of the documented value, and Coarse/Fine `Cd`
    drift `<= 5%`. No external runtime or case is part of C3.
 
-   The accepted force path is intentionally a lowest-order baseline: wall
-   pressure is taken from the owner cell and the viscous term uses a one-sided
-   wall-normal velocity derivative. It is not yet the reconstructed wall-face
-   pressure and full deviatoric traction required by the spatial-accuracy
-   track.
+   The original accepted C3 force path was intentionally a lowest-order
+   baseline: wall pressure came from the owner cell and the viscous term used a
+   one-sided wall-normal velocity derivative. The spatial-accuracy track has
+   now replaced that viscous baseline with reconstructed final `grad(U)` and
+   full deviatoric Newtonian traction. For the currently supported
+   `zeroGradient` pressure contract, wall pressure remains the boundary-face
+   owner value. The refreshed C3 gate below is authoritative for this new
+   method; the earlier C3 Cd values are retained only as historical evidence
+   for the superseded baseline.
 
    The release gate passed on 2026-07-29. Both identical `Coarse` runs stopped
    after 1,181 SIMPLE iterations with bit-identical final `U` and `p`; the
@@ -1705,6 +1714,20 @@ The immediate sequence is:
    refinement, report, and determinism assertion passed. This two-level drift
    is a useful regression gate, not a formal observed-order, Richardson, or GCI
    result.
+
+   The refreshed full-deviatoric-traction C3 gate passed on 2026-07-31.
+   Both identical `Coarse` runs stopped after 1,176 SIMPLE iterations with
+   bit-identical final `U` and `p`; the first recorded normalized
+   local/global/cumulative errors were
+   `2.406451e-12 / -4.37658e-14 / -1.160372e-10`, with
+   `Cd=11.46785` and `Cl=1.074062e-8`. `Fine` stopped after 3,575 SIMPLE
+   iterations with normalized local/global/cumulative errors
+   `1.969985e-12 / -7.990225e-15 / -2.942244e-10`,
+   `Cd=11.51842`, and `Cl=9.547134e-9`. The Coarse/Fine drag drift was
+   `0.439036%`. Every convergence, deterministic repetition, continuity,
+   force, refinement, and method-provenance assertion passed. This remains a
+   two-level regression result; the separate three-mesh observed-order,
+   Richardson, and GCI gate is still required.
 
    This gate exposed a corrected-non-orthogonal flux inconsistency: final
    `phi` now subtracts the solved pressure flux from the exact face-flux base
@@ -1796,8 +1819,8 @@ The immediate sequence is:
       for Channel (`9/9`), and `0.969953` for Cylinder (`8/9`). Therefore the
       parallel mode remains opt-in, no 30-pair escalation was warranted, and no
       default or general-speed claim is accepted;
-   6. **F-CYL-SPATIAL-ACCURACY (active; direct WLS gradient parity accepted;
-      reconstructed wall traction, grid convergence, and final parity
+   6. **F-CYL-SPATIAL-ACCURACY (active; direct WLS gradient parity and
+      reconstructed wall traction accepted; grid convergence and final parity
       pending):** weighted
       least-squares scalar/vector kernels, constraint semantics, production
       dispatch, and the public open/closed-pressure-system and
@@ -1808,10 +1831,20 @@ The immediate sequence is:
       `7dc7a4968fc1` and tree `d7e9ed8d81e6` accepted all four fixtures and
       every unchanged analytic and cross-engine `grad(p)`/`grad(U)` threshold.
       This closes only the direct reconstruction proof.
-      Boundary-condition-resolved wall-face pressure and full deviatoric
-      viscous traction, three-mesh observed-order/Richardson/GCI, and the final
-      same-mesh Foundation 13 parity/performance refresh remain open before
-      any general higher-accuracy or speed claim.
+      The independently authored Safe-Rust wall-force path now reconstructs
+      final `grad(U)` with the active production scheme and integrates
+      zero-gradient owner pressure plus the full deviatoric Newtonian viscous
+      traction. It retains explicit pressure-gauge, area, face-orientation,
+      force-on-body, finite-value, allocation, and deterministic face-order
+      contracts. The CLI bridge is opt-in, leaves the normal solver hot path
+      unchanged, and records exact method provenance in console, JSON, and
+      Markdown reports. The additive `wallFaceLoadsCsv` audit path now exports
+      the retained core face contributions with round-trip values, exact
+      patch/face ordering, complete units and method provenance, compensated
+      aggregate parity, and safe output confinement. Three-mesh
+      observed-order/Richardson/GCI and the final same-mesh Foundation 13
+      parity/performance refresh remain open before any general higher-accuracy
+      or speed claim.
 
    The executed per-leaf protocols, fixed-work budgets, input hashes, and
    results are recorded above and in external hashed artifacts; they must not be
