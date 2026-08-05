@@ -719,9 +719,13 @@ ferrumRun -solver incompressibleFluid -case tutorials/incompressibleFluid/lamina
 ```
 
 By default, the current SIMPLE implementation reads OpenFOAM-style relaxation factors from
-`system/fvSolution`: `relaxationFactors.equations.U` for velocity and
+`system/fvSolution`: `relaxationFactors.equations.U`, falling back to
+`relaxationFactors.equations.default`, for velocity and
 `relaxationFactors.fields.p` for pressure. The CLI flags above are explicit
-overrides for experiments. It also reads `solvers.U.tolerance`,
+overrides for experiments. Matching OpenFOAM Foundation 13, momentum-equation
+relaxation is disabled only when both `U` and `equations.default` are absent,
+while an explicit effective value of `1` still performs the diagonal-dominance
+step of equation relaxation. It also reads `solvers.U.tolerance`,
 `solvers.p.tolerance`, `solvers.U.relTol`, `solvers.p.relTol`,
 `solvers.p.solver PCG`, `solvers.p.preconditioner DIC`,
 `SIMPLE.nNonOrthogonalCorrectors`, `SIMPLE.pRefCell`, `SIMPLE.pRefValue`, and
@@ -869,7 +873,12 @@ convergence flag, initial normalized residual, raw L2 residual, final normalized
 residual, effective normalized tolerance, and stop reason (`NotRun`,
 `ExactZero`, `AbsoluteTolerance`, `RelativeTolerance`, `MaxIterations`, or
 `Breakdown`). These fields are additive: the existing aggregate fields remain
-available. The iteration history, CSV, console, JSON, and Markdown outputs
+available. JSON additionally records the first non-converged momentum and
+pressure solves under `linearNonConvergenceDiagnostics`. Their worst algebraic
+row contains `incidentFaces`: `maxAbsFace*` identifies the largest finite
+incident flux, while `firstNonFiniteFace*` identifies the lowest global
+incident mesh-face index with a NaN or infinite flux; unavailable values are
+`null`. The iteration history, CSV, console, JSON, and Markdown outputs
 distinguish each field's OpenFOAM-normalized initial residual from its final
 linear residual and show the outer `residualControl` state independently.
 The top-level JSON `outerConvergence` object records `status`, `configured`,
@@ -880,11 +889,20 @@ reported through the corresponding `SolverPerformance`-style fields. The pressur
 bridge uses an internal momentum-equation object to apply equation relaxation,
 retain cell-wise `A` and `H1` diagnostics for `rAU/rAtU`, reconstruct
 `HbyA`, compute `phiHbyA` from HbyA with velocity boundary constraints applied,
-run OpenFOAM-like `adjustPhi` on pressure-controlled open boundaries, including
-`inletOutlet` faces only while they are outflowing, solve an absolute pressure
-equation, correct `phi` from the pressure-equation flux, correct velocity as
-`U = HbyA - rAtU grad(p)`, and carry that corrected surface flux into the next
-SIMPLE iteration. The pressure equation now supports
+run `adjustPhi` only when the original pressure field needs an explicit
+reference, and leave systems with pressure `fixedValue` or pressure
+`inletOutlet` unchanged in every flow direction. In a reference-needing
+system, positive adjustable outflow is scaled by the OpenFOAM mass-correction
+ratio derived from prescribed inflow and fixed outflow. A literal velocity
+`inletOutlet` face is adjustable only while it is outflowing;
+`pressureInletOutletVelocity` remains backflow-sensitive for momentum but is
+fixed positive outflow for `adjustPhi`. The `empty`, `wedge`, and
+`symmetryPlane` velocity constraints always contribute exact zero normal flux
+and are never adjusted; a nonzero constraint flux is rejected before mutation.
+The bridge then solves an absolute pressure equation, corrects `phi` from the
+pressure-equation flux, corrects velocity as `U = HbyA - rAtU grad(p)`, and
+carries that corrected surface flux into the next SIMPLE iteration. The
+pressure equation now supports
 OpenFOAM-like pressure reference anchoring for closed-pressure cases and executes
 `nNonOrthogonalCorrectors + 1` pressure solves, with `phi` updated from the
 final pressure solve. With `SIMPLE.consistent true`, Ferrum builds a

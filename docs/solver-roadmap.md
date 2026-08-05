@@ -839,7 +839,7 @@ another unbounded sequence of GAMG micro-optimizations:
 1. retain the new Lid Cavity closed-pressure E2E smoke for
    `pRefCell`/`pRefValue` and `constrainPressure`, then complete the remaining
    deliberately skewed corrected non-orthogonal E2E mesh and physical cavity
-   acceptance; open-pressure `adjustPhi` and pressure-flux coverage remains
+   acceptance; reference-needing `adjustPhi` and pressure-flux coverage remains
    part of the combined gate;
 2. retain the accepted Cylinder force/continuity gate, refine the
    `lidDrivenCavity` physical acceptance, then add `backwardFacingStep` and
@@ -1845,6 +1845,27 @@ The immediate sequence is:
       observed-order/Richardson/GCI and the final same-mesh Foundation 13
       parity/performance refresh remain open before any general higher-accuracy
       or speed claim.
+
+      The first formal 6F run stopped fail-closed on 2026-08-01 when the G2
+      normal solve reached a zero Ux diagonal at row `85973`; G0 and G1 had
+      converged, but no mixed-run GCI result was accepted. A deterministic
+      powers-of-two oracle reproduced a mechanism consistent with the failure:
+      floating-point cancellation between a large bounded boundary-flux
+      contribution and its later net-flux correction. The active generic
+      correction defers bounded diffusion diagonals until that conservative
+      correction is complete and applies the Foundation-13 equation-relaxation
+      formula before deriving `rAU`. The first retained G2 diagnostic on that
+      candidate then stopped fail-closed at boundary face `171582`: its
+      `rAU = 2.1752942825948595e-16` was finite and positive but fell just below
+      an absolute `f64::EPSILON` guard in `fixedFluxPressure`. Foundation 13 has
+      no corresponding absolute cutoff in its `rAU`, `constrainPressure`, or
+      pressure-Laplacian path. The active correction therefore accepts every
+      representable positive `rAU`/`rAtU`, restores the exact consistent
+      `rAtU >= rAU` invariant after reciprocal roundoff, and retains fail-closed
+      checks for zero, underflow, overflow, non-finite derived values, and
+      non-positive denominators. A fresh retained G2 diagnostic remains required,
+      followed by all seven 6F solves from one exact merged tree before point 6
+      can close; every pre-correction artifact remains diagnostic only.
 
    The executed per-leaf protocols, fixed-work budgets, input hashes, and
    results are recorded above and in external hashed artifacts; they must not be

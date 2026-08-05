@@ -581,12 +581,17 @@ non-symmetric `bicgstab` momentum path with a PCG pressure solve without
 changing the case files. OpenFOAM-style `fvSolution`
 entries are the default source for pressure and velocity under-relaxation and
 for per-equation linear
-tolerances: `relaxationFactors.equations.U`,
+tolerances: `relaxationFactors.equations.U` with
+`relaxationFactors.equations.default` fallback,
 `relaxationFactors.fields.p`, `solvers.U.tolerance`, `solvers.p.tolerance`,
 `solvers.U.relTol`, `solvers.p.relTol`,
 `solvers.p.solver PCG`, `solvers.p.preconditioner DIC`,
 `SIMPLE.nNonOrthogonalCorrectors`, `SIMPLE.pRefCell`, `SIMPLE.pRefValue`, and
-`SIMPLE.consistent`, and optional `maxIter` values. OpenFOAM-style
+`SIMPLE.consistent`, and optional `maxIter` values. Momentum equation
+relaxation also preserves configuration presence: missing `U` and
+`equations.default` entries are a no-op, whereas an explicit effective value
+of `1` still applies the Foundation-style diagonal-dominance transformation.
+OpenFOAM-style
 `SIMPLE.residualControl` entries for `U` and `p` are read as the normal
 early-convergence criteria. As in OpenFOAM Foundation 13, each steady SIMPLE
 criterion is one absolute scalar. Ferrum evaluates the initial residual from
@@ -640,15 +645,29 @@ normalisation factor likewise adds `1e-20` to the accumulated factor instead of
 flooring it. This is a static user control whose effective target is recomputed
 per solve, not an autonomous adaptive controller. A non-zero `minIter` outside
 GAMG and `smoothSolver nSweeps` other than `1` remain explicitly unsupported.
-The pressure bridge now follows the OpenFOAM shape more closely: it applies
-equation relaxation through an internal momentum-equation object, builds
-cell-wise `rAU` from the original momentum diagonal, exposes per-component
+The pressure bridge now follows the OpenFOAM shape more closely: bounded
+momentum assembly keeps diffusion diagonals separate until the conservative
+net-flux correction is complete, preventing a large cancelling flux pair from
+rounding out finite diffusion. It then applies OpenFOAM-style equation
+relaxation through an internal momentum-equation object, builds cell-wise
+`rAU` from the stabilized pre-alpha momentum diagonal (equivalently the
+reciprocal of the final relaxed diagonal), exposes per-component
 momentum residuals plus `A/H1` ranges in reports, reconstructs `HbyA`, computes
 `phiHbyA` from that HbyA field with velocity boundary constraints applied,
-applies an OpenFOAM-like `adjustPhi` mass-balance correction only on
-pressure-controlled open boundaries, treats velocity
-`inletOutlet`/`pressureInletOutletVelocity` as flux-dependent open boundaries
-for backflow, solves an absolute variable-coefficient pressure equation,
+applies `adjustPhi` only when the original pressure field needs an explicit
+reference, and leaves systems with pressure `fixedValue` or pressure
+`inletOutlet` unchanged in every flow direction. In a reference-needing system
+it follows the OpenFOAM mass balance: specified inflow and fixed outflow
+determine one multiplicative correction for positive adjustable outflow. A
+literal velocity `inletOutlet` face is adjustable only while it carries
+outflow and becomes prescribed inflow on backflow.
+`pressureInletOutletVelocity` remains backflow-sensitive in the momentum path,
+but its fixed-value classification makes positive outflow fixed for
+`adjustPhi`. Velocity constraints from `empty`, `wedge`, and `symmetryPlane`
+produce an exact zero normal face flux and are excluded from `adjustPhi` mass
+accounting and correction; a nonzero injected constraint flux fails before any
+flux mutation. The bridge then solves an absolute variable-coefficient pressure
+equation,
 corrects `phi` with the pressure-equation flux, corrects velocity as
 `U = HbyA - rAtU grad(p)`, and carries that corrected surface flux into the next
 SIMPLE iteration. The normal solver path no longer
@@ -660,6 +679,14 @@ pressure solve. `SIMPLE.consistent true` switches the pressure and velocity
 correction to a Rust `rAtU` value derived from the current momentum matrix
 (`1/rAU - H1`), and the non-orthogonal corrector loop now rebuilds the pressure
 source with an explicit non-orthogonal pressure-flux correction between solves.
+Finite positive `rAU`/`rAtU` values remain valid independent of their absolute
+magnitude, matching the Foundation 13 pressure-coupling path instead of using a
+dimensionful machine-epsilon cutoff. Underflow to zero, overflow, non-finite
+`rAU` reciprocals, area-`rAU` denominators, and fixed-gradient values or fluxes
+still fail closed.
+The consistent path also restores its analytic `rAtU >= rAU` invariant after
+reciprocal roundoff, so downstream differences use a strict sign contract rather
+than an absolute tolerance.
 The momentum convection term is scheme-driven. `Gauss upwind` uses a fully
 implicit upwind contribution. `Gauss linearUpwind grad(U)` keeps the same
 non-symmetric upwind matrix and adds the gradient part as a deferred
