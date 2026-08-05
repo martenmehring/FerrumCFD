@@ -2893,6 +2893,7 @@ fn assemble_momentum_equation(
             mesh,
             &mesh_cache.face_addressing,
             &mesh_cache.momentum,
+            &mesh_cache.pressure_geometry,
             options.dynamic_viscosity,
             options.density,
             flux,
@@ -3838,10 +3839,12 @@ fn assemble_momentum_component_system(
     convection_scheme: LaminarSimpleConvectionScheme,
 ) -> Result<ScalarComponentSystem> {
     let face_addressing = CompactSimpleFaceAddressing::from_mesh(mesh)?;
+    let pressure_geometry = PressureGeometryCache::from_mesh(mesh);
     assemble_momentum_component_system_with_addressing(
         mesh,
         &face_addressing,
         momentum_csr_pattern,
+        &pressure_geometry,
         diffusivity,
         density,
         flux,
@@ -3855,6 +3858,217 @@ fn assemble_momentum_component_system(
 
 #[allow(clippy::too_many_arguments)]
 fn assemble_momentum_component_system_with_addressing(
+    mesh: &SolverRuntimeMeshData,
+    face_addressing: &CompactSimpleFaceAddressing,
+    momentum_csr_pattern: &MomentumCsrPattern,
+    pressure_geometry: &PressureGeometryCache,
+    diffusivity: f64,
+    density: f64,
+    flux: &[f64],
+    volumetric_source: &[f64],
+    boundary: &[ScalarFaceTreatment],
+    old_values: &[f64],
+    old_gradient: Option<&[Point3]>,
+    convection_scheme: LaminarSimpleConvectionScheme,
+) -> Result<ScalarComponentSystem> {
+    if momentum_csr_pattern.sparsity.rows() != mesh.cells
+        || momentum_csr_pattern.sparsity.cols() != mesh.cells
+    {
+        return Err(invalid_input(format!(
+            "momentum CSR pattern is {}x{}, expected {}x{}",
+            momentum_csr_pattern.sparsity.rows(),
+            momentum_csr_pattern.sparsity.cols(),
+            mesh.cells,
+            mesh.cells
+        )));
+    }
+    if flux.len() != mesh.faces {
+        return Err(invalid_input(format!(
+            "momentum flux has {} values, expected {} mesh faces",
+            flux.len(),
+            mesh.faces
+        )));
+    }
+    if volumetric_source.len() != mesh.cells {
+        return Err(invalid_input(format!(
+            "momentum component source has {} values, expected {} mesh cells",
+            volumetric_source.len(),
+            mesh.cells
+        )));
+    }
+    if boundary.len() != mesh.faces {
+        return Err(invalid_input(format!(
+            "momentum component boundary has {} values, expected {} mesh faces",
+            boundary.len(),
+            mesh.faces
+        )));
+    }
+    if old_values.len() != mesh.cells {
+        return Err(invalid_input(format!(
+            "momentum component old values have {} values, expected {} mesh cells",
+            old_values.len(),
+            mesh.cells
+        )));
+    }
+    if let Some(gradient) = old_gradient
+        && gradient.len() != mesh.cells
+    {
+        return Err(invalid_input(format!(
+            "momentum component old gradient has {} values, expected {} mesh cells",
+            gradient.len(),
+            mesh.cells
+        )));
+    }
+
+    let mut values = vec![0.0; momentum_csr_pattern.sparsity.nnz()];
+    let mut rhs = volumetric_source
+        .iter()
+        .zip(&mesh.cell_volumes)
+        .map(|(source, volume)| source * volume)
+        .collect::<Vec<_>>();
+
+    for (face_index, treatment) in boundary.iter().enumerate() {
+        let owner = face_addressing.owner(face_index);
+        let mass_flux = density * flux[face_index];
+        if !mass_flux.is_finite() {
+            return Err(invalid_input(format!(
+                "momentum face {face_index} mass flux must be finite, got {mass_flux}"
+            )));
+        }
+
+        if let Some(neighbour) = face_addressing.neighbour(face_index) {
+            let coefficient = cached_constant_face_diffusion_coefficient(
+                pressure_geometry,
+                diffusivity,
+                face_index,
+            )?;
+            let (owner_neighbour_slot, neighbour_owner_slot) =
+                momentum_csr_pattern.internal_slots(face_index);
+            add_csr_value(
+                &mut values,
+                momentum_csr_pattern.diagonal_slot(owner),
+                coefficient,
+            );
+            add_csr_value(&mut values, owner_neighbour_slot, -coefficient);
+            add_csr_value(
+                &mut values,
+                momentum_csr_pattern.diagonal_slot(neighbour),
+                coefficient,
+            );
+            add_csr_value(&mut values, neighbour_owner_slot, -coefficient);
+            add_internal_convection(
+                &mut values,
+                &mut rhs,
+                momentum_csr_pattern,
+                mesh,
+                old_values,
+                old_gradient,
+                owner,
+                neighbour,
+                face_index,
+                mass_flux,
+                convection_scheme,
+            );
+            continue;
+        }
+
+        match *treatment {
+            ScalarFaceTreatment::FixedValue(value) => {
+                let coefficient = cached_constant_face_diffusion_coefficient(
+                    pressure_geometry,
+                    diffusivity,
+                    face_index,
+                )?;
+                add_csr_value(
+                    &mut values,
+                    momentum_csr_pattern.diagonal_slot(owner),
+                    coefficient,
+                );
+                rhs[owner] += coefficient * value;
+                add_boundary_convection(
+                    &mut values,
+                    &mut rhs,
+                    momentum_csr_pattern,
+                    mesh,
+                    old_values,
+                    old_gradient,
+                    owner,
+                    face_index,
+                    value,
+                    mass_flux,
+                    convection_scheme,
+                );
+            }
+            ScalarFaceTreatment::InletOutlet(value) if mass_flux < 0.0 => {
+                let coefficient = cached_constant_face_diffusion_coefficient(
+                    pressure_geometry,
+                    diffusivity,
+                    face_index,
+                )?;
+                add_csr_value(
+                    &mut values,
+                    momentum_csr_pattern.diagonal_slot(owner),
+                    coefficient,
+                );
+                rhs[owner] += coefficient * value;
+                add_boundary_convection(
+                    &mut values,
+                    &mut rhs,
+                    momentum_csr_pattern,
+                    mesh,
+                    old_values,
+                    old_gradient,
+                    owner,
+                    face_index,
+                    value,
+                    mass_flux,
+                    convection_scheme,
+                );
+            }
+            ScalarFaceTreatment::FixedGradient(_)
+            | ScalarFaceTreatment::InletOutlet(_)
+            | ScalarFaceTreatment::ZeroGradient
+            | ScalarFaceTreatment::Constraint => {
+                add_boundary_extrapolated_convection(
+                    &mut values,
+                    &mut rhs,
+                    momentum_csr_pattern,
+                    mesh,
+                    old_values,
+                    old_gradient,
+                    owner,
+                    face_index,
+                    mass_flux,
+                    convection_scheme,
+                );
+            }
+        }
+    }
+
+    if convection_scheme.is_bounded() {
+        let net_flux = net_cell_flux_with_addressing(mesh, face_addressing, flux)?;
+        for (cell, cell_flux) in net_flux.into_iter().enumerate() {
+            let correction = checked_product(
+                density,
+                cell_flux,
+                format!("bounded momentum cell {cell} net mass flux"),
+            )?;
+            add_csr_value(
+                &mut values,
+                momentum_csr_pattern.diagonal_slot(cell),
+                -correction,
+            );
+        }
+    }
+
+    let matrix = CsrMatrix::from_pattern(&momentum_csr_pattern.sparsity, values)?;
+
+    Ok(ScalarComponentSystem { matrix, rhs })
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn assemble_momentum_component_system_legacy_scanned_oracle(
     mesh: &SolverRuntimeMeshData,
     face_addressing: &CompactSimpleFaceAddressing,
     momentum_csr_pattern: &MomentumCsrPattern,
@@ -6917,6 +7131,7 @@ fn validate_runtime_mesh(mesh: &SolverRuntimeMeshData) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn face_diffusion_coefficient(
     diffusivity: f64,
     area_vector: Point3,
@@ -6936,6 +7151,27 @@ fn face_diffusion_coefficient(
         z: to.z - from.z,
     };
     let projected_distance = (dot(delta, area_vector) / area).abs();
+    if !projected_distance.is_finite() || projected_distance <= f64::EPSILON {
+        return Err(invalid_input(format!(
+            "face {face_index} has non-positive projected diffusion distance {projected_distance}"
+        )));
+    }
+    Ok(diffusivity * area / projected_distance)
+}
+
+fn cached_constant_face_diffusion_coefficient(
+    pressure_geometry: &PressureGeometryCache,
+    diffusivity: f64,
+    face_index: usize,
+) -> Result<f64> {
+    let geometry = pressure_geometry.face(face_index);
+    let area = geometry.area_magnitude;
+    if !area.is_finite() || area <= f64::EPSILON {
+        return Err(invalid_input(format!(
+            "face {face_index} has non-positive area magnitude {area}"
+        )));
+    }
+    let projected_distance = geometry.projected_distance;
     if !projected_distance.is_finite() || projected_distance <= f64::EPSILON {
         return Err(invalid_input(format!(
             "face {face_index} has non-positive projected diffusion distance {projected_distance}"
@@ -7254,6 +7490,307 @@ mod tests {
         .expect("coefficient");
 
         assert_close(coefficient, 2.0);
+    }
+
+    #[test]
+    fn cached_momentum_diffusion_matches_scanned_internal_boundary_and_skewed_bits() {
+        for skewed in [false, true] {
+            let mut runtime = two_cell_runtime();
+            if skewed {
+                runtime.mesh.cell_centres[1] = point(0.75, 0.25, -0.125);
+                runtime.mesh.face_centres[1] = point(-0.25, 0.125, 0.0625);
+                runtime.mesh.face_centres[2] = point(1.25, -0.1875, 0.125);
+                runtime.mesh.face_area_vectors[0] = point(1.25, 0.5, -0.25);
+                runtime.mesh.face_area_vectors[1] = point(-1.5, 0.25, 0.125);
+                runtime.mesh.face_area_vectors[2] = point(0.875, -0.375, 0.25);
+            }
+            let pressure_geometry = super::PressureGeometryCache::from_mesh(&runtime.mesh);
+            for face_index in 0..runtime.mesh.faces {
+                let owner = runtime.mesh.owner[face_index];
+                let from = runtime.mesh.cell_centres[owner];
+                let to = runtime.mesh.neighbour[face_index]
+                    .map(|neighbour| runtime.mesh.cell_centres[neighbour])
+                    .unwrap_or(runtime.mesh.face_centres[face_index]);
+                let diffusivity = 0.625 + face_index as f64 * 0.375;
+                let scanned = face_diffusion_coefficient(
+                    diffusivity,
+                    runtime.mesh.face_area_vectors[face_index],
+                    from,
+                    to,
+                    face_index,
+                )
+                .expect("legacy scanned momentum coefficient");
+                let cached = super::cached_constant_face_diffusion_coefficient(
+                    &pressure_geometry,
+                    diffusivity,
+                    face_index,
+                )
+                .expect("cached momentum coefficient");
+                assert_eq!(cached.to_bits(), scanned.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn cached_momentum_diffusion_preserves_error_precedence_payloads_and_lazy_boundaries() {
+        let mut runtime = two_cell_runtime();
+        runtime.mesh.face_area_vectors[0] = zero();
+        let pressure_geometry = super::PressureGeometryCache::from_mesh(&runtime.mesh);
+        let scanned_area = face_diffusion_coefficient(
+            1.0,
+            runtime.mesh.face_area_vectors[0],
+            runtime.mesh.cell_centres[0],
+            runtime.mesh.cell_centres[1],
+            0,
+        )
+        .expect_err("legacy zero-area failure");
+        let cached_area =
+            super::cached_constant_face_diffusion_coefficient(&pressure_geometry, 1.0, 0)
+                .expect_err("cached zero-area failure");
+        assert_eq!(cached_area.to_string(), scanned_area.to_string());
+        assert_eq!(
+            cached_area.to_string(),
+            "face 0 has non-positive area magnitude 0"
+        );
+
+        runtime.mesh.face_area_vectors[0] = point(0.0, 1.0, 0.0);
+        let pressure_geometry = super::PressureGeometryCache::from_mesh(&runtime.mesh);
+        let scanned_distance = face_diffusion_coefficient(
+            1.0,
+            runtime.mesh.face_area_vectors[0],
+            runtime.mesh.cell_centres[0],
+            runtime.mesh.cell_centres[1],
+            0,
+        )
+        .expect_err("legacy projected-distance failure");
+        let cached_distance =
+            super::cached_constant_face_diffusion_coefficient(&pressure_geometry, 1.0, 0)
+                .expect_err("cached projected-distance failure");
+        assert_eq!(cached_distance.to_string(), scanned_distance.to_string());
+        assert_eq!(
+            cached_distance.to_string(),
+            "face 0 has non-positive projected diffusion distance 0"
+        );
+
+        let face_addressing = super::CompactSimpleFaceAddressing::from_mesh(&runtime.mesh)
+            .expect("compact momentum addressing");
+        let pattern = MomentumCsrPattern::from_mesh(&runtime.mesh).expect("momentum pattern");
+        let boundary = vec![ScalarFaceTreatment::Constraint; runtime.mesh.faces];
+        let mass_flux_error = super::assemble_momentum_component_system_with_addressing(
+            &runtime.mesh,
+            &face_addressing,
+            &pattern,
+            &pressure_geometry,
+            1.0,
+            1.0,
+            &[f64::NAN, 0.0, 0.0],
+            &[0.0, 0.0],
+            &boundary,
+            &[0.0, 0.0],
+            None,
+            LaminarSimpleConvectionScheme::GaussUpwind,
+        )
+        .expect_err("mass flux validation must precede cached geometry");
+        assert_eq!(
+            mass_flux_error.to_string(),
+            "momentum face 0 mass flux must be finite, got NaN"
+        );
+        let geometry_error = super::assemble_momentum_component_system_with_addressing(
+            &runtime.mesh,
+            &face_addressing,
+            &pattern,
+            &pressure_geometry,
+            1.0,
+            1.0,
+            &[0.0, 0.0, 0.0],
+            &[0.0, 0.0],
+            &boundary,
+            &[0.0, 0.0],
+            None,
+            LaminarSimpleConvectionScheme::GaussUpwind,
+        )
+        .expect_err("finite mass flux reaches cached geometry");
+        assert_eq!(geometry_error.to_string(), scanned_distance.to_string());
+
+        runtime.mesh.face_area_vectors[0] = point(1.0, 0.0, 0.0);
+        let invalid_boundary_face = runtime.mesh.internal_faces;
+        runtime.mesh.face_area_vectors[invalid_boundary_face] = zero();
+        let pressure_geometry = super::PressureGeometryCache::from_mesh(&runtime.mesh);
+        let face_addressing = super::CompactSimpleFaceAddressing::from_mesh(&runtime.mesh)
+            .expect("refreshed compact momentum addressing");
+        let pattern = MomentumCsrPattern::from_mesh(&runtime.mesh).expect("refreshed pattern");
+        let mut lazy_boundary = vec![ScalarFaceTreatment::Constraint; runtime.mesh.faces];
+        super::assemble_momentum_component_system_with_addressing(
+            &runtime.mesh,
+            &face_addressing,
+            &pattern,
+            &pressure_geometry,
+            1.0,
+            1.0,
+            &[0.0, 0.0, 0.0],
+            &[0.0, 0.0],
+            &lazy_boundary,
+            &[0.0, 0.0],
+            None,
+            LaminarSimpleConvectionScheme::GaussUpwind,
+        )
+        .expect("unused invalid boundary geometry remains lazy");
+        lazy_boundary[invalid_boundary_face] = ScalarFaceTreatment::FixedValue(0.0);
+        let boundary_error = super::assemble_momentum_component_system_with_addressing(
+            &runtime.mesh,
+            &face_addressing,
+            &pattern,
+            &pressure_geometry,
+            1.0,
+            1.0,
+            &[0.0, 0.0, 0.0],
+            &[0.0, 0.0],
+            &lazy_boundary,
+            &[0.0, 0.0],
+            None,
+            LaminarSimpleConvectionScheme::GaussUpwind,
+        )
+        .expect_err("active boundary diffusion validates cached geometry");
+        assert_eq!(
+            boundary_error.to_string(),
+            format!("face {invalid_boundary_face} has non-positive area magnitude 0")
+        );
+    }
+
+    #[test]
+    fn cached_momentum_assembly_matches_scanned_matrix_rhs_diagonal_and_h1_bits() {
+        for skewed in [false, true] {
+            let mut runtime = two_cell_runtime();
+            if skewed {
+                runtime.mesh.cell_centres[1] = point(0.75, 0.25, -0.125);
+                runtime.mesh.face_centres[1] = point(-0.25, 0.125, 0.0625);
+                runtime.mesh.face_centres[2] = point(1.25, -0.1875, 0.125);
+                runtime.mesh.face_area_vectors[0] = point(1.25, 0.5, -0.25);
+                runtime.mesh.face_area_vectors[1] = point(-1.5, 0.25, 0.125);
+                runtime.mesh.face_area_vectors[2] = point(0.875, -0.375, 0.25);
+            }
+            let face_addressing = super::CompactSimpleFaceAddressing::from_mesh(&runtime.mesh)
+                .expect("compact momentum addressing");
+            let pattern = MomentumCsrPattern::from_mesh(&runtime.mesh).expect("momentum pattern");
+            let pressure_geometry = super::PressureGeometryCache::from_mesh(&runtime.mesh);
+            let source = [0.125, -0.375];
+            let old_values = [1.5, -2.25];
+            let old_gradient = [point(0.25, -0.5, 0.75), point(-1.0, 0.125, 0.5)];
+            let boundary_and_flux = [
+                (
+                    [
+                        ScalarFaceTreatment::Constraint,
+                        ScalarFaceTreatment::FixedValue(0.625),
+                        ScalarFaceTreatment::InletOutlet(-1.25),
+                    ],
+                    [0.75, -0.25, -0.5],
+                ),
+                (
+                    [
+                        ScalarFaceTreatment::Constraint,
+                        ScalarFaceTreatment::InletOutlet(0.375),
+                        ScalarFaceTreatment::InletOutlet(-0.875),
+                    ],
+                    [0.75, 0.25, 0.5],
+                ),
+                (
+                    [
+                        ScalarFaceTreatment::Constraint,
+                        ScalarFaceTreatment::FixedGradient(0.5),
+                        ScalarFaceTreatment::ZeroGradient,
+                    ],
+                    [0.75, -0.25, 0.5],
+                ),
+                (
+                    [
+                        ScalarFaceTreatment::Constraint,
+                        ScalarFaceTreatment::Constraint,
+                        ScalarFaceTreatment::ZeroGradient,
+                    ],
+                    [-0.75, 0.25, -0.5],
+                ),
+            ];
+
+            for scheme in [
+                LaminarSimpleConvectionScheme::GaussUpwind,
+                LaminarSimpleConvectionScheme::GaussLinearUpwind,
+                LaminarSimpleConvectionScheme::BoundedGaussLinearUpwind(
+                    LaminarSimpleGradientScheme::GaussLinear,
+                ),
+            ] {
+                let gradient = scheme
+                    .uses_linear_upwind()
+                    .then_some(old_gradient.as_slice());
+                for (boundary, flux) in &boundary_and_flux {
+                    let cached = super::assemble_momentum_component_system_with_addressing(
+                        &runtime.mesh,
+                        &face_addressing,
+                        &pattern,
+                        &pressure_geometry,
+                        0.8125,
+                        1.375,
+                        flux,
+                        &source,
+                        boundary,
+                        &old_values,
+                        gradient,
+                        scheme,
+                    )
+                    .expect("cached momentum assembly");
+                    let scanned = super::assemble_momentum_component_system_legacy_scanned_oracle(
+                        &runtime.mesh,
+                        &face_addressing,
+                        &pattern,
+                        0.8125,
+                        1.375,
+                        flux,
+                        &source,
+                        boundary,
+                        &old_values,
+                        gradient,
+                        scheme,
+                    )
+                    .expect("legacy scanned momentum assembly");
+                    assert_scalar_component_systems_bit_equal(&cached, &scanned);
+
+                    let mut cached_relaxed = cached.clone();
+                    let mut scanned_relaxed = scanned.clone();
+                    let cached_diagonal =
+                        relax_scalar_component_equation(&mut cached_relaxed, &old_values, 0.6875)
+                            .expect("cached momentum relaxation");
+                    let scanned_diagonal =
+                        relax_scalar_component_equation(&mut scanned_relaxed, &old_values, 0.6875)
+                            .expect("scanned momentum relaxation");
+                    assert_eq!(
+                        cached_diagonal
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .collect::<Vec<_>>(),
+                        scanned_diagonal
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .collect::<Vec<_>>()
+                    );
+                    assert_scalar_component_systems_bit_equal(&cached_relaxed, &scanned_relaxed);
+                    let cached_h1 =
+                        super::momentum_h1_from_matrix(&runtime.mesh, &cached_relaxed.matrix)
+                            .expect("cached momentum H1");
+                    let scanned_h1 =
+                        super::momentum_h1_from_matrix(&runtime.mesh, &scanned_relaxed.matrix)
+                            .expect("scanned momentum H1");
+                    assert_eq!(
+                        cached_h1
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .collect::<Vec<_>>(),
+                        scanned_h1
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -12854,6 +13391,207 @@ mod tests {
         assert_eq!(left.stop_reason, right.stop_reason);
         assert_eq!(left.pcg_timing.is_some(), right.pcg_timing.is_some());
         assert_eq!(left.gamg_timing.is_some(), right.gamg_timing.is_some());
+    }
+
+    fn assert_scalar_component_systems_bit_equal(
+        left: &ScalarComponentSystem,
+        right: &ScalarComponentSystem,
+    ) {
+        assert_eq!(left.matrix.row_offsets(), right.matrix.row_offsets());
+        assert_eq!(left.matrix.col_indices(), right.matrix.col_indices());
+        assert_eq!(
+            left.matrix
+                .values()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            right
+                .matrix
+                .values()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            left.rhs
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            right
+                .rhs
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn cached_momentum_geometry_reuses_storage_and_preserves_serial_parallel_work() {
+        let mut runtime = two_cell_runtime();
+        runtime.mesh.cell_centres[1] = point(0.75, 0.25, -0.125);
+        runtime.mesh.face_centres[1] = point(-0.25, 0.125, 0.0625);
+        runtime.mesh.face_centres[2] = point(1.25, -0.1875, 0.125);
+        runtime.mesh.face_area_vectors[0] = point(1.25, 0.5, -0.25);
+        runtime.mesh.face_area_vectors[1] = point(-1.5, 0.25, 0.125);
+        runtime.mesh.face_area_vectors[2] = point(0.875, -0.375, 0.25);
+        let mesh_cache =
+            LaminarSimpleMeshCache::from_mesh(&runtime.mesh, LaminarSimpleSchemes::default())
+                .expect("SIMPLE mesh cache");
+        let geometry_pointer = mesh_cache.pressure_geometry.faces.as_ptr();
+        let geometry_capacity = mesh_cache.pressure_geometry.faces.capacity();
+        let velocity = [point(1.25, -0.5, 0.75), point(-0.25, 1.5, -1.0)];
+        let velocity_boundary = [
+            VectorFaceTreatment::Constraint,
+            VectorFaceTreatment::FixedValue(point(0.5, -0.25, 0.125)),
+            VectorFaceTreatment::FixedValue(point(-0.75, 0.375, 0.625)),
+        ];
+        let flux = [0.0; 3];
+        let old_components = split_components(&velocity);
+        let options = minimal_laminar_options();
+        let controls = ScalarSolveControls {
+            solver: options.momentum_linear_solver,
+            preconditioner: options.momentum_preconditioner,
+            tolerance: options.momentum_linear_tolerance,
+            relative_tolerance: options.momentum_linear_relative_tolerance,
+            max_iterations: options.momentum_max_linear_iterations,
+            gamg_options: None,
+            profile_gamg: false,
+            profile_pcg: false,
+        };
+        let mut serial_workspace = ScalarSolveWorkspace::new(runtime.mesh.cells);
+        let mut scanned_workspace = ScalarSolveWorkspace::new(runtime.mesh.cells);
+        let mut executor =
+            MomentumComponentExecutor::new(runtime.mesh.cells).expect("component executor");
+
+        for lifecycle in 0..10 {
+            let scale = lifecycle as f64 + 1.0;
+            let grad_p = [
+                point(0.125 * scale, -0.25 * scale, 0.0625 * scale),
+                point(-0.375 * scale, 0.5 * scale, -0.125 * scale),
+            ];
+            let equation = assemble_momentum_equation(
+                &runtime.mesh,
+                &mesh_cache,
+                &velocity,
+                &velocity_boundary,
+                &flux,
+                &grad_p,
+                &old_components,
+                &options,
+            )
+            .expect("cached momentum equation");
+
+            let mut scanned_components = Vec::with_capacity(3);
+            let mut scanned_diagonal = Vec::new();
+            let mut scanned_h1 = Vec::new();
+            for (component, old_component) in old_components.iter().enumerate() {
+                let volumetric_source = grad_p
+                    .iter()
+                    .map(|value| -super::component_value(*value, component))
+                    .collect::<Vec<_>>();
+                let boundary = scalar_component_boundary(&velocity_boundary, component);
+                let mut system = super::assemble_momentum_component_system_legacy_scanned_oracle(
+                    &runtime.mesh,
+                    &mesh_cache.face_addressing,
+                    &mesh_cache.momentum,
+                    options.dynamic_viscosity,
+                    options.density,
+                    &flux,
+                    &volumetric_source,
+                    &boundary,
+                    old_component,
+                    None,
+                    options.schemes.div_phi_u,
+                )
+                .expect("legacy scanned momentum equation component");
+                let component_diagonal = relax_scalar_component_equation(
+                    &mut system,
+                    old_component,
+                    options.velocity_relaxation,
+                )
+                .expect("legacy scanned momentum relaxation");
+                if component == 0 {
+                    scanned_diagonal = component_diagonal;
+                    scanned_h1 = super::momentum_h1_from_matrix(&runtime.mesh, &system.matrix)
+                        .expect("legacy scanned momentum H1");
+                }
+                scanned_components.push(system);
+            }
+
+            assert_eq!(equation.components.len(), scanned_components.len());
+            for (component, scanned_component) in scanned_components.iter().enumerate() {
+                assert_scalar_component_systems_bit_equal(
+                    &equation.components[component],
+                    scanned_component,
+                );
+            }
+            assert_eq!(
+                equation
+                    .diagonal
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                scanned_diagonal
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                equation
+                    .h1
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                scanned_h1
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+
+            let serial = solve_momentum_components_serial(
+                &equation.components,
+                &old_components,
+                controls,
+                &mut serial_workspace,
+            )
+            .expect("cached serial momentum work");
+            let scanned = solve_momentum_components_serial(
+                &scanned_components,
+                &old_components,
+                controls,
+                &mut scanned_workspace,
+            )
+            .expect("scanned serial momentum work");
+            let parallel = executor
+                .solve(
+                    equation.components.clone(),
+                    old_components.clone(),
+                    controls,
+                )
+                .expect("cached parallel momentum work");
+            for component in 0..3 {
+                assert_scalar_solve_reports_bit_equal(&serial[component], &scanned[component]);
+                assert_scalar_solve_reports_bit_equal(&serial[component], &parallel[component]);
+            }
+            assert_eq!(
+                mesh_cache.pressure_geometry.faces.as_ptr(),
+                geometry_pointer
+            );
+            assert_eq!(
+                mesh_cache.pressure_geometry.faces.capacity(),
+                geometry_capacity
+            );
+        }
+
+        for observations in &executor.workspace_observations {
+            assert_eq!(observations.len(), 10);
+            assert!(
+                observations
+                    .iter()
+                    .all(|identity| *identity == observations[0])
+            );
+        }
+        executor.shutdown().expect("component executor shutdown");
     }
 
     #[test]
